@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Brokkr · offsite Photos backup — LaunchAgent (runs on the workstation, per-user).
+  Daily encrypted push of the Photos originals to the configured crypt remote.
+
+  __BROKKR_DIR__ is substituted with the repo path by launchd/install.sh.
+  Install: ./launchd/install.sh   (see launchd/README.md)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.grimnir.brokkr.offsite-photos</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BROKKR_DIR__/scripts/offsite-photos-backup.sh</string>
+    </array>
+
+    <!-- Daily at 04:15 local. RunAtLoad is false so installing the agent never
+         starts a potentially long upload unexpectedly. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Homebrew paths for Apple Silicon and Intel, followed by system paths. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/brokkr/offsite-photos.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/brokkr/offsite-photos.launchd.log</string>
+</dict>
+</plist>

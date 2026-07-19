@@ -1,0 +1,36 @@
+[Unit]
+Description=Brokkr weekly npm dependency report — npm outdated across all service repos (detect+report only)
+After=network-online.target munin-memory.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=brokkr
+WorkingDirectory=/opt/brokkr
+Environment=REGISTRY_PATH=/opt/grimnir/services.json
+ExecStart=/usr/bin/bash scripts/maintenance-report.sh deps
+TimeoutStartSec=600
+
+# npm writes its cache into the private /tmp, repos are read-only.
+Environment=npm_config_cache=/tmp/npm-cache
+
+# Read-only hardening (mirrors grimnir-security-scan, which also runs npm).
+ProtectSystem=strict
+ReadOnlyPaths=/opt
+ProtectHome=read-only
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

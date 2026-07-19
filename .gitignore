@@ -1,0 +1,24 @@
+# Secrets / env
+.env
+*.env
+*.env.*
+!*.env.example
+*.local
+
+# Operator-local state and live infrastructure configuration
+STATUS.md
+network/cloudflared/config.yml
+samba/timemachine.conf
+rclone.conf
+
+# Logs
+*.log
+logs/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

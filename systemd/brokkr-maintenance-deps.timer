@@ -1,0 +1,11 @@
+[Unit]
+Description=Brokkr weekly npm dependency report
+
+[Timer]
+# Monday early morning, off-peak and clear of the Sunday 03:00 security scan.
+OnCalendar=Mon *-*-* 02:10:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,41 @@
+// Grimnir-managed unattended-upgrades policy — installed by
+// scripts/setup-host-patching.sh onto every Pi host in services.json.
+//
+// Policy decisions (see docs/scheduled-tasks.md "OS auto-patching"):
+//   * SECURITY ONLY. Only the Debian-Security archive is auto-applied.
+//     Regular Debian and Raspberry Pi Foundation packages (incl. kernel /
+//     firmware) are deliberately NOT auto-upgraded — those surface via the
+//     daily OS maintenance report (grimnir-maintenance-os) for deliberate,
+//     human-approved updates (the "deliberate-over-automatic" principle).
+//   * NO automatic reboot. A kernel/libc patch that needs a reboot is
+//     surfaced by grimnir-maintenance-os (reboot-required → Munin + Telegram);
+//     The operator schedules reboots when convenient.
+
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+};
+
+// No packages held back.
+Unattended-Upgrade::Package-Blacklist {
+};
+
+// Repair a dpkg state interrupted by a crash/power loss on the next run.
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+
+// Upgrade in minimal increments so a power loss leaves a consistent system.
+Unattended-Upgrade::MinimalSteps "true";
+
+// Keep the boot partition tidy — superseded kernels are auto-removed.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+
+// Do not reboot automatically — surfaced + done by hand instead.
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+
+// No MTA on these hosts; rely on Grimnir's Munin/Telegram reporting instead.
+Unattended-Upgrade::Mail "";
+
+// Log to syslog so journalctl / the maintenance report can read outcomes.
+Unattended-Upgrade::SyslogEnable "true";

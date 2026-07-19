@@ -1,0 +1,15 @@
+# Brokkr · platform-health snapshot (oneshot, driven by brokkr-health.timer).
+# Installed to /etc/systemd/system/ on the NAS Pi by scripts/deploy-nas.sh.
+[Unit]
+Description=Brokkr platform health snapshot
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=brokkr
+WorkingDirectory=/opt/brokkr
+# Optional (leading '-'): provides HEIMDALL_HUB_URL + HEIMDALL_FLEET_TOKEN for the push.
+# Derived at deploy time from the shared fleet token; never stored in the repo.
+EnvironmentFile=-/home/brokkr/.config/brokkr/env
+ExecStart=/opt/brokkr/scripts/health-snapshot.sh

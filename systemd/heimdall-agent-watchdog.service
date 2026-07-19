@@ -1,0 +1,13 @@
+# Brokkr · heimdall-agent watchdog (oneshot, driven by heimdall-agent-watchdog.timer).
+# USER unit — installed to ~/.config/systemd/user/ on each fleet host by
+# scripts/deploy-agent-watchdog.sh. It must be a user unit (not system) because the
+# agent it restarts is a `systemctl --user` unit; the restart runs on the same bus.
+[Unit]
+Description=Brokkr watchdog — restart heimdall-agent if its pushes go stale (wedge detection, brokkr#14)
+After=heimdall-agent.service
+
+[Service]
+Type=oneshot
+# Optional (leading '-'): HEIMDALL_AGENT_STALE_SECS / _STATE_DIR / _UNIT overrides.
+EnvironmentFile=-%h/.config/brokkr/env
+ExecStart=%h/repos/brokkr/scripts/heimdall-agent-watchdog.sh

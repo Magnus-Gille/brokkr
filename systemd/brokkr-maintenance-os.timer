@@ -1,0 +1,12 @@
+[Unit]
+Description=Brokkr daily OS maintenance report
+
+[Timer]
+# After the stock apt-daily-upgrade run (~06:02–06:41) and the Skuld briefing (06:00),
+# so it reflects the morning's unattended-upgrades outcome.
+OnCalendar=*-*-* 07:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+// Grimnir-managed — installed by scripts/setup-host-patching.sh
+// Enables the stock apt-daily / apt-daily-upgrade timers to actually
+// refresh package lists and run unattended-upgrades.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";

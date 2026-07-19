@@ -1,0 +1,13 @@
+# Brokkr · run the heimdall-agent watchdog every minute.
+# USER unit — installed to ~/.config/systemd/user/ on each fleet host.
+# (No Persistent=true: a missed liveness check is irrelevant; we only care about now.)
+[Unit]
+Description=Run the Brokkr heimdall-agent watchdog every minute (brokkr#14)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

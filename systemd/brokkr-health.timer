@@ -1,0 +1,12 @@
+# Brokkr · run the platform-health snapshot every 15 minutes.
+# Installed to /etc/systemd/system/ on the NAS Pi by scripts/deploy-nas.sh.
+[Unit]
+Description=Run Brokkr platform health snapshot every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

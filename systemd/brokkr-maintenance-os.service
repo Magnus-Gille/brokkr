@@ -1,0 +1,30 @@
+[Unit]
+Description=Brokkr daily OS maintenance report — pending security updates, reboot-required & disk across all Pis
+After=network-online.target munin-memory.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=brokkr
+WorkingDirectory=/opt/brokkr
+Environment=REGISTRY_PATH=/opt/grimnir/services.json
+ExecStart=/usr/bin/bash scripts/maintenance-report.sh os
+TimeoutStartSec=180
+
+# Lighter sandbox than the read-only jobs: this one reads apt state under /var
+# and SSHes to nas, so /var stays writable and home is read-only (not blocked).
+ProtectSystem=true
+ProtectHome=read-only
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

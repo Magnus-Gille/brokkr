@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Brokkr control-node dead-man check every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+RandomizedDelaySec=20s
+Persistent=true
+Unit=brokkr-control-node-deadman.service
+
+[Install]
+WantedBy=timers.target

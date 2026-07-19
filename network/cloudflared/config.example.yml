@@ -1,0 +1,8 @@
+# Copy to config.yml and replace every placeholder locally. config.yml is ignored.
+tunnel: 00000000-0000-4000-8000-000000000000
+credentials-file: /etc/cloudflared/00000000-0000-4000-8000-000000000000.json
+
+ingress:
+  - hostname: memory.example.com
+    service: http://127.0.0.1:3030
+  - service: http_status:404
