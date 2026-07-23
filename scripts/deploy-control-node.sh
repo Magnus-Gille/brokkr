@@ -1,66 +1,92 @@
 #!/usr/bin/env bash
-# Brokkr · deploy to the control node: sync the repo and install the maintenance
-# timers. Idempotent.
+# Brokkr · deploy control-node maintenance + failure monitoring. Idempotent.
 #
-#   BROKKR_SSH_TARGET=brokkr@control-node ./scripts/deploy-control-node.sh [user@host]
-#
-# Requires ssh + passwordless sudo on control-node. The maintenance timers read
-# grimnir's services.json registry at runtime (REGISTRY_PATH env var) — that
-# coupling is baked into the systemd unit Environment= directives and into
-# the scripts themselves via the REGISTRY_PATH default.
-#
-# This deploy also performs the cutover automatically + idempotently: it retires the OLD
-# grimnir-maintenance-os/-deps units (disable + remove) that this repo replaces, so they
-# do not keep firing after their scripts moved to brokkr. Safe to re-run anytime.
-#
-# Verify the new timers took over:
-#   ssh brokkr@control-node systemctl list-timers brokkr-maintenance-\*.timer
+# The install target is deliberately separate from a canonical checkout. Runtime
+# identity/layout and Heimdall delivery inputs are explicit so a deployment never
+# assumes a particular account, home directory, or secret-file location.
 set -euo pipefail
 
 CONTROL_NODE="${1:-${BROKKR_SSH_TARGET:-brokkr@control-node}}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEST="${BROKKR_REMOTE_DIR:-/opt/brokkr}"
-HEIMDALL_SOURCE_ENV="${BROKKR_HEIMDALL_SOURCE_ENV:-/etc/brokkr/heimdall-source.env}"
+DEPLOY_TARGET="${BROKKR_DEPLOY_TARGET:-${BROKKR_REMOTE_DIR:-/opt/brokkr}}"
+RUNTIME_USER="${BROKKR_RUNTIME_USER:-brokkr}"
+RUNTIME_HOME="${BROKKR_RUNTIME_HOME:-/home/$RUNTIME_USER}"
+REGISTRY_PATH="${BROKKR_REGISTRY_PATH:-/opt/grimnir/services.json}"
+HEIMDALL_URL="${BROKKR_HEIMDALL_URL:-}"
+HEIMDALL_TOKEN_SOURCE="${BROKKR_HEIMDALL_TOKEN_SOURCE:-}"
 
-echo "==> Syncing repo to $CONTROL_NODE:$DEST"
-rsync -a --delete --exclude '.git' --exclude '.local' "$HERE/" "$CONTROL_NODE:$DEST/"
+die() { echo "brokkr deploy: $*" >&2; exit 64; }
+valid_path() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/@:+-]+$ ]] \
+    && [[ "$1" != *'//'* && "$1" != */./* && "$1" != */../* && "$1" != */. && "$1" != */.. ]]
+}
 
-echo "==> Installing systemd units on $CONTROL_NODE"
+[[ "$RUNTIME_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid BROKKR_RUNTIME_USER"
+valid_path "$DEPLOY_TARGET" || die "invalid BROKKR_DEPLOY_TARGET"
+valid_path "$RUNTIME_HOME" || die "invalid BROKKR_RUNTIME_HOME"
+valid_path "$REGISTRY_PATH" || die "invalid BROKKR_REGISTRY_PATH"
+valid_path "$HEIMDALL_TOKEN_SOURCE" || die "BROKKR_HEIMDALL_TOKEN_SOURCE must be an absolute server-side path"
+[[ "$HEIMDALL_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || die "BROKKR_HEIMDALL_URL must be an explicit non-secret http(s) panel endpoint"
+
+echo "==> Syncing Brokkr release to $CONTROL_NODE"
+rsync -a --delete --exclude '.git' --exclude '.local' "$HERE/" "$CONTROL_NODE:$DEPLOY_TARGET/"
+
+echo "==> Rendering + installing control-node systemd units"
 ssh "$CONTROL_NODE" "
   set -euo pipefail
 
-  # The failure monitor must never be enabled without its primary delivery
-  # path. Derive its owner-only runtime env from the same host-local source
-  # convention used by the NAS deployment; values never leave the host or log.
-  if ! sudo test -f '$HEIMDALL_SOURCE_ENV'; then
-    echo 'ERROR: Heimdall source environment is missing; refusing to enable the failure sweep' >&2
+  # The selected runtime identity must exist, own a concrete home, and be able
+  # to read the registry used by the maintenance units. Do this before writing
+  # any environment/unit state or enabling a timer.
+  if ! id '$RUNTIME_USER' >/dev/null 2>&1 \
+    || ! sudo test -d '$RUNTIME_HOME' || sudo test -L '$RUNTIME_HOME' \
+    || ! sudo -u '$RUNTIME_USER' test -w '$RUNTIME_HOME'; then
+    echo 'ERROR: runtime user or home is not usable' >&2
     exit 2
   fi
-  if [ \"\$(sudo grep -Ec '^HEIMDALL_HUB_URL=' '$HEIMDALL_SOURCE_ENV')\" -ne 1 ] \
-    || [ \"\$(sudo grep -Ec '^HEIMDALL_FLEET_TOKEN=' '$HEIMDALL_SOURCE_ENV')\" -ne 1 ] \
-    || ! sudo grep -Eq '^HEIMDALL_HUB_URL=.+$' '$HEIMDALL_SOURCE_ENV' \
-    || ! sudo grep -Eq '^HEIMDALL_FLEET_TOKEN=.+$' '$HEIMDALL_SOURCE_ENV'; then
-    echo 'ERROR: Heimdall source environment must contain exactly one non-empty URL and fleet token; refusing to enable the failure sweep' >&2
+  if ! sudo test -f '$REGISTRY_PATH' || ! sudo -u '$RUNTIME_USER' test -r '$REGISTRY_PATH'; then
+    echo 'ERROR: registry path is not a readable regular file for the runtime user' >&2
     exit 2
   fi
-  sudo install -d -m 0700 -o brokkr -g brokkr /home/brokkr/.config/brokkr
-  sudo sh -c \"umask 077; grep -E '^HEIMDALL_(HUB_URL|FLEET_TOKEN)=' '$HEIMDALL_SOURCE_ENV' > /home/brokkr/.config/brokkr/env\"
-  sudo chown brokkr:brokkr /home/brokkr/.config/brokkr/env
-  sudo chmod 0600 /home/brokkr/.config/brokkr/env
 
-  sudo install -m 0644 '$DEST'/systemd/brokkr-maintenance-os.service  /etc/systemd/system/brokkr-maintenance-os.service
-  sudo install -m 0644 '$DEST'/systemd/brokkr-maintenance-os.timer    /etc/systemd/system/brokkr-maintenance-os.timer
-  sudo install -m 0644 '$DEST'/systemd/brokkr-maintenance-deps.service /etc/systemd/system/brokkr-maintenance-deps.service
-  sudo install -m 0644 '$DEST'/systemd/brokkr-maintenance-deps.timer   /etc/systemd/system/brokkr-maintenance-deps.timer
-  sudo install -m 0644 '$DEST'/systemd/brokkr-systemd-failure@.service /etc/systemd/system/brokkr-systemd-failure@.service
-  sudo install -m 0644 '$DEST'/systemd/brokkr-systemd-failure-sweep.service /etc/systemd/system/brokkr-systemd-failure-sweep.service
-  sudo install -m 0644 '$DEST'/systemd/brokkr-systemd-failure-sweep.timer /etc/systemd/system/brokkr-systemd-failure-sweep.timer
+  # Never enable the monitor before proving the token source is a protected,
+  # regular root-owned file with exactly one non-empty token assignment.
+  if ! sudo test -f '$HEIMDALL_TOKEN_SOURCE' || sudo test -L '$HEIMDALL_TOKEN_SOURCE' || ! sudo test -O '$HEIMDALL_TOKEN_SOURCE'; then
+    echo 'ERROR: Heimdall token source is not a protected regular root-owned file' >&2
+    exit 2
+  fi
+  token_mode=\$(sudo stat -c '%a' '$HEIMDALL_TOKEN_SOURCE')
+  case \$token_mode in 400|600) ;; *) echo 'ERROR: Heimdall token source must have mode 0400 or 0600' >&2; exit 2 ;; esac
+  if [ \"\$(sudo grep -Ec '^HEIMDALL_FLEET_TOKEN=' '$HEIMDALL_TOKEN_SOURCE')\" -ne 1 ] \
+    || ! sudo grep -Eq '^HEIMDALL_FLEET_TOKEN=.+$' '$HEIMDALL_TOKEN_SOURCE'; then
+    echo 'ERROR: Heimdall token source must contain exactly one non-empty fleet token' >&2
+    exit 2
+  fi
+
+  # A syntactically valid URL and token file are insufficient: only an
+  # authenticated 2xx panel readback proves delivery will work from this host.
+  # The helper reads the server-side token source itself and puts the credential
+  # only on curl's stdin configuration, never in argv or output.
+  if ! sudo '$DEPLOY_TARGET/scripts/verify-heimdall-delivery.sh' '$HEIMDALL_URL' '$HEIMDALL_TOKEN_SOURCE'; then
+    echo 'ERROR: Heimdall endpoint preflight failed; refusing to enable timers' >&2
+    exit 2
+  fi
+
+  sudo install -d -m 0700 -o '$RUNTIME_USER' -g '$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr'
+  sudo sh -c \"umask 077; { printf '%s\\n' 'HEIMDALL_HUB_URL=$HEIMDALL_URL'; grep -E '^HEIMDALL_FLEET_TOKEN=' '$HEIMDALL_TOKEN_SOURCE'; } > '$RUNTIME_HOME/.config/brokkr/env'\"
+  sudo chown '$RUNTIME_USER:$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr/env'
+  sudo chmod 0600 '$RUNTIME_HOME/.config/brokkr/env'
+
+  sudo env BROKKR_RUNTIME_USER='$RUNTIME_USER' BROKKR_RUNTIME_HOME='$RUNTIME_HOME' BROKKR_DEPLOY_TARGET='$DEPLOY_TARGET' BROKKR_REGISTRY_PATH='$REGISTRY_PATH' \
+    '$DEPLOY_TARGET/scripts/render-systemd-failure-units.sh' /etc/systemd/system
+  sudo install -m 0644 '$DEPLOY_TARGET/systemd/brokkr-maintenance-os.timer' /etc/systemd/system/brokkr-maintenance-os.timer
+  sudo install -m 0644 '$DEPLOY_TARGET/systemd/brokkr-maintenance-deps.timer' /etc/systemd/system/brokkr-maintenance-deps.timer
+  sudo install -m 0644 '$DEPLOY_TARGET/systemd/brokkr-systemd-failure-sweep.timer' /etc/systemd/system/brokkr-systemd-failure-sweep.timer
 
   sudo systemctl daemon-reload
   sudo systemctl enable --now brokkr-maintenance-os.timer brokkr-maintenance-deps.timer brokkr-systemd-failure-sweep.timer
 
-  # Cutover (idempotent): retire the OLD grimnir-maintenance-* units this repo replaces,
-  # so they do not keep firing now that their scripts moved to brokkr.
+  # Retire the old Grimnir maintenance units after the Brokkr units are enabled.
   removed=0
   for u in grimnir-maintenance-os grimnir-maintenance-deps; do
     if sudo test -e /etc/systemd/system/\$u.timer || sudo test -e /etc/systemd/system/\$u.service; then
@@ -74,4 +100,4 @@ ssh "$CONTROL_NODE" "
   echo '-- timer status --'
   systemctl list-timers brokkr-maintenance-os.timer brokkr-maintenance-deps.timer brokkr-systemd-failure-sweep.timer --no-pager 2>/dev/null || true
 "
-echo "==> Done. Old grimnir-maintenance-* units retired if present; brokkr-maintenance timers active."
+echo "==> Done. No Heimdall credential values were printed."
