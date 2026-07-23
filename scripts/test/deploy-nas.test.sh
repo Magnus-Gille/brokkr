@@ -117,7 +117,14 @@ check "protected Heimdall values and source path are not printed" '[[ "$OUT" != 
 : >"$CALLS"
 export MOCK_SOURCE_MODE=644
 run
-check "unsafe Heimdall source refuses before systemd mutation without leakage" '[[ "$RC" -ne 0 && "$OUT" == *"unsafe permissions"* ]] && ! grep -q "/etc/systemd/system\|systemctl" "$CALLS" && [[ "$OUT" != *secret-sentinel* && "$OUT" != *"$BROKKR_HEIMDALL_SOURCE_ENV"* ]] && ! grep -Fq secret-sentinel "$CALLS" && ! grep -Fq "$BROKKR_HEIMDALL_SOURCE_ENV" "$CALLS"'
+check "unsafe Heimdall source returns non-zero" '[[ "$RC" -ne 0 ]]'
+check "unsafe Heimdall source reports the permission refusal" '[[ "$OUT" == *"unsafe permissions"* ]]'
+check "unsafe Heimdall source installs no systemd unit" '! grep -Fq "/etc/systemd/system/" "$CALLS"'
+check "unsafe Heimdall source invokes no systemctl mutation" '! grep -Fq "systemctl" "$CALLS"'
+check "unsafe Heimdall source output contains no secret value" '[[ "$OUT" != *secret-sentinel* ]]'
+check "unsafe Heimdall source output contains no source path" '[[ "$OUT" != *"$BROKKR_HEIMDALL_SOURCE_ENV"* ]]'
+check "unsafe Heimdall source call log contains no secret value" '! grep -Fq secret-sentinel "$CALLS"'
+check "unsafe Heimdall source call log contains no source path" '! grep -Fq "$BROKKR_HEIMDALL_SOURCE_ENV" "$CALLS"'
 unset MOCK_SOURCE_MODE
 
 : >"$CALLS"
