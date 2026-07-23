@@ -1,0 +1,22 @@
+# Brokkr · reconcile every failed system service on this host (brokkr#6).
+[Unit]
+Description=Brokkr sweep for failed systemd services
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=brokkr
+WorkingDirectory=/opt/brokkr
+EnvironmentFile=-/home/brokkr/.config/brokkr/env
+ExecStart=/opt/brokkr/scripts/systemd-failure-monitor.sh --sweep
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+SystemCallArchitectures=native

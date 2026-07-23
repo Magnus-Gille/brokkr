@@ -4,6 +4,7 @@
 Description=Brokkr platform health snapshot
 After=network-online.target local-fs.target
 Wants=network-online.target
+OnFailure=brokkr-systemd-failure@%n.service
 
 [Service]
 Type=oneshot

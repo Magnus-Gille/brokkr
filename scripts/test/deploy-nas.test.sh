@@ -40,11 +40,15 @@ EOF
 
 cat >"$TMP/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
-[[ "$*" == 'list-timers brokkr-health.timer --no-pager' ]] || exit 64
+case "$*" in
+  'list-timers brokkr-health.timer --no-pager') prefix=timer ;;
+  'list-timers brokkr-systemd-failure-sweep.timer --no-pager') prefix=failure-monitor-timer ;;
+  *) exit 64 ;;
+esac
 # More than a pipe buffer, with the production-observed failure code if a reader closes early.
 trap 'exit 141' PIPE
 for ((i = 1; i <= 20000; i++)); do
-  printf 'timer-%06d\n' "$i"
+  printf '%s-%06d\n' "$prefix" "$i"
 done
 printf '%s\n' complete >"$MOCK_PRODUCER_STATE"
 EOF
@@ -71,6 +75,7 @@ echo "deploy-nas.test.sh"
 check "deploy reaches success after the timer display" '[[ "$RC" -eq 0 && "$OUT" == *"==> Done."* ]]'
 check "timer display keeps exactly two rows" '[[ "$(grep -c "^timer-" <<<"$OUT")" -eq 2 ]]'
 check "timer display starts at the first row" 'grep -q "^timer-000001$" <<<"$OUT" && grep -q "^timer-000002$" <<<"$OUT"'
+check "failure-monitor timer display is included" 'grep -q "^failure-monitor-timer-000001$" <<<"$OUT" && grep -q "^failure-monitor-timer-000002$" <<<"$OUT"'
 check "timer producer is consumed rather than closed early" '[[ "$(cat "$MOCK_PRODUCER_STATE" 2>/dev/null)" == complete ]]'
 check "rsync and ssh are mocked rather than reaching a host" '[[ "$(grep -c "^rsync " "$CALLS")" -eq 1 && "$(grep -c "^ssh " "$CALLS")" -eq 1 ]]'
 

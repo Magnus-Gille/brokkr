@@ -52,6 +52,7 @@ required to run or understand Brokkr.
 | `disk/`, `timemachine/`, `samba/` | Storage, capacity, Time Machine, and share checks |
 | `scripts/offsite-photos-backup.sh` | Fail-closed `rclone crypt` backup with deletion gates |
 | `heimdall/` | Compose and push hardware-health snapshots |
+| `systemd/brokkr-systemd-failure*` | Fail-loud reporting for failed system services and timer-driven oneshots |
 | `scripts/maintenance-report.sh` | OS, dependency, and firmware visibility |
 | `systemd/`, `launchd/` | Example timers, service units, and resource limits |
 | `network/cloudflared/config.example.yml` | Placeholder-only tunnel configuration |
@@ -97,6 +98,7 @@ Feature-specific setup and acceptance checks live in:
 - [`docs/backup-evidence.md`](docs/backup-evidence.md)
 - [`docs/control-node-deadman.md`](docs/control-node-deadman.md)
 - [`docs/heimdall-agent-watchdog.md`](docs/heimdall-agent-watchdog.md)
+- [`docs/systemd-failure-monitor.md`](docs/systemd-failure-monitor.md)
 - [`runbooks/restore.md`](runbooks/restore.md)
 
 ## Security model and limitations

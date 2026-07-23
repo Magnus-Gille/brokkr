@@ -1,0 +1,28 @@
+# Brokkr · immediate alert target for a failed system service (brokkr#6).
+#
+# Other system services opt in with:
+#   OnFailure=brokkr-systemd-failure@%n.service
+# Do not add OnFailure to this handler or the sweep: a broken alert path must not
+# recursively alert itself. The periodic sweep retries delivery and exposes it in
+# journald; an independent dead-man covers host-wide loss.
+[Unit]
+Description=Brokkr report failed systemd service %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=brokkr
+WorkingDirectory=/opt/brokkr
+EnvironmentFile=-/home/brokkr/.config/brokkr/env
+ExecStart=/opt/brokkr/scripts/systemd-failure-monitor.sh --unit %i
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+SystemCallArchitectures=native
