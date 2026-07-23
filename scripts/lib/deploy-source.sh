@@ -62,13 +62,26 @@ verify_deploy_source_identity() {
 }
 
 require_brokkr_deploy_source_binding() {
+  local entry_source=${1:-}
   local expected_source=${BROKKR_EXPECTED_SOURCE:-}
   local expected_revision=${BROKKR_EXPECTED_COMMIT:-}
+  local resolved_expected_source resolved_entry_source
 
-  if [[ -z "$expected_source" || -z "$expected_revision" ]]; then
+  if [[ -z "$entry_source" || -z "$expected_source" || -z "$expected_revision" ]]; then
     echo "ERROR: BROKKR_EXPECTED_SOURCE and BROKKR_EXPECTED_COMMIT (a full immutable SHA) are required" >&2
     return 1
   fi
 
   verify_deploy_source_identity "$expected_source" "$expected_revision" "$PWD"
+
+  resolved_expected_source=$(cd "$expected_source" 2>/dev/null && pwd -P) || return 1
+  resolved_entry_source=$(cd "$entry_source" 2>/dev/null && pwd -P) || {
+    echo "ERROR: deployment entry point source root cannot be resolved" >&2
+    return 1
+  }
+  if [[ "$resolved_entry_source" != "$resolved_expected_source" ]]; then
+    echo "Entry source: $resolved_entry_source"
+    echo "ERROR: deployment entry point source root does not match the expected source" >&2
+    return 1
+  fi
 }

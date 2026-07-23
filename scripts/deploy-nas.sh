@@ -22,7 +22,7 @@ valid_path() {
 require() { [[ -n "${!1:-}" ]] || die "$1 is required"; }
 
 # This outermost local gate must run before even the remote target preflight.
-require_brokkr_deploy_source_binding
+require_brokkr_deploy_source_binding "$HERE"
 
 require BROKKR_RUNTIME_USER
 require BROKKR_RUNTIME_HOME

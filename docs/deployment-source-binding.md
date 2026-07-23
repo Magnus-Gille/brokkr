@@ -27,6 +27,8 @@ Before executing the guarded command it verifies all of the following:
 
 - the expected path resolves to the caller's physical current directory;
 - that directory is exactly the resolved Git worktree root, not a subdirectory;
+- the physical repository root containing the deployment entry script is that
+  same expected worktree;
 - the actual `HEAD` equals the expected immutable SHA.
 
 Detached worktrees are supported. On any mismatch the command is not started,

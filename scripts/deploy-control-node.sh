@@ -24,7 +24,7 @@ valid_path() {
 }
 
 # This outermost local gate must run before even the remote target preflight.
-require_brokkr_deploy_source_binding
+require_brokkr_deploy_source_binding "$HERE"
 
 [[ "$RUNTIME_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid BROKKR_RUNTIME_USER"
 valid_path "$DEPLOY_TARGET" || die "invalid BROKKR_DEPLOY_TARGET"

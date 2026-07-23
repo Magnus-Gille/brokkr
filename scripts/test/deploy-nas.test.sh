@@ -12,6 +12,11 @@ git -C "$SOURCE" checkout --detach -q "$SOURCE_SHA"
 # Exercise the current implementation while retaining a detached worktree.
 cp "$REPO_SOURCE/scripts/deploy-nas.sh" "$SOURCE/scripts/deploy-nas.sh"
 cp "$REPO_SOURCE/scripts/lib/deploy-source.sh" "$SOURCE/scripts/lib/deploy-source.sh"
+STALE_SOURCE="$TMP/stale-source"
+git clone -q "$REPO_SOURCE" "$STALE_SOURCE"
+git -C "$STALE_SOURCE" checkout --detach -q "$SOURCE_SHA^"
+cp "$REPO_SOURCE/scripts/deploy-nas.sh" "$STALE_SOURCE/scripts/deploy-nas.sh"
+cp "$REPO_SOURCE/scripts/lib/deploy-source.sh" "$STALE_SOURCE/scripts/lib/deploy-source.sh"
 cleanup() {
   rm -rf "$TMP"
 }
@@ -125,7 +130,11 @@ ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1" >&2; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 # shellcheck disable=SC2034 # checks consume OUT and RC through eval.
-run() { OUT="$(cd "$SOURCE" && bash "$DEPLOY" 2>&1)"; RC=$?; }
+run() {
+  local deploy=${1:-$DEPLOY}
+  OUT="$(cd "$SOURCE" && bash "$deploy" 2>&1)"
+  RC=$?
+}
 
 echo "deploy-nas.test.sh"
 
@@ -133,6 +142,10 @@ unset BROKKR_EXPECTED_COMMIT
 run
 check "missing source revision refuses before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_EXPECTED_SOURCE and BROKKR_EXPECTED_COMMIT"* ]] && [[ ! -s "$CALLS" ]]'
 export BROKKR_EXPECTED_COMMIT="$SOURCE_SHA"
+
+: >"$CALLS"
+run "$STALE_SOURCE/scripts/deploy-nas.sh"
+check "stale entry script refuses from an accepted detached cwd before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"entry point source root does not match"* ]] && [[ ! -s "$CALLS" ]]'
 
 : >"$CALLS"
 mkdir -p "$TMP/wrong-source"
