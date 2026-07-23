@@ -82,11 +82,14 @@ ssh "$CONTROL_NODE" "
 "
 
 echo "==> Syncing Brokkr release to $CONTROL_NODE"
-rsync -a --delete --exclude '.git' --exclude '.local' "$DEPLOY_PAYLOAD_ROOT/" "$CONTROL_NODE:$DEPLOY_TARGET/"
+rsync -a --no-perms --executability --delete --exclude '.git' --exclude '.local' "$DEPLOY_PAYLOAD_ROOT/" "$CONTROL_NODE:$DEPLOY_TARGET/"
 
 echo "==> Rendering + installing control-node systemd units"
 ssh "$CONTROL_NODE" "
   set -euo pipefail
+
+  sudo chmod 0750 '$DEPLOY_TARGET'
+  [ \"\$(sudo stat -c '%a' '$DEPLOY_TARGET')\" = 750 ] || { echo 'ERROR: release target mode is not 0750 after sync' >&2; exit 2; }
 
   # The selected runtime identity must exist, own a concrete home, and be able
   # to read the registry used by the maintenance units. Do this before writing

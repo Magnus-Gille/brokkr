@@ -83,7 +83,7 @@ ssh "$NAS" "
 "
 
 echo "==> Syncing Brokkr release to $NAS"
-rsync -a --delete --exclude '.git' --exclude '.local' \
+rsync -a --no-perms --executability --delete --exclude '.git' --exclude '.local' \
   --rsync-path="sudo -u $RUNTIME_USER rsync" "$DEPLOY_PAYLOAD_ROOT/" "$NAS:$DEPLOY_TARGET/"
 
 echo "==> Rendering + installing NAS systemd units"
@@ -102,6 +102,8 @@ ssh "$NAS" "
     echo 'ERROR: release target is not a runtime-user-owned writable directory' >&2
     exit 2
   fi
+  sudo chmod 0750 '$DEPLOY_TARGET'
+  [ \"\$(sudo stat -c '%a' '$DEPLOY_TARGET')\" = 750 ] || { echo 'ERROR: release target mode is not 0750 after sync' >&2; exit 2; }
   if ! sudo test -f '$REGISTRY_PATH' || sudo test -L '$REGISTRY_PATH' \
     || ! sudo -u '$RUNTIME_USER' test -r '$REGISTRY_PATH'; then
     echo 'ERROR: registry path is not a readable regular file for the runtime user' >&2

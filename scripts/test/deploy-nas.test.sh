@@ -19,7 +19,7 @@ git -C "$SOURCE" commit -qm 'fixture deploy binding'
 SOURCE_SHA="$(git -C "$SOURCE" rev-parse HEAD)"
 STALE_SOURCE="$TMP/stale-source"
 git clone -q "$SOURCE" "$STALE_SOURCE"
-git -C "$STALE_SOURCE" checkout --detach -q "$SOURCE_SHA^"
+git -C "$STALE_SOURCE" checkout --detach -q "$BASE_SHA"
 cp "$REPO_SOURCE/scripts/deploy-nas.sh" "$STALE_SOURCE/scripts/deploy-nas.sh"
 cp "$REPO_SOURCE/scripts/lib/deploy-source.sh" "$STALE_SOURCE/scripts/lib/deploy-source.sh"
 cleanup() {
@@ -46,6 +46,7 @@ if [[ ! -d "$release" ]]; then
   echo 'mock rsync: release target was not prepared' >&2
   exit 11
 fi
+chmod 755 "$release"
 if [[ -x "$release/scripts/deploy-nas.sh" ]]; then
   exit 0
 fi
@@ -104,13 +105,18 @@ case "${1:-}" in
     exit 0
     ;;
   stat)
-    if [[ "${!#}" == "$MOCK_RUNTIME_ENV" ]]; then
+    if [[ "${!#}" == "$MOCK_RELEASE_TARGET" ]]; then
+      stat -c '%a' "${!#}" 2>/dev/null || stat -f '%Lp' "${!#}"
+    elif [[ "${!#}" == "$MOCK_RUNTIME_ENV" ]]; then
       printf 'mock-runtime-mode %s\n' "${MOCK_RUNTIME_MODE:-600}" >>"$MOCK_CALLS"
       printf '%s\n' "${MOCK_RUNTIME_MODE:-600}"
     else
       printf 'mock-source-mode %s\n' "${MOCK_SOURCE_MODE:-600}" >>"$MOCK_CALLS"
       printf '%s\n' "${MOCK_SOURCE_MODE:-600}"
     fi
+    ;;
+  chmod)
+    if [[ "$3" == "$MOCK_RELEASE_TARGET" ]]; then chmod "$2" "$3"; fi
     ;;
   grep) "$@" ;;
   sh) exit 0 ;;
@@ -145,6 +151,7 @@ PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1" >&2; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 # shellcheck disable=SC2034 # checks consume OUT and RC through eval.
 run() {
   local deploy=${1:-$DEPLOY}
@@ -197,12 +204,13 @@ run
 check "first install with a non-default runtime layout succeeds" '[[ "$RC" -eq 0 && "$OUT" == *"==> Done."* ]]'
 check "archive payload excludes ignored live files" '[[ ! -e "$BROKKR_DEPLOY_TARGET/.env" && ! -e "$BROKKR_DEPLOY_TARGET/STATUS.md" ]]'
 check "archive payload resists a post-materialization tracked mutation" '! grep -q "post-archive mutation" "$BROKKR_DEPLOY_TARGET/README.md"'
+check "archive payload preserves executable bits without making data files executable" '[[ -x "$BROKKR_DEPLOY_TARGET/scripts/deploy-nas.sh" && ! -x "$BROKKR_DEPLOY_TARGET/README.md" ]]'
 check "archive payload parent is cleaned after deploy" '[[ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name "brokkr-deploy.*" -print)" ]]'
-check "remote release root keeps intentional mode" '[[ "$(stat -f %Lp "$BROKKR_DEPLOY_TARGET")" == 750 ]]'
+check "remote release root keeps intentional mode" '[[ "$(mode "$BROKKR_DEPLOY_TARGET")" == 750 ]]'
 unset MOCK_MUTATE_SOURCE
 git -C "$SOURCE" checkout -- README.md
 check "nested runtime-user release target is prepared before rsync" '[[ -d "$BROKKR_DEPLOY_TARGET" ]] && [[ "$(grep -n "sudo install -d" "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n "^rsync " "$CALLS" | head -1 | cut -d: -f1)" ]]'
-check "release synchronization uses the runtime identity" 'grep -Fq -- "--rsync-path=sudo -u $BROKKR_RUNTIME_USER rsync" "$CALLS"'
+check "release synchronization uses the runtime identity and preserves executability" 'grep -Fq -- "--rsync-path=sudo -u $BROKKR_RUNTIME_USER rsync" "$CALLS" && grep -Fq -- "--no-perms --executability" "$CALLS"'
 check "health unit is rendered for the explicit runtime layout" 'grep -Fqx "User=$BROKKR_RUNTIME_USER" "$MOCK_INSTALLED_UNITS/brokkr-health.service" && grep -Fqx "WorkingDirectory=$BROKKR_DEPLOY_TARGET" "$MOCK_INSTALLED_UNITS/brokkr-health.service" && grep -Fqx "EnvironmentFile=-$BROKKR_RUNTIME_HOME/.config/brokkr/env" "$MOCK_INSTALLED_UNITS/brokkr-health.service" && grep -Fqx "ExecStart=$BROKKR_DEPLOY_TARGET/scripts/health-snapshot.sh" "$MOCK_INSTALLED_UNITS/brokkr-health.service"'
 check "failure services are rendered for the explicit runtime layout" 'grep -Fqx "User=$BROKKR_RUNTIME_USER" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure@.service" && grep -Fqx "WorkingDirectory=$BROKKR_DEPLOY_TARGET" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure-sweep.service" && grep -Fqx "ExecStart=$BROKKR_DEPLOY_TARGET/scripts/systemd-failure-monitor.sh --sweep" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure-sweep.service"'
 check "registry and executable/unit validation happen before systemd mutation" 'grep -q "sudo systemd-analyze verify" "$CALLS" && [[ "$(grep -n "sudo systemd-analyze verify" "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n "/etc/systemd/system/brokkr-health.service" "$CALLS" | head -1 | cut -d: -f1)" ]]'
