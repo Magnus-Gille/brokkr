@@ -32,9 +32,12 @@ ssh "$CONTROL_NODE" "
   sudo install -m 0644 '$DEST'/systemd/brokkr-maintenance-os.timer    /etc/systemd/system/brokkr-maintenance-os.timer
   sudo install -m 0644 '$DEST'/systemd/brokkr-maintenance-deps.service /etc/systemd/system/brokkr-maintenance-deps.service
   sudo install -m 0644 '$DEST'/systemd/brokkr-maintenance-deps.timer   /etc/systemd/system/brokkr-maintenance-deps.timer
+  sudo install -m 0644 '$DEST'/systemd/brokkr-systemd-failure@.service /etc/systemd/system/brokkr-systemd-failure@.service
+  sudo install -m 0644 '$DEST'/systemd/brokkr-systemd-failure-sweep.service /etc/systemd/system/brokkr-systemd-failure-sweep.service
+  sudo install -m 0644 '$DEST'/systemd/brokkr-systemd-failure-sweep.timer /etc/systemd/system/brokkr-systemd-failure-sweep.timer
 
   sudo systemctl daemon-reload
-  sudo systemctl enable --now brokkr-maintenance-os.timer brokkr-maintenance-deps.timer
+  sudo systemctl enable --now brokkr-maintenance-os.timer brokkr-maintenance-deps.timer brokkr-systemd-failure-sweep.timer
 
   # Cutover (idempotent): retire the OLD grimnir-maintenance-* units this repo replaces,
   # so they do not keep firing now that their scripts moved to brokkr.
@@ -49,6 +52,6 @@ ssh "$CONTROL_NODE" "
   [ \"\$removed\" = 1 ] && sudo systemctl daemon-reload
 
   echo '-- timer status --'
-  systemctl list-timers brokkr-maintenance-os.timer brokkr-maintenance-deps.timer --no-pager 2>/dev/null || true
+  systemctl list-timers brokkr-maintenance-os.timer brokkr-maintenance-deps.timer brokkr-systemd-failure-sweep.timer --no-pager 2>/dev/null || true
 "
 echo "==> Done. Old grimnir-maintenance-* units retired if present; brokkr-maintenance timers active."

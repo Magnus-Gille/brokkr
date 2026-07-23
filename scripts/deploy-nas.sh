@@ -31,8 +31,11 @@ ssh "$NAS" "
 
   sudo install -m 0644 '$DEST'/systemd/brokkr-health.service /etc/systemd/system/brokkr-health.service
   sudo install -m 0644 '$DEST'/systemd/brokkr-health.timer   /etc/systemd/system/brokkr-health.timer
+  sudo install -m 0644 '$DEST'/systemd/brokkr-systemd-failure@.service /etc/systemd/system/brokkr-systemd-failure@.service
+  sudo install -m 0644 '$DEST'/systemd/brokkr-systemd-failure-sweep.service /etc/systemd/system/brokkr-systemd-failure-sweep.service
+  sudo install -m 0644 '$DEST'/systemd/brokkr-systemd-failure-sweep.timer /etc/systemd/system/brokkr-systemd-failure-sweep.timer
   sudo systemctl daemon-reload
-  sudo systemctl enable --now brokkr-health.timer
+  sudo systemctl enable --now brokkr-health.timer brokkr-systemd-failure-sweep.timer
 
   echo '-- running one snapshot now --'
   sudo systemctl start brokkr-health.service
@@ -40,5 +43,6 @@ ssh "$NAS" "
   echo '-- health.json --'; cat ~/.local/state/brokkr/health.json 2>/dev/null || echo '(none)'
   echo; echo '-- journal --'; journalctl -u brokkr-health.service -n 6 --no-pager 2>/dev/null
   echo '-- timer --'; systemctl list-timers brokkr-health.timer --no-pager 2>/dev/null | sed -n '1,2p'
+  echo '-- failure-monitor timer --'; systemctl list-timers brokkr-systemd-failure-sweep.timer --no-pager 2>/dev/null | sed -n '1,2p'
 "
 echo "==> Done."

@@ -1,0 +1,12 @@
+# Brokkr · backstop for failed timer-driven oneshots and services without OnFailure.
+[Unit]
+Description=Run Brokkr systemd failed-unit sweep every two minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

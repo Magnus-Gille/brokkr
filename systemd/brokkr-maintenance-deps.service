@@ -2,6 +2,7 @@
 Description=Brokkr weekly npm dependency report — npm outdated across all service repos (detect+report only)
 After=network-online.target munin-memory.service
 Wants=network-online.target
+OnFailure=brokkr-systemd-failure@%n.service
 
 [Service]
 Type=oneshot

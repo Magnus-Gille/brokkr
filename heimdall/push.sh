@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Brokkr · push platform health to Heimdall (POST /api/panels), following mimir's pattern.
 # Reads a snapshot JSON (default $STATE/health.json) and upserts a 'hw-health' status panel
-# for service "brokkr". A completely unconfigured push remains an explicit no-op. Once
+# for service "brokkr". Callers may select another validated Brokkr panel/label and separate
+# stamp prefix (the systemd failure monitor does this). A completely unconfigured push remains an explicit no-op. Once
 # configured, malformed input, partial configuration, HTTP errors, and redirects fail
 # loudly and are timestamped locally so a reporting outage cannot look successful.
 #
@@ -12,16 +13,24 @@ set -euo pipefail
 
 STATE_DIR="${BROKKR_STATE_DIR:-$HOME/.local/state/brokkr}"
 SNAP="${1:-$STATE_DIR/health.json}"
+PANEL="${BROKKR_HEIMDALL_PANEL:-hw-health}"
+LABEL="${BROKKR_HEIMDALL_LABEL:-Hardware Health}"
+STAMP_PREFIX="${BROKKR_HEIMDALL_STAMP_PREFIX:-}"
+
+if [[ ! "$PANEL" =~ ^[a-z0-9-]+$ ]] || [ -z "$LABEL" ] || [[ ! "$STAMP_PREFIX" =~ ^[a-z0-9-]*$ ]]; then
+  echo "brokkr push: invalid panel, label, or stamp prefix" >&2
+  exit 2
+fi
 
 record_stamp() {
   local name="$1" tmp
-  tmp="$STATE_DIR/.${name}.$$"
+  tmp="$STATE_DIR/.${STAMP_PREFIX}${name}.$$"
   if ! date +%s > "$tmp"; then
     rm -f "$tmp"
     echo "brokkr push: could not record $name" >&2
     return 1
   fi
-  if ! mv "$tmp" "$STATE_DIR/$name"; then
+  if ! mv "$tmp" "$STATE_DIR/${STAMP_PREFIX}${name}"; then
     rm -f "$tmp"
     echo "brokkr push: could not publish $name" >&2
     return 1
@@ -68,8 +77,8 @@ else:
     msg = f'{len(checks)} checks, all nominal'
 msg = msg[:240]
 body = json.dumps({
-    "service": "brokkr", "panel": "hw-health", "kind": "status",
-    "label": "Hardware Health", "state": state, "message": msg,
+    "service": "brokkr", "panel": os.environ.get("BROKKR_HEIMDALL_PANEL", "hw-health"), "kind": "status",
+    "label": os.environ.get("BROKKR_HEIMDALL_LABEL", "Hardware Health"), "state": state, "message": msg,
 }).encode()
 req = urllib.request.Request(
     os.environ["HEIMDALL_HUB_URL"], data=body, method="POST",
@@ -89,7 +98,7 @@ except Exception as e:
 PY
 then
   record_stamp last-push-success
-  rm -f "$STATE_DIR/last-push-failure"
+  rm -f "$STATE_DIR/${STAMP_PREFIX}last-push-failure"
   exit 0
 else
   rc=$?

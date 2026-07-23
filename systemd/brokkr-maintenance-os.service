@@ -2,6 +2,7 @@
 Description=Brokkr daily OS maintenance report — pending security updates, reboot-required & disk across all Pis
 After=network-online.target munin-memory.service
 Wants=network-online.target
+OnFailure=brokkr-systemd-failure@%n.service
 
 [Service]
 Type=oneshot
