@@ -8,16 +8,33 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { checkSchema, schemaErrors, evidenceDigest, strictUtc } from "./lib/node-substrate-contract.mjs";
+import {
+  assertPinnedContractFiles, checkSchema, evidenceDigest, observationEvidenceId, schemaErrors, strictUtc,
+} from "./lib/node-substrate-contract.mjs";
 
 const fail = (message) => {
   process.stderr.write(`node-inventory: ${message}\n`);
   process.exit(1);
 };
 
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const schemaPath = path.join(root, "docs/node-substrate-contract-v1.schema.json");
+const manifestPath = path.join(root, "tests/fixtures/node-substrate-contract/consumer-fixture-set.json");
+const provenancePath = path.join(root, "docs/node-substrate-contract-provenance.md");
+try {
+  // This must precede schema parsing and collection: the v1 meaning comes from
+  // Grimnir, not from whatever files happen to be present at runtime.
+  assertPinnedContractFiles({ schemaPath, manifestPath, provenancePath });
+} catch (error) {
+  fail(`refusing to use unverified vendored contract: ${error.message}`);
+}
+
+const detailRequested = process.argv.slice(2).every((arg) => arg === "--detail") && process.argv.length === 3;
+if (!detailRequested && process.argv.length !== 2) fail("usage: node-inventory.mjs [--detail]");
+
 // --- Strict input validation, before any collection.
-// The contract id pattern allows 63 chars; the producer caps the node id at 58
-// so the derived `obs-<node_id>` evidence id always fits the same pattern.
+// The contract id pattern allows 63 chars.  Evidence ids use a hash of the
+// complete observation material, so node ids need not be truncated into them.
 const NODE_ID = /^[a-z][a-z0-9-]{2,57}$/;
 const nodeId = process.env.BROKKR_NODE_ID ?? os.hostname().split(".")[0].toLowerCase();
 if (!NODE_ID.test(nodeId)) fail(`invalid node id '${nodeId}': need ^[a-z][a-z0-9-]{2,57}$ (set BROKKR_NODE_ID)`);
@@ -44,51 +61,58 @@ const uniqueSubset = (value, allowed) =>
   Array.isArray(value) && value.length > 0 && new Set(value).size === value.length && value.every((item) => allowed.includes(item));
 
 function loadOverlay(overlayPath) {
-  let stat;
+  const noFollow = fs.constants.O_NOFOLLOW;
+  if (typeof noFollow !== "number") fail("secure owner overlay reads are unsupported on this platform");
+  let fd;
   try {
-    stat = fs.lstatSync(overlayPath);
+    fd = fs.openSync(overlayPath, fs.constants.O_RDONLY | noFollow);
   } catch {
-    fail(`overlay '${overlayPath}' is not readable`);
+    fail("overlay is unreadable or not a regular non-symlink file");
   }
-  if (!stat.isFile()) fail(`overlay '${overlayPath}' must be a regular file, not a symlink or special file`);
-  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) fail(`overlay '${overlayPath}' must be owned by the current user`);
-  if ((stat.mode & 0o077) !== 0) fail(`overlay '${overlayPath}' must not be group/other accessible (chmod 600)`);
-  let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(overlayPath, "utf8"));
-  } catch {
-    fail(`overlay '${overlayPath}' is not valid JSON`);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) fail("overlay must be a regular non-symlink file");
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) fail("overlay must be owned by the current user");
+    if ((stat.mode & 0o077) !== 0) fail("overlay must not be group/other accessible");
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(fd, "utf8"));
+    } catch {
+      fail("overlay is not valid JSON");
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) fail("overlay must be a JSON object");
+    for (const key of Object.keys(parsed)) {
+      if (!OVERLAY_KEYS.includes(key)) fail("overlay contains an unsupported key");
+    }
+    if (parsed.uptime_class !== undefined && !["always_on", "best_effort"].includes(parsed.uptime_class)) {
+      fail("overlay uptime_class must be always_on or best_effort");
+    }
+    if (parsed.deployment_mechanisms !== undefined && !uniqueSubset(parsed.deployment_mechanisms, DEPLOYMENT_MECHANISMS)) {
+      fail(`overlay deployment_mechanisms must be a unique non-empty subset of ${DEPLOYMENT_MECHANISMS.join("/")}`);
+    }
+    if (parsed.health_reporting !== undefined && !["supported", "unsupported"].includes(parsed.health_reporting)) {
+      fail("overlay health_reporting must be supported or unsupported");
+    }
+    if (parsed.logical_storage !== undefined) {
+      const valid = Array.isArray(parsed.logical_storage) && parsed.logical_storage.length > 0 &&
+        parsed.logical_storage.every((entry) =>
+          entry !== null && typeof entry === "object" && !Array.isArray(entry) &&
+          JSON.stringify(Object.keys(entry).sort()) === '["class","mount"]' &&
+          STORAGE_CLASSES.includes(entry.class) && typeof entry.mount === "string" && entry.mount.startsWith("/"));
+      if (!valid) fail(`overlay logical_storage entries must be {class: ${STORAGE_CLASSES.join("/")}, mount: /absolute/path}`);
+    }
+    if (parsed.workloads !== undefined) {
+      const valid = Array.isArray(parsed.workloads) && new Set(parsed.workloads).size === parsed.workloads.length &&
+        parsed.workloads.every((id) => typeof id === "string" && OVERLAY_ID.test(id));
+      if (!valid) fail("overlay workloads must be unique ids matching ^[a-z][a-z0-9-]{2,52}$");
+    }
+    if (parsed.backup_roles !== undefined && !uniqueSubset(parsed.backup_roles, ["producer", "consumer"])) {
+      fail("overlay backup_roles must be a unique non-empty subset of producer/consumer");
+    }
+    return parsed;
+  } finally {
+    fs.closeSync(fd);
   }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) fail("overlay must be a JSON object");
-  for (const key of Object.keys(parsed)) {
-    if (!OVERLAY_KEYS.includes(key)) fail(`overlay key '${key}' is not part of the closed overlay contract`);
-  }
-  if (parsed.uptime_class !== undefined && !["always_on", "best_effort"].includes(parsed.uptime_class)) {
-    fail("overlay uptime_class must be always_on or best_effort");
-  }
-  if (parsed.deployment_mechanisms !== undefined && !uniqueSubset(parsed.deployment_mechanisms, DEPLOYMENT_MECHANISMS)) {
-    fail(`overlay deployment_mechanisms must be a unique non-empty subset of ${DEPLOYMENT_MECHANISMS.join("/")}`);
-  }
-  if (parsed.health_reporting !== undefined && !["supported", "unsupported"].includes(parsed.health_reporting)) {
-    fail("overlay health_reporting must be supported or unsupported");
-  }
-  if (parsed.logical_storage !== undefined) {
-    const valid = Array.isArray(parsed.logical_storage) && parsed.logical_storage.length > 0 &&
-      parsed.logical_storage.every((entry) =>
-        entry !== null && typeof entry === "object" && !Array.isArray(entry) &&
-        JSON.stringify(Object.keys(entry).sort()) === '["class","mount"]' &&
-        STORAGE_CLASSES.includes(entry.class) && typeof entry.mount === "string" && entry.mount.startsWith("/"));
-    if (!valid) fail(`overlay logical_storage entries must be {class: ${STORAGE_CLASSES.join("/")}, mount: /absolute/path}`);
-  }
-  if (parsed.workloads !== undefined) {
-    const valid = Array.isArray(parsed.workloads) && new Set(parsed.workloads).size === parsed.workloads.length &&
-      parsed.workloads.every((id) => typeof id === "string" && OVERLAY_ID.test(id));
-    if (!valid) fail("overlay workloads must be unique ids matching ^[a-z][a-z0-9-]{2,52}$");
-  }
-  if (parsed.backup_roles !== undefined && !uniqueSubset(parsed.backup_roles, ["producer", "consumer"])) {
-    fail("overlay backup_roles must be a unique non-empty subset of producer/consumer");
-  }
-  return parsed;
 }
 
 const overlay = process.env.BROKKR_INVENTORY_OVERLAY ? loadOverlay(process.env.BROKKR_INVENTORY_OVERLAY) : null;
@@ -130,6 +154,7 @@ if (architecture === "unknown") failures.push("architecture");
 
 let serviceManager = "unknown";
 let systemd = false;
+let launchd = false;
 const systemctlRes = probe("systemctl", ["--version"]);
 if (systemctlRes.status === "ok") {
   serviceManager = "systemd";
@@ -138,51 +163,130 @@ if (systemctlRes.status === "ok") {
   failures.push("service-manager");
 } else {
   const launchctlRes = probe("launchctl", ["version"]);
-  if (launchctlRes.status === "ok") serviceManager = "launchd";
+  if (launchctlRes.status === "ok") {
+    serviceManager = "launchd";
+    launchd = true;
+  }
   else failures.push("service-manager");
 }
 
-let units = null;
+let unitObservation = { status: "unavailable", units: [] };
 if (systemd) {
   const unitsRes = probe("systemctl", ["list-units", "--all", "--type=service", "--type=timer", "--no-legend", "--plain"]);
-  if (unitsRes.status === "ok") {
-    units = unitsRes.out.split("\n").map((line) => line.trim().split(/\s+/)[0]).filter((name) => /^[a-z0-9@._-]+$/i.test(name));
+  const filesRes = probe("systemctl", ["list-unit-files", "--type=service", "--type=timer", "--no-legend", "--plain"]);
+  if (unitsRes.status === "ok" && filesRes.status === "ok") {
+    const observed = new Map(filesRes.out.split("\n").flatMap((line) => {
+      const [name, installed] = line.trim().split(/\s+/);
+      return /^[a-z0-9@._-]+$/i.test(name) && /^[a-z0-9_-]+$/i.test(installed)
+        ? [[name, { name, installed_state: installed, active_state: "unknown", sub_state: "unknown" }]]
+        : [];
+    }));
+    for (const line of unitsRes.out.split("\n")) {
+      const [name, load, active, sub] = line.trim().split(/\s+/);
+      if (!/^[a-z0-9@._-]+$/i.test(name) || !/^[a-z0-9_-]+$/i.test(load) || !/^[a-z0-9_-]+$/i.test(active) || !/^[a-z0-9_-]+$/i.test(sub)) continue;
+      observed.set(name, { name, installed_state: observed.get(name)?.installed_state ?? load, active_state: active, sub_state: sub });
+    }
+    unitObservation = {
+      status: "known",
+      units: [...observed.values()],
+    };
   } else {
     failures.push("units");
+    unitObservation = { status: "unknown", units: [] };
+  }
+} else if (launchd) {
+  const jobsRes = probe("launchctl", ["list"]);
+  if (jobsRes.status === "ok") {
+    unitObservation = {
+      status: "known",
+      units: jobsRes.out.split("\n").flatMap((line) => {
+        const [pid, status, name] = line.trim().split(/\s+/);
+        return /^[a-z0-9._-]+$/i.test(name) && /^(?:-|[0-9]+)$/.test(pid) && /^(?:-|[0-9]+)$/.test(status)
+          ? [{ name, installed_state: "loaded", active_state: pid === "-" ? "not-running" : "running", sub_state: status === "-" ? "unknown" : "exited" }]
+          : [];
+      }),
+    };
+  } else {
+    failures.push("units");
+    unitObservation = { status: "unknown", units: [] };
   }
 }
 
-// Only links that are administratively UP with carrier (LOWER_UP) count as
-// active paths; interface class comes from the kernel naming convention.
+// Linux gets carrier state from ip.  Darwin has no ip by default, so it uses
+// ifconfig -u plus networksetup's hardware-port map; en* alone never implies
+// Ethernet because a Wi-Fi adapter is commonly en0.
 const network = [];
-const linkRes = probe("ip", ["-o", "link", "show"]);
-if (linkRes.status === "ok") {
-  for (const line of linkRes.out.split("\n")) {
-    const match = /^\d+:\s+([a-z0-9._-]+?)(?:@\S+)?:\s+<([^>]*)>/i.exec(line.trim());
-    if (!match) continue;
-    const [, name, rawFlags] = match;
-    const flags = rawFlags.split(",");
-    if (!flags.includes("UP") || !flags.includes("LOWER_UP")) continue;
-    if (/^(eth|en|lan)/.test(name) && !network.includes("wired")) network.push("wired");
-    if (/^wl/.test(name) && !network.includes("wifi")) network.push("wifi");
+const osType = probe("uname", ["-s"]);
+if (osType.status === "ok" && osType.out === "Darwin") {
+  const interfacesRes = probe("ifconfig", ["-u"]);
+  const portsRes = probe("networksetup", ["-listallhardwareports"]);
+  if (interfacesRes.status === "ok" && portsRes.status === "ok") {
+    const active = new Set(interfacesRes.out.split("\n").flatMap((line) => {
+      const match = /^([a-z0-9._-]+):\s+flags=/i.exec(line.trim());
+      return match ? [match[1]] : [];
+    }));
+    const classes = new Map();
+    let port = null;
+    for (const line of portsRes.out.split("\n")) {
+      const hardware = /^Hardware Port:\s*(.+)$/i.exec(line.trim());
+      if (hardware) {
+        port = hardware[1];
+        continue;
+      }
+      const device = /^Device:\s*([a-z0-9._-]+)$/i.exec(line.trim());
+      if (!device || !port) continue;
+      if (/^(?:wi-fi|airport)$/i.test(port)) classes.set(device[1], "wifi");
+      else if (/ethernet|\blan\b/i.test(port)) classes.set(device[1], "wired");
+    }
+    for (const kind of ["wired", "wifi"]) {
+      if ([...active].some((name) => classes.get(name) === kind)) network.push(kind);
+    }
+  } else {
+    failures.push("network");
   }
 } else {
-  failures.push("network");
+  const linkRes = probe("ip", ["-o", "link", "show"]);
+  if (linkRes.status === "ok") {
+    for (const line of linkRes.out.split("\n")) {
+      const match = /^\d+:\s+([a-z0-9._-]+?)(?:@\S+)?:\s+<([^>]*)>/i.exec(line.trim());
+      if (!match) continue;
+      const [, name, rawFlags] = match;
+      const flags = rawFlags.split(",");
+      if (!flags.includes("UP") || !flags.includes("LOWER_UP")) continue;
+      if (/^(eth|en|lan)/.test(name) && !network.includes("wired")) network.push("wired");
+      if (/^wl/.test(name) && !network.includes("wifi")) network.push("wifi");
+    }
+  } else {
+    failures.push("network");
+  }
 }
 
-// Tailnet requires valid running-state JSON; a stopped or absent tailscale is
-// an observation of no tailnet, while malformed output is a probe failure.
+// Tailnet requires a valid, running, online JSON status.  A missing client is
+// no capability; stopped, offline, malformed, and failed probes are distinct
+// fail-closed observations.
 const tailscaleRes = probe("tailscale", ["status", "--json"]);
 if (tailscaleRes.status === "ok") {
   let status = null;
   try {
     status = JSON.parse(tailscaleRes.out);
   } catch {
-    failures.push("tailnet");
+    failures.push("tailnet-malformed");
   }
-  if (status !== null && typeof status === "object" && !Array.isArray(status) && status.BackendState === "Running") network.push("tailnet");
+  if (status !== null) {
+    if (typeof status !== "object" || Array.isArray(status) || typeof status.BackendState !== "string") {
+      failures.push("tailnet-malformed");
+    } else if (status.BackendState !== "Running") {
+      failures.push("tailnet-stopped");
+    } else if (status.Self === null || typeof status.Self !== "object" || Array.isArray(status.Self) || typeof status.Self.Online !== "boolean") {
+      failures.push("tailnet-malformed");
+    } else if (status.Self.Online !== true) {
+      failures.push("tailnet-offline");
+    } else {
+      network.push("tailnet");
+    }
+  }
 } else if (tailscaleRes.status === "failed") {
-  failures.push("tailnet");
+  failures.push("tailnet-unavailable");
 }
 if (!network.length) network.push("unknown");
 
@@ -226,7 +330,7 @@ const record = {
   node_id: nodeId,
   observed_at: now,
   valid_until: validUntil,
-  evidence: { evidence_id: `obs-${nodeId}`, producer: "brokkr", observed_at: now, digest: "" },
+  evidence: { evidence_id: "", producer: "brokkr", observed_at: now, digest: "" },
   capability_status: failures.length ? "unknown" : "known",
   architecture,
   // Schema floors (1) stand in when a probe failed; the matching
@@ -240,18 +344,35 @@ const record = {
   health_reporting: overlay?.health_reporting ?? "unknown",
   extensions,
 };
+record.evidence.evidence_id = observationEvidenceId(record);
 record.evidence.digest = `sha256:${evidenceDigest(record)}`;
 
 // Every emitted record is validated against the pinned normative schema; a
 // record this producer cannot prove valid is never emitted.
-const schemaPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../docs/node-substrate-contract-v1.schema.json");
 const schema = JSON.parse(fs.readFileSync(schemaPath, "utf8"));
 checkSchema(schema);
 const violations = schemaErrors(schema, record);
 if (violations.length) fail(`refusing to emit record violating pinned v1 schema: ${violations.join("; ")}`);
 
 process.stdout.write(`${JSON.stringify(record)}\n`);
-const unitsSummary = !systemd ? "units=unavailable" : units === null ? "units=unknown" : `units=${units.join(",") || "none"}`;
+if (detailRequested) {
+  // This is deliberately separate from the normative v1 record: v1 is a
+  // closed consumer contract and cannot carry arbitrary operational payload.
+  // The optional stderr record has a closed, versioned, public-safe shape: no
+  // addresses, paths, interface names, descriptions, or credentials.
+  const detail = {
+    kind: "brokkr-node-inventory-detail",
+    schema_version: "v1",
+    observation_evidence_id: record.evidence.evidence_id,
+    unit_state: unitObservation,
+    workloads: overlay?.workloads ?? [],
+    backup_roles: overlay?.backup_roles ?? [],
+  };
+  process.stderr.write(`Brokkr node inventory detail JSON: ${JSON.stringify(detail)}\n`);
+}
+const unitsSummary = unitObservation.status === "unavailable" ? "units=unavailable"
+  : unitObservation.status === "unknown" ? "units=unknown"
+    : `units=${unitObservation.units.map((unit) => `${unit.name}[${unit.active_state}/${unit.sub_state}]`).join(",") || "none"}`;
 const overlaySummary = overlay
   ? ` workloads=${(overlay.workloads ?? []).join(",") || "none"}; backup-roles=${(overlay.backup_roles ?? []).join(",") || "none"};`
   : "";

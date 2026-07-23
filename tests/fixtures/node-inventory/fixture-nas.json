@@ -5,10 +5,10 @@
   "observed_at": "2026-07-23T10:00:00Z",
   "valid_until": "2026-07-23T11:00:00Z",
   "evidence": {
-    "evidence_id": "obs-fixture-nas",
+    "evidence_id": "obs-77ac6dcb7b6d44aff7a0190539548cb1ede575e4c95dc859a50ad909",
     "producer": "brokkr",
     "observed_at": "2026-07-23T10:00:00Z",
-    "digest": "sha256:447618092c832c18fd935681dc3384003b7b0609309a813a72cfe71740d70628"
+    "digest": "sha256:6be3aea43e5827275756a8529cd5e3602c0b61509a3467bc8b9ae625322360f3"
   },
   "capability_status": "known",
   "architecture": "arm64",

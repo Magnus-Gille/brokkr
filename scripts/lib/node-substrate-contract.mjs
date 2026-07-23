@@ -3,6 +3,7 @@
 // in grimnir tests/scripts/validate-node-substrate-contract.mjs at the pinned
 // revision recorded in docs/node-substrate-contract-provenance.md.
 import crypto from "node:crypto";
+import fs from "node:fs";
 
 const plain = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const typeMatches = (type, value) => ({
@@ -52,6 +53,49 @@ export const evidenceDigest = (record) => {
   const copy = structuredClone(record);
   if (plain(copy.evidence)) delete copy.evidence.digest;
   return crypto.createHash("sha256").update(canonicalJson(copy)).digest("hex");
+};
+
+// These are the byte pins recorded in the public provenance note.  The
+// producer validates them itself before parsing the schema so an accidental or
+// hostile local edit cannot silently change the contract it enforces.
+export const PINNED_CONTRACT_SHA256 = Object.freeze({
+  schema: "9a69f1b23499cd6e70fdaa80ee57bf983e7e5b288882e0cf2b0f01f10824fbbe",
+  manifest: "355481f2b3866840795ba18033077d6f36487d1a447b36c323384cf7837c5fcb",
+  provenance: "ec8918cfc52e5ad95e1f339ab7aa6fd5af1411f2aaaa400228357c061bdf1bea",
+});
+
+const sha256File = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+
+export function assertPinnedContractFiles({ schemaPath, manifestPath, provenancePath }) {
+  const files = [
+    ["schema", schemaPath],
+    ["consumer fixture manifest", manifestPath],
+    ["provenance", provenancePath],
+  ];
+  for (const [name, file] of files) {
+    let actual;
+    try {
+      actual = sha256File(file);
+    } catch {
+      throw new Error(`pinned ${name} is unavailable`);
+    }
+    const expected = name === "schema" ? PINNED_CONTRACT_SHA256.schema
+      : name === "consumer fixture manifest" ? PINNED_CONTRACT_SHA256.manifest
+        : PINNED_CONTRACT_SHA256.provenance;
+    if (actual !== expected) throw new Error(`pinned ${name} SHA-256 mismatch`);
+  }
+}
+
+// An evidence id is an observation identity, not a stable node alias.  Its
+// material deliberately excludes the two self-referential evidence fields;
+// the final evidence digest below then covers the complete record.
+export const observationEvidenceId = (record) => {
+  const material = structuredClone(record);
+  if (plain(material.evidence)) {
+    delete material.evidence.evidence_id;
+    delete material.evidence.digest;
+  }
+  return `obs-${crypto.createHash("sha256").update(canonicalJson(material)).digest("hex").slice(0, 56)}`;
 };
 
 const SUPPORTED_KEYWORDS = new Set([

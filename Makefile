@@ -16,7 +16,7 @@ offsite-photos-install: ## Install/refresh the offsite-photos LaunchAgent (daily
 	@./launchd/install.sh
 
 node-inventory: ## Emit a read-only v1 node-capability JSON record (human status on stderr)
-	@node scripts/node-inventory.mjs
+	@node scripts/node-inventory.mjs $(ARGS)
 
 maintenance-os: ## Run the OS maintenance report on the service host (ARGS="--dry-run --verbose")
 	@ssh $(BROKKR_SSH_TARGET) 'cd $(BROKKR_REMOTE_DIR) && bash scripts/maintenance-report.sh os $(ARGS)'

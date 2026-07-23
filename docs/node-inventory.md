@@ -4,8 +4,11 @@ Run `make node-inventory`. Standard output is exactly one Grimnir v1
 `node-capability` record, validated by the producer itself against the pinned
 normative schema (`docs/node-substrate-contract-v1.schema.json`) with the
 dependency-free validator in `scripts/lib/node-substrate-contract.mjs` before it
-is emitted. Standard error is the concise operator view, including observed unit
-names; treat that view as private runtime evidence.
+is emitted. Before parsing that schema, the runtime SHA-256 verifies the exact
+vendored schema, consumer fixture manifest, and provenance note against their
+Grimnir pins. Drift or an unsupported schema fails before JSON is emitted.
+Standard error is the concise operator view, including observed unit state; treat
+that view as private runtime evidence.
 
 ## Inputs (validated strictly before any collection)
 
@@ -25,11 +28,16 @@ Malformed input fails with a clear message on stderr and emits no JSON.
 All probes are read-only, bounded (5 s timeout, 1 MiB output cap), and
 distinguish "not installed" from "installed but broken":
 
-- Network paths come only from links that are administratively `UP` with
-  carrier (`LOWER_UP`) in `ip -o link show`; down or carrier-less links never
-  become capabilities. `tailnet` requires valid `tailscale status --json` output
-  with `BackendState == "Running"`; a stopped or absent tailscale is an
-  observation of no tailnet, while malformed output is a probe failure.
+- On Linux, network paths come only from links that are administratively `UP`
+  with carrier (`LOWER_UP`) in `ip -o link show`. On Darwin (including M5), the
+  bounded read-only collector combines `ifconfig -u` with
+  `networksetup -listallhardwareports`; it classifies Wi-Fi and Ethernet from
+  the hardware-port mapping, never from an `en*` name alone. Down or
+  carrier-less links never become capabilities. `tailnet` requires valid
+  `tailscale status --json`, `BackendState == "Running"`, and
+  `Self.Online == true`. Stopped, offline, malformed, and unavailable states
+  are distinct explicit fail-closed probe observations and never advertise
+  `tailnet`.
 - Storage classes are never guessed from `df`. The owner overlay declares
   logical stores (class + mount); `df -Pm` only confirms the mount and measures
   available MiB. A declared but unmounted store is reported with
@@ -60,6 +68,25 @@ topology. Anything not declared is reported as `unknown`, never invented.
 key-sorted, no insignificant whitespace) of the whole record with only the
 `evidence.digest` field itself excluded. Tests recompute it from emitted records
 and from the committed fixtures.
+
+`evidence.evidence_id` is a deterministic `obs-<sha256-prefix>` over the full
+observation material excluding the two self-referential evidence fields. Thus a
+rerun with identical material is stable, while a changed observation (including
+its instant) has a distinct contract-valid identity.
+
+## Optional operational detail
+
+The Grimnir v1 record is intentionally closed and cannot carry arbitrary
+operational fields. For the separately requested, read-only SSH-replacement
+view, run `make node-inventory ARGS=--detail` (or
+`node scripts/node-inventory.mjs --detail`). Stdout remains exactly the
+normative record. Stderr additionally carries one prefixed JSON record with the
+closed/versioned `brokkr-node-inventory-detail/v1` shape: the normative evidence
+ID, installed/active/sub-state for systemd or launchd units, and observed
+overlay workloads plus backup roles. It excludes paths, addresses, interface
+names, descriptions, credentials, and Tailscale identity. Because unit and
+workload names can still reveal local topology, this record is opt-in and must
+be handled as private runtime evidence.
 
 ## Fixtures
 

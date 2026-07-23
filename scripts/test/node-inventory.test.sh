@@ -28,7 +28,7 @@ done
 # --- producer uses, so tests and producer cannot diverge silently).
 cat >"$TMP/check.mjs" <<NODE
 import fs from "node:fs";
-import { schemaErrors, checkSchema, canonicalJson, evidenceDigest, strictUtc } from "${LIB}";
+import { schemaErrors, checkSchema, canonicalJson, evidenceDigest, strictUtc, assertPinnedContractFiles } from "${LIB}";
 const schema = JSON.parse(fs.readFileSync("${SCHEMA}", "utf8"));
 const read = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 const die = (message) => { console.error(message); process.exit(1); };
@@ -64,6 +64,8 @@ if (command === "schema-selfcheck") {
   const mutated = structuredClone(positive.records[0]);
   mutated.private_note = "x";
   if (!schemaErrors(schema, mutated).length) die("additional property accepted");
+} else if (command === "pinned-contract") {
+  assertPinnedContractFiles({ schemaPath: rest[0], manifestPath: rest[1], provenancePath: rest[2] });
 } else if (command === "record") {
   validRecord(read(rest[0]), rest[0]);
 } else if (command === "compare") {
@@ -78,6 +80,21 @@ if (command === "schema-selfcheck") {
   for (const expression of rest.slice(1)) {
     if (!Function("r", "return (" + expression + ");")(r)) die("assertion failed on " + rest[0] + ": " + expression);
   }
+} else if (command === "evidence-ids") {
+  const [sameA, sameB, distinct] = rest.map(read);
+  if (sameA.evidence.evidence_id !== sameB.evidence.evidence_id) die("identical observations received different evidence ids");
+  if (sameA.evidence.evidence_id === distinct.evidence.evidence_id) die("distinct observations reused an evidence id");
+} else if (command === "detail") {
+  const line = fs.readFileSync(rest[0], "utf8").split("\n").find((entry) => entry.startsWith("Brokkr node inventory detail JSON: "));
+  if (!line) die("missing detail record");
+  const detail = JSON.parse(line.slice("Brokkr node inventory detail JSON: ".length));
+  const expected = ["backup_roles", "kind", "observation_evidence_id", "schema_version", "unit_state", "workloads"];
+  if (JSON.stringify(Object.keys(detail).sort()) !== JSON.stringify(expected)) die("detail record is not closed");
+  if (detail.kind !== "brokkr-node-inventory-detail" || detail.schema_version !== "v1") die("detail record is not versioned");
+  if (!Array.isArray(detail.unit_state.units) || detail.unit_state.status !== "known") die("detail omits known unit state");
+  for (const unit of detail.unit_state.units) {
+    if (JSON.stringify(Object.keys(unit).sort()) !== JSON.stringify(["active_state", "installed_state", "name", "sub_state"])) die("detail unit has an unsafe field");
+  }
 } else {
   die("unknown check command " + command);
 }
@@ -88,9 +105,23 @@ check() { "$NODE_BIN" "$TMP/check.mjs" "$@"; }
 # --- 2. Vendored contract self-check with the dependency-free validator.
 check schema-selfcheck
 
+# --- 3. The runtime preflight, not only this test, pins the exact shared
+# --- schema, consumer manifest, and provenance before parsing the schema.
+check pinned-contract "$SCHEMA" \
+  "$ROOT/tests/fixtures/node-substrate-contract/consumer-fixture-set.json" "$PROVENANCE"
+PINNED_COPY="$TMP/pinned-contract"; mkdir -p "$PINNED_COPY"
+cp "$SCHEMA" "$PINNED_COPY/schema.json"
+cp "$ROOT/tests/fixtures/node-substrate-contract/consumer-fixture-set.json" "$PINNED_COPY/manifest.json"
+cp "$PROVENANCE" "$PINNED_COPY/provenance.md"
+printf '\n' >>"$PINNED_COPY/schema.json"
+if check pinned-contract "$PINNED_COPY/schema.json" "$PINNED_COPY/manifest.json" "$PINNED_COPY/provenance.md" 2>/dev/null; then
+  fail "tampered pinned schema was accepted"
+fi
+
 new_mock() { MOCK="$TMP/mock-$1"; rm -rf "$MOCK"; mkdir -p "$MOCK"; }
 mock() { cat >"$MOCK/$1"; chmod +x "$MOCK/$1"; }
 run_inventory() { env -i PATH="$MOCK" "$@" "$NODE_BIN" "$INVENTORY"; }
+run_inventory_detail() { env -i PATH="$MOCK" "$@" "$NODE_BIN" "$INVENTORY" --detail; }
 expect_fail() {
   local desc="$1" pattern="$2"; shift 2
   local out
@@ -125,6 +156,11 @@ EOF
 #!/bin/sh
 if [ "$1" = --version ]; then
   echo 'systemd 252'
+elif [ "$1" = list-unit-files ]; then
+  printf 'mimir.service enabled\n'
+  printf 'tunnel.service enabled\n'
+  printf 'agent.service enabled\n'
+  printf 'backup-offsite.timer enabled\n'
 else
   printf 'mimir.service loaded active running Fixture\n'
   printf 'tunnel.service loaded active running Fixture\n'
@@ -139,7 +175,7 @@ printf '3: wlan0: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN mode DEFA
 EOF
   mock tailscale <<'EOF'
 #!/bin/sh
-echo '{"BackendState":"Running"}'
+echo '{"BackendState":"Running","Self":{"Online":true}}'
 EOF
 }
 
@@ -163,7 +199,7 @@ write_overlay "$NAS_OVERLAY" <<'EOF'
 }
 EOF
 
-# --- 3. NAS golden path: exact fixture, digest recomputation, active-path parsing.
+# --- 4. NAS golden path: exact fixture, digest recomputation, active-path parsing.
 nas_mocks
 run_inventory BROKKR_NODE_ID=fixture-nas BROKKR_INVENTORY_NOW=2026-07-23T10:00:00Z \
   BROKKR_INVENTORY_OVERLAY="$NAS_OVERLAY" >"$TMP/nas.json" 2>"$TMP/nas.err"
@@ -176,10 +212,28 @@ check assert "$TMP/nas.json" \
   'r.logical_storage[1].class === "external_ssd" && r.logical_storage[1].available_mib === 553869 && r.logical_storage[1].status === "known"' \
   'r.extensions.map((e) => e.id).join(",") === "backup-role-consumer,backup-role-producer,workload-mimir"' \
   'r.extensions.every((e) => e.version === "v1" && e.decision_effect === "informational")'
-grep -q 'units=mimir.service,tunnel.service,agent.service,backup-offsite.timer' "$TMP/nas.err"
+grep -q 'units=mimir.service\[active/running\],tunnel.service\[active/running\],agent.service\[active/running\],backup-offsite.timer\[active/waiting\]' "$TMP/nas.err"
 grep -q 'workloads=mimir' "$TMP/nas.err"
 grep -q 'backup-roles=consumer,producer' "$TMP/nas.err"
 grep -q 'all probes collected' "$TMP/nas.err"
+
+# The optional detail record preserves stdout as exactly the normative v1
+# record while making installed/active unit state and overlay observations
+# available without a second SSH exploration.
+nas_mocks
+run_inventory_detail BROKKR_NODE_ID=fixture-nas BROKKR_INVENTORY_NOW=2026-07-23T10:00:00Z \
+  BROKKR_INVENTORY_OVERLAY="$NAS_OVERLAY" >"$TMP/nas-detail.json" 2>"$TMP/nas-detail.err"
+check compare "$TMP/nas-detail.json" "$FIXTURES/fixture-nas.json"
+check detail "$TMP/nas-detail.err"
+
+# The same material is stable, but a new observation instant gets a new,
+# contract-valid id rather than reusing obs-<node> forever.
+nas_mocks
+run_inventory BROKKR_NODE_ID=fixture-nas BROKKR_INVENTORY_NOW=2026-07-23T10:00:00Z \
+  BROKKR_INVENTORY_OVERLAY="$NAS_OVERLAY" >"$TMP/nas-stable.json" 2>/dev/null
+run_inventory BROKKR_NODE_ID=fixture-nas BROKKR_INVENTORY_NOW=2026-07-23T10:00:01Z \
+  BROKKR_INVENTORY_OVERLAY="$NAS_OVERLAY" >"$TMP/nas-next.json" 2>/dev/null
+check evidence-ids "$TMP/nas.json" "$TMP/nas-stable.json" "$TMP/nas-next.json"
 
 m5_mocks() {
   new_mock m5
@@ -197,25 +251,39 @@ echo 17179869184
 EOF
   mock uname <<'EOF'
 #!/bin/sh
-echo arm64
+if [ "$1" = -s ]; then
+  echo Darwin
+else
+  echo arm64
+fi
 EOF
-  mock launchctl <<'EOF'
+mock launchctl <<'EOF'
 #!/bin/sh
-echo 'Darwin Bootstrapper Version 8.0.0'
+if [ "$1" = version ]; then
+  echo 'Darwin Bootstrapper Version 8.0.0'
+else
+  printf '%s\t%s\t%s\n' 411 0 com.example.fixture-hugin
+  printf '%s\t%s\t%s\n' - 0 com.example.fixture-backup
+fi
 EOF
   mock df <<'EOF'
 #!/bin/sh
 printf 'Filesystem 1M-blocks Used Available Capacity Mounted on\n'
 printf '/dev/disk3s5 3901000 1200000 500000 31%% /\n'
 EOF
-  mock ip <<'EOF'
+  mock ifconfig <<'EOF'
 #!/bin/sh
-printf '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000\n'
-printf '3: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DORMANT group default qlen 1000\n'
+printf 'en0: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n'
+printf 'en7: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n'
+EOF
+  mock networksetup <<'EOF'
+#!/bin/sh
+printf 'Hardware Port: Wi-Fi\nDevice: en0\nEthernet Address: 00:00:00:00:00:00\n\n'
+printf 'Hardware Port: USB 10/100/1000 LAN\nDevice: en7\nEthernet Address: 00:00:00:00:00:01\n'
 EOF
   mock tailscale <<'EOF'
 #!/bin/sh
-echo '{"BackendState":"Running"}'
+echo '{"BackendState":"Running","Self":{"Online":true}}'
 EOF
 }
 
@@ -231,7 +299,7 @@ write_overlay "$M5_OVERLAY" <<'EOF'
 }
 EOF
 
-# --- 4. M5 golden path: launchd, sysctl memory fallback, all active paths.
+# --- 5. M5 golden path: launchd, sysctl memory fallback, Darwin network classification.
 m5_mocks
 run_inventory BROKKR_NODE_ID=fixture-m5 BROKKR_INVENTORY_NOW=2026-07-23T10:00:00Z \
   BROKKR_INVENTORY_OVERLAY="$M5_OVERLAY" >"$TMP/m5.json" 2>"$TMP/m5.err"
@@ -242,10 +310,11 @@ check assert "$TMP/m5.json" \
   'r.resources.cpu_cores === 10 && r.resources.memory_mib === 16384' \
   'JSON.stringify(r.network_capabilities) === JSON.stringify(["wired","wifi","tailnet"])' \
   'r.extensions.map((e) => e.id).join(",") === "backup-role-producer,workload-fixture-hugin"'
-grep -q 'units=unavailable' "$TMP/m5.err"
+grep -q 'units=com.example.fixture-hugin\[running/exited\],com.example.fixture-backup\[not-running/exited\]' "$TMP/m5.err"
 grep -q 'all probes collected' "$TMP/m5.err"
 
-# --- 5. Down links and a stopped tailscaled are observations, not capabilities.
+# --- 6. Stopped, offline, and malformed Tailscale states are distinct
+# --- fail-closed observations and never advertise tailnet.
 nas_mocks
 mock ip <<'EOF'
 #!/bin/sh
@@ -260,8 +329,20 @@ run_inventory BROKKR_NODE_ID=fixture-nas BROKKR_INVENTORY_NOW=2026-07-23T10:00:0
 check record "$TMP/down.json"
 check assert "$TMP/down.json" \
   'JSON.stringify(r.network_capabilities) === JSON.stringify(["unknown"])' \
-  'r.capability_status === "known"' \
-  'r.extensions.every((e) => !e.id.startsWith("probe-failed-"))'
+  'r.capability_status === "unknown"' \
+  'r.extensions.some((e) => e.id === "probe-failed-tailnet-stopped")'
+
+nas_mocks
+mock tailscale <<'EOF'
+#!/bin/sh
+echo '{"BackendState":"Running","Self":{"Online":false}}'
+EOF
+run_inventory BROKKR_NODE_ID=fixture-nas BROKKR_INVENTORY_NOW=2026-07-23T10:00:00Z \
+  BROKKR_INVENTORY_OVERLAY="$NAS_OVERLAY" >"$TMP/offline.json" 2>/dev/null
+check assert "$TMP/offline.json" \
+  '!r.network_capabilities.includes("tailnet")' \
+  'r.capability_status === "unknown"' \
+  'r.extensions.some((e) => e.id === "probe-failed-tailnet-offline")'
 
 # --- 6. Malformed tailscale JSON is a probe failure, never a tailnet capability.
 nas_mocks
@@ -275,8 +356,8 @@ check record "$TMP/malformed.json"
 check assert "$TMP/malformed.json" \
   '!r.network_capabilities.includes("tailnet")' \
   'r.capability_status === "unknown"' \
-  'r.extensions.some((e) => e.id === "probe-failed-tailnet")'
-grep -q 'partial probes=tailnet' "$TMP/malformed.err"
+  'r.extensions.some((e) => e.id === "probe-failed-tailnet-malformed")'
+grep -q 'partial probes=tailnet-malformed' "$TMP/malformed.err"
 
 # --- 7. Partial probe failure stays schema-valid, explicit, and keeps known facts.
 nas_mocks
