@@ -40,6 +40,10 @@ check "dry run is non-mutating" '[[ "$RC" -eq 0 && "$OUT" == *"DRY RUN"* && ! -e
 run --restart
 check "restart without apply is refused" '[[ "$RC" -eq 64 && "$OUT" == *"requires --apply"* && ! -s "$CALLS" ]]'
 
+export MOCK_UID=0
+run --apply --dry-run
+check "conflicting apply and dry-run modes are refused without mutation" '[[ "$RC" -eq 64 && "$OUT" == *"mutually exclusive"* && ! -e "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && ! -s "$CALLS" ]]'
+
 export MOCK_UID=1000
 run --apply
 check "non-root apply is refused before mutation" '[[ "$RC" -eq 64 && "$OUT" == *"must be run as root"* && ! -e "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && ! -s "$CALLS" ]]'

@@ -22,17 +22,19 @@ die() { echo "ERROR: $*" >&2; exit 64; }
 
 apply=false
 restart=false
+dry_run=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply) apply=true ;;
     --restart) restart=true ;;
-    --dry-run) ;;
+    --dry-run) dry_run=true ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
 done
 
+$apply && $dry_run && die "--apply and --dry-run are mutually exclusive"
 [[ "$SOURCE" = /* && "$DROPIN_DIR" = /* && "$JOURNAL_DIR" = /* ]] || die "journal paths must be absolute"
 [[ -f "$SOURCE" && ! -L "$SOURCE" ]] || die "policy source must be a regular non-symlink file"
 
