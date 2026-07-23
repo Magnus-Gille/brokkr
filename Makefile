@@ -1,7 +1,7 @@
 BROKKR_SSH_TARGET ?= brokkr@control-node
 BROKKR_REMOTE_DIR ?= /opt/brokkr
 
-.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install test shellcheck
+.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install node-inventory test shellcheck
 
 patching: ## Install/refresh unattended-upgrades on all Pi hosts (ARGS="--dry-run" or a host)
 	@./scripts/setup-host-patching.sh $(ARGS)
@@ -14,6 +14,9 @@ offsite-photos-dryrun: ## Dry-run the offsite Photos backup (touches nothing)
 
 offsite-photos-install: ## Install/refresh the offsite-photos LaunchAgent (daily 04:15)
 	@./launchd/install.sh
+
+node-inventory: ## Emit a read-only v1 node-capability JSON record (human status on stderr)
+	@node scripts/node-inventory.mjs
 
 maintenance-os: ## Run the OS maintenance report on the service host (ARGS="--dry-run --verbose")
 	@ssh $(BROKKR_SSH_TARGET) 'cd $(BROKKR_REMOTE_DIR) && bash scripts/maintenance-report.sh os $(ARGS)'
