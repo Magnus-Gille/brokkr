@@ -3,13 +3,17 @@
 `location-network-storage.example.json` is a versioned, public declaration of
 reusable substrate facts.  It uses logical storage IDs such as
 `backup-primary`: device nodes and mount paths are intentionally absent, so a
-disk replacement does not alter an application's storage identity.
+disk replacement does not alter an application's storage identity.  Public
+locations declare only requirements and thresholds — separate Wi-Fi and
+Ethernet throughput minimums, signal, filesystem, capacity, backup transfer
+windows, and whether a stable tailnet identity is required.
 
 The owner creates a separate JSON overlay from
 `location-network-storage.overlay.example.json`, keeps it outside this
-repository, and sets it to mode `600`.  The overlay contains private locators
-and the active SSID plus a path to an owner-only credential file.  Neither file
-is printed by the preflight.  Credentials themselves are never stored in JSON.
+repository, and sets it to mode `600`.  All private locators live only in the
+overlay: the active SSID, the path to an owner-only credential file, the
+stable tailnet identity, and mount paths.  Neither file is printed by the
+preflight, and credentials themselves are never stored in JSON.
 
 Run a non-mutating preflight on the target host:
 
@@ -19,10 +23,20 @@ python3 profiles/preflight.py \
   --overlay /owner-private/brokkr/location-overlay.json
 ```
 
-Preflight proves the configured tailnet identity separately from LAN and mDNS,
-uses Ethernet when ready and otherwise validates the owner-selected Wi-Fi
-association, and checks signal, link throughput, mounts, filesystem, a
-create-and-remove write probe, capacity, and each declared transfer window.
-It fails closed whenever evidence is missing.  It does not configure a network,
-mount a volume, or run a backup.  Backup producer/consumer semantics remain in
-their owning component repositories.
+Both files are validated against a closed, versioned schema before any host
+evidence is gathered: unknown, mistyped, malformed, and out-of-range fields
+are rejected with messages that name the offending field but never echo
+owner-supplied values or paths.
+
+The preflight is strictly read-only.  It proves the overlay's tailnet
+identity against a running and online Tailscale backend, requires the
+expected Wi-Fi connection profile to exist with autoconnect enabled even
+while Ethernet is active, and validates the owner-selected Wi-Fi association,
+signal, and link throughput when Wi-Fi carries traffic — or the Ethernet
+link speed against the wired threshold otherwise.  Storage checks use mount
+options and conservative permission evidence instead of a write probe, plus
+filesystem, capacity, and each declared transfer window.  Every external
+command is time-bounded and parsed locale-independently.  It fails closed
+whenever evidence is missing.  It does not configure a network, mount a
+volume, create files, or run a backup.  Backup producer/consumer semantics
+remain in their owning component repositories.

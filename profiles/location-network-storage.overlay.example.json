@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "location": "house-1",
+  "tailnet_identity": "nas.example.ts.net",
   "wifi": {
     "ssid": "owner-provided-ssid",
     "credentials_file": "/owner-provided/private/wifi-credentials"

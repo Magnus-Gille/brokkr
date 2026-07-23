@@ -2,12 +2,17 @@
   "schema_version": 1,
   "locations": {
     "house-1": {
-      "tailnet_identity": "nas.example.ts.net",
+      "tailnet": {
+        "required": true
+      },
       "network": {
         "wifi": {
           "required": true,
           "min_signal_percent": 70,
           "min_throughput_mbps": 20
+        },
+        "ethernet": {
+          "min_throughput_mbps": 100
         }
       },
       "storage": {
@@ -28,12 +33,17 @@
       ]
     },
     "house-2": {
-      "tailnet_identity": "nas.example.ts.net",
+      "tailnet": {
+        "required": true
+      },
       "network": {
         "wifi": {
           "required": true,
           "min_signal_percent": 70,
           "min_throughput_mbps": 20
+        },
+        "ethernet": {
+          "min_throughput_mbps": 100
         }
       },
       "storage": {
