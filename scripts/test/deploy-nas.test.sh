@@ -21,6 +21,9 @@ if [[ ! -d "$release" ]]; then
   echo 'mock rsync: release target was not prepared' >&2
   exit 11
 fi
+if [[ -x "$release/scripts/deploy-nas.sh" ]]; then
+  exit 0
+fi
 cp -R "$MOCK_RELEASE_SOURCE/." "$release"
 EOF
 
