@@ -17,12 +17,16 @@ import sys
 
 MAX_PROFILE_BYTES = 1_000_000
 DEFAULT_COMMAND_TIMEOUT = 10.0
-SAFE_KEY = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
-DNS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
-FILESYSTEM_NAME = re.compile(r"[a-z0-9]{1,32}")
-ABSOLUTE_PATH = re.compile(r"/[^\x00\n]{0,1023}")
-PRINTABLE_SSID = re.compile(r"[^\x00-\x1f\x7f]{1,32}")
 DEVICE_NAME = re.compile(r"[A-Za-z0-9._-]{1,32}")
+SCHEMA_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+DRAFT_2020_12_SCHEMA = "https://json-schema.org/draft/2020-12/schema"
+SUPPORTED_SCHEMA_KEYWORDS = frozenset({
+    "$schema", "$id", "$comment", "title", "description", "type", "const",
+    "pattern", "properties", "required", "additionalProperties", "propertyNames",
+    "minProperties", "items", "minItems", "minimum", "maximum",
+    "exclusiveMinimum",
+})
+SCHEMA_TYPES = frozenset({"object", "array", "string", "integer", "number", "boolean"})
 
 COMMAND_TIMEOUT = DEFAULT_COMMAND_TIMEOUT
 
@@ -40,117 +44,147 @@ def schema_fail(label, path, problem):
     fail(f"{label} {where} {problem}")
 
 
-def check_schema_version(value, label, path):
-    if isinstance(value, bool) or value != 1:
-        fail(f"{label} declares an unsupported schema version")
+def schema_comment(schema, default):
+    """Return a safe diagnostic supplied by a tracked schema artifact."""
+    comment = schema.get("$comment")
+    return comment if isinstance(comment, str) else default
 
 
-def check_bool(value, label, path):
-    if not isinstance(value, bool):
-        schema_fail(label, path, "must be true or false")
+def validate_schema_artifact(schema, label, root=True):
+    """Validate the deliberately small Draft 2020-12 vocabulary this runtime uses.
+
+    This makes the artifacts executable specifications without a third-party JSON
+    Schema dependency.  Rejecting unsupported keywords prevents a schema change
+    from appearing to alter validation while the dependency-free runtime ignores it.
+    """
+    if not isinstance(schema, dict):
+        fail(f"{label} is invalid")
+    if set(schema) - SUPPORTED_SCHEMA_KEYWORDS:
+        fail(f"{label} uses an unsupported schema keyword")
+    if root and schema.get("$schema") != DRAFT_2020_12_SCHEMA:
+        fail(f"{label} is not a Draft 2020-12 schema")
+    for keyword in ("$schema", "$id", "$comment", "title", "description"):
+        if keyword in schema and not isinstance(schema[keyword], str):
+            fail(f"{label} is invalid")
+    schema_type = schema.get("type")
+    if schema_type is not None and schema_type not in SCHEMA_TYPES:
+        fail(f"{label} is invalid")
+    if "pattern" in schema:
+        if not isinstance(schema["pattern"], str):
+            fail(f"{label} is invalid")
+        try:
+            re.compile(schema["pattern"])
+        except re.error:
+            fail(f"{label} is invalid")
+    for keyword in ("minimum", "maximum", "exclusiveMinimum"):
+        if keyword in schema and (isinstance(schema[keyword], bool) or
+                                  not isinstance(schema[keyword], (int, float)) or
+                                  not math.isfinite(schema[keyword])):
+            fail(f"{label} is invalid")
+    for keyword in ("minProperties", "minItems"):
+        if keyword in schema and (isinstance(schema[keyword], bool) or
+                                  not isinstance(schema[keyword], int) or
+                                  schema[keyword] < 0):
+            fail(f"{label} is invalid")
+    if "required" in schema:
+        required = schema["required"]
+        if (not isinstance(required, list) or any(not isinstance(key, str) for key in required)
+                or len(required) != len(set(required))):
+            fail(f"{label} is invalid")
+    if "properties" in schema:
+        if not isinstance(schema["properties"], dict):
+            fail(f"{label} is invalid")
+        for child in schema["properties"].values():
+            validate_schema_artifact(child, label, root=False)
+    if "additionalProperties" in schema:
+        additional = schema["additionalProperties"]
+        if not isinstance(additional, (bool, dict)):
+            fail(f"{label} is invalid")
+        if isinstance(additional, dict):
+            validate_schema_artifact(additional, label, root=False)
+    if "propertyNames" in schema:
+        validate_schema_artifact(schema["propertyNames"], label, root=False)
+    if "items" in schema:
+        validate_schema_artifact(schema["items"], label, root=False)
 
 
-def check_int(minimum, maximum):
-    def check(value, label, path):
-        if isinstance(value, bool) or not isinstance(value, int):
-            schema_fail(label, path, "must be an integer")
-        if not minimum <= value <= maximum:
-            schema_fail(label, path, "is out of range")
-    return check
+def type_matches(value, schema_type):
+    if schema_type == "object":
+        return isinstance(value, dict)
+    if schema_type == "array":
+        return isinstance(value, list)
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if schema_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, bool)
 
 
-def check_number(maximum):
-    def check(value, label, path):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            schema_fail(label, path, "must be a number")
-        if not math.isfinite(value) or not 0 < value <= maximum:
-            schema_fail(label, path, "is out of range")
-    return check
+def json_equal(left, right):
+    """JSON value equality, without Python's True == 1 surprise."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return math.isfinite(left) and math.isfinite(right) and left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, list):
+        return len(left) == len(right) and all(json_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(json_equal(left[key], right[key]) for key in left)
+    return left == right
 
 
-def check_string(pattern, problem):
-    def check(value, label, path):
-        if not isinstance(value, str) or not pattern.fullmatch(value):
-            schema_fail(label, path, problem)
-    return check
-
-
-def check_object(fields):
-    def check(value, label, path):
-        if not isinstance(value, dict):
-            schema_fail(label, path, "must be an object")
-        for key in value:
-            if key not in fields:
-                schema_fail(label, path, "contains an unsupported field")
-        for key, checker in fields.items():
+def validate_against_schema(value, schema, label, path=None):
+    """Validate an instance against the supported schema subset."""
+    path = [] if path is None else path
+    schema_type = schema.get("type")
+    if schema_type and not type_matches(value, schema_type):
+        type_problem = {
+            "boolean": "must be true or false",
+            "integer": "must be an integer",
+            "number": "must be a number",
+        }.get(schema_type, f"must be a {schema_type}")
+        schema_fail(label, path, type_problem)
+    if "const" in schema and not json_equal(value, schema["const"]):
+        schema_fail(label, path, schema_comment(schema, "does not match the schema"))
+    if "pattern" in schema and (not isinstance(value, str) or
+                                 not re.fullmatch(schema["pattern"], value)):
+        schema_fail(label, path, schema_comment(schema, "does not match the required pattern"))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(value):
+            schema_fail(label, path, schema_comment(schema, "must be a finite number"))
+        if "minimum" in schema and value < schema["minimum"]:
+            schema_fail(label, path, schema_comment(schema, "is out of range"))
+        if "maximum" in schema and value > schema["maximum"]:
+            schema_fail(label, path, schema_comment(schema, "is out of range"))
+        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
+            schema_fail(label, path, schema_comment(schema, "is out of range"))
+    if isinstance(value, dict):
+        if "minProperties" in schema and len(value) < schema["minProperties"]:
+            schema_fail(label, path, schema_comment(schema, "must be a non-empty object"))
+        properties = schema.get("properties", {})
+        for key in schema.get("required", []):
             if key not in value:
                 schema_fail(label, path + [key], "is missing")
-            checker(value[key], label, path + [key])
-    return check
-
-
-def check_keyed_map(checker):
-    def check(value, label, path):
-        if not isinstance(value, dict) or not value:
-            schema_fail(label, path, "must be a non-empty object")
+        additional = schema.get("additionalProperties", True)
         for key, item in value.items():
-            if not isinstance(key, str) or not SAFE_KEY.fullmatch(key):
-                schema_fail(label, path, "contains an invalid key")
-            checker(item, label, path + [key])
-    return check
-
-
-def check_array(checker):
-    def check(value, label, path):
-        if not isinstance(value, list):
-            schema_fail(label, path, "must be an array")
-        for index, item in enumerate(value):
-            checker(item, label, path + [str(index)])
-    return check
-
-
-PERCENT = check_int(1, 100)
-THROUGHPUT_MBPS = check_number(100_000.0)
-SAFE_NAME = check_string(SAFE_KEY, "must be a lowercase identifier")
-OWNER_PATH = check_string(ABSOLUTE_PATH, "must be an absolute path")
-
-PROFILE_SCHEMA = check_object({
-    "schema_version": check_schema_version,
-    "locations": check_keyed_map(check_object({
-        "tailnet": check_object({"required": check_bool}),
-        "network": check_object({
-            "wifi": check_object({
-                "required": check_bool,
-                "min_signal_percent": PERCENT,
-                "min_throughput_mbps": THROUGHPUT_MBPS,
-            }),
-            "ethernet": check_object({"min_throughput_mbps": THROUGHPUT_MBPS}),
-        }),
-        "storage": check_keyed_map(check_object({
-            "filesystem": check_string(FILESYSTEM_NAME, "must be a filesystem name"),
-            "max_used_percent": PERCENT,
-            "requires_write": check_bool,
-        })),
-        "backup_roles": check_array(check_object({
-            "logical_storage_id": SAFE_NAME,
-            "producer": SAFE_NAME,
-            "consumer": SAFE_NAME,
-            "bytes": check_number(1e15),
-            "window_minutes": check_number(10_080.0),
-        })),
-    })),
-})
-
-OVERLAY_SCHEMA = check_object({
-    "schema_version": check_schema_version,
-    "location": SAFE_NAME,
-    "tailnet_identity": check_string(DNS_NAME, "must be a DNS name"),
-    "wifi": check_object({
-        "ssid": check_string(PRINTABLE_SSID, "must be a printable SSID"),
-        "credentials_file": OWNER_PATH,
-    }),
-    "storage": check_keyed_map(check_object({"mount": OWNER_PATH})),
-})
+            if "propertyNames" in schema:
+                validate_against_schema(key, schema["propertyNames"], label, path)
+            if key in properties:
+                validate_against_schema(item, properties[key], label, path + [key])
+            elif additional is False:
+                schema_fail(label, path, "contains an unsupported field")
+            elif isinstance(additional, dict):
+                validate_against_schema(item, additional, label, path + [key])
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            schema_fail(label, path, schema_comment(schema, "must not be empty"))
+        if "items" in schema:
+            for index, item in enumerate(value):
+                validate_against_schema(item, schema["items"], label, path + [str(index)])
 
 
 def load_json(path, label, private=False):
@@ -171,6 +205,12 @@ def load_json(path, label, private=False):
     except (OSError, ValueError):
         fail(f"{label} is invalid")
     return value
+
+
+def load_schema(path, label):
+    schema = load_json(path, label)
+    validate_schema_artifact(schema, label)
+    return schema
 
 
 def command(*args):
@@ -312,14 +352,26 @@ def check_tailnet(identity):
 
 def check_storage(logical_id, declared, bound):
     mount = bound["mount"]
-    output = command("findmnt", "--noheadings", "--output", "FSTYPE,OPTIONS",
+    if os.path.normpath(mount) != mount or os.path.realpath(mount) != mount:
+        fail(f"logical storage {logical_id} mount path is not canonical")
+    output = command("findmnt", "--json", "--output", "TARGET,FSTYPE,OPTIONS",
                      "--target", mount)
     if output is None:
         fail(f"logical storage {logical_id} is not mounted")
-    parts = output.split()
-    if len(parts) != 2:
+    try:
+        filesystems = json.loads(output)["filesystems"]
+        if not isinstance(filesystems, list) or len(filesystems) != 1:
+            raise ValueError
+        evidence = filesystems[0]
+        target = evidence["target"]
+        filesystem = evidence["fstype"]
+        options = evidence["options"]
+        if not all(isinstance(item, str) for item in (target, filesystem, options)):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
         fail(f"logical storage {logical_id} mount evidence is invalid")
-    filesystem, options = parts
+    if target != mount:
+        fail(f"logical storage {logical_id} mount target does not match profile")
     if filesystem != declared["filesystem"]:
         fail(f"logical storage {logical_id} filesystem does not match profile")
     if declared["requires_write"]:
@@ -343,6 +395,12 @@ def main():
     parser = argparse.ArgumentParser(description="Preflight a Brokkr location profile")
     parser.add_argument("--profile", required=True)
     parser.add_argument("--overlay", required=True)
+    parser.add_argument("--profile-schema",
+                        default=os.path.join(SCHEMA_DIRECTORY,
+                                             "location-network-storage.schema.json"))
+    parser.add_argument("--overlay-schema",
+                        default=os.path.join(SCHEMA_DIRECTORY,
+                                             "location-network-storage.overlay.schema.json"))
     parser.add_argument("--command-timeout", type=float, default=DEFAULT_COMMAND_TIMEOUT,
                         help="upper bound in seconds for each external command")
     args = parser.parse_args()
@@ -352,8 +410,10 @@ def main():
 
     profile = load_json(args.profile, "public profile")
     overlay = load_json(args.overlay, "owner overlay", private=True)
-    PROFILE_SCHEMA(profile, "public profile", [])
-    OVERLAY_SCHEMA(overlay, "owner overlay", [])
+    profile_schema = load_schema(args.profile_schema, "public profile schema")
+    overlay_schema = load_schema(args.overlay_schema, "owner overlay schema")
+    validate_against_schema(profile, profile_schema, "public profile")
+    validate_against_schema(overlay, overlay_schema, "owner overlay")
 
     location_name = overlay["location"]
     location = profile["locations"].get(location_name)
@@ -366,17 +426,24 @@ def main():
         if role["logical_storage_id"] not in declared_storage:
             fail("backup role references undeclared logical storage")
 
-    if location["tailnet"]["required"]:
-        check_tailnet(overlay["tailnet_identity"])
+    tailnet_identity = overlay.get("tailnet_identity")
+    if location["tailnet"]["required"] and tailnet_identity is None:
+        fail("owner overlay tailnet identity is required by location")
+    if tailnet_identity is not None:
+        check_tailnet(tailnet_identity)
 
     network = location["network"]
-    overlay_wifi = overlay["wifi"]
-    require_private_file(overlay_wifi["credentials_file"], "Wi-Fi credentials")
-    if network["wifi"]["required"]:
+    overlay_wifi = overlay.get("wifi")
+    if network["wifi"]["required"] and overlay_wifi is None:
+        fail("owner overlay Wi-Fi evidence is required by location")
+    if overlay_wifi is not None:
+        require_private_file(overlay_wifi["credentials_file"], "Wi-Fi credentials")
         check_wifi_profile(overlay_wifi["ssid"])
 
     network_kind, device = active_network()
     if network_kind == "wifi":
+        if overlay_wifi is None:
+            fail("owner overlay Wi-Fi evidence is required for active Wi-Fi")
         signal, throughput = wifi_evidence(overlay_wifi["ssid"])
         if signal < network["wifi"]["min_signal_percent"]:
             fail("Wi-Fi signal is below profile minimum")

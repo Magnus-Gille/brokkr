@@ -4,7 +4,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-TMP="$(mktemp -d)"
+TMP="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/mount"
 
@@ -21,7 +21,9 @@ EOF
 cat > "$TMP/bin/findmnt" <<'EOF'
 #!/usr/bin/env bash
 [ "${MOCK_MOUNT:-present}" = present ] || exit 1
-printf '%s %s\n' "${MOCK_FILESYSTEM:-ext4}" "${MOCK_MOUNT_OPTIONS:-rw,relatime}"
+target="${@: -1}"
+printf '{"filesystems":[{"target":"%s","fstype":"%s","options":"%s"}]}\n' \
+  "${MOCK_MOUNT_TARGET:-$target}" "${MOCK_FILESYSTEM:-ext4}" "${MOCK_MOUNT_OPTIONS:-rw,relatime}"
 EOF
 cat > "$TMP/bin/df" <<'EOF'
 #!/usr/bin/env bash
@@ -147,6 +149,15 @@ check "capacity breach fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"logical stor
 preflight "$PROFILE" "$OVERLAY" MOCK_MOUNT_OPTIONS='ro,relatime'
 check "read-only mount options fail closed without a write probe" '[[ "$RC" -eq 2 && "$OUT" == *"logical storage backup-primary is mounted read-only"* ]]'
 
+preflight "$PROFILE" "$OVERLAY" MOCK_MOUNT_TARGET="$TMP"
+check "a parent filesystem selected through a storage subdirectory is rejected" '[[ "$RC" -eq 2 && "$OUT" == *"logical storage backup-primary mount target does not match profile"* && "$OUT" != *"$TMP"* ]]'
+
+ln -s "$TMP/mount" "$TMP/mount-alias"
+sed "s#$TMP/mount#$TMP/mount-alias#" "$OVERLAY" > "$TMP/symlink-overlay.json"
+chmod 600 "$TMP/symlink-overlay.json"
+preflight "$PROFILE" "$TMP/symlink-overlay.json"
+check "a symlinked storage path is rejected without exposing either path" '[[ "$RC" -eq 2 && "$OUT" == *"logical storage backup-primary mount path is not canonical"* && "$OUT" != *mount-alias* && "$OUT" != *"$TMP"* ]]'
+
 if [ "$(id -u)" -ne 0 ]; then
   mkdir "$TMP/readonly"
   sed "s#$TMP/mount#$TMP/readonly#" "$OVERLAY" > "$TMP/readonly-overlay.json"
@@ -205,6 +216,77 @@ sed 's/"wifi":/"stray_secret": "hunter2-value", "wifi":/' "$OVERLAY" > "$TMP/unk
 chmod 600 "$TMP/unknown-overlay.json"
 preflight "$PROFILE" "$TMP/unknown-overlay.json"
 check "unknown owner overlay field is rejected without echoing key or value" '[[ "$RC" -eq 2 && "$OUT" == *"unsupported field"* && "$OUT" != *stray_secret* && "$OUT" != *hunter2-value* ]]'
+
+check "tracked public and owner-overlay Draft 2020-12 schema artifacts exist" '[[ -f "$ROOT/profiles/location-network-storage.schema.json" && -f "$ROOT/profiles/location-network-storage.overlay.schema.json" ]]'
+
+python3 - "$ROOT/profiles/location-network-storage.schema.json" "$TMP/strict-profile.schema.json" <<'EOF'
+import json, sys
+schema = json.load(open(sys.argv[1]))
+location = schema["properties"]["locations"]["additionalProperties"]
+storage = location["properties"]["storage"]["additionalProperties"]
+storage["properties"]["max_used_percent"]["maximum"] = 50
+json.dump(schema, open(sys.argv[2], "w"))
+EOF
+EXTRA_ARGS=(--profile-schema "$TMP/strict-profile.schema.json")
+preflight "$PROFILE" "$OVERLAY"
+check "runtime consumes a tracked schema constraint instead of a duplicate Python checker" '[[ "$RC" -eq 2 && "$OUT" == *"max_used_percent is out of range"* ]]'
+
+python3 - "$ROOT/profiles/location-network-storage.schema.json" "$TMP/unsupported-profile.schema.json" <<'EOF'
+import json, sys
+schema = json.load(open(sys.argv[1]))
+schema["$ref"] = "https://example.invalid/not-supported"
+json.dump(schema, open(sys.argv[2], "w"))
+EOF
+EXTRA_ARGS=(--profile-schema "$TMP/unsupported-profile.schema.json")
+preflight "$PROFILE" "$OVERLAY"
+check "unsupported Draft 2020-12 keywords fail closed instead of silently drifting" '[[ "$RC" -eq 2 && "$OUT" == *"public profile schema uses an unsupported schema keyword"* ]]'
+EXTRA_ARGS=()
+
+python3 - "$PROFILE" "$TMP/wired-profile.json" <<'EOF'
+import json, sys
+value = json.load(open(sys.argv[1]))
+value["locations"] = {
+    "wired": {
+        "tailnet": {"required": False},
+        "network": {
+            "wifi": {"required": False, "min_signal_percent": 70, "min_throughput_mbps": 1},
+            "ethernet": {"min_throughput_mbps": 10},
+        },
+        "storage": value["locations"]["house-1"]["storage"],
+        "backup_roles": [],
+    }
+}
+json.dump(value, open(sys.argv[2], "w"))
+EOF
+cat > "$TMP/wired-overlay.json" <<EOF
+{"schema_version": 1, "location": "wired", "storage": {"backup-primary": {"mount": "$TMP/mount"}}}
+EOF
+chmod 600 "$TMP/wired-overlay.json"
+preflight "$TMP/wired-profile.json" "$TMP/wired-overlay.json"
+check "minimal wired no-tailnet overlay needs no Wi-Fi credential or identity placeholders" '[[ "$RC" -eq 0 && "$OUT" == "OK: location profile wired preflight passed" ]]'
+
+cat > "$TMP/wired-optional-overlay.json" <<EOF
+{"schema_version": 1, "location": "wired", "tailnet_identity": "nas.example.ts.net", "wifi": {"ssid": "example-house-1", "credentials_file": "$TMP/wifi.secret"}, "storage": {"backup-primary": {"mount": "$TMP/mount"}}}
+EOF
+chmod 600 "$TMP/wired-optional-overlay.json"
+preflight "$TMP/wired-profile.json" "$TMP/wired-optional-overlay.json"
+check "optional tailnet and Wi-Fi overlay evidence validates when supplied" '[[ "$RC" -eq 0 && "$OUT" == "OK: location profile wired preflight passed" ]]'
+
+python3 - "$OVERLAY" "$TMP/no-tailnet-overlay.json" "$TMP/no-wifi-overlay.json" <<'EOF'
+import json, sys
+value = json.load(open(sys.argv[1]))
+without_tailnet = dict(value)
+del without_tailnet["tailnet_identity"]
+json.dump(without_tailnet, open(sys.argv[2], "w"))
+without_wifi = dict(value)
+del without_wifi["wifi"]
+json.dump(without_wifi, open(sys.argv[3], "w"))
+EOF
+chmod 600 "$TMP/no-tailnet-overlay.json" "$TMP/no-wifi-overlay.json"
+preflight "$PROFILE" "$TMP/no-tailnet-overlay.json"
+check "tailnet identity is required when the selected public location requires it" '[[ "$RC" -eq 2 && "$OUT" == *"owner overlay tailnet identity is required by location"* ]]'
+preflight "$PROFILE" "$TMP/no-wifi-overlay.json"
+check "Wi-Fi evidence is required when the selected public location requires it" '[[ "$RC" -eq 2 && "$OUT" == *"owner overlay Wi-Fi evidence is required by location"* ]]'
 
 cp "$ROOT/profiles/location-network-storage.example.json" "$TMP/shipped-profile.json"
 cp "$ROOT/profiles/location-network-storage.overlay.example.json" "$TMP/shipped-overlay.json"

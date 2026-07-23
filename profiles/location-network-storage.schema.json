@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brokkr.example/schemas/location-network-storage.schema.json",
+  "title": "Brokkr public location, network, storage, and backup-role profile",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "$comment": "declares an unsupported schema version"
+    },
+    "locations": {
+      "type": "object",
+      "minProperties": 1,
+      "$comment": "must be a non-empty object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+        "$comment": "contains an invalid key"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "tailnet": {
+            "type": "object",
+            "properties": {
+              "required": {"type": "boolean", "$comment": "must be true or false"}
+            },
+            "required": ["required"],
+            "additionalProperties": false
+          },
+          "network": {
+            "type": "object",
+            "properties": {
+              "wifi": {
+                "type": "object",
+                "properties": {
+                  "required": {"type": "boolean", "$comment": "must be true or false"},
+                  "min_signal_percent": {"type": "integer", "minimum": 1, "maximum": 100, "$comment": "is out of range"},
+                  "min_throughput_mbps": {"type": "number", "exclusiveMinimum": 0, "maximum": 100000, "$comment": "is out of range"}
+                },
+                "required": ["required", "min_signal_percent", "min_throughput_mbps"],
+                "additionalProperties": false
+              },
+              "ethernet": {
+                "type": "object",
+                "properties": {
+                  "min_throughput_mbps": {"type": "number", "exclusiveMinimum": 0, "maximum": 100000, "$comment": "is out of range"}
+                },
+                "required": ["min_throughput_mbps"],
+                "additionalProperties": false
+              }
+            },
+            "required": ["wifi", "ethernet"],
+            "additionalProperties": false
+          },
+          "storage": {
+            "type": "object",
+            "minProperties": 1,
+            "$comment": "must be a non-empty object",
+            "propertyNames": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+              "$comment": "contains an invalid key"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "filesystem": {"type": "string", "pattern": "^[a-z0-9]{1,32}$", "$comment": "must be a filesystem name"},
+                "max_used_percent": {"type": "integer", "minimum": 1, "maximum": 100, "$comment": "is out of range"},
+                "requires_write": {"type": "boolean", "$comment": "must be true or false"}
+              },
+              "required": ["filesystem", "max_used_percent", "requires_write"],
+              "additionalProperties": false
+            }
+          },
+          "backup_roles": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "logical_storage_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$", "$comment": "must be a lowercase identifier"},
+                "producer": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$", "$comment": "must be a lowercase identifier"},
+                "consumer": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$", "$comment": "must be a lowercase identifier"},
+                "bytes": {"type": "number", "exclusiveMinimum": 0, "maximum": 1000000000000000, "$comment": "is out of range"},
+                "window_minutes": {"type": "number", "exclusiveMinimum": 0, "maximum": 10080, "$comment": "is out of range"}
+              },
+              "required": ["logical_storage_id", "producer", "consumer", "bytes", "window_minutes"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["tailnet", "network", "storage", "backup_roles"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema_version", "locations"],
+  "additionalProperties": false
+}
