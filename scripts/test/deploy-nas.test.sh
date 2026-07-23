@@ -3,10 +3,20 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEPLOY="$HERE/../deploy-nas.sh"
-SOURCE="$(cd "$HERE/../.." && pwd)"
+REPO_SOURCE="$(cd "$HERE/../.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+SOURCE="$TMP/bound-source"
+SOURCE_SHA="$(git -C "$REPO_SOURCE" rev-parse HEAD)"
+git clone -q "$REPO_SOURCE" "$SOURCE"
+git -C "$SOURCE" checkout --detach -q "$SOURCE_SHA"
+# Exercise the current implementation while retaining a detached worktree.
+cp "$REPO_SOURCE/scripts/deploy-nas.sh" "$SOURCE/scripts/deploy-nas.sh"
+cp "$REPO_SOURCE/scripts/lib/deploy-source.sh" "$SOURCE/scripts/lib/deploy-source.sh"
+cleanup() {
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+DEPLOY="$SOURCE/scripts/deploy-nas.sh"
 
 mkdir -p "$TMP/bin" "$TMP/home" "$TMP/installed-units"
 CALLS="$TMP/calls"
@@ -107,6 +117,7 @@ mkdir -p "$BROKKR_RUNTIME_HOME" "$(dirname "$BROKKR_REGISTRY_PATH")"
 printf '{"components":[]}\n' >"$BROKKR_REGISTRY_PATH"
 export BROKKR_HEIMDALL_SOURCE_ENV="$TMP/heimdall-source.env"
 export MOCK_HEIMDALL_SOURCE_ENV="$BROKKR_HEIMDALL_SOURCE_ENV"
+export BROKKR_EXPECTED_SOURCE="$SOURCE" BROKKR_EXPECTED_COMMIT="$SOURCE_SHA"
 printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
 
 PASS=0; FAIL=0
@@ -114,9 +125,27 @@ ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1" >&2; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 # shellcheck disable=SC2034 # checks consume OUT and RC through eval.
-run() { OUT="$(bash "$DEPLOY" 2>&1)"; RC=$?; }
+run() { OUT="$(cd "$SOURCE" && bash "$DEPLOY" 2>&1)"; RC=$?; }
 
 echo "deploy-nas.test.sh"
+
+unset BROKKR_EXPECTED_COMMIT
+run
+check "missing source revision refuses before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_EXPECTED_SOURCE and BROKKR_EXPECTED_COMMIT"* ]] && [[ ! -s "$CALLS" ]]'
+export BROKKR_EXPECTED_COMMIT="$SOURCE_SHA"
+
+: >"$CALLS"
+mkdir -p "$TMP/wrong-source"
+export BROKKR_EXPECTED_SOURCE="$TMP/wrong-source"
+run
+check "wrong source path refuses before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"different directory"* ]] && [[ ! -s "$CALLS" ]]'
+export BROKKR_EXPECTED_SOURCE="$SOURCE"
+
+: >"$CALLS"
+export BROKKR_EXPECTED_COMMIT=0000000000000000000000000000000000000000
+run
+check "stale clean revision refuses before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"revision does not match"* ]] && [[ ! -s "$CALLS" ]]'
+export BROKKR_EXPECTED_COMMIT="$SOURCE_SHA"
 
 unset BROKKR_RUNTIME_USER
 run

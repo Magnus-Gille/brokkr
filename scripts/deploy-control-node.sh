@@ -8,6 +8,8 @@ set -euo pipefail
 
 CONTROL_NODE="${1:-${BROKKR_SSH_TARGET:-brokkr@control-node}}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/deploy-source.sh
+source "$HERE/scripts/lib/deploy-source.sh"
 DEPLOY_TARGET="${BROKKR_DEPLOY_TARGET:-${BROKKR_REMOTE_DIR:-/opt/brokkr}}"
 RUNTIME_USER="${BROKKR_RUNTIME_USER:-brokkr}"
 RUNTIME_HOME="${BROKKR_RUNTIME_HOME:-/home/$RUNTIME_USER}"
@@ -20,6 +22,9 @@ valid_path() {
   [[ "$1" =~ ^/[A-Za-z0-9._/@:+-]+$ ]] \
     && [[ "$1" != *'//'* && "$1" != */./* && "$1" != */../* && "$1" != */. && "$1" != */.. ]]
 }
+
+# This outermost local gate must run before even the remote target preflight.
+require_brokkr_deploy_source_binding
 
 [[ "$RUNTIME_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid BROKKR_RUNTIME_USER"
 valid_path "$DEPLOY_TARGET" || die "invalid BROKKR_DEPLOY_TARGET"

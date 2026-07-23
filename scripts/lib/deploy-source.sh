@@ -60,3 +60,15 @@ verify_deploy_source_identity() {
     return 1
   fi
 }
+
+require_brokkr_deploy_source_binding() {
+  local expected_source=${BROKKR_EXPECTED_SOURCE:-}
+  local expected_revision=${BROKKR_EXPECTED_COMMIT:-}
+
+  if [[ -z "$expected_source" || -z "$expected_revision" ]]; then
+    echo "ERROR: BROKKR_EXPECTED_SOURCE and BROKKR_EXPECTED_COMMIT (a full immutable SHA) are required" >&2
+    return 1
+  fi
+
+  verify_deploy_source_identity "$expected_source" "$expected_revision" "$PWD"
+}

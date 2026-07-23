@@ -4,14 +4,14 @@ Every Brokkr deployment must bind the selected checkout to the immutable full
 commit SHA accepted for the release. A clean checkout alone is not sufficient:
 it can be a stale commit or an unintended worktree.
 
-Run deployment commands through Brokkr's local guard:
+The canonical NAS and control-node deployment entry points require the binding
+themselves. Run them from the selected worktree root:
 
 ```sh
 cd /private/tmp/brokkr-release
-./scripts/guarded-deploy.sh \
-  /private/tmp/brokkr-release \
-  <accepted-full-commit-sha> \
-  -- ./scripts/deploy-nas.sh
+BROKKR_EXPECTED_SOURCE=/private/tmp/brokkr-release \
+BROKKR_EXPECTED_COMMIT=<accepted-full-commit-sha> \
+  ./scripts/deploy-nas.sh
 ```
 
 The SHA must be the accepted release revision, never a value derived from the
@@ -32,8 +32,9 @@ Before executing the guarded command it verifies all of the following:
 Detached worktrees are supported. On any mismatch the command is not started,
 so existing Brokkr deployment safety checks remain intact as inner gates and no
 sync, copy, package installation, systemd change, restart, or remote mutation
-can be reached through this entry point.
+can be reached through either canonical entry point.
 
-This is compatible with Grimnir's deployment-source-binding contract while
-remaining self-contained: orchestration may call this guard directly instead
-of relying on another repository's wrapper.
+`scripts/guarded-deploy.sh` remains available for other owning-repository
+deployment commands. This is compatible with Grimnir's deployment-source-binding
+contract while remaining self-contained: orchestration does not need another
+repository's wrapper.

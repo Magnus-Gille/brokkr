@@ -4,6 +4,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY="$HERE/../deploy-control-node.sh"
+SOURCE="$(cd "$HERE/../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
@@ -89,15 +90,38 @@ export MOCK_HEIMDALL_PROBE="$HERE/../verify-heimdall-delivery.sh"
 export BROKKR_SSH_TARGET=brokkr@control-node
 export BROKKR_DEPLOY_TARGET="$TMP/release" BROKKR_RUNTIME_USER=operator BROKKR_RUNTIME_HOME=/home/operator BROKKR_REGISTRY_PATH=/srv/grimnir/services.json
 export MOCK_RUNTIME_HOME="$BROKKR_RUNTIME_HOME" MOCK_REGISTRY_PATH="$BROKKR_REGISTRY_PATH" MOCK_RELEASE_TARGET="$BROKKR_DEPLOY_TARGET"
+export BROKKR_EXPECTED_SOURCE="$SOURCE"
+BROKKR_EXPECTED_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
+export BROKKR_EXPECTED_COMMIT
 
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1" >&2; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 # shellcheck disable=SC2034 # checks consume OUT and RC through eval.
-run() { OUT="$(bash "$DEPLOY" 2>&1)"; RC=$?; }
+run() { OUT="$(cd "$SOURCE" && bash "$DEPLOY" 2>&1)"; RC=$?; }
 
 echo "deploy-control-node.test.sh"
+
+unset BROKKR_EXPECTED_COMMIT
+run
+check "missing source revision refuses before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_EXPECTED_SOURCE and BROKKR_EXPECTED_COMMIT"* ]] && [[ ! -s "$CALLS" ]]'
+BROKKR_EXPECTED_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
+export BROKKR_EXPECTED_COMMIT
+
+: >"$CALLS"
+mkdir -p "$TMP/wrong-source"
+export BROKKR_EXPECTED_SOURCE="$TMP/wrong-source"
+run
+check "wrong source path refuses before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"different directory"* ]] && [[ ! -s "$CALLS" ]]'
+export BROKKR_EXPECTED_SOURCE="$SOURCE"
+
+: >"$CALLS"
+export BROKKR_EXPECTED_COMMIT=0000000000000000000000000000000000000000
+run
+check "stale clean revision refuses before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"revision does not match"* ]] && [[ ! -s "$CALLS" ]]'
+BROKKR_EXPECTED_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
+export BROKKR_EXPECTED_COMMIT
 
 unset BROKKR_HEIMDALL_TOKEN_SOURCE BROKKR_HEIMDALL_URL
 run

@@ -6,6 +6,8 @@ set -euo pipefail
 
 NAS="${1:-${BROKKR_SSH_TARGET:-brokkr@nas-host}}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/deploy-source.sh
+source "$HERE/scripts/lib/deploy-source.sh"
 DEPLOY_TARGET="${BROKKR_DEPLOY_TARGET:-}"
 RUNTIME_USER="${BROKKR_RUNTIME_USER:-}"
 RUNTIME_HOME="${BROKKR_RUNTIME_HOME:-}"
@@ -18,6 +20,9 @@ valid_path() {
     && [[ "$1" != *'//'* && "$1" != */./* && "$1" != */../* && "$1" != */. && "$1" != */.. ]]
 }
 require() { [[ -n "${!1:-}" ]] || die "$1 is required"; }
+
+# This outermost local gate must run before even the remote target preflight.
+require_brokkr_deploy_source_binding
 
 require BROKKR_RUNTIME_USER
 require BROKKR_RUNTIME_HOME
