@@ -398,9 +398,9 @@ run_os() {
   echo
   echo "$summary"
 
-  report_write "maintenance/os/$RUN_DATE" "summary" "$summary" \
+  report_write "maintenance/os" "$RUN_DATE" "$summary" \
     "[\"maintenance\",\"os\",\"automated\"]"
-  report_log "maintenance/" "OS maintenance report run @ $TIMESTAMP — action_needed=$any_action" \
+  report_log "maintenance" "OS maintenance report run @ $TIMESTAMP — action_needed=$any_action" \
     "[\"maintenance\",\"os-event\",\"automated\"]"
 
   if $any_action && [[ -n "$alerts" ]]; then
@@ -487,9 +487,9 @@ run_deps() {
   echo
   echo "$summary"
 
-  report_write "maintenance/deps/$RUN_DATE" "summary" "$summary" \
+  report_write "maintenance/deps" "$RUN_DATE" "$summary" \
     "[\"maintenance\",\"deps\",\"automated\"]"
-  report_log "maintenance/" "npm dependency report run @ $TIMESTAMP — $grand_total outdated ($grand_major major) across $checked repos, $errors error(s)" \
+  report_log "maintenance" "npm dependency report run @ $TIMESTAMP — $grand_total outdated ($grand_major major) across $checked repos, $errors error(s)" \
     "[\"maintenance\",\"deps-event\",\"automated\"]"
 
   if [[ "$grand_total" -gt 0 || "$errors" -gt 0 ]]; then
@@ -517,7 +517,7 @@ run_brew() {
 
   report_write "maintenance/brew/laptop" "latest" "$summary" \
     "[\"maintenance\",\"brew\",\"laptop\",\"automated\"]"
-  report_log "maintenance/" "brew laptop report @ $TIMESTAMP — $ncasks cask(s) need manual upgrade, alert=$balert" \
+  report_log "maintenance" "brew laptop report @ $TIMESTAMP — $ncasks cask(s) need manual upgrade, alert=$balert" \
     "[\"maintenance\",\"brew-event\",\"automated\"]"
 
   { [[ "$ncasks" -gt 0 ]] || [[ "$balert" == "1" ]]; } && alert "🍺 $summary"
