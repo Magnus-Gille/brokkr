@@ -52,6 +52,13 @@ established Ratatoskr/direct-Telegram fallback. It is secondary to the
 authenticated Heimdall upsert and remains best effort by that helper's contract.
 Never commit the environment file or any values from it.
 
+On the control node, `deploy-control-node.sh` derives this file from the
+host-local `/etc/brokkr/heimdall-source.env` before it enables the sweep. The
+source must contain exactly one non-empty value for each assignment; set
+`BROKKR_HEIMDALL_SOURCE_ENV` only when the approved source has another local
+path. A missing or malformed source aborts the deployment before any timer is
+enabled.
+
 ## Install after merge
 
 This pull request does not deploy or restart anything. After it is merged, use

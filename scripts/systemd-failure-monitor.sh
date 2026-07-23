@@ -20,9 +20,9 @@ case "$MODE" in
   --sweep) [ "$#" -eq 1 ] || usage ;;
   --unit)
     [ "$#" -eq 2 ] || usage
-    # `%I` from the template must name a system service, not a shell fragment,
+    # `%i` from the template must name a system service, not a shell fragment,
     # path, or a user unit. The independent sweep remains the safety net.
-    if [[ ! "$UNIT" =~ ^[A-Za-z0-9:_.@-]+\.service$ ]]; then
+    if [[ ! "$UNIT" =~ ^[A-Za-z0-9:_.@\\-]+\.service$ ]]; then
       echo "brokkr systemd failure monitor: invalid unit '$UNIT'" >&2
       exit 64
     fi
@@ -42,14 +42,22 @@ mkdir -p "$STATE_DIR"
 # shellcheck source=lib/notify.sh
 source "$HERE/scripts/lib/notify.sh"
 
-# A handler and a timer can arrive together. Leave the next timer tick to retry
-# rather than racing the state file or emitting duplicate notifications.
-LOCK_DIR="$STATE_DIR/.lock"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+# A handler and a timer can arrive together. Use a kernel-released advisory lock:
+# a SIGKILL or reboot releases it automatically, unlike a mkdir sentinel. Remove
+# an empty sentinel left by the pre-flock implementation during an upgrade.
+LOCK_FILE="$STATE_DIR/.lock"
+if [ -d "$LOCK_FILE" ] && ! rmdir "$LOCK_FILE" 2>/dev/null; then
   echo "brokkr systemd failure monitor: another reconciliation is in progress; skipping" >&2
   exit 0
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+if ! exec 9>"$LOCK_FILE"; then
+  echo "brokkr systemd failure monitor: could not open lock file" >&2
+  exit 1
+fi
+if ! flock -n 9; then
+  echo "brokkr systemd failure monitor: another reconciliation is in progress; skipping" >&2
+  exit 0
+fi
 
 if ! listed="$(systemctl list-units --all --type=service --state=failed --no-legend --plain)"; then
   echo "brokkr systemd failure monitor: could not list failed system services" >&2
@@ -60,19 +68,21 @@ CURRENT="$STATE_DIR/.current.$$"
 PREVIOUS="$STATE_DIR/failed-units"
 NEW="$STATE_DIR/.new.$$"
 RECOVERED="$STATE_DIR/.recovered.$$"
+SORTED_PREVIOUS="$STATE_DIR/.previous.$$"
 SNAPSHOT="$STATE_DIR/systemd-failures.json"
 TMP_SNAPSHOT="$STATE_DIR/.snapshot.$$"
-trap 'rm -f "$CURRENT" "$NEW" "$RECOVERED" "$TMP_SNAPSHOT"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+TMP_PREVIOUS="$STATE_DIR/.failed-units.$$"
+trap 'rm -f "$CURRENT" "$NEW" "$RECOVERED" "$SORTED_PREVIOUS" "$TMP_SNAPSHOT" "$TMP_PREVIOUS"' EXIT
 
 # `systemctl list-units` is column-oriented. Only accept legal service names so
 # malformed output can never become a panel/notification injection primitive.
 printf '%s\n' "$listed" | awk '
-  $1 ~ /^[A-Za-z0-9:_.@-]+\.service$/ { print $1 }
+  $1 ~ /^[A-Za-z0-9:_.@\\-]+\.service$/ { print $1 }
 ' | LC_ALL=C sort -u >"$CURRENT"
 [ -f "$PREVIOUS" ] || : >"$PREVIOUS"
-LC_ALL=C sort -u "$PREVIOUS" -o "$PREVIOUS"
-comm -13 "$PREVIOUS" "$CURRENT" >"$NEW"
-comm -23 "$PREVIOUS" "$CURRENT" >"$RECOVERED"
+LC_ALL=C sort -u "$PREVIOUS" >"$SORTED_PREVIOUS"
+comm -13 "$SORTED_PREVIOUS" "$CURRENT" >"$NEW"
+comm -23 "$SORTED_PREVIOUS" "$CURRENT" >"$RECOVERED"
 
 if ! python3 - "$CURRENT" "$TMP_SNAPSHOT" <<'PY'
 import json
@@ -128,7 +138,10 @@ if [ -s "$RECOVERED" ]; then
   done <"$RECOVERED"
 fi
 
-cp "$CURRENT" "$PREVIOUS"
+# Publish the dedup state atomically only after Heimdall acknowledged the
+# snapshot, so a delivery failure remains a retryable transition.
+cp "$CURRENT" "$TMP_PREVIOUS"
+mv "$TMP_PREVIOUS" "$PREVIOUS"
 if [ ! -s "$NEW" ] && [ ! -s "$RECOVERED" ]; then
   echo "brokkr systemd failure monitor: no state change"
 fi

@@ -20,6 +20,7 @@ set -euo pipefail
 CONTROL_NODE="${1:-${BROKKR_SSH_TARGET:-brokkr@control-node}}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${BROKKR_REMOTE_DIR:-/opt/brokkr}"
+HEIMDALL_SOURCE_ENV="${BROKKR_HEIMDALL_SOURCE_ENV:-/etc/brokkr/heimdall-source.env}"
 
 echo "==> Syncing repo to $CONTROL_NODE:$DEST"
 rsync -a --delete --exclude '.git' --exclude '.local' "$HERE/" "$CONTROL_NODE:$DEST/"
@@ -27,6 +28,25 @@ rsync -a --delete --exclude '.git' --exclude '.local' "$HERE/" "$CONTROL_NODE:$D
 echo "==> Installing systemd units on $CONTROL_NODE"
 ssh "$CONTROL_NODE" "
   set -euo pipefail
+
+  # The failure monitor must never be enabled without its primary delivery
+  # path. Derive its owner-only runtime env from the same host-local source
+  # convention used by the NAS deployment; values never leave the host or log.
+  if ! sudo test -f '$HEIMDALL_SOURCE_ENV'; then
+    echo 'ERROR: Heimdall source environment is missing; refusing to enable the failure sweep' >&2
+    exit 2
+  fi
+  if [ \"\$(sudo grep -Ec '^HEIMDALL_HUB_URL=' '$HEIMDALL_SOURCE_ENV')\" -ne 1 ] \
+    || [ \"\$(sudo grep -Ec '^HEIMDALL_FLEET_TOKEN=' '$HEIMDALL_SOURCE_ENV')\" -ne 1 ] \
+    || ! sudo grep -Eq '^HEIMDALL_HUB_URL=.+$' '$HEIMDALL_SOURCE_ENV' \
+    || ! sudo grep -Eq '^HEIMDALL_FLEET_TOKEN=.+$' '$HEIMDALL_SOURCE_ENV'; then
+    echo 'ERROR: Heimdall source environment must contain exactly one non-empty URL and fleet token; refusing to enable the failure sweep' >&2
+    exit 2
+  fi
+  sudo install -d -m 0700 -o brokkr -g brokkr /home/brokkr/.config/brokkr
+  sudo sh -c \"umask 077; grep -E '^HEIMDALL_(HUB_URL|FLEET_TOKEN)=' '$HEIMDALL_SOURCE_ENV' > /home/brokkr/.config/brokkr/env\"
+  sudo chown brokkr:brokkr /home/brokkr/.config/brokkr/env
+  sudo chmod 0600 /home/brokkr/.config/brokkr/env
 
   sudo install -m 0644 '$DEST'/systemd/brokkr-maintenance-os.service  /etc/systemd/system/brokkr-maintenance-os.service
   sudo install -m 0644 '$DEST'/systemd/brokkr-maintenance-os.timer    /etc/systemd/system/brokkr-maintenance-os.timer

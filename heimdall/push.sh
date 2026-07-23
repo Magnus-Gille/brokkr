@@ -11,7 +11,7 @@
 # locally at deploy time and never stored in this repo.
 set -euo pipefail
 
-STATE_DIR="${BROKKR_STATE_DIR:-$HOME/.local/state/brokkr}"
+STATE_DIR="${BROKKR_STATE_DIR:-${HOME:-/var/lib/brokkr}/.local/state/brokkr}"
 SNAP="${1:-$STATE_DIR/health.json}"
 PANEL="${BROKKR_HEIMDALL_PANEL:-hw-health}"
 LABEL="${BROKKR_HEIMDALL_LABEL:-Hardware Health}"
