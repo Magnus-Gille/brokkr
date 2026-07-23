@@ -6,6 +6,36 @@ is_full_commit_sha() {
   [[ "$revision" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]
 }
 
+reject_symlinked_deploy_entry() {
+  local entry_path=${1:-} absolute_path component current_path
+
+  [[ -n "$entry_path" ]] || {
+    echo "ERROR: deployment entry point path is required" >&2
+    return 1
+  }
+  if [[ "$entry_path" == /* ]]; then
+    absolute_path=$entry_path
+  else
+    absolute_path="$(pwd -P)/$entry_path"
+  fi
+
+  current_path=/
+  local IFS=/
+  local -a components
+  read -r -a components <<<"${absolute_path#/}"
+  for component in "${components[@]}"; do
+    case "$component" in
+      ''|.) continue ;;
+      ..) current_path=$(dirname "$current_path"); continue ;;
+    esac
+    current_path="${current_path%/}/$component"
+    if [[ -L "$current_path" ]]; then
+      echo "ERROR: deployment entry point path must not contain symlinks" >&2
+      return 1
+    fi
+  done
+}
+
 verify_deploy_source_identity() {
   local requested_source=${1:-} expected_revision=${2:-}
   local invocation_source=${3:-$PWD}
@@ -61,10 +91,8 @@ verify_deploy_source_identity() {
   fi
 }
 
-require_brokkr_deploy_source_binding() {
-  local entry_source=${1:-}
-  local expected_source=${BROKKR_EXPECTED_SOURCE:-}
-  local expected_revision=${BROKKR_EXPECTED_COMMIT:-}
+verify_brokkr_deploy_source_binding() {
+  local entry_source=${1:-} expected_source=${2:-} expected_revision=${3:-}
   local resolved_expected_source resolved_entry_source
 
   if [[ -z "$entry_source" || -z "$expected_source" || -z "$expected_revision" ]]; then
@@ -84,4 +112,15 @@ require_brokkr_deploy_source_binding() {
     echo "ERROR: deployment entry point source root does not match the expected source" >&2
     return 1
   fi
+
+  if ! git -C "$resolved_expected_source" diff --quiet --ignore-submodules -- \
+    || ! git -C "$resolved_expected_source" diff --cached --quiet --ignore-submodules --; then
+    echo "ERROR: deployment source has tracked changes; commit or discard them before deployment" >&2
+    return 1
+  fi
+}
+
+require_brokkr_deploy_source_binding() {
+  verify_brokkr_deploy_source_binding \
+    "${1:-}" "${BROKKR_EXPECTED_SOURCE:-}" "${BROKKR_EXPECTED_COMMIT:-}"
 }

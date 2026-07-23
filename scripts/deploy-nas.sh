@@ -5,7 +5,19 @@
 set -euo pipefail
 
 NAS="${1:-${BROKKR_SSH_TARGET:-brokkr@nas-host}}"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENTRY_SCRIPT="${BASH_SOURCE[0]}"
+ENTRY_PATH="$ENTRY_SCRIPT"
+[[ "$ENTRY_PATH" == /* ]] || ENTRY_PATH="$(pwd -P)/$ENTRY_PATH"
+ENTRY_CURSOR=/
+IFS=/ read -r -a ENTRY_COMPONENTS <<<"${ENTRY_PATH#/}"
+for ENTRY_COMPONENT in "${ENTRY_COMPONENTS[@]}"; do
+  case "$ENTRY_COMPONENT" in ''|.) continue ;; ..) ENTRY_CURSOR=$(dirname "$ENTRY_CURSOR"); continue ;; esac
+  ENTRY_CURSOR="${ENTRY_CURSOR%/}/$ENTRY_COMPONENT"
+  [[ ! -L "$ENTRY_CURSOR" ]] || { echo "brokkr NAS deploy: deployment entry point path must not contain symlinks" >&2; exit 64; }
+done
+# Resolve only after rejecting every lexical symlink component in the entry path.
+SCRIPT_DIR="$(cd "$(dirname "$ENTRY_SCRIPT")" && pwd -P)"
+HERE="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 # shellcheck source=scripts/lib/deploy-source.sh
 source "$HERE/scripts/lib/deploy-source.sh"
 DEPLOY_TARGET="${BROKKR_DEPLOY_TARGET:-}"

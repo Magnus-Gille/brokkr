@@ -4,16 +4,21 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_SOURCE="$(cd "$HERE/../.." && pwd)"
-TMP="$(mktemp -d)"
+TMP="$(cd "$(mktemp -d)" && pwd -P)"
 SOURCE="$TMP/bound-source"
-SOURCE_SHA="$(git -C "$REPO_SOURCE" rev-parse HEAD)"
+BASE_SHA="$(git -C "$REPO_SOURCE" rev-parse HEAD)"
 git clone -q "$REPO_SOURCE" "$SOURCE"
-git -C "$SOURCE" checkout --detach -q "$SOURCE_SHA"
+git -C "$SOURCE" checkout --detach -q "$BASE_SHA"
 # Exercise the current implementation while retaining a detached worktree.
 cp "$REPO_SOURCE/scripts/deploy-nas.sh" "$SOURCE/scripts/deploy-nas.sh"
 cp "$REPO_SOURCE/scripts/lib/deploy-source.sh" "$SOURCE/scripts/lib/deploy-source.sh"
+git -C "$SOURCE" config user.name test
+git -C "$SOURCE" config user.email test@example.invalid
+git -C "$SOURCE" add scripts/deploy-nas.sh scripts/lib/deploy-source.sh
+git -C "$SOURCE" commit -qm 'fixture deploy binding'
+SOURCE_SHA="$(git -C "$SOURCE" rev-parse HEAD)"
 STALE_SOURCE="$TMP/stale-source"
-git clone -q "$REPO_SOURCE" "$STALE_SOURCE"
+git clone -q "$SOURCE" "$STALE_SOURCE"
 git -C "$STALE_SOURCE" checkout --detach -q "$SOURCE_SHA^"
 cp "$REPO_SOURCE/scripts/deploy-nas.sh" "$STALE_SOURCE/scripts/deploy-nas.sh"
 cp "$REPO_SOURCE/scripts/lib/deploy-source.sh" "$STALE_SOURCE/scripts/lib/deploy-source.sh"
@@ -146,6 +151,18 @@ export BROKKR_EXPECTED_COMMIT="$SOURCE_SHA"
 : >"$CALLS"
 run "$STALE_SOURCE/scripts/deploy-nas.sh"
 check "stale entry script refuses from an accepted detached cwd before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"entry point source root does not match"* ]] && [[ ! -s "$CALLS" ]]'
+
+: >"$CALLS"
+ln -s "$STALE_SOURCE/scripts/deploy-nas.sh" "$SOURCE/scripts/deploy-via-link.sh"
+run "$SOURCE/scripts/deploy-via-link.sh"
+check "symlinked entry script refuses before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"path must not contain symlinks"* ]] && [[ ! -s "$CALLS" ]]'
+rm -f "$SOURCE/scripts/deploy-via-link.sh"
+
+: >"$CALLS"
+printf '\n# dirty fixture\n' >>"$SOURCE/scripts/health-snapshot.sh"
+run
+check "dirty tracked source refuses before SSH or rsync" '[[ "$RC" -ne 0 && "$OUT" == *"tracked changes"* ]] && [[ ! -s "$CALLS" ]]'
+git -C "$SOURCE" checkout -- scripts/health-snapshot.sh
 
 : >"$CALLS"
 mkdir -p "$TMP/wrong-source"

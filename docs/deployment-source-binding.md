@@ -30,6 +30,8 @@ Before executing the guarded command it verifies all of the following:
 - the physical repository root containing the deployment entry script is that
   same expected worktree;
 - the actual `HEAD` equals the expected immutable SHA.
+- no tracked file in that worktree is staged or modified; and
+- the invoked deployment script path contains no symlink.
 
 Detached worktrees are supported. On any mismatch the command is not started,
 so existing Brokkr deployment safety checks remain intact as inner gates and no

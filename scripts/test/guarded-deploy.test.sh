@@ -5,8 +5,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GUARD="$HERE/../guarded-deploy.sh"
-TMP="$(mktemp -d)"
+SOURCE_ROOT="$(cd "$HERE/../.." && pwd)"
+TMP="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
 
 REPO="$TMP/repo"
@@ -19,8 +19,12 @@ COMMAND="$TMP/fake-deploy"
 git init -q "$REPO"
 git -C "$REPO" config user.name test
 git -C "$REPO" config user.email test@example.invalid
+mkdir -p "$REPO/scripts/lib"
+cp "$SOURCE_ROOT/scripts/guarded-deploy.sh" "$REPO/scripts/guarded-deploy.sh"
+cp "$SOURCE_ROOT/scripts/lib/deploy-source.sh" "$REPO/scripts/lib/deploy-source.sh"
+chmod +x "$REPO/scripts/guarded-deploy.sh"
 printf 'first\n' >"$REPO/revision"
-git -C "$REPO" add revision
+git -C "$REPO" add revision scripts
 git -C "$REPO" commit -qm first
 STALE_SHA="$(git -C "$REPO" rev-parse HEAD)"
 printf 'current\n' >"$REPO/revision"
@@ -29,6 +33,8 @@ CURRENT_SHA="$(git -C "$REPO" rev-parse HEAD)"
 git -C "$REPO" worktree add --detach -q "$RELEASE" "$STALE_SHA"
 git -C "$REPO" worktree add --detach -q "$WRONG" "$CURRENT_SHA"
 git -C "$REPO" worktree add --detach -q "$CURRENT" "$CURRENT_SHA"
+GUARD="$CURRENT/scripts/guarded-deploy.sh"
+STALE_GUARD="$RELEASE/scripts/guarded-deploy.sh"
 
 cat >"$COMMAND" <<'EOF'
 #!/usr/bin/env bash
@@ -71,6 +77,27 @@ rm -f "$MARKER"
 run "$RELEASE" "$GUARD" "$RELEASE" "$CURRENT_SHA" -- "$COMMAND"
 check "stale clean checkout is rejected" '[[ "$RC" -ne 0 && "$OUT" == *"revision does not match"* ]]'
 check "stale checkout never reaches deploy command" '[[ ! -e "$MARKER" ]]'
+
+# A wrapper from a different checkout cannot authorize a command from the
+# selected worktree, even when the caller cwd and revision are otherwise valid.
+rm -f "$MARKER"
+run "$CURRENT" "$STALE_GUARD" "$CURRENT" "$CURRENT_SHA" -- "$COMMAND"
+check "wrong-checkout wrapper is rejected" '[[ "$RC" -ne 0 && "$OUT" == *"entry point source root does not match"* ]]'
+check "wrong-checkout wrapper never reaches deploy command" '[[ ! -e "$MARKER" ]]'
+
+rm -f "$MARKER"
+ln -s "$STALE_GUARD" "$CURRENT/scripts/guarded-via-link.sh"
+run "$CURRENT" "$CURRENT/scripts/guarded-via-link.sh" "$CURRENT" "$CURRENT_SHA" -- "$COMMAND"
+check "symlinked wrapper is rejected" '[[ "$RC" -ne 0 && "$OUT" == *"path must not contain symlinks"* ]]'
+check "symlinked wrapper never reaches deploy command" '[[ ! -e "$MARKER" ]]'
+rm -f "$CURRENT/scripts/guarded-via-link.sh"
+
+rm -f "$MARKER"
+printf 'dirty\n' >>"$CURRENT/revision"
+run "$CURRENT" "$GUARD" "$CURRENT" "$CURRENT_SHA" -- "$COMMAND"
+check "dirty tracked wrapper source is rejected" '[[ "$RC" -ne 0 && "$OUT" == *"tracked changes"* ]]'
+check "dirty tracked wrapper source never reaches deploy command" '[[ ! -e "$MARKER" ]]'
+git -C "$CURRENT" checkout -- revision
 
 # Detached release worktrees are legitimate when their root and immutable SHA bind.
 rm -f "$MARKER"

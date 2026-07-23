@@ -3,9 +3,19 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEPLOY="$HERE/../deploy-control-node.sh"
-SOURCE="$(cd "$HERE/../.." && pwd)"
-TMP="$(mktemp -d)"
+REPO_SOURCE="$(cd "$HERE/../.." && pwd)"
+TMP="$(cd "$(mktemp -d)" && pwd -P)"
+SOURCE="$TMP/bound-source"
+BASE_SHA="$(git -C "$REPO_SOURCE" rev-parse HEAD)"
+git clone -q "$REPO_SOURCE" "$SOURCE"
+git -C "$SOURCE" checkout --detach -q "$BASE_SHA"
+cp "$REPO_SOURCE/scripts/deploy-control-node.sh" "$SOURCE/scripts/deploy-control-node.sh"
+cp "$REPO_SOURCE/scripts/lib/deploy-source.sh" "$SOURCE/scripts/lib/deploy-source.sh"
+git -C "$SOURCE" config user.name test
+git -C "$SOURCE" config user.email test@example.invalid
+git -C "$SOURCE" add scripts/deploy-control-node.sh scripts/lib/deploy-source.sh
+git -C "$SOURCE" commit -qm 'fixture deploy binding'
+DEPLOY="$SOURCE/scripts/deploy-control-node.sh"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 CALLS="$TMP/calls"
