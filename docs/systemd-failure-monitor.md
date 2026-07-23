@@ -124,6 +124,9 @@ clean-install defaults into `/etc/systemd/system/` using the explicit runtime
 values. It therefore does not execute monitor code from a canonical checkout.
 The deploy target is the release copy synchronized by the installer; choose a
 separate path rather than a development worktree or checkout.
+For a first install, the installer creates the nested release target before
+`rsync`, then verifies it is a non-symlink directory owned and writable by the
+explicit runtime user; an unsafe existing target aborts before synchronization.
 `BROKKR_REGISTRY_PATH` is rendered into the maintenance units and defaults to
 `/opt/grimnir/services.json` for a clean install; set it explicitly when the
 host keeps its checked-out registry elsewhere.
