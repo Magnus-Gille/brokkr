@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "location": "house-1",
+  "wifi": {
+    "ssid": "owner-provided-ssid",
+    "credentials_file": "/owner-provided/private/wifi-credentials"
+  },
+  "storage": {
+    "backup-primary": {
+      "mount": "/owner-provided/private/mount"
+    }
+  }
+}
