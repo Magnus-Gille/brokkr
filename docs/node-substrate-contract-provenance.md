@@ -16,3 +16,7 @@ fixtures `consumer-fixture-set=355481f2b3866840795ba18033077d6f36487d1a447b36c32
 `partial-drain=b596e56fb60a0710e1653c1a7935e15a98baf818b7ce6c56421a84cfbdd21d7b`,
 `partial-substrate=3a26d123bfcb98adbd8f8f81c2736b38d485a1ac2665deb1770636f219ba6d07`,
 and `positive=42f34fe1c576648240cef0f7f427073e9f39c11f8bfe0cf3f2ea74899bfee234`.
+
+The vendored copies were re-verified byte-identical against that upstream commit,
+and `scripts/test/node-inventory.test.sh` recomputes every pin on each run, so any
+local drift from the immutable schema or fixtures fails the suite.
