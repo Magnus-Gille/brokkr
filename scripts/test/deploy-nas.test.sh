@@ -42,6 +42,12 @@ safe_args="${*//$MOCK_HEIMDALL_SOURCE_ENV/<protected-source>}"
 printf 'sudo %s\n' "$safe_args" >>"$MOCK_CALLS"
 case "${1:-}" in
   test)
+    if [[ "$*" == *"$MOCK_HEIMDALL_SOURCE_ENV"* ]]; then
+      case "${2:-}" in
+        -f|-O) exit 0 ;;
+        -L) exit 1 ;;
+      esac
+    fi
     "$@"
     ;;
   -u)
