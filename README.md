@@ -72,6 +72,11 @@ make test
 make shellcheck
 ```
 
+Before any deployment helper, bind the accepted release worktree and immutable
+full commit SHA with [`scripts/guarded-deploy.sh`](scripts/guarded-deploy.sh).
+The [deployment-source-binding guide](docs/deployment-source-binding.md) covers
+the required invocation and the fail-closed identity checks.
+
 Start with examples, never live values:
 
 ```bash
@@ -90,9 +95,12 @@ BROKKR_RUNTIME_USER=operator \
 BROKKR_RUNTIME_HOME=/home/operator \
 BROKKR_REGISTRY_PATH=/srv/grimnir/services.json \
 BROKKR_HEIMDALL_SOURCE_ENV=/etc/brokkr/heimdall-source.env \
+BROKKR_EXPECTED_SOURCE="$(pwd -P)" \
+BROKKR_EXPECTED_COMMIT=<accepted-full-commit-sha> \
   ./scripts/deploy-nas.sh
 
 REGISTRY_PATH=/opt/grimnir/services.json DEPLOY_USER=brokkr \
+  ./scripts/guarded-deploy.sh "$(pwd -P)" <accepted-full-commit-sha> -- \
   ./scripts/setup-host-patching.sh --dry-run
 ```
 
