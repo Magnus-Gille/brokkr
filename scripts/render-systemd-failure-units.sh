@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Brokkr · render control-node system units for an explicit runtime identity.
+# Brokkr · render system units for an explicit runtime identity.
 #
 # The tracked units retain safe clean-install defaults. Deployers call this
 # renderer on the target host to substitute only validated, non-secret runtime
@@ -62,6 +62,7 @@ render() {
 }
 
 for unit in \
+  brokkr-health.service \
   brokkr-maintenance-os.service \
   brokkr-maintenance-deps.service \
   brokkr-systemd-failure@.service \

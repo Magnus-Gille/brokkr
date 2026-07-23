@@ -84,8 +84,12 @@ chmod 600 ~/.config/grimnir/notify.env
 ignored intentionally. Supply deployment identity and paths explicitly, for example:
 
 ```bash
-BROKKR_SSH_TARGET=brokkr@nas-host \
-BROKKR_REMOTE_DIR=/opt/brokkr \
+BROKKR_SSH_TARGET=operator@nas-host \
+BROKKR_DEPLOY_TARGET=/srv/brokkr-release \
+BROKKR_RUNTIME_USER=operator \
+BROKKR_RUNTIME_HOME=/home/operator \
+BROKKR_REGISTRY_PATH=/srv/grimnir/services.json \
+BROKKR_HEIMDALL_SOURCE_ENV=/etc/brokkr/heimdall-source.env \
   ./scripts/deploy-nas.sh
 
 REGISTRY_PATH=/opt/grimnir/services.json DEPLOY_USER=brokkr \
@@ -98,6 +102,7 @@ Feature-specific setup and acceptance checks live in:
 - [`docs/backup-evidence.md`](docs/backup-evidence.md)
 - [`docs/control-node-deadman.md`](docs/control-node-deadman.md)
 - [`docs/heimdall-agent-watchdog.md`](docs/heimdall-agent-watchdog.md)
+- [`docs/nas-deploy.md`](docs/nas-deploy.md)
 - [`docs/systemd-failure-monitor.md`](docs/systemd-failure-monitor.md)
 - [`runbooks/restore.md`](runbooks/restore.md)
 
