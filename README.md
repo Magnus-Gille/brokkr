@@ -57,6 +57,7 @@ required to run or understand Brokkr.
 | `scripts/maintenance-report.sh` | OS, dependency, and firmware visibility |
 | `systemd/`, `launchd/` | Example timers, service units, and resource limits |
 | `network/cloudflared/config.example.yml` | Placeholder-only tunnel configuration |
+| `profiles/` | Public location/network/storage examples and a non-mutating owner-overlay preflight |
 | `docs/`, `runbooks/` | Backup evidence, recovery, and operations guidance |
 | `scripts/test/` | Hermetic shell regression suite |
 

@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brokkr.example/schemas/location-network-storage.overlay.schema.json",
+  "title": "Brokkr owner-only location overlay",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "$comment": "declares an unsupported schema version"
+    },
+    "location": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+      "$comment": "must be a lowercase identifier"
+    },
+    "tailnet_identity": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+      "$comment": "must be a DNS name"
+    },
+    "wifi": {
+      "type": "object",
+      "properties": {
+        "ssid": {
+          "type": "string",
+          "pattern": "^[^\\u0000-\\u001f\\u007f]{1,32}$",
+          "$comment": "must be a printable SSID"
+        },
+        "credentials_file": {
+          "type": "string",
+          "pattern": "^/[^\\u0000\\r\\n]{0,1023}$",
+          "$comment": "must be an absolute path"
+        }
+      },
+      "required": ["ssid", "credentials_file"],
+      "additionalProperties": false
+    },
+    "storage": {
+      "type": "object",
+      "minProperties": 1,
+      "$comment": "must be a non-empty object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+        "$comment": "contains an invalid key"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "mount": {
+            "type": "string",
+            "pattern": "^/[^\\u0000\\r\\n]{0,1023}$",
+            "$comment": "must be an absolute path"
+          }
+        },
+        "required": ["mount"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema_version", "location", "storage"],
+  "additionalProperties": false
+}

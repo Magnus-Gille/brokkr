@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "locations": {
+    "house-1": {
+      "tailnet": {
+        "required": true
+      },
+      "network": {
+        "wifi": {
+          "required": true,
+          "min_signal_percent": 70,
+          "min_throughput_mbps": 20
+        },
+        "ethernet": {
+          "min_throughput_mbps": 100
+        }
+      },
+      "storage": {
+        "backup-primary": {
+          "filesystem": "ext4",
+          "max_used_percent": 85,
+          "requires_write": true
+        }
+      },
+      "backup_roles": [
+        {
+          "logical_storage_id": "backup-primary",
+          "producer": "photo-export",
+          "consumer": "encrypted-offsite",
+          "bytes": 7500000000,
+          "window_minutes": 30
+        }
+      ]
+    },
+    "house-2": {
+      "tailnet": {
+        "required": true
+      },
+      "network": {
+        "wifi": {
+          "required": true,
+          "min_signal_percent": 70,
+          "min_throughput_mbps": 20
+        },
+        "ethernet": {
+          "min_throughput_mbps": 100
+        }
+      },
+      "storage": {
+        "backup-primary": {
+          "filesystem": "ext4",
+          "max_used_percent": 85,
+          "requires_write": true
+        }
+      },
+      "backup_roles": [
+        {
+          "logical_storage_id": "backup-primary",
+          "producer": "photo-export",
+          "consumer": "encrypted-offsite",
+          "bytes": 7500000000,
+          "window_minutes": 30
+        }
+      ]
+    }
+  }
+}
