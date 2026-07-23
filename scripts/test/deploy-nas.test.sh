@@ -42,7 +42,7 @@ safe_args="${*//$MOCK_HEIMDALL_SOURCE_ENV/<protected-source>}"
 printf 'sudo %s\n' "$safe_args" >>"$MOCK_CALLS"
 case "${1:-}" in
   test)
-    if [[ "$*" == *"$MOCK_HEIMDALL_SOURCE_ENV"* ]]; then
+    if [[ "${MOCK_PROTECTED_SOURCE_TESTS:-0}" == 1 ]]; then
       case "${2:-}" in
         -f|-O) exit 0 ;;
         -L) exit 1 ;;
@@ -121,7 +121,7 @@ check "registry and executable/unit validation happen before systemd mutation" '
 check "protected Heimdall values and source path are not printed" '[[ "$OUT" != *secret-sentinel* && "$OUT" != *"$BROKKR_HEIMDALL_SOURCE_ENV"* ]] && ! grep -Fq secret-sentinel "$CALLS" && ! grep -Fq "$BROKKR_HEIMDALL_SOURCE_ENV" "$CALLS"'
 
 : >"$CALLS"
-export MOCK_SOURCE_MODE=644
+export MOCK_PROTECTED_SOURCE_TESTS=1 MOCK_SOURCE_MODE=644
 run
 check "unsafe Heimdall source returns non-zero" '[[ "$RC" -ne 0 ]]'
 check "unsafe Heimdall source reports the permission refusal" '[[ "$OUT" == *"unsafe permissions"* ]]'
@@ -131,7 +131,7 @@ check "unsafe Heimdall source output contains no secret value" '[[ "$OUT" != *se
 check "unsafe Heimdall source output contains no source path" '[[ "$OUT" != *"$BROKKR_HEIMDALL_SOURCE_ENV"* ]]'
 check "unsafe Heimdall source call log contains no secret value" '! grep -Fq secret-sentinel "$CALLS"'
 check "unsafe Heimdall source call log contains no source path" '! grep -Fq "$BROKKR_HEIMDALL_SOURCE_ENV" "$CALLS"'
-unset MOCK_SOURCE_MODE
+unset MOCK_PROTECTED_SOURCE_TESTS MOCK_SOURCE_MODE
 
 : >"$CALLS"
 rm -rf "$BROKKR_DEPLOY_TARGET"
