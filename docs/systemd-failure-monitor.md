@@ -52,12 +52,18 @@ established Ratatoskr/direct-Telegram fallback. It is secondary to the
 authenticated Heimdall upsert and remains best effort by that helper's contract.
 Never commit the environment file or any values from it.
 
-On the control node, `deploy-control-node.sh` derives this file from the
-host-local `/etc/brokkr/heimdall-source.env` before it enables the sweep. The
-source must contain exactly one non-empty value for each assignment; set
-`BROKKR_HEIMDALL_SOURCE_ENV` only when the approved source has another local
-path. A missing or malformed source aborts the deployment before any timer is
-enabled.
+On the control node, `deploy-control-node.sh` requires two explicit deployment
+inputs before it enables the sweep:
+
+- `BROKKR_HEIMDALL_URL` — the non-secret `http(s)` panel endpoint.
+- `BROKKR_HEIMDALL_TOKEN_SOURCE` — an absolute, server-side file containing
+  exactly one non-empty `HEIMDALL_FLEET_TOKEN=` assignment.
+
+The token source is parsed, never sourced. It must be a regular, non-symlink,
+root-owned file with mode `0400` or `0600`; its path and value are never printed.
+The installer derives the runtime user's mode-`0600` environment file from the
+explicit URL and token source. A missing, malformed, or unsafe source aborts
+before any timer is enabled.
 
 ## Install after merge
 
@@ -65,8 +71,16 @@ This pull request does not deploy or restart anything. After it is merged, use
 the normal role deployment from a clean checkout:
 
 ```bash
-# control node (installs the template, sweep, and Brokkr maintenance OnFailure hooks)
-BROKKR_SSH_TARGET=brokkr@control-node ./scripts/deploy-control-node.sh
+# control node: choose an independent release target and explicit runtime identity.
+# The token source is created server-side by the operator and is never committed.
+BROKKR_SSH_TARGET=operator@control-node \
+BROKKR_DEPLOY_TARGET=/srv/brokkr-release \
+BROKKR_RUNTIME_USER=operator \
+BROKKR_RUNTIME_HOME=/home/operator \
+BROKKR_REGISTRY_PATH=/srv/grimnir/services.json \
+BROKKR_HEIMDALL_URL=https://heimdall.example/api/panels \
+BROKKR_HEIMDALL_TOKEN_SOURCE=/etc/brokkr/heimdall-fleet-token.env \
+  ./scripts/deploy-control-node.sh
 
 # NAS (installs the template, sweep, and Brokkr health OnFailure hook)
 BROKKR_SSH_TARGET=brokkr@nas-host ./scripts/deploy-nas.sh
@@ -93,6 +107,15 @@ OnFailure=brokkr-systemd-failure@%n.service
 No service needs to own or duplicate the sweep. `brokkr#6` is limited to
 detection/delivery; relocation attribution, drain, mutation, and rollback remain
 with the separately owned reconciliation lifecycle.
+
+The control-node installer renders its four service units from the tracked
+clean-install defaults into `/etc/systemd/system/` using the explicit runtime
+values. It therefore does not execute monitor code from a canonical checkout.
+The deploy target is the release copy synchronized by the installer; choose a
+separate path rather than a development worktree or checkout.
+`BROKKR_REGISTRY_PATH` is rendered into the maintenance units and defaults to
+`/opt/grimnir/services.json` for a clean install; set it explicitly when the
+host keeps its checked-out registry elsewhere.
 
 ## Acceptance and rollback
 

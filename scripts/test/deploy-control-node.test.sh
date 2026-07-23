@@ -24,6 +24,7 @@ cat >"$TMP/bin/sudo" <<'EOF'
 printf 'sudo %s\n' "$*" >>"$MOCK_CALLS"
 case "${1:-}" in
   test|grep) "$@" ;;
+  stat) printf '%s\n' "${MOCK_STAT_MODE:-600}" ;;
   *) exit 0 ;;
 esac
 EOF
@@ -35,7 +36,8 @@ EOF
 chmod +x "$TMP/bin/"*
 
 export PATH="$TMP/bin:$PATH" MOCK_CALLS="$CALLS" MOCK_BIN="$TMP/bin" MOCK_HOME="$TMP/home"
-export BROKKR_SSH_TARGET=brokkr@control-node BROKKR_REMOTE_DIR=/opt/brokkr
+export BROKKR_SSH_TARGET=brokkr@control-node
+export BROKKR_DEPLOY_TARGET=/srv/brokkr BROKKR_RUNTIME_USER=operator BROKKR_RUNTIME_HOME=/home/operator BROKKR_REGISTRY_PATH=/srv/grimnir/services.json
 
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
@@ -46,19 +48,38 @@ run() { OUT="$(bash "$DEPLOY" 2>&1)"; RC=$?; }
 
 echo "deploy-control-node.test.sh"
 
-export BROKKR_HEIMDALL_SOURCE_ENV="$TMP/missing-source.env"
+unset BROKKR_HEIMDALL_TOKEN_SOURCE BROKKR_HEIMDALL_URL
 run
-check "missing Heimdall source fails before enabling the sweep" '[[ "$RC" -ne 0 && "$OUT" == *"Heimdall"* ]] && ! grep -q "systemctl enable" "$CALLS"'
+check "missing explicit Heimdall delivery inputs fail before enabling the sweep" '[[ "$RC" -ne 0 && "$OUT" == *"HEIMDALL"* ]] && ! grep -q "systemctl enable" "$CALLS"'
 
-cat >"$TMP/heimdall-source.env" <<'EOF'
-HEIMDALL_HUB_URL=https://heimdall.example/api/panels
-HEIMDALL_FLEET_TOKEN=test-token
+cat >"$TMP/heimdall-token.env" <<'EOF'
+HEIMDALL_FLEET_TOKEN=secret-sentinel
 EOF
 : >"$CALLS"
-export BROKKR_HEIMDALL_SOURCE_ENV="$TMP/heimdall-source.env"
+export BROKKR_HEIMDALL_TOKEN_SOURCE="$TMP/heimdall-token.env"
+export BROKKR_HEIMDALL_URL=http://heimdall.example/api/panels
 run
-check "valid Heimdall source permits enabling the sweep" '[[ "$RC" -eq 0 ]] && grep -q "sudo systemctl enable --now .*brokkr-systemd-failure-sweep.timer" "$CALLS"'
-check "deployment derives only the expected Heimdall assignments" 'grep -q "HEIMDALL_(HUB_URL|FLEET_TOKEN)" "$DEPLOY"'
+check "valid explicit token source and URL permit enabling the sweep" '[[ "$RC" -eq 0 ]] && grep -q "sudo systemctl enable --now .*brokkr-systemd-failure-sweep.timer" "$CALLS"'
+check "deployment renders units for the explicit runtime identity and target" 'grep -Fq "BROKKR_RUNTIME_USER=operator" "$CALLS" && grep -Fq "BROKKR_RUNTIME_HOME=/home/operator" "$CALLS" && grep -Fq "BROKKR_DEPLOY_TARGET=/srv/brokkr" "$CALLS" && grep -Fq "BROKKR_REGISTRY_PATH=/srv/grimnir/services.json" "$CALLS"'
+check "token value is never printed or sent as an argument" '! grep -Fq "secret-sentinel" "$CALLS" && [[ "$OUT" != *"secret-sentinel"* ]]'
+
+printf 'HEIMDALL_FLEET_TOKEN=one\nHEIMDALL_FLEET_TOKEN=two\n' >"$TMP/heimdall-token.env"
+: >"$CALLS"
+run
+check "duplicate token assignment refuses before unit enablement" '[[ "$RC" -ne 0 && "$OUT" == *"exactly one"* ]] && ! grep -q "systemctl enable" "$CALLS"'
+
+printf 'HEIMDALL_FLEET_TOKEN=secret-sentinel\n' >"$TMP/heimdall-token.env"
+: >"$CALLS"
+export MOCK_STAT_MODE=644
+run
+check "unsafe token-source mode refuses before unit enablement" '[[ "$RC" -ne 0 && "$OUT" == *"0400 or 0600"* ]] && ! grep -q "systemctl enable" "$CALLS"'
+unset MOCK_STAT_MODE
+
+: >"$CALLS"
+export BROKKR_HEIMDALL_URL=not-a-url
+run
+check "invalid explicit Heimdall URL refuses before unit enablement" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_HEIMDALL_URL"* ]] && ! grep -q "systemctl enable" "$CALLS"'
+export BROKKR_HEIMDALL_URL=http://heimdall.example/api/panels
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
