@@ -1,0 +1,49 @@
+{
+  "kind": "node-capability",
+  "schema_version": "v1",
+  "node_id": "fixture-m5",
+  "observed_at": "2026-07-23T10:00:00Z",
+  "valid_until": "2026-07-23T11:00:00Z",
+  "evidence": {
+    "evidence_id": "obs-0e574be0ae4826efb3e0d08227a070e21ec7b5642cb2d94e05036d44",
+    "producer": "brokkr",
+    "observed_at": "2026-07-23T10:00:00Z",
+    "digest": "sha256:2d210a0022b0d4c9368e97b495a5e923d137f84532917970e4fc0dfb97034c12"
+  },
+  "capability_status": "known",
+  "architecture": "arm64",
+  "resources": {
+    "cpu_cores": 10,
+    "memory_mib": 16384
+  },
+  "uptime_class": "always_on",
+  "network_capabilities": [
+    "wired",
+    "wifi",
+    "tailnet"
+  ],
+  "logical_storage": [
+    {
+      "class": "local_ssd",
+      "available_mib": 500000,
+      "status": "known"
+    }
+  ],
+  "service_manager": "launchd",
+  "deployment_mechanisms": [
+    "guarded_deploy"
+  ],
+  "health_reporting": "supported",
+  "extensions": [
+    {
+      "id": "backup-role-producer",
+      "version": "v1",
+      "decision_effect": "informational"
+    },
+    {
+      "id": "workload-fixture-hugin",
+      "version": "v1",
+      "decision_effect": "informational"
+    }
+  ]
+}
