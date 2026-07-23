@@ -7,7 +7,20 @@
 set -euo pipefail
 
 CONTROL_NODE="${1:-${BROKKR_SSH_TARGET:-brokkr@control-node}}"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENTRY_SCRIPT="${BASH_SOURCE[0]}"
+ENTRY_PATH="$ENTRY_SCRIPT"
+[[ "$ENTRY_PATH" == /* ]] || ENTRY_PATH="$(pwd -P)/$ENTRY_PATH"
+ENTRY_CURSOR=/
+IFS=/ read -r -a ENTRY_COMPONENTS <<<"${ENTRY_PATH#/}"
+for ENTRY_COMPONENT in "${ENTRY_COMPONENTS[@]}"; do
+  case "$ENTRY_COMPONENT" in ''|.) continue ;; ..) ENTRY_CURSOR=$(dirname "$ENTRY_CURSOR"); continue ;; esac
+  ENTRY_CURSOR="${ENTRY_CURSOR%/}/$ENTRY_COMPONENT"
+  [[ ! -L "$ENTRY_CURSOR" ]] || { echo "brokkr deploy: deployment entry point path must not contain symlinks" >&2; exit 64; }
+done
+SCRIPT_DIR="$(cd "$(dirname "$ENTRY_SCRIPT")" && pwd -P)"
+HERE="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+# shellcheck source=scripts/lib/deploy-source.sh
+source "$HERE/scripts/lib/deploy-source.sh"
 DEPLOY_TARGET="${BROKKR_DEPLOY_TARGET:-${BROKKR_REMOTE_DIR:-/opt/brokkr}}"
 RUNTIME_USER="${BROKKR_RUNTIME_USER:-brokkr}"
 RUNTIME_HOME="${BROKKR_RUNTIME_HOME:-/home/$RUNTIME_USER}"
@@ -20,6 +33,15 @@ valid_path() {
   [[ "$1" =~ ^/[A-Za-z0-9._/@:+-]+$ ]] \
     && [[ "$1" != *'//'* && "$1" != */./* && "$1" != */../* && "$1" != */. && "$1" != */.. ]]
 }
+
+# This outermost local gate must run before even the remote target preflight.
+require_brokkr_deploy_source_binding "$HERE"
+DEPLOY_PAYLOAD_PARENT=""
+DEPLOY_PAYLOAD_ROOT=""
+cleanup_deploy_payload() { [[ -z "$DEPLOY_PAYLOAD_PARENT" ]] || rm -rf "$DEPLOY_PAYLOAD_PARENT"; }
+trap cleanup_deploy_payload EXIT
+trap 'cleanup_deploy_payload; exit 1' HUP INT TERM
+materialize_brokkr_deploy_payload "$HERE" "$BROKKR_EXPECTED_COMMIT"
 
 [[ "$RUNTIME_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid BROKKR_RUNTIME_USER"
 valid_path "$DEPLOY_TARGET" || die "invalid BROKKR_DEPLOY_TARGET"
@@ -60,11 +82,14 @@ ssh "$CONTROL_NODE" "
 "
 
 echo "==> Syncing Brokkr release to $CONTROL_NODE"
-rsync -a --delete --exclude '.git' --exclude '.local' "$HERE/" "$CONTROL_NODE:$DEPLOY_TARGET/"
+rsync -a --no-perms --executability --delete --exclude '.git' --exclude '.local' "$DEPLOY_PAYLOAD_ROOT/" "$CONTROL_NODE:$DEPLOY_TARGET/"
 
 echo "==> Rendering + installing control-node systemd units"
 ssh "$CONTROL_NODE" "
   set -euo pipefail
+
+  sudo chmod 0750 '$DEPLOY_TARGET'
+  [ \"\$(sudo stat -c '%a' '$DEPLOY_TARGET')\" = 750 ] || { echo 'ERROR: release target mode is not 0750 after sync' >&2; exit 2; }
 
   # The selected runtime identity must exist, own a concrete home, and be able
   # to read the registry used by the maintenance units. Do this before writing

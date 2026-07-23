@@ -5,7 +5,21 @@
 set -euo pipefail
 
 NAS="${1:-${BROKKR_SSH_TARGET:-brokkr@nas-host}}"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENTRY_SCRIPT="${BASH_SOURCE[0]}"
+ENTRY_PATH="$ENTRY_SCRIPT"
+[[ "$ENTRY_PATH" == /* ]] || ENTRY_PATH="$(pwd -P)/$ENTRY_PATH"
+ENTRY_CURSOR=/
+IFS=/ read -r -a ENTRY_COMPONENTS <<<"${ENTRY_PATH#/}"
+for ENTRY_COMPONENT in "${ENTRY_COMPONENTS[@]}"; do
+  case "$ENTRY_COMPONENT" in ''|.) continue ;; ..) ENTRY_CURSOR=$(dirname "$ENTRY_CURSOR"); continue ;; esac
+  ENTRY_CURSOR="${ENTRY_CURSOR%/}/$ENTRY_COMPONENT"
+  [[ ! -L "$ENTRY_CURSOR" ]] || { echo "brokkr NAS deploy: deployment entry point path must not contain symlinks" >&2; exit 64; }
+done
+# Resolve only after rejecting every lexical symlink component in the entry path.
+SCRIPT_DIR="$(cd "$(dirname "$ENTRY_SCRIPT")" && pwd -P)"
+HERE="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+# shellcheck source=scripts/lib/deploy-source.sh
+source "$HERE/scripts/lib/deploy-source.sh"
 DEPLOY_TARGET="${BROKKR_DEPLOY_TARGET:-}"
 RUNTIME_USER="${BROKKR_RUNTIME_USER:-}"
 RUNTIME_HOME="${BROKKR_RUNTIME_HOME:-}"
@@ -18,6 +32,15 @@ valid_path() {
     && [[ "$1" != *'//'* && "$1" != */./* && "$1" != */../* && "$1" != */. && "$1" != */.. ]]
 }
 require() { [[ -n "${!1:-}" ]] || die "$1 is required"; }
+
+# This outermost local gate must run before even the remote target preflight.
+require_brokkr_deploy_source_binding "$HERE"
+DEPLOY_PAYLOAD_PARENT=""
+DEPLOY_PAYLOAD_ROOT=""
+cleanup_deploy_payload() { [[ -z "$DEPLOY_PAYLOAD_PARENT" ]] || rm -rf "$DEPLOY_PAYLOAD_PARENT"; }
+trap cleanup_deploy_payload EXIT
+trap 'cleanup_deploy_payload; exit 1' HUP INT TERM
+materialize_brokkr_deploy_payload "$HERE" "$BROKKR_EXPECTED_COMMIT"
 
 require BROKKR_RUNTIME_USER
 require BROKKR_RUNTIME_HOME
@@ -60,8 +83,8 @@ ssh "$NAS" "
 "
 
 echo "==> Syncing Brokkr release to $NAS"
-rsync -a --delete --exclude '.git' --exclude '.local' \
-  --rsync-path="sudo -u $RUNTIME_USER rsync" "$HERE/" "$NAS:$DEPLOY_TARGET/"
+rsync -a --no-perms --executability --delete --exclude '.git' --exclude '.local' \
+  --rsync-path="sudo -u $RUNTIME_USER rsync" "$DEPLOY_PAYLOAD_ROOT/" "$NAS:$DEPLOY_TARGET/"
 
 echo "==> Rendering + installing NAS systemd units"
 ssh "$NAS" "
@@ -79,6 +102,8 @@ ssh "$NAS" "
     echo 'ERROR: release target is not a runtime-user-owned writable directory' >&2
     exit 2
   fi
+  sudo chmod 0750 '$DEPLOY_TARGET'
+  [ \"\$(sudo stat -c '%a' '$DEPLOY_TARGET')\" = 750 ] || { echo 'ERROR: release target mode is not 0750 after sync' >&2; exit 2; }
   if ! sudo test -f '$REGISTRY_PATH' || sudo test -L '$REGISTRY_PATH' \
     || ! sudo -u '$RUNTIME_USER' test -r '$REGISTRY_PATH'; then
     echo 'ERROR: registry path is not a readable regular file for the runtime user' >&2
