@@ -15,6 +15,10 @@ cat >"$TMP/bin/rsync" <<'EOF'
 printf 'rsync %s\n' "$*" >>"$MOCK_CALLS"
 destination="${!#}"
 release="${destination#*:}"
+if [[ ! -d "$release" ]]; then
+  echo 'mock rsync: release target was not prepared' >&2
+  exit 11
+fi
 mkdir -p "$release/scripts"
 cp "$MOCK_HEIMDALL_PROBE" "$release/scripts/verify-heimdall-delivery.sh"
 EOF
@@ -40,9 +44,16 @@ case "${1:-}" in
     ;;
   -u)
     case "$*" in
+      *"$MOCK_RELEASE_TARGET"*) exit "${MOCK_RELEASE_OWNER_RC:-0}" ;;
       *"$MOCK_RUNTIME_HOME"*) exit "${MOCK_RUNTIME_HOME_RC:-0}" ;;
       *"$MOCK_REGISTRY_PATH"*) exit "${MOCK_REGISTRY_RC:-0}" ;;
     esac
+    ;;
+  install)
+    if [[ "${2:-}" == -d && "$*" == *"$MOCK_RELEASE_TARGET"* ]]; then
+      [[ "${MOCK_RELEASE_PREP_RC:-0}" -eq 0 ]] || exit "$MOCK_RELEASE_PREP_RC"
+      mkdir -p "${!#}"
+    fi
     ;;
   grep) "$@" ;;
   stat) printf '%s\n' "${MOCK_STAT_MODE:-600}" ;;
@@ -77,7 +88,7 @@ export PATH="$TMP/bin:$PATH" MOCK_CALLS="$CALLS" MOCK_BIN="$TMP/bin" MOCK_HOME="
 export MOCK_HEIMDALL_PROBE="$HERE/../verify-heimdall-delivery.sh"
 export BROKKR_SSH_TARGET=brokkr@control-node
 export BROKKR_DEPLOY_TARGET="$TMP/release" BROKKR_RUNTIME_USER=operator BROKKR_RUNTIME_HOME=/home/operator BROKKR_REGISTRY_PATH=/srv/grimnir/services.json
-export MOCK_RUNTIME_HOME="$BROKKR_RUNTIME_HOME" MOCK_REGISTRY_PATH="$BROKKR_REGISTRY_PATH"
+export MOCK_RUNTIME_HOME="$BROKKR_RUNTIME_HOME" MOCK_REGISTRY_PATH="$BROKKR_REGISTRY_PATH" MOCK_RELEASE_TARGET="$BROKKR_DEPLOY_TARGET"
 
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
@@ -101,6 +112,7 @@ export MOCK_TOKEN_SOURCE="$BROKKR_HEIMDALL_TOKEN_SOURCE"
 export BROKKR_HEIMDALL_URL=http://heimdall.example/api/panels
 run
 check "valid explicit token source and URL permit enabling the sweep" '[[ "$RC" -eq 0 ]] && grep -q "sudo systemctl enable --now .*brokkr-systemd-failure-sweep.timer" "$CALLS"'
+check "first install prepares the nested release target before rsync" '[[ -d "$BROKKR_DEPLOY_TARGET" ]] && [[ "$(grep -n -F "sudo install -d" "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n -F "rsync " "$CALLS" | head -1 | cut -d: -f1)" ]]'
 check "deployment renders units for the explicit runtime identity and target" 'grep -Fq "BROKKR_RUNTIME_USER=$BROKKR_RUNTIME_USER" "$CALLS" && grep -Fq "BROKKR_RUNTIME_HOME=$BROKKR_RUNTIME_HOME" "$CALLS" && grep -Fq "BROKKR_DEPLOY_TARGET=$BROKKR_DEPLOY_TARGET" "$CALLS" && grep -Fq "BROKKR_REGISTRY_PATH=$BROKKR_REGISTRY_PATH" "$CALLS"'
 check "probe uses authenticated non-mutating readback without leaking token or source path" 'grep -q "curl .*--config -.*--request GET.*service=brokkr" "$CALLS" && ! grep -Fq "secret-sentinel" "$CALLS" && ! grep -Fq "$BROKKR_HEIMDALL_TOKEN_SOURCE" "$CALLS" && [[ "$OUT" != *"secret-sentinel"* && "$OUT" != *"$BROKKR_HEIMDALL_TOKEN_SOURCE"* ]]'
 
@@ -170,8 +182,24 @@ export BROKKR_DEPLOY_TARGET="$TMP/release/../escape"
 run
 check "traversal deploy target refuses before ssh or timer enablement" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_DEPLOY_TARGET"* ]] && ! grep -q "ssh\|systemctl enable" "$CALLS"'
 export BROKKR_DEPLOY_TARGET="$TMP/release"
+export MOCK_RELEASE_TARGET="$BROKKR_DEPLOY_TARGET"
 
 export BROKKR_HEIMDALL_URL=http://heimdall.example/api/panels
+
+: >"$CALLS"
+export MOCK_RELEASE_OWNER_RC=1
+run
+check "unsafe existing release target refuses before rsync or timer enablement" '[[ "$RC" -ne 0 && "$OUT" == *"existing release target"* ]] && ! grep -q "rsync\|systemctl enable" "$CALLS"'
+unset MOCK_RELEASE_OWNER_RC
+
+: >"$CALLS"
+export BROKKR_DEPLOY_TARGET="$TMP/failed-first-install/nested/release"
+export MOCK_RELEASE_TARGET="$BROKKR_DEPLOY_TARGET" MOCK_RELEASE_PREP_RC=1
+run
+check "release-target preparation failure refuses before rsync or timer enablement" '[[ "$RC" -ne 0 && "$OUT" == *"could not prepare"* ]] && ! grep -q "rsync\|systemctl enable" "$CALLS"'
+unset MOCK_RELEASE_PREP_RC
+export BROKKR_DEPLOY_TARGET="$TMP/release"
+export MOCK_RELEASE_TARGET="$BROKKR_DEPLOY_TARGET"
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"

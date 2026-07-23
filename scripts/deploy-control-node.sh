@@ -28,6 +28,37 @@ valid_path "$REGISTRY_PATH" || die "invalid BROKKR_REGISTRY_PATH"
 valid_path "$HEIMDALL_TOKEN_SOURCE" || die "BROKKR_HEIMDALL_TOKEN_SOURCE must be an absolute server-side path"
 [[ "$HEIMDALL_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || die "BROKKR_HEIMDALL_URL must be an explicit non-secret http(s) panel endpoint"
 
+echo "==> Preparing control-node release target"
+ssh "$CONTROL_NODE" "
+  set -euo pipefail
+
+  # Establish the runtime identity before touching a first-install target. An
+  # existing target must already belong to that user; never silently repurpose
+  # another deployment's release directory.
+  if ! id '$RUNTIME_USER' >/dev/null 2>&1 \
+    || ! sudo test -d '$RUNTIME_HOME' || sudo test -L '$RUNTIME_HOME' \
+    || ! sudo -u '$RUNTIME_USER' test -w '$RUNTIME_HOME'; then
+    echo 'ERROR: runtime user or home is not usable' >&2
+    exit 2
+  fi
+  if sudo test -e '$DEPLOY_TARGET' || sudo test -L '$DEPLOY_TARGET'; then
+    if ! sudo test -d '$DEPLOY_TARGET' || sudo test -L '$DEPLOY_TARGET' \
+      || ! sudo -u '$RUNTIME_USER' test -O '$DEPLOY_TARGET' \
+      || ! sudo -u '$RUNTIME_USER' test -w '$DEPLOY_TARGET'; then
+      echo 'ERROR: existing release target is not a runtime-user-owned writable directory' >&2
+      exit 2
+    fi
+  else
+    if ! sudo install -d -m 0750 -o '$RUNTIME_USER' '$DEPLOY_TARGET' \
+      || ! sudo test -d '$DEPLOY_TARGET' || sudo test -L '$DEPLOY_TARGET' \
+      || ! sudo -u '$RUNTIME_USER' test -O '$DEPLOY_TARGET' \
+      || ! sudo -u '$RUNTIME_USER' test -w '$DEPLOY_TARGET'; then
+      echo 'ERROR: could not prepare a runtime-user-owned writable release target' >&2
+      exit 2
+    fi
+  fi
+"
+
 echo "==> Syncing Brokkr release to $CONTROL_NODE"
 rsync -a --delete --exclude '.git' --exclude '.local' "$HERE/" "$CONTROL_NODE:$DEPLOY_TARGET/"
 
