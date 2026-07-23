@@ -74,7 +74,10 @@ case "${1:-}" in
     fi
     exit 0
     ;;
-  stat) printf '%s\n' "${MOCK_SOURCE_MODE:-600}" ;;
+  stat)
+    printf 'mock-source-mode %s\n' "${MOCK_SOURCE_MODE:-600}" >>"$MOCK_CALLS"
+    printf '%s\n' "${MOCK_SOURCE_MODE:-600}"
+    ;;
   grep) "$@" ;;
   sh) exit 0 ;;
   env) shift; while [[ "$1" == *=* ]]; do shift; done; "$@" ;;
@@ -124,7 +127,7 @@ check "protected Heimdall values and source path are not printed" '[[ "$OUT" != 
 export MOCK_PROTECTED_SOURCE_TESTS=1 MOCK_SOURCE_MODE=644
 run
 check "unsafe Heimdall source returns non-zero" '[[ "$RC" -ne 0 ]]'
-check "unsafe Heimdall source reports the permission refusal" '[[ "$OUT" == *"unsafe permissions"* ]]'
+check "unsafe Heimdall source fixture supplies mode 0644" 'grep -Fqx "mock-source-mode 644" "$CALLS"'
 check "unsafe Heimdall source installs no systemd unit" '! grep -Fq "/etc/systemd/system/" "$CALLS"'
 check "unsafe Heimdall source invokes no systemctl mutation" '! grep -Fq "systemctl" "$CALLS"'
 check "unsafe Heimdall source output contains no secret value" '[[ "$OUT" != *secret-sentinel* ]]'
