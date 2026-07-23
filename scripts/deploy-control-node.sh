@@ -32,6 +32,20 @@ echo "==> Rendering + installing control-node systemd units"
 ssh "$CONTROL_NODE" "
   set -euo pipefail
 
+  # The selected runtime identity must exist, own a concrete home, and be able
+  # to read the registry used by the maintenance units. Do this before writing
+  # any environment/unit state or enabling a timer.
+  if ! id '$RUNTIME_USER' >/dev/null 2>&1 \
+    || ! sudo test -d '$RUNTIME_HOME' || sudo test -L '$RUNTIME_HOME' \
+    || ! sudo -u '$RUNTIME_USER' test -w '$RUNTIME_HOME'; then
+    echo 'ERROR: runtime user or home is not usable' >&2
+    exit 2
+  fi
+  if ! sudo test -f '$REGISTRY_PATH' || ! sudo -u '$RUNTIME_USER' test -r '$REGISTRY_PATH'; then
+    echo 'ERROR: registry path is not a readable regular file for the runtime user' >&2
+    exit 2
+  fi
+
   # Never enable the monitor before proving the token source is a protected,
   # regular root-owned file with exactly one non-empty token assignment.
   if ! sudo test -f '$HEIMDALL_TOKEN_SOURCE' || sudo test -L '$HEIMDALL_TOKEN_SOURCE' || ! sudo test -O '$HEIMDALL_TOKEN_SOURCE'; then
@@ -43,6 +57,15 @@ ssh "$CONTROL_NODE" "
   if [ \"\$(sudo grep -Ec '^HEIMDALL_FLEET_TOKEN=' '$HEIMDALL_TOKEN_SOURCE')\" -ne 1 ] \
     || ! sudo grep -Eq '^HEIMDALL_FLEET_TOKEN=.+$' '$HEIMDALL_TOKEN_SOURCE'; then
     echo 'ERROR: Heimdall token source must contain exactly one non-empty fleet token' >&2
+    exit 2
+  fi
+
+  # A syntactically valid URL and token file are insufficient: only an
+  # authenticated 2xx panel readback proves delivery will work from this host.
+  # The helper reads the server-side token source itself and puts the credential
+  # only on curl's stdin configuration, never in argv or output.
+  if ! sudo '$DEPLOY_TARGET/scripts/verify-heimdall-delivery.sh' '$HEIMDALL_URL' '$HEIMDALL_TOKEN_SOURCE'; then
+    echo 'ERROR: Heimdall endpoint preflight failed; refusing to enable timers' >&2
     exit 2
   fi
 

@@ -61,9 +61,19 @@ inputs before it enables the sweep:
 
 The token source is parsed, never sourced. It must be a regular, non-symlink,
 root-owned file with mode `0400` or `0600`; its path and value are never printed.
+Its value must use the standard Bearer-token (`b64token`) alphabet so it can be
+passed safely to the probe's stdin-only curl configuration.
 The installer derives the runtime user's mode-`0600` environment file from the
 explicit URL and token source. A missing, malformed, or unsafe source aborts
 before any timer is enabled.
+
+Before it writes runtime state or enables a timer, the installer also proves
+that the explicit runtime user exists, its non-symlink home is writable, and
+that user can read the selected registry. Finally it performs an authenticated
+`GET /api/panels?service=brokkr` readback from the control node. Only a 2xx
+result passes; unreachable, redirected, or unauthorized endpoints abort without
+enabling timers. The server-side probe sends the token to curl through stdin
+configuration, never command arguments or output, and does not mutate panels.
 
 ## Install after merge
 
