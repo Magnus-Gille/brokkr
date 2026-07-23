@@ -16,7 +16,7 @@ fail() {
 # The deployer validates both arguments and the source permissions before this
 # helper runs. Recheck the token shape here so the helper stays safe to invoke
 # directly from a controlled server-side deployment workflow.
-[[ "$HEIMDALL_URL" =~ ^https?://[^[:space:]\'?]+$ ]] || fail
+[[ "$HEIMDALL_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || fail
 if [ "$(grep -Ec '^HEIMDALL_FLEET_TOKEN=' "$TOKEN_SOURCE" 2>/dev/null)" -ne 1 ]; then
   fail
 fi

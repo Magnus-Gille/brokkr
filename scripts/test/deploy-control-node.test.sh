@@ -148,6 +148,29 @@ unset MOCK_STAT_MODE
 export BROKKR_HEIMDALL_URL=not-a-url
 run
 check "invalid explicit Heimdall URL refuses before unit enablement" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_HEIMDALL_URL"* ]] && ! grep -q "systemctl enable" "$CALLS"'
+
+: >"$CALLS"
+export BROKKR_HEIMDALL_URL='http://heimdall.example/api/"panels'
+run
+check "quote-bearing Heimdall URL refuses before ssh or timer enablement" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_HEIMDALL_URL"* ]] && ! grep -q "ssh\|systemctl enable" "$CALLS"'
+
+: >"$CALLS"
+export BROKKR_HEIMDALL_URL='http://heimdall.example/api/$panels'
+run
+check "dollar-bearing Heimdall URL refuses before ssh or timer enablement" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_HEIMDALL_URL"* ]] && ! grep -q "ssh\|systemctl enable" "$CALLS"'
+
+: >"$CALLS"
+export BROKKR_HEIMDALL_URL='http://heimdall.example/api/`panels`'
+run
+check "backtick-bearing Heimdall URL refuses before ssh or timer enablement" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_HEIMDALL_URL"* ]] && ! grep -q "ssh\|systemctl enable" "$CALLS"'
+
+: >"$CALLS"
+export BROKKR_HEIMDALL_URL=http://heimdall.example/api/panels
+export BROKKR_DEPLOY_TARGET="$TMP/release/../escape"
+run
+check "traversal deploy target refuses before ssh or timer enablement" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_DEPLOY_TARGET"* ]] && ! grep -q "ssh\|systemctl enable" "$CALLS"'
+export BROKKR_DEPLOY_TARGET="$TMP/release"
+
 export BROKKR_HEIMDALL_URL=http://heimdall.example/api/panels
 
 echo "----"

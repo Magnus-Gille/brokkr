@@ -16,14 +16,17 @@ HEIMDALL_URL="${BROKKR_HEIMDALL_URL:-}"
 HEIMDALL_TOKEN_SOURCE="${BROKKR_HEIMDALL_TOKEN_SOURCE:-}"
 
 die() { echo "brokkr deploy: $*" >&2; exit 64; }
-valid_path() { [[ "$1" =~ ^/[A-Za-z0-9._/@:+-]+$ ]]; }
+valid_path() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/@:+-]+$ ]] \
+    && [[ "$1" != *'//'* && "$1" != */./* && "$1" != */../* && "$1" != */. && "$1" != */.. ]]
+}
 
 [[ "$RUNTIME_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid BROKKR_RUNTIME_USER"
 valid_path "$DEPLOY_TARGET" || die "invalid BROKKR_DEPLOY_TARGET"
 valid_path "$RUNTIME_HOME" || die "invalid BROKKR_RUNTIME_HOME"
 valid_path "$REGISTRY_PATH" || die "invalid BROKKR_REGISTRY_PATH"
 valid_path "$HEIMDALL_TOKEN_SOURCE" || die "BROKKR_HEIMDALL_TOKEN_SOURCE must be an absolute server-side path"
-[[ "$HEIMDALL_URL" =~ ^https?://[^[:space:]\']+$ ]] || die "BROKKR_HEIMDALL_URL must be an explicit non-secret http(s) URL"
+[[ "$HEIMDALL_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || die "BROKKR_HEIMDALL_URL must be an explicit non-secret http(s) panel endpoint"
 
 echo "==> Syncing Brokkr release to $CONTROL_NODE"
 rsync -a --delete --exclude '.git' --exclude '.local' "$HERE/" "$CONTROL_NODE:$DEPLOY_TARGET/"

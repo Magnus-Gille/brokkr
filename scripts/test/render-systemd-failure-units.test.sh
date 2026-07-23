@@ -46,6 +46,18 @@ OUT="$(BROKKR_DEPLOY_TARGET='relative/path' "$RENDER" "$OUT_DIR" 2>&1)"
 RC=$?
 check "relative deploy target is rejected" '[[ "$RC" -eq 64 && "$OUT" == *"invalid BROKKR_DEPLOY_TARGET"* ]]'
 
+# shellcheck disable=SC2034 # assertion consumes OUT through eval.
+OUT="$(BROKKR_DEPLOY_TARGET='/srv/../brokkr' "$RENDER" "$OUT_DIR" 2>&1)"
+# shellcheck disable=SC2034 # assertion consumes RC through eval.
+RC=$?
+check "traversal path segments are rejected" '[[ "$RC" -eq 64 && "$OUT" == *"invalid BROKKR_DEPLOY_TARGET"* ]]'
+
+# shellcheck disable=SC2034 # assertion consumes OUT through eval.
+OUT="$(BROKKR_REGISTRY_PATH='/srv//grimnir/services.json' "$RENDER" "$OUT_DIR" 2>&1)"
+# shellcheck disable=SC2034 # assertion consumes RC through eval.
+RC=$?
+check "ambiguous repeated path separators are rejected" '[[ "$RC" -eq 64 && "$OUT" == *"invalid BROKKR_REGISTRY_PATH"* ]]'
+
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

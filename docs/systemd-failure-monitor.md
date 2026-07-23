@@ -55,7 +55,8 @@ Never commit the environment file or any values from it.
 On the control node, `deploy-control-node.sh` requires two explicit deployment
 inputs before it enables the sweep:
 
-- `BROKKR_HEIMDALL_URL` — the non-secret `http(s)` panel endpoint.
+- `BROKKR_HEIMDALL_URL` — the non-secret base `http(s)` panel endpoint, with
+  no query string (the installer appends its authenticated service readback).
 - `BROKKR_HEIMDALL_TOKEN_SOURCE` — an absolute, server-side file containing
   exactly one non-empty `HEIMDALL_FLEET_TOKEN=` assignment.
 
