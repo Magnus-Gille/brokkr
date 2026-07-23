@@ -85,8 +85,12 @@ ssh "$NAS" "
     exit 2
   fi
 
+  runtime_env='$RUNTIME_HOME/.config/brokkr/env'
+
   # Copy only the two expected assignments from a protected server-side source.
-  # Never print the source path or its values.
+  # Never print the source path or its values. When no provisioning source was
+  # supplied, inspect only metadata for an existing runtime env; the health
+  # snapshot below remains the semantic delivery check.
   if [ -n '$HEIMDALL_SOURCE_ENV' ]; then
     if ! sudo test -f '$HEIMDALL_SOURCE_ENV' || sudo test -L '$HEIMDALL_SOURCE_ENV' \
       || ! sudo test -O '$HEIMDALL_SOURCE_ENV'; then
@@ -104,7 +108,21 @@ ssh "$NAS" "
     sudo sh -c \"umask 077; grep -E '^HEIMDALL_(HUB_URL|FLEET_TOKEN)=' '$HEIMDALL_SOURCE_ENV' > '$RUNTIME_HOME/.config/brokkr/env'\"
     sudo chown '$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr/env'
     sudo chmod 0600 '$RUNTIME_HOME/.config/brokkr/env'
-    echo '   Heimdall runtime environment configured'
+    echo '   Heimdall runtime environment provisioned from protected source'
+  elif sudo test -e \$runtime_env || sudo test -L \$runtime_env; then
+    if ! sudo test -f \$runtime_env || sudo test -L \$runtime_env \
+      || ! sudo -u '$RUNTIME_USER' test -O \$runtime_env \
+      || ! sudo -u '$RUNTIME_USER' test -r \$runtime_env \
+      || ! sudo test -s \$runtime_env; then
+      echo 'ERROR: preserved Heimdall runtime environment is not a protected readable non-empty regular file' >&2
+      exit 2
+    fi
+    runtime_mode=\$(sudo stat -c '%a' \$runtime_env)
+    case \$runtime_mode in
+      400|600) ;;
+      *) echo 'ERROR: preserved Heimdall runtime environment has unsafe permissions' >&2; exit 2 ;;
+    esac
+    echo '   Heimdall runtime environment preserved (provisioning source omitted)'
   else
     echo '   WARNING: Heimdall runtime environment not configured; pushes will be skipped'
   fi
