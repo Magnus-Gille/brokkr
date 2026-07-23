@@ -36,6 +36,12 @@ valid_path() {
 
 # This outermost local gate must run before even the remote target preflight.
 require_brokkr_deploy_source_binding "$HERE"
+DEPLOY_PAYLOAD_PARENT=""
+DEPLOY_PAYLOAD_ROOT=""
+cleanup_deploy_payload() { [[ -z "$DEPLOY_PAYLOAD_PARENT" ]] || rm -rf "$DEPLOY_PAYLOAD_PARENT"; }
+trap cleanup_deploy_payload EXIT
+trap 'cleanup_deploy_payload; exit 1' HUP INT TERM
+materialize_brokkr_deploy_payload "$HERE" "$BROKKR_EXPECTED_COMMIT"
 
 [[ "$RUNTIME_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "invalid BROKKR_RUNTIME_USER"
 valid_path "$DEPLOY_TARGET" || die "invalid BROKKR_DEPLOY_TARGET"
@@ -76,7 +82,7 @@ ssh "$CONTROL_NODE" "
 "
 
 echo "==> Syncing Brokkr release to $CONTROL_NODE"
-rsync -a --delete --exclude '.git' --exclude '.local' "$HERE/" "$CONTROL_NODE:$DEPLOY_TARGET/"
+rsync -a --delete --exclude '.git' --exclude '.local' "$DEPLOY_PAYLOAD_ROOT/" "$CONTROL_NODE:$DEPLOY_TARGET/"
 
 echo "==> Rendering + installing control-node systemd units"
 ssh "$CONTROL_NODE" "

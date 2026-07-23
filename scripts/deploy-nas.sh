@@ -35,6 +35,12 @@ require() { [[ -n "${!1:-}" ]] || die "$1 is required"; }
 
 # This outermost local gate must run before even the remote target preflight.
 require_brokkr_deploy_source_binding "$HERE"
+DEPLOY_PAYLOAD_PARENT=""
+DEPLOY_PAYLOAD_ROOT=""
+cleanup_deploy_payload() { [[ -z "$DEPLOY_PAYLOAD_PARENT" ]] || rm -rf "$DEPLOY_PAYLOAD_PARENT"; }
+trap cleanup_deploy_payload EXIT
+trap 'cleanup_deploy_payload; exit 1' HUP INT TERM
+materialize_brokkr_deploy_payload "$HERE" "$BROKKR_EXPECTED_COMMIT"
 
 require BROKKR_RUNTIME_USER
 require BROKKR_RUNTIME_HOME
@@ -78,7 +84,7 @@ ssh "$NAS" "
 
 echo "==> Syncing Brokkr release to $NAS"
 rsync -a --delete --exclude '.git' --exclude '.local' \
-  --rsync-path="sudo -u $RUNTIME_USER rsync" "$HERE/" "$NAS:$DEPLOY_TARGET/"
+  --rsync-path="sudo -u $RUNTIME_USER rsync" "$DEPLOY_PAYLOAD_ROOT/" "$NAS:$DEPLOY_TARGET/"
 
 echo "==> Rendering + installing NAS systemd units"
 ssh "$NAS" "

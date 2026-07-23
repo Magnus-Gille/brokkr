@@ -38,6 +38,12 @@ so existing Brokkr deployment safety checks remain intact as inner gates and no
 sync, copy, package installation, systemd change, restart, or remote mutation
 can be reached through either canonical entry point.
 
+The NAS and control-node entry points materialize their rsync payload with
+`git archive` at the bound commit into a private temporary directory. Ignored,
+untracked, and post-materialization working-tree bytes therefore cannot enter
+the deployed release. `guarded-deploy.sh` deliberately authorizes its arbitrary
+command only; each deploy entry point owns payload materialization.
+
 `scripts/guarded-deploy.sh` remains available for other owning-repository
 deployment commands. This is compatible with Grimnir's deployment-source-binding
 contract while remaining self-contained: orchestration does not need another

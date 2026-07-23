@@ -124,3 +124,27 @@ require_brokkr_deploy_source_binding() {
   verify_brokkr_deploy_source_binding \
     "${1:-}" "${BROKKR_EXPECTED_SOURCE:-}" "${BROKKR_EXPECTED_COMMIT:-}"
 }
+
+materialize_brokkr_deploy_payload() {
+  local source_root=${1:-} revision=${2:-}
+
+  is_full_commit_sha "$revision" || {
+    echo "ERROR: deploy payload requires an explicit full commit SHA" >&2
+    return 1
+  }
+  DEPLOY_PAYLOAD_PARENT=$(mktemp -d "${TMPDIR:-/tmp}/brokkr-deploy.XXXXXX") || {
+    echo "ERROR: could not create private deploy payload parent" >&2
+    return 1
+  }
+  DEPLOY_PAYLOAD_ROOT="$DEPLOY_PAYLOAD_PARENT/payload"
+  mkdir -m 0755 "$DEPLOY_PAYLOAD_ROOT" || {
+    rm -rf "$DEPLOY_PAYLOAD_PARENT"
+    echo "ERROR: could not create deploy payload root" >&2
+    return 1
+  }
+  if ! git -C "$source_root" archive "$revision" | tar -x -C "$DEPLOY_PAYLOAD_ROOT"; then
+    rm -rf "$DEPLOY_PAYLOAD_PARENT"
+    echo "ERROR: could not materialize committed deploy payload" >&2
+    return 1
+  fi
+}

@@ -35,6 +35,11 @@ CALLS="$TMP/calls"
 cat >"$TMP/bin/rsync" <<'EOF'
 #!/usr/bin/env bash
 printf 'rsync %s\n' "$*" >>"$MOCK_CALLS"
+source="${@: -2:1}"
+source="${source%/}"
+if [[ -n "${MOCK_MUTATE_SOURCE:-}" ]]; then
+  printf '\npost-archive mutation\n' >>"$MOCK_MUTATE_SOURCE/README.md"
+fi
 destination="${!#}"
 release="${destination#*:}"
 if [[ ! -d "$release" ]]; then
@@ -44,7 +49,7 @@ fi
 if [[ -x "$release/scripts/deploy-nas.sh" ]]; then
   exit 0
 fi
-cp -R "$MOCK_RELEASE_SOURCE/." "$release"
+cp -R "$source/." "$release"
 EOF
 
 cat >"$TMP/bin/ssh" <<'EOF'
@@ -88,6 +93,7 @@ case "${1:-}" in
     if [[ "${2:-}" == -d && "$*" == *"$MOCK_RELEASE_TARGET"* ]]; then
       [[ "${MOCK_RELEASE_PREP_RC:-0}" -eq 0 ]] || exit "$MOCK_RELEASE_PREP_RC"
       mkdir -p "${!#}"
+      chmod "${4:-755}" "${!#}"
       exit 0
     fi
     destination="${!#}"
@@ -117,7 +123,7 @@ EOF
 
 chmod +x "$TMP/bin/"*
 export PATH="$TMP/bin:$PATH" MOCK_BIN="$TMP/bin" MOCK_CALLS="$CALLS" MOCK_REMOTE_HOME="$TMP/home"
-export MOCK_RELEASE_SOURCE="$SOURCE" MOCK_INSTALLED_UNITS="$TMP/installed-units"
+export MOCK_INSTALLED_UNITS="$TMP/installed-units"
 export BROKKR_SSH_TARGET=operator@nas-host
 export BROKKR_DEPLOY_TARGET="$TMP/releases/nas/brokkr" BROKKR_RUNTIME_USER=operator
 export BROKKR_RUNTIME_HOME="$TMP/home/operator" BROKKR_REGISTRY_PATH="$TMP/registry/services.json"
@@ -128,6 +134,11 @@ printf '{"components":[]}\n' >"$BROKKR_REGISTRY_PATH"
 export BROKKR_HEIMDALL_SOURCE_ENV="$TMP/heimdall-source.env"
 export MOCK_HEIMDALL_SOURCE_ENV="$BROKKR_HEIMDALL_SOURCE_ENV"
 export BROKKR_EXPECTED_SOURCE="$SOURCE" BROKKR_EXPECTED_COMMIT="$SOURCE_SHA"
+mkdir -p "$TMP/payload-tmp"
+export TMPDIR="$TMP/payload-tmp"
+export MOCK_MUTATE_SOURCE="$SOURCE"
+printf 'ignored-secret\n' >"$SOURCE/.env"
+printf 'ignored-status\n' >"$SOURCE/STATUS.md"
 printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
 
 PASS=0; FAIL=0
@@ -184,6 +195,12 @@ export BROKKR_RUNTIME_USER=operator
 
 run
 check "first install with a non-default runtime layout succeeds" '[[ "$RC" -eq 0 && "$OUT" == *"==> Done."* ]]'
+check "archive payload excludes ignored live files" '[[ ! -e "$BROKKR_DEPLOY_TARGET/.env" && ! -e "$BROKKR_DEPLOY_TARGET/STATUS.md" ]]'
+check "archive payload resists a post-materialization tracked mutation" '! grep -q "post-archive mutation" "$BROKKR_DEPLOY_TARGET/README.md"'
+check "archive payload parent is cleaned after deploy" '[[ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name "brokkr-deploy.*" -print)" ]]'
+check "remote release root keeps intentional mode" '[[ "$(stat -f %Lp "$BROKKR_DEPLOY_TARGET")" == 750 ]]'
+unset MOCK_MUTATE_SOURCE
+git -C "$SOURCE" checkout -- README.md
 check "nested runtime-user release target is prepared before rsync" '[[ -d "$BROKKR_DEPLOY_TARGET" ]] && [[ "$(grep -n "sudo install -d" "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n "^rsync " "$CALLS" | head -1 | cut -d: -f1)" ]]'
 check "release synchronization uses the runtime identity" 'grep -Fq -- "--rsync-path=sudo -u $BROKKR_RUNTIME_USER rsync" "$CALLS"'
 check "health unit is rendered for the explicit runtime layout" 'grep -Fqx "User=$BROKKR_RUNTIME_USER" "$MOCK_INSTALLED_UNITS/brokkr-health.service" && grep -Fqx "WorkingDirectory=$BROKKR_DEPLOY_TARGET" "$MOCK_INSTALLED_UNITS/brokkr-health.service" && grep -Fqx "EnvironmentFile=-$BROKKR_RUNTIME_HOME/.config/brokkr/env" "$MOCK_INSTALLED_UNITS/brokkr-health.service" && grep -Fqx "ExecStart=$BROKKR_DEPLOY_TARGET/scripts/health-snapshot.sh" "$MOCK_INSTALLED_UNITS/brokkr-health.service"'

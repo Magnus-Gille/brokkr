@@ -24,14 +24,15 @@ CALLS="$TMP/calls"
 cat >"$TMP/bin/rsync" <<'EOF'
 #!/usr/bin/env bash
 printf 'rsync %s\n' "$*" >>"$MOCK_CALLS"
+source="${@: -2:1}"
+source="${source%/}"
 destination="${!#}"
 release="${destination#*:}"
 if [[ ! -d "$release" ]]; then
   echo 'mock rsync: release target was not prepared' >&2
   exit 11
 fi
-mkdir -p "$release/scripts"
-cp "$MOCK_HEIMDALL_PROBE" "$release/scripts/verify-heimdall-delivery.sh"
+cp -R "$source/." "$release"
 EOF
 cat >"$TMP/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
@@ -96,13 +97,16 @@ EOF
 chmod +x "$TMP/bin/"*
 
 export PATH="$TMP/bin:$PATH" MOCK_CALLS="$CALLS" MOCK_BIN="$TMP/bin" MOCK_HOME="$TMP/home"
-export MOCK_HEIMDALL_PROBE="$HERE/../verify-heimdall-delivery.sh"
 export BROKKR_SSH_TARGET=brokkr@control-node
 export BROKKR_DEPLOY_TARGET="$TMP/release" BROKKR_RUNTIME_USER=operator BROKKR_RUNTIME_HOME=/home/operator BROKKR_REGISTRY_PATH=/srv/grimnir/services.json
 export MOCK_RUNTIME_HOME="$BROKKR_RUNTIME_HOME" MOCK_REGISTRY_PATH="$BROKKR_REGISTRY_PATH" MOCK_RELEASE_TARGET="$BROKKR_DEPLOY_TARGET"
 export BROKKR_EXPECTED_SOURCE="$SOURCE"
 BROKKR_EXPECTED_COMMIT="$(git -C "$SOURCE" rev-parse HEAD)"
 export BROKKR_EXPECTED_COMMIT
+mkdir -p "$TMP/payload-tmp"
+export TMPDIR="$TMP/payload-tmp"
+printf 'ignored-secret\n' >"$SOURCE/.env"
+printf 'ignored-status\n' >"$SOURCE/STATUS.md"
 
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
@@ -146,6 +150,8 @@ export MOCK_TOKEN_SOURCE="$BROKKR_HEIMDALL_TOKEN_SOURCE"
 export BROKKR_HEIMDALL_URL=http://heimdall.example/api/panels
 run
 check "valid explicit token source and URL permit enabling the sweep" '[[ "$RC" -eq 0 ]] && grep -q "sudo systemctl enable --now .*brokkr-systemd-failure-sweep.timer" "$CALLS"'
+check "archive payload excludes ignored live files" '[[ ! -e "$BROKKR_DEPLOY_TARGET/.env" && ! -e "$BROKKR_DEPLOY_TARGET/STATUS.md" ]]'
+check "archive payload parent is cleaned after deploy" '[[ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name "brokkr-deploy.*" -print)" ]]'
 check "first install prepares the nested release target before rsync" '[[ -d "$BROKKR_DEPLOY_TARGET" ]] && [[ "$(grep -n -F "sudo install -d" "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n -F "rsync " "$CALLS" | head -1 | cut -d: -f1)" ]]'
 check "deployment renders units for the explicit runtime identity and target" 'grep -Fq "BROKKR_RUNTIME_USER=$BROKKR_RUNTIME_USER" "$CALLS" && grep -Fq "BROKKR_RUNTIME_HOME=$BROKKR_RUNTIME_HOME" "$CALLS" && grep -Fq "BROKKR_DEPLOY_TARGET=$BROKKR_DEPLOY_TARGET" "$CALLS" && grep -Fq "BROKKR_REGISTRY_PATH=$BROKKR_REGISTRY_PATH" "$CALLS"'
 check "probe uses authenticated non-mutating readback without leaking token or source path" 'grep -q "curl .*--config -.*--request GET.*service=brokkr" "$CALLS" && ! grep -Fq "secret-sentinel" "$CALLS" && ! grep -Fq "$BROKKR_HEIMDALL_TOKEN_SOURCE" "$CALLS" && [[ "$OUT" != *"secret-sentinel"* && "$OUT" != *"$BROKKR_HEIMDALL_TOKEN_SOURCE"* ]]'
