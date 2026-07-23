@@ -13,8 +13,8 @@ that view as private runtime evidence.
 ## Inputs (validated strictly before any collection)
 
 - `BROKKR_NODE_ID`: `^[a-z][a-z0-9-]{2,57}$` (defaults to the lowercased short
-  hostname; the cap keeps the derived `obs-<node_id>` evidence id inside the
-  contract id pattern).
+  hostname; evidence identity is derived separately from the complete
+  observation).
 - `BROKKR_INVENTORY_NOW`: optional exact UTC instant `YYYY-MM-DDTHH:MM:SSZ` on a
   real calendar date (defaults to the current time).
 - `BROKKR_INVENTORY_TTL_SECONDS`: integer in `[60, 86400]` (default `3600`);
