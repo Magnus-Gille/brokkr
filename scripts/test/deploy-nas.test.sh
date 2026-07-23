@@ -78,8 +78,13 @@ case "${1:-}" in
     exit 0
     ;;
   stat)
-    printf 'mock-source-mode %s\n' "${MOCK_SOURCE_MODE:-600}" >>"$MOCK_CALLS"
-    printf '%s\n' "${MOCK_SOURCE_MODE:-600}"
+    if [[ "${!#}" == "$MOCK_RUNTIME_ENV" ]]; then
+      printf 'mock-runtime-mode %s\n' "${MOCK_RUNTIME_MODE:-600}" >>"$MOCK_CALLS"
+      printf '%s\n' "${MOCK_RUNTIME_MODE:-600}"
+    else
+      printf 'mock-source-mode %s\n' "${MOCK_SOURCE_MODE:-600}" >>"$MOCK_CALLS"
+      printf '%s\n' "${MOCK_SOURCE_MODE:-600}"
+    fi
     ;;
   grep) "$@" ;;
   sh) exit 0 ;;
@@ -97,6 +102,7 @@ export BROKKR_SSH_TARGET=operator@nas-host
 export BROKKR_DEPLOY_TARGET="$TMP/releases/nas/brokkr" BROKKR_RUNTIME_USER=operator
 export BROKKR_RUNTIME_HOME="$TMP/home/operator" BROKKR_REGISTRY_PATH="$TMP/registry/services.json"
 export MOCK_RELEASE_TARGET="$BROKKR_DEPLOY_TARGET" MOCK_RUNTIME_HOME="$BROKKR_RUNTIME_HOME" MOCK_REGISTRY_PATH="$BROKKR_REGISTRY_PATH"
+export MOCK_RUNTIME_ENV="$BROKKR_RUNTIME_HOME/.config/brokkr/env"
 mkdir -p "$BROKKR_RUNTIME_HOME" "$(dirname "$BROKKR_REGISTRY_PATH")"
 printf '{"components":[]}\n' >"$BROKKR_REGISTRY_PATH"
 export BROKKR_HEIMDALL_SOURCE_ENV="$TMP/heimdall-source.env"
@@ -125,6 +131,29 @@ check "health unit is rendered for the explicit runtime layout" 'grep -Fqx "User
 check "failure services are rendered for the explicit runtime layout" 'grep -Fqx "User=$BROKKR_RUNTIME_USER" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure@.service" && grep -Fqx "WorkingDirectory=$BROKKR_DEPLOY_TARGET" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure-sweep.service" && grep -Fqx "ExecStart=$BROKKR_DEPLOY_TARGET/scripts/systemd-failure-monitor.sh --sweep" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure-sweep.service"'
 check "registry and executable/unit validation happen before systemd mutation" 'grep -q "sudo systemd-analyze verify" "$CALLS" && [[ "$(grep -n "sudo systemd-analyze verify" "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n "/etc/systemd/system/brokkr-health.service" "$CALLS" | head -1 | cut -d: -f1)" ]]'
 check "protected Heimdall values and source path are not printed" '[[ "$OUT" != *secret-sentinel* && "$OUT" != *"$BROKKR_HEIMDALL_SOURCE_ENV"* ]] && ! grep -Fq secret-sentinel "$CALLS" && ! grep -Fq "$BROKKR_HEIMDALL_SOURCE_ENV" "$CALLS"'
+
+: >"$CALLS"
+runtime_env="$BROKKR_RUNTIME_HOME/.config/brokkr/env"
+mkdir -p "$(dirname "$runtime_env")"
+printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=preserved-secret-sentinel\n' >"$runtime_env"
+chmod 600 "$runtime_env"
+unset BROKKR_HEIMDALL_SOURCE_ENV
+run
+check "omitted source preserves and reports an existing protected runtime env" '[[ "$RC" -eq 0 && "$OUT" == *"Heimdall runtime environment preserved"* && "$OUT" != *"pushes will be skipped"* ]]'
+check "preserved runtime credentials are not printed" '[[ "$OUT" != *preserved-secret-sentinel* ]] && ! grep -Fq preserved-secret-sentinel "$CALLS"'
+
+: >"$CALLS"
+export MOCK_RUNTIME_MODE=644
+run
+check "unsafe preserved runtime env fails closed before systemd mutation" '[[ "$RC" -ne 0 && "$OUT" == *"preserved Heimdall runtime environment has unsafe permissions"* ]] && ! grep -q "/etc/systemd/system\|systemctl" "$CALLS"'
+check "unsafe preserved runtime env output contains no credential value" '[[ "$OUT" != *preserved-secret-sentinel* ]]'
+unset MOCK_RUNTIME_MODE
+
+: >"$CALLS"
+rm -f "$runtime_env"
+run
+check "omitted source with no runtime env remains an explicit unconfigured success" '[[ "$RC" -eq 0 && "$OUT" == *"runtime environment not configured; pushes will be skipped"* && "$OUT" != *"environment preserved"* ]]'
+export BROKKR_HEIMDALL_SOURCE_ENV="$MOCK_HEIMDALL_SOURCE_ENV"
 
 : >"$CALLS"
 export MOCK_PROTECTED_SOURCE_TESTS=1 MOCK_SOURCE_MODE=644

@@ -24,8 +24,13 @@ The optional Heimdall source is a server-side, root-owned regular file with mode
 `0400` or `0600`. It must contain exactly one non-empty
 `HEIMDALL_HUB_URL=` and `HEIMDALL_FLEET_TOKEN=` assignment. The deployer copies
 only those assignments into the runtime user's `~/.config/brokkr/env` with mode
-`0600`; it never prints their values or the source path. Omitting the source is
-supported for an intentionally unconfigured push path.
+`0600`; it never prints their values or the source path. Omitting the source
+preserves an existing runtime environment when it is a non-empty, non-symlink,
+runtime-user-owned and readable regular file with mode `0400` or `0600`. The
+deployer checks only that file's metadata, not credential values, and the
+immediately triggered health snapshot remains the delivery check. With neither
+a source nor an existing runtime environment, pushes remain intentionally
+unconfigured and the deployer reports that state.
 
 Before synchronizing a first release, the deployer creates the nested target as
 the runtime user. An existing target must be a non-symlink, runtime-user-owned,
