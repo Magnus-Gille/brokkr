@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   assertPinnedContractFiles, canonicalJson, checkSchema, evidenceDigest,
-  schemaErrors, strictUtc,
+  observationEvidenceId, schemaErrors, strictUtc,
 } from "./lib/node-substrate-contract.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -115,6 +115,7 @@ const validateLocationEvidence = (evidence, inventory, profileBytes) => {
   if (!strictUtc(evidence.observed_at) || !strictUtc(evidence.valid_until) || evidence.observed_at > evidence.valid_until || evidence.profile_digest !== hash(profileBytes) || evidence.outcome !== "verified" || evidence.digest !== hash(material)) fail("location-evidence-invalid", "brokkr", "location evidence digest does not verify");
   if (!Array.isArray(evidence.network_capabilities) || new Set(evidence.network_capabilities).size !== evidence.network_capabilities.length || !evidence.network_capabilities.every(kind => ["wired", "wifi", "tailnet"].includes(kind))) fail("location-evidence-invalid", "brokkr", "location network evidence is invalid");
   if (!Array.isArray(evidence.storage) || !evidence.storage.length) fail("location-evidence-invalid", "brokkr", "location storage evidence is missing");
+  if (new Set(evidence.storage.map(store => store?.logical_storage_id)).size !== evidence.storage.length) fail("location-evidence-invalid", "brokkr", "location storage evidence contains duplicate ids");
   for (const store of evidence.storage) {
     if (!exactKeys(store, ["capacity", "class", "logical_storage_id", "status", "transfer_window", "writable"]) || !PROFILE_ID.test(store.logical_storage_id) || !["local_ssd", "external_ssd", "network_share"].includes(store.class) || !["known", "unknown"].includes(store.status) || typeof store.writable !== "boolean" || !["sufficient", "insufficient", "unknown"].includes(store.capacity) || !["sufficient", "insufficient", "unknown"].includes(store.transfer_window)) fail("location-evidence-invalid", "brokkr", "location storage evidence is invalid");
   }
@@ -137,6 +138,7 @@ const validateRequirements = (bundle) => {
     for (const field of ["units", "timers", "dependencies", "cohost_forbidden"]) if (!Array.isArray(item[field]) || new Set(item[field]).size !== item[field].length || !item[field].every(value => typeof value === "string" && ID.test(value.replace(/[.@_]/g, "-")))) fail("requirements-invalid", "grimnir", `workload ${field} requirements are invalid`);
     if (!Array.isArray(item.required_backup_roles)) fail("requirements-invalid", item.owner_repo, "backup role requirements are invalid");
     for (const role of item.required_backup_roles) if (!exactKeys(role, ["actor", "logical_storage_id", "role"]) || !PROFILE_ID.test(role.actor) || !PROFILE_ID.test(role.logical_storage_id) || !["producer", "consumer"].includes(role.role)) fail("requirements-invalid", item.owner_repo, "backup role requirements are invalid");
+    if (new Set(item.required_backup_roles.map(canonicalJson)).size !== item.required_backup_roles.length) fail("requirements-invalid", item.owner_repo, "backup role requirements contain duplicates");
   }
   const dependencyIds = new Set();
   for (const evidence of bundle.dependency_evidence) {
@@ -190,6 +192,8 @@ const main = () => {
     if (schemaErrors(schema, record).length) fail(code, owner, `${label} violates the pinned Grimnir v1 schema`);
   }
   if (inventory.evidence.digest !== `sha256:${evidenceDigest(inventory)}`) fail("inventory-digest-invalid", "brokkr", "inventory evidence digest does not verify");
+  if (inventory.evidence.evidence_id !== observationEvidenceId(inventory)) fail("inventory-evidence-id-invalid", "brokkr", "inventory observation evidence id does not match its observation material");
+  if (inventory.evidence.observed_at !== inventory.observed_at) fail("inventory-observed-at-mismatch", "brokkr", "inventory evidence timestamp does not match the observation timestamp");
   validateDetail(detail, inventory, publicKey);
   validateRequirements(requirements);
   validateProfile(args.location_profile);
@@ -200,6 +204,9 @@ const main = () => {
 
   const now = args.now;
   const blockers = [];
+  const profileStorageIds = Object.keys(location.storage).sort();
+  const evidenceStorageIds = locationEvidence.storage.map(store => store.logical_storage_id).sort();
+  add(blockers, canonicalJson(profileStorageIds) !== canonicalJson(evidenceStorageIds), "storage-enumeration-mismatch", "brokkr", "Location profile and evidence storage ids disagree.");
   add(blockers, inventory.observed_at > now || inventory.valid_until <= now, "stale-inventory-evidence", "brokkr", "Target inventory evidence is stale.");
   add(blockers, detail.observed_at > now || detail.valid_until <= now, "stale-detail-evidence", "brokkr", "Signed operational detail is stale.");
   add(blockers, locationEvidence.observed_at > now || locationEvidence.valid_until <= now, "stale-location-evidence", "brokkr", "Location preflight evidence is stale.");
@@ -233,6 +240,8 @@ const main = () => {
   }
 
   const requiredDependencies = requestedProfile ? requestedProfile.dependencies : [];
+  add(blockers, requestedProfile && canonicalJson([...workload.units].sort()) !== canonicalJson([...requestedProfile.units].sort()), "unit-requirement-mismatch", requestedProfile?.owner_repo ?? "grimnir", "Pinned and planning unit requirements disagree.");
+  add(blockers, requestedProfile && canonicalJson([...workload.timers].sort()) !== canonicalJson([...requestedProfile.timers].sort()), "timer-requirement-mismatch", requestedProfile?.owner_repo ?? "grimnir", "Pinned and planning timer requirements disagree.");
   add(blockers, requestedProfile && canonicalJson([...workload.dependencies].sort()) !== canonicalJson([...requiredDependencies].sort()), "dependency-requirement-mismatch", requestedProfile?.owner_repo ?? "grimnir", "Pinned and planning dependency requirements disagree.");
   for (const item of targetProfiles) {
     for (const dependency of item.dependencies) {
@@ -243,19 +252,23 @@ const main = () => {
     }
   }
 
-  const requiredRoles = requestedProfile?.required_backup_roles ?? [];
+  const requestedRoles = requestedProfile?.required_backup_roles ?? [];
   if (workload.backup_restore === "required") {
-    const roleNames = requiredRoles.map(role => role.role).sort();
+    const roleNames = requestedRoles.map(role => role.role).sort();
     add(blockers, canonicalJson(roleNames) !== canonicalJson(["consumer", "producer"]), "backup-role-requirement-incomplete", requestedProfile?.owner_repo ?? "grimnir", "Backup-required workload must name exactly one producer and one consumer.");
   }
   const profileRoles = location.backup_roles.flatMap(role => [
     { role: "producer", actor: role.producer, logical_storage_id: role.logical_storage_id },
     { role: "consumer", actor: role.consumer, logical_storage_id: role.logical_storage_id },
   ]);
-  for (const role of requiredRoles) {
-    add(blockers, !Object.hasOwn(location.storage, role.logical_storage_id), "backup-storage-ref-invalid", requestedProfile.owner_repo, "Required backup role references undeclared location storage.");
-    add(blockers, !profileRoles.some(item => canonicalJson(item) === canonicalJson(role)), "backup-role-profile-mismatch", requestedProfile.owner_repo, "Required backup role is absent from the selected location profile.");
-    add(blockers, !locationEvidence.backup_roles.some(item => item.status === "verified" && item.role === role.role && item.actor === role.actor && item.logical_storage_id === role.logical_storage_id), "backup-role-evidence-missing", requestedProfile.owner_repo, "Required backup role lacks exact verified evidence.");
+  const allRequiredRoles = [];
+  for (const item of targetProfiles) {
+    for (const role of item.required_backup_roles) {
+      allRequiredRoles.push(role);
+      add(blockers, !Object.hasOwn(location.storage, role.logical_storage_id), "backup-storage-ref-invalid", item.owner_repo, `Workload ${item.workload_id} backup role references undeclared location storage.`);
+      add(blockers, !profileRoles.some(profileRole => canonicalJson(profileRole) === canonicalJson(role)), "backup-role-profile-mismatch", item.owner_repo, `Workload ${item.workload_id} backup role is absent from the selected location profile.`);
+      add(blockers, !locationEvidence.backup_roles.some(evidenceRole => evidenceRole.status === "verified" && evidenceRole.role === role.role && evidenceRole.actor === role.actor && evidenceRole.logical_storage_id === role.logical_storage_id), "backup-role-evidence-missing", item.owner_repo, `Workload ${item.workload_id} backup role lacks exact verified evidence.`);
+    }
   }
 
   const requiredNetwork = new Set();
@@ -286,9 +299,9 @@ const main = () => {
   const result = {
     kind: "brokkr-relocation-plan", schema_version: "v1", plan_id: life.plan_id, plan_digest: life.plan_digest, outcome, lifecycle_result: life,
     input_evidence: { inventory: inventory.evidence.evidence_id, detail: detail.detail_digest, location: locationEvidence.digest, requirements: requirements.digest, desired_revision: intent.desired_revision },
-    workloads: targetIds.map(id => ({ workload_id: id, owner_repo: profiles.get(id)?.owner_repo ?? "grimnir", placement: id === workload.workload_id && !detail.workloads.includes(id) ? "planned" : "current", cohost_forbidden: profiles.get(id)?.cohost_forbidden ?? [] })),
+    workloads: targetIds.map(id => ({ workload_id: id, owner_repo: profiles.get(id)?.owner_repo ?? "grimnir", placement: id === workload.workload_id && !detail.workloads.includes(id) ? "planned" : "current", units: profiles.get(id)?.units ?? [], timers: profiles.get(id)?.timers ?? [], cohost_forbidden: profiles.get(id)?.cohost_forbidden ?? [] })),
     resources: { available_cpu_cores: inventory.resources.cpu_cores, available_memory_mib: inventory.resources.memory_mib, required_cpu_cores: requiredCpu, required_memory_mib: requiredMemory },
-    backup_roles: { required: sorted(requiredRoles), verified: sorted(locationEvidence.backup_roles) },
+    backup_roles: { required: sorted(allRequiredRoles), verified: sorted(locationEvidence.backup_roles) },
     mounts: sorted(locationEvidence.storage.map(store => ({ logical_storage_id: store.logical_storage_id, class: store.class, status: store.status }))),
     dependencies: sorted(targetProfiles.flatMap(item => item.dependencies.map(id => {
       const evidence = requirements.dependency_evidence.find(candidate => candidate.workload_id === id);

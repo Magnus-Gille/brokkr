@@ -20,10 +20,11 @@ make relocation-plan ARGS="--json --now 2026-07-23T10:05:00Z \
 `workload-requirement` v1 records; `inventory` is the unchanged Brokkr #7
 `node-capability` record. The runtime verifies the exact vendored Grimnir
 schema, fixture manifest, and provenance pins before it parses them. It also
-recomputes #7 inventory evidence digests and requires the #7 detail record to
-bind to that observation ID and digest, carry matching timestamps and a
-canonical digest, and verify under the explicit Ed25519 public key. Stale,
-unsigned, or state-enum-incompatible detail fails closed.
+recomputes #7 inventory evidence digests and observation IDs, requires the
+nested evidence timestamp to equal the observation timestamp, and requires the
+#7 detail record to bind to that observation ID and digest, carry matching
+timestamps and a canonical digest, and verify under the explicit Ed25519 public
+key. Stale, unsigned, or state-enum-incompatible detail fails closed.
 
 `requirements` is a closed, digest-bound
 `brokkr-relocation-requirements/v1` planning input. It supplies the facts absent
@@ -62,15 +63,18 @@ paths, addresses, SSIDs, or credentials:
 ```
 
 The planner rejects stale, malformed, digest-mismatched, missing, unknown, or
-incompatible evidence. It also blocks CPU/RAM, cohost, dependency, exact backup
-role/storage-reference, capacity, writeability, transfer-window,
-network/tunnel, hosted-unit, health, hook, and rollback gaps. JSON output is a
-versioned `brokkr-relocation-plan` envelope containing a validated pinned v1
-`lifecycle_result`; its plan lists all current and planned workloads, resource
-totals, dependencies, backup roles, logical mounts, network/tunnel
-dependencies, health, hooks, interruption, rollback, and blockers. Every
-blocker includes its owning repository. Even missing or malformed inputs emit
-this blocked JSON lifecycle when `--json` is requested.
+incompatible evidence. Location storage IDs must be unique and exactly match
+the selected profile. It also blocks CPU/RAM, cohost, dependency, pinned
+unit/timer, exact backup role/storage-reference for every planned and current
+workload, capacity, writeability, transfer-window, network/tunnel, hosted-unit,
+health, hook, and rollback gaps. JSON output is a versioned
+`brokkr-relocation-plan` envelope containing a validated pinned v1
+`lifecycle_result`; its plan lists all current and planned workloads with their
+required units and timers, resource totals, dependencies, all target workload
+backup roles, logical mounts, network/tunnel dependencies, health, hooks,
+interruption, rollback, and blockers. Every blocker includes its owning
+repository. Even missing or malformed inputs emit this blocked JSON lifecycle
+when `--json` is requested.
 
 The output is planning evidence only. A later owner-controlled lifecycle must
 invoke hooks and execute any mutation; this planner never does.
