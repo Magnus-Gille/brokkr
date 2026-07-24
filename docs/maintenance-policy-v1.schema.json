@@ -1,0 +1,245 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grimnir.gille.ai/contracts/maintenance-policy/v1/schema.json",
+  "title": "Grimnir maintenance-policy contract v1",
+  "description": "Versioned, public-safe, intent-only records for unattended substrate upkeep. This document expresses desired policy and bound decision-effect projections only. It never contains live observations, eligibility proofs, credentials, private locators, shell commands, or configuration contents, and it neither proves eligibility nor authorizes mutation without fresh Brokkr observations and the execution controller's own safety gates. Semantic validation (IANA timezone membership, DST classification, digest recomputation, decision-effect recomputation) is defined by tests/scripts/validate-maintenance-policy-contract.mjs; structural closure (additionalProperties: false everywhere) is normative here.",
+  "oneOf": [
+    { "$ref": "#/$defs/maintenance-policy" },
+    { "$ref": "#/$defs/maintenance-decision" }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+    "utc": { "type": "string", "format": "date-time" },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "duration": {
+      "type": "string",
+      "description": "A bounded ISO 8601 duration restricted to day/hour/minute/second components. Calendar year and month components are deliberately unsupported because they are not absolute durations; see the contract doc.",
+      "pattern": "^P(?=\\d|T\\d)(\\d+D)?(T(?=\\d)(\\d+H)?(\\d+M)?(\\d+S)?)?$"
+    },
+    "extension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "decision_effect"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+        "version": { "type": "string", "pattern": "^v[1-9][0-9]*$" },
+        "decision_effect": { "enum": ["informational"] }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_id", "producer", "observed_at", "digest"],
+      "properties": {
+        "evidence_id": { "$ref": "#/$defs/id" },
+        "producer": { "const": "brokkr" },
+        "observed_at": { "$ref": "#/$defs/utc" },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_ids", "workload_ids"],
+      "properties": {
+        "node_ids": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "workload_ids": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } }
+      }
+    },
+    "dst-policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nonexistent_time", "ambiguous_time"],
+      "properties": {
+        "nonexistent_time": { "enum": ["shift_forward_to_next_valid", "skip_occurrence", "fail_closed"] },
+        "ambiguous_time": { "enum": ["use_first_instant", "use_second_instant", "fail_closed"] }
+      }
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["days_of_week", "start_local_time", "duration"],
+      "properties": {
+        "days_of_week": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] }
+        },
+        "start_local_time": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" },
+        "duration": { "$ref": "#/$defs/duration" }
+      }
+    },
+    "missed-window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["behavior"],
+      "properties": {
+        "behavior": { "enum": ["run_at_next_window", "run_as_soon_as_possible", "skip_occurrence"] }
+      }
+    },
+    "overdue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["after_missed_windows", "behavior"],
+      "properties": {
+        "after_missed_windows": { "type": "integer", "minimum": 1 },
+        "behavior": { "enum": ["escalate_operator_gate", "run_as_soon_as_possible", "hold"] }
+      }
+    },
+    "maximum-deferral": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["duration"],
+      "properties": {
+        "duration": { "$ref": "#/$defs/duration" }
+      }
+    },
+    "hold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active", "reason"],
+      "properties": {
+        "active": { "type": "boolean" },
+        "reason": { "enum": ["operator_requested", "incident_response", "pending_review", "not_applicable"] },
+        "until": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "hold"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "hold": { "$ref": "#/$defs/hold" }
+      }
+    },
+    "updates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed_classes", "allowed_sources"],
+      "properties": {
+        "allowed_classes": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "enum": ["security", "bugfix", "kernel", "firmware"] }
+        },
+        "allowed_sources": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": { "enum": ["distro_repository", "package_manager_lts_channel", "vendor_signed_firmware_channel"] }
+        }
+      }
+    },
+    "reboot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy", "max_reboot_wait"],
+      "properties": {
+        "policy": { "enum": ["never", "if_required", "always_after_window"] },
+        "max_reboot_wait": { "$ref": "#/$defs/duration" }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_attempts", "backoff"],
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "backoff": { "$ref": "#/$defs/duration" }
+      }
+    },
+    "execution-limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeout", "retry"],
+      "properties": {
+        "timeout": { "$ref": "#/$defs/duration" },
+        "retry": { "$ref": "#/$defs/retry" }
+      }
+    },
+    "concurrency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_concurrent_targets", "ordering"],
+      "properties": {
+        "max_concurrent_targets": { "type": "integer", "minimum": 1 },
+        "ordering": { "enum": ["sequential_by_selector_order", "parallel_unordered", "canary_then_remaining"] },
+        "canary_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "failure-limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_consecutive_failures", "on_limit_exceeded"],
+      "properties": {
+        "max_consecutive_failures": { "type": "integer", "minimum": 1 },
+        "on_limit_exceeded": { "enum": ["hold_policy", "escalate_operator_gate", "skip_remaining_targets"] }
+      }
+    },
+    "maintenance-policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "schema_version", "policy_id", "selector", "timezone", "dst_policy", "window",
+        "missed_window", "overdue", "maximum_deferral", "state", "updates", "reboot",
+        "execution_limits", "concurrency", "failure_limits", "policy_digest", "created_at", "extensions"
+      ],
+      "properties": {
+        "kind": { "const": "maintenance-policy" },
+        "schema_version": { "const": "v1" },
+        "policy_id": { "$ref": "#/$defs/id" },
+        "selector": { "$ref": "#/$defs/selector" },
+        "timezone": { "type": "string", "pattern": "^(UTC|[A-Za-z_]+(?:/[A-Za-z0-9_+-]+){1,2})$" },
+        "dst_policy": { "$ref": "#/$defs/dst-policy" },
+        "window": { "$ref": "#/$defs/window" },
+        "missed_window": { "$ref": "#/$defs/missed-window" },
+        "overdue": { "$ref": "#/$defs/overdue" },
+        "maximum_deferral": { "$ref": "#/$defs/maximum-deferral" },
+        "state": { "$ref": "#/$defs/state" },
+        "updates": { "$ref": "#/$defs/updates" },
+        "reboot": { "$ref": "#/$defs/reboot" },
+        "execution_limits": { "$ref": "#/$defs/execution-limits" },
+        "concurrency": { "$ref": "#/$defs/concurrency" },
+        "failure_limits": { "$ref": "#/$defs/failure-limits" },
+        "policy_digest": { "$ref": "#/$defs/digest" },
+        "created_at": { "$ref": "#/$defs/utc" },
+        "extensions": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/extension" } }
+      }
+    },
+    "window-occurrence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["local_date", "start", "end", "local_time_kind"],
+      "properties": {
+        "local_date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "start": { "$ref": "#/$defs/utc" },
+        "end": { "$ref": "#/$defs/utc" },
+        "local_time_kind": { "enum": ["normal", "ambiguous", "nonexistent"] }
+      }
+    },
+    "maintenance-decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "schema_version", "decision_id", "policy_id", "policy_digest", "evidence", "as_of",
+        "window_occurrence", "missed_occurrences", "deferral_elapsed", "effect", "reason", "extensions"
+      ],
+      "properties": {
+        "kind": { "const": "maintenance-decision" },
+        "schema_version": { "const": "v1" },
+        "decision_id": { "$ref": "#/$defs/id" },
+        "policy_id": { "$ref": "#/$defs/id" },
+        "policy_digest": { "$ref": "#/$defs/digest" },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "as_of": { "$ref": "#/$defs/utc" },
+        "window_occurrence": { "$ref": "#/$defs/window-occurrence" },
+        "missed_occurrences": { "type": "integer", "minimum": 0 },
+        "deferral_elapsed": { "$ref": "#/$defs/duration" },
+        "effect": {
+          "enum": ["on_schedule", "run_deferred", "deferred_to_next_window", "skip_occurrence", "escalate_operator_gate", "held"]
+        },
+        "reason": {
+          "enum": ["on_schedule", "missed_window", "overdue_after_missed_windows", "maximum_deferral_reached", "hold_active", "disabled"]
+        },
+        "extensions": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/extension" } }
+      }
+    }
+  }
+}

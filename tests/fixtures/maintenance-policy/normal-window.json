@@ -1,0 +1,36 @@
+{
+  "records": [
+    {
+      "kind": "maintenance-policy", "schema_version": "v1", "policy_id": "policy-normal-window",
+      "selector": { "node_ids": ["fixture-m5"], "workload_ids": [] },
+      "timezone": "UTC",
+      "dst_policy": { "nonexistent_time": "shift_forward_to_next_valid", "ambiguous_time": "use_first_instant" },
+      "window": { "days_of_week": ["wed"], "start_local_time": "03:00", "duration": "PT2H" },
+      "missed_window": { "behavior": "run_at_next_window" },
+      "overdue": { "after_missed_windows": 3, "behavior": "escalate_operator_gate" },
+      "maximum_deferral": { "duration": "P7D" },
+      "state": { "enabled": true, "hold": { "active": false, "reason": "not_applicable" } },
+      "updates": { "allowed_classes": ["security", "bugfix"], "allowed_sources": ["distro_repository"] },
+      "reboot": { "policy": "if_required", "max_reboot_wait": "PT15M" },
+      "execution_limits": { "timeout": "PT30M", "retry": { "max_attempts": 3, "backoff": "PT5M" } },
+      "concurrency": { "max_concurrent_targets": 1, "ordering": "sequential_by_selector_order" },
+      "failure_limits": { "max_consecutive_failures": 3, "on_limit_exceeded": "escalate_operator_gate" },
+      "policy_digest": "sha256:446287ea66fe3055f9c9070784987a80be9017caa29bbe1307d2f406cbb38a1f",
+      "created_at": "2026-07-01T00:00:00Z",
+      "extensions": []
+    },
+    {
+      "kind": "maintenance-decision", "schema_version": "v1", "decision_id": "decision-normal-window",
+      "policy_id": "policy-normal-window",
+      "policy_digest": "sha256:446287ea66fe3055f9c9070784987a80be9017caa29bbe1307d2f406cbb38a1f",
+      "evidence": { "evidence_id": "obs-normal-001", "producer": "brokkr", "observed_at": "2026-07-22T02:55:00Z", "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      "as_of": "2026-07-22T03:15:00Z",
+      "window_occurrence": { "local_date": "2026-07-22", "start": "2026-07-22T03:00:00Z", "end": "2026-07-22T05:00:00Z", "local_time_kind": "normal" },
+      "missed_occurrences": 0,
+      "deferral_elapsed": "PT0S",
+      "effect": "on_schedule",
+      "reason": "on_schedule",
+      "extensions": []
+    }
+  ]
+}
