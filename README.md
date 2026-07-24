@@ -117,6 +117,7 @@ Feature-specific setup and acceptance checks live in:
 - [`docs/nas-deploy.md`](docs/nas-deploy.md)
 - [`docs/systemd-failure-monitor.md`](docs/systemd-failure-monitor.md)
 - [`docs/relocation-planner.md`](docs/relocation-planner.md)
+- [`docs/maintenance-plan.md`](docs/maintenance-plan.md)
 - [`runbooks/restore.md`](runbooks/restore.md)
 
 ## Security model and limitations
