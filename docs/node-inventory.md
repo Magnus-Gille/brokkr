@@ -78,15 +78,19 @@ its instant) has a distinct contract-valid identity.
 
 The Grimnir v1 record is intentionally closed and cannot carry arbitrary
 operational fields. For the separately requested, read-only SSH-replacement
-view, run `make node-inventory ARGS=--detail` (or
-`node scripts/node-inventory.mjs --detail`). Stdout remains exactly the
-normative record. Stderr additionally carries one prefixed JSON record with the
+view, supply an owner-only Ed25519 PKCS#8 key in
+`BROKKR_INVENTORY_DETAIL_SIGNING_KEY` and run
+`make node-inventory ARGS=--detail` (or `node
+scripts/node-inventory.mjs --detail`). Stdout remains exactly the normative
+record. Stderr additionally carries one prefixed JSON record with the
 closed/versioned `brokkr-node-inventory-detail/v1` shape: the normative evidence
-ID, installed/active/sub-state for systemd or launchd units, and observed
-overlay workloads plus backup roles. It excludes paths, addresses, interface
-names, descriptions, credentials, and Tailscale identity. Because unit and
-workload names can still reveal local topology, this record is opt-in and must
-be handled as private runtime evidence.
+ID and digest, matching observation timestamps, installed/active/sub-state for
+systemd or launchd units, observed overlay workloads and backup roles, an
+Ed25519 signing-key ID, a canonical detail digest, and signature. Consumers
+must verify all bindings, the signature, and freshness before using the detail.
+It excludes paths, addresses, interface names, descriptions, credentials, and
+Tailscale identity. Because unit and workload names can still reveal local
+topology, this record is opt-in and must be handled as private runtime evidence.
 
 ## Fixtures
 

@@ -9,6 +9,15 @@ SCHEMA="$ROOT/docs/node-substrate-contract-v1.schema.json"
 FIXTURES="$ROOT/tests/fixtures/node-inventory"
 NODE_BIN="$(command -v node)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+DETAIL_KEY="$TMP/detail-private.pem"
+DETAIL_PUBLIC_KEY="$TMP/detail-public.pem"
+"$NODE_BIN" - "$DETAIL_KEY" "$DETAIL_PUBLIC_KEY" <<'NODE'
+const fs = require("fs"), crypto = require("crypto");
+const [privateFile, publicFile] = process.argv.slice(2);
+const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
+fs.writeFileSync(privateFile, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+fs.writeFileSync(publicFile, publicKey.export({ type: "spki", format: "pem" }));
+NODE
 
 fail() { echo "node-inventory.test.sh: FAIL: $1" >&2; exit 1; }
 
@@ -28,6 +37,7 @@ done
 # --- producer uses, so tests and producer cannot diverge silently).
 cat >"$TMP/check.mjs" <<NODE
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { schemaErrors, checkSchema, canonicalJson, evidenceDigest, strictUtc, assertPinnedContractFiles } from "${LIB}";
 const schema = JSON.parse(fs.readFileSync("${SCHEMA}", "utf8"));
 const read = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
@@ -88,9 +98,19 @@ if (command === "schema-selfcheck") {
   const line = fs.readFileSync(rest[0], "utf8").split("\n").find((entry) => entry.startsWith("Brokkr node inventory detail JSON: "));
   if (!line) die("missing detail record");
   const detail = JSON.parse(line.slice("Brokkr node inventory detail JSON: ".length));
-  const expected = ["backup_roles", "kind", "observation_evidence_id", "schema_version", "unit_state", "workloads"];
+  const expected = ["backup_roles", "detail_digest", "kind", "observation_digest", "observation_evidence_id", "observed_at", "schema_version", "signature", "signing_key_id", "unit_state", "valid_until", "workloads"];
   if (JSON.stringify(Object.keys(detail).sort()) !== JSON.stringify(expected)) die("detail record is not closed");
   if (detail.kind !== "brokkr-node-inventory-detail" || detail.schema_version !== "v1") die("detail record is not versioned");
+  if (!strictUtc(detail.observed_at) || !strictUtc(detail.valid_until)) die("detail lacks strict freshness");
+  const signature = detail.signature;
+  delete detail.signature;
+  const claimedDigest = detail.detail_digest;
+  delete detail.detail_digest;
+  const actualDigest = "sha256:" + crypto.createHash("sha256").update(canonicalJson(detail)).digest("hex");
+  if (claimedDigest !== actualDigest) die("detail digest does not verify");
+  detail.detail_digest = claimedDigest;
+  const publicKey = crypto.createPublicKey(fs.readFileSync("${DETAIL_PUBLIC_KEY}"));
+  if (!crypto.verify(null, Buffer.from(canonicalJson(detail)), publicKey, Buffer.from(signature, "base64"))) die("detail signature does not verify");
   if (!Array.isArray(detail.unit_state.units) || detail.unit_state.status !== "known") die("detail omits known unit state");
   for (const unit of detail.unit_state.units) {
     if (JSON.stringify(Object.keys(unit).sort()) !== JSON.stringify(["active_state", "installed_state", "name", "sub_state"])) die("detail unit has an unsafe field");
@@ -121,7 +141,7 @@ fi
 new_mock() { MOCK="$TMP/mock-$1"; rm -rf "$MOCK"; mkdir -p "$MOCK"; }
 mock() { cat >"$MOCK/$1"; chmod +x "$MOCK/$1"; }
 run_inventory() { env -i PATH="$MOCK" "$@" "$NODE_BIN" "$INVENTORY"; }
-run_inventory_detail() { env -i PATH="$MOCK" "$@" "$NODE_BIN" "$INVENTORY" --detail; }
+run_inventory_detail() { env -i PATH="$MOCK" BROKKR_INVENTORY_DETAIL_SIGNING_KEY="$DETAIL_KEY" "$@" "$NODE_BIN" "$INVENTORY" --detail; }
 expect_fail() {
   local desc="$1" pattern="$2"; shift 2
   local out
@@ -225,6 +245,15 @@ run_inventory_detail BROKKR_NODE_ID=fixture-nas BROKKR_INVENTORY_NOW=2026-07-23T
   BROKKR_INVENTORY_OVERLAY="$NAS_OVERLAY" >"$TMP/nas-detail.json" 2>"$TMP/nas-detail.err"
 check compare "$TMP/nas-detail.json" "$FIXTURES/fixture-nas.json"
 check detail "$TMP/nas-detail.err"
+
+nas_mocks
+if env -i PATH="$MOCK" BROKKR_NODE_ID=fixture-nas BROKKR_INVENTORY_NOW=2026-07-23T10:00:00Z \
+  BROKKR_INVENTORY_OVERLAY="$NAS_OVERLAY" "$NODE_BIN" "$INVENTORY" --detail \
+  >"$TMP/unsigned-detail.out" 2>"$TMP/unsigned-detail.err"; then
+  fail "unsigned operational detail was emitted"
+fi
+[ ! -s "$TMP/unsigned-detail.out" ] || fail "unsigned detail failure emitted inventory stdout"
+grep -q 'DETAIL_SIGNING_KEY is required' "$TMP/unsigned-detail.err" || fail "missing signing key was not named"
 
 # The same material is stable, but a new observation instant gets a new,
 # contract-valid id rather than reusing obs-<node> forever.
