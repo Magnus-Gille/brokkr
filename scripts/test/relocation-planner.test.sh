@@ -165,6 +165,9 @@ assert_blocked "$TMP/bad-unit.out" "unit-not-healthy" "existing"
 resign_detail "$TMP/detail.json" "$TMP/unknown-unit.json" 'v.unit_state.units[0].active_state="wonderful"'
 if run_plan --detail "$TMP/unknown-unit.json" >"$TMP/unknown-unit.out"; then fail "unsupported unit state passed"; fi
 assert_blocked "$TMP/unknown-unit.out" "detail-unit-state-invalid" "brokkr"
+resign_detail "$TMP/detail.json" "$TMP/duplicate-unit.json" 'v.unit_state.units.push({...structuredClone(v.unit_state.units[0]),active_state:"failed",sub_state:"failed"})'
+if run_plan --detail "$TMP/duplicate-unit.json" >"$TMP/duplicate-unit.out"; then fail "conflicting duplicate unit evidence passed"; fi
+assert_blocked "$TMP/duplicate-unit.out" "detail-unit-state-invalid" "brokkr"
 
 # Location evidence must enumerate each profile storage exactly once.
 rebind_json "$TMP/evidence.json" "$TMP/duplicate-storage.json" 'v.storage.push(structuredClone(v.storage[0]))'
@@ -173,6 +176,9 @@ assert_blocked "$TMP/duplicate-storage.out" "location-evidence-invalid" "brokkr"
 rebind_json "$TMP/evidence.json" "$TMP/extra-storage.json" 'v.storage.push({...structuredClone(v.storage[0]),logical_storage_id:"undeclared-storage"})'
 if run_plan --location-evidence "$TMP/extra-storage.json" >"$TMP/extra-storage.out"; then fail "undeclared location storage evidence passed"; fi
 assert_blocked "$TMP/extra-storage.out" "storage-enumeration-mismatch" "brokkr"
+rebind_json "$TMP/evidence.json" "$TMP/conflicting-backup-role.json" 'v.backup_roles.push({...structuredClone(v.backup_roles[0]),status:"unknown"})'
+if run_plan --location-evidence "$TMP/conflicting-backup-role.json" >"$TMP/conflicting-backup-role.out"; then fail "conflicting duplicate backup-role evidence passed"; fi
+assert_blocked "$TMP/conflicting-backup-role.out" "location-evidence-invalid" "brokkr"
 
 # Backup role requirements for current cohosts are as decision-relevant as the
 # requested workload's roles.

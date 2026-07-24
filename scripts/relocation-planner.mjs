@@ -105,6 +105,7 @@ const validateDetail = (detail, inventory, publicKey) => {
   for (const unit of detail.unit_state.units) {
     if (!exactKeys(unit, ["active_state", "installed_state", "name", "sub_state"]) || typeof unit.name !== "string" || !installed.has(unit.installed_state) || !active.has(unit.active_state) || !sub.has(unit.sub_state)) fail("detail-unit-state-invalid", "brokkr", "inventory unit detail contains an unsupported state");
   }
+  if (new Set(detail.unit_state.units.map(unit => unit.name)).size !== detail.unit_state.units.length) fail("detail-unit-state-invalid", "brokkr", "inventory unit detail contains duplicate names");
 };
 
 const validateLocationEvidence = (evidence, inventory, profileBytes) => {
@@ -123,6 +124,8 @@ const validateLocationEvidence = (evidence, inventory, profileBytes) => {
   for (const role of evidence.backup_roles) {
     if (!exactKeys(role, ["actor", "logical_storage_id", "role", "status"]) || !PROFILE_ID.test(role.actor) || !PROFILE_ID.test(role.logical_storage_id) || !["producer", "consumer"].includes(role.role) || !["verified", "unknown"].includes(role.status)) fail("location-evidence-invalid", "brokkr", "location backup-role evidence is invalid");
   }
+  const roleIds = evidence.backup_roles.map(({ actor, logical_storage_id, role }) => canonicalJson({ actor, logical_storage_id, role }));
+  if (new Set(roleIds).size !== roleIds.length) fail("location-evidence-invalid", "brokkr", "location backup-role evidence contains duplicate identities");
 };
 
 const validateRequirements = (bundle) => {
