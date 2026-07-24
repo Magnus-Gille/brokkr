@@ -394,7 +394,9 @@ def main():
     global COMMAND_TIMEOUT
     parser = argparse.ArgumentParser(description="Preflight a Brokkr location profile")
     parser.add_argument("--profile", required=True)
-    parser.add_argument("--overlay", required=True)
+    parser.add_argument("--overlay")
+    parser.add_argument("--validate-profile", action="store_true",
+                        help="validate only the public profile against its tracked schema")
     parser.add_argument("--profile-schema",
                         default=os.path.join(SCHEMA_DIRECTORY,
                                              "location-network-storage.schema.json"))
@@ -409,10 +411,17 @@ def main():
     COMMAND_TIMEOUT = args.command_timeout
 
     profile = load_json(args.profile, "public profile")
-    overlay = load_json(args.overlay, "owner overlay", private=True)
     profile_schema = load_schema(args.profile_schema, "public profile schema")
-    overlay_schema = load_schema(args.overlay_schema, "owner overlay schema")
     validate_against_schema(profile, profile_schema, "public profile")
+    if args.validate_profile:
+        if args.overlay is not None:
+            fail("owner overlay is not accepted with profile-only validation")
+        print("OK: location profile schema validated")
+        return
+    if args.overlay is None:
+        fail("owner overlay is required")
+    overlay = load_json(args.overlay, "owner overlay", private=True)
+    overlay_schema = load_schema(args.overlay_schema, "owner overlay schema")
     validate_against_schema(overlay, overlay_schema, "owner overlay")
 
     location_name = overlay["location"]
