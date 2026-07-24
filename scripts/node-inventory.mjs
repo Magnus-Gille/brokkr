@@ -4,12 +4,13 @@
 // that cannot be probed read-only come from an owner-only overlay file or are
 // reported as explicit unknowns; nothing is invented.
 import fs from "node:fs";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
-  assertPinnedContractFiles, checkSchema, evidenceDigest, observationEvidenceId, schemaErrors, strictUtc,
+  assertPinnedContractFiles, canonicalJson, checkSchema, evidenceDigest, observationEvidenceId, schemaErrors, strictUtc,
 } from "./lib/node-substrate-contract.mjs";
 
 const fail = (message) => {
@@ -31,6 +32,27 @@ try {
 
 const detailRequested = process.argv.slice(2).every((arg) => arg === "--detail") && process.argv.length === 3;
 if (!detailRequested && process.argv.length !== 2) fail("usage: node-inventory.mjs [--detail]");
+
+const loadDetailSigningKey = () => {
+  const keyPath = process.env.BROKKR_INVENTORY_DETAIL_SIGNING_KEY;
+  if (!keyPath) fail("BROKKR_INVENTORY_DETAIL_SIGNING_KEY is required with --detail");
+  let fd;
+  try {
+    fd = fs.openSync(keyPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || (typeof process.getuid === "function" && stat.uid !== process.getuid()) || (stat.mode & 0o077) !== 0) throw new Error();
+    const privateKey = crypto.createPrivateKey(fs.readFileSync(fd));
+    if (privateKey.asymmetricKeyType !== "ed25519") throw new Error();
+    const publicKey = crypto.createPublicKey(privateKey);
+    const signingKeyId = `sha256:${crypto.createHash("sha256").update(publicKey.export({ type: "spki", format: "der" })).digest("hex")}`;
+    return { privateKey, signingKeyId };
+  } catch {
+    fail("detail signing key must be an owner-only regular Ed25519 private key");
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+};
+const detailSigning = detailRequested ? loadDetailSigningKey() : null;
 
 // --- Strict input validation, before any collection.
 // The contract id pattern allows 63 chars.  Evidence ids use a hash of the
@@ -364,10 +386,16 @@ if (detailRequested) {
     kind: "brokkr-node-inventory-detail",
     schema_version: "v1",
     observation_evidence_id: record.evidence.evidence_id,
+    observation_digest: record.evidence.digest,
+    observed_at: record.observed_at,
+    valid_until: record.valid_until,
+    signing_key_id: detailSigning.signingKeyId,
     unit_state: unitObservation,
     workloads: overlay?.workloads ?? [],
     backup_roles: overlay?.backup_roles ?? [],
   };
+  detail.detail_digest = `sha256:${crypto.createHash("sha256").update(canonicalJson(detail)).digest("hex")}`;
+  detail.signature = crypto.sign(null, Buffer.from(canonicalJson(detail)), detailSigning.privateKey).toString("base64");
   process.stderr.write(`Brokkr node inventory detail JSON: ${JSON.stringify(detail)}\n`);
 }
 const unitsSummary = unitObservation.status === "unavailable" ? "units=unavailable"
