@@ -77,5 +77,35 @@ env -i \
   >"$TMP/config.out" 2>&1
 check "config file can explicitly supply Ratatoskr URL" grep -q 'http://ratatoskr-config.example/api/send' "$CALLS"
 
+# Regression (brokkr-maintenance-os exit 1, 2026-07-25): the real ratatoskr/.env
+# on the control node never defines RATATOSKR_URL (it's a client-side setting —
+# Ratatoskr doesn't need to know its own URL), only RATATOSKR_SEND_API_KEY,
+# TELEGRAM_ALLOWED_USERS, and TELEGRAM_BOT_TOKEN. _notify_cfg_get's pipeline
+# (`grep | head | cut | tr`) returns grep's "no match" exit status (1) under the
+# caller's inherited `set -o pipefail`, even though "key absent from this file"
+# is an explicitly documented, valid, best-effort outcome — NOT a hard error. A
+# bare `url="${RATATOSKR_URL:-$(_notify_cfg_get ...)}"` assignment then aborts
+# the whole calling script (maintenance-report.sh, `set -euo pipefail`) under
+# set -e, breaking the documented contract that "a notify failure NEVER fails
+# the calling script" (notify.sh header). Reproduce with a config file that
+# omits the RATATOSKR_URL= line entirely (not merely sets it empty).
+cat >"$TMP/prod-shaped.env" <<'EOF'
+RATATOSKR_SEND_API_KEY=fake-send-key
+TELEGRAM_ALLOWED_USERS=123456789
+TELEGRAM_BOT_TOKEN=fake-bot-token
+EOF
+: >"$CALLS"
+set +e
+env -i \
+  HOME="$TMP/home" PATH="$TMP/bin:/usr/local/bin:/usr/bin:/bin" MOCK_CALLS="$CALLS" \
+  RATATOSKR_ENV="$TMP/missing-ratatoskr.env" NOTIFY_ENV="$TMP/prod-shaped.env" \
+  bash -c 'set -euo pipefail; source "$1"; notify_telegram "synthetic alert"' _ "$LIB" \
+  >"$TMP/prod-shaped.out" 2>&1
+prod_rc=$?
+set -e
+check "a config file missing an unrelated key does not abort the caller" test "$prod_rc" -eq 0
+check "the lookup falls through to the direct Telegram fallback" \
+  grep -q 'api.telegram.org/botfake-bot-token/sendMessage' "$CALLS"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

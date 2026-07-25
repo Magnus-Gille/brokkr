@@ -37,9 +37,17 @@ _notify_json_string() {
 # Read VAR= from a config file (grep only — never sources the file).
 # $1 = config file path, $2 = variable name. Prints the value (may be empty).
 # Strips wrapping double-quotes and any CR so a CRLF-saved file still parses.
+# "Key not present in this file" is an expected, valid outcome (e.g. the real
+# ratatoskr/.env never sets RATATOSKR_URL — that's a client-side setting), NOT
+# an error: it must not surface as a nonzero exit. Without the trailing
+# `|| true`, grep's own "no match" status (1) would otherwise propagate through
+# this pipeline under a caller's `set -o pipefail` and abort the whole script
+# under `set -e` — exactly what broke brokkr-maintenance-os.service (issue
+# filed 2026-07-25): notify_telegram() is documented as best-effort and must
+# never fail the calling script.
 _notify_cfg_get() {
   [[ -f "$1" ]] || return 0
-  grep -E "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"\r'
+  grep -E "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"\r' || true
 }
 
 notify_telegram() {

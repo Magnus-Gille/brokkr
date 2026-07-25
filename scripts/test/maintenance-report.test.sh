@@ -102,5 +102,53 @@ check "dependency run logs under the canonical maintenance namespace" has_call m
 MODE=brew run_report
 check "brew run logs under the canonical maintenance namespace" has_call memory_log maintenance
 
+# Regression (brokkr-maintenance-os exit 1, 2026-07-25): on the live host, os
+# mode exited 1 daily even though it completed its report correctly. Root
+# cause: a deploy-tier host was unreachable (nas.local), which is a normal,
+# already-alerted condition (any_action=true) — NOT a script failure. Sending
+# that alert calls notify_telegram(), which resolves its config from
+# ratatoskr/.env. That file never sets RATATOSKR_URL (Ratatoskr doesn't need
+# its own URL — only RATATOSKR_SEND_API_KEY/TELEGRAM_ALLOWED_USERS/
+# TELEGRAM_BOT_TOKEN), and the lookup helper's pipeline propagated grep's
+# "no match" status through `set -o pipefail`, aborting the whole script
+# under `set -e`. Reproduce end-to-end: an unreachable deploy host + a
+# prod-shaped notify config missing RATATOSKR_URL must still exit 0.
+mkdir -p "$TMP/unreachable/bin"
+cat >"$TMP/unreachable/bin/ssh" <<'MOCK'
+#!/usr/bin/env bash
+# Every host, including the liveness check ("... true"), is unreachable.
+exit 255
+MOCK
+cp "$TMP/bin/curl" "$TMP/bin/hostname" "$TMP/unreachable/bin/"
+chmod +x "$TMP/unreachable/bin/ssh"
+
+cat >"$TMP/unreachable-services.json" <<'JSON'
+{"components":[{"name":"fixture","repo":"fixture","host":"nas-fixture.example","deploy":true,"scan":false}]}
+JSON
+cat >"$TMP/prod-shaped-notify.env" <<'EOF'
+RATATOSKR_SEND_API_KEY=fake-send-key
+TELEGRAM_ALLOWED_USERS=123456789
+TELEGRAM_BOT_TOKEN=fake-bot-token
+EOF
+
+: >"$TMP/calls.jsonl"
+set +e
+env \
+  PATH="$TMP/unreachable/bin:$PATH" \
+  MOCK_MUNIN_CALLS="$TMP/calls.jsonl" \
+  MUNIN_TOKEN=fixture-token \
+  REGISTRY_PATH="$TMP/unreachable-services.json" \
+  REGISTRY_NO_GIT=1 \
+  REPOS_DIR="$TMP/repos" \
+  RATATOSKR_ENV="$TMP/missing-ratatoskr.env" \
+  NOTIFY_ENV="$TMP/prod-shaped-notify.env" \
+  bash "$ROOT/scripts/maintenance-report.sh" os >"$TMP/unreachable.out" 2>&1
+unreachable_rc=$?
+set -e
+check "an unreachable deploy host + prod-shaped notify config still exits 0" \
+  test "$unreachable_rc" -eq 0
+check "the run still reports the unreachable host, not a silent abort" \
+  grep -q 'nas-fixture: UNREACHABLE' "$TMP/unreachable.out"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
