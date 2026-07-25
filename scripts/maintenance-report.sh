@@ -143,7 +143,12 @@ report_log() {    # namespace content tags_json
     || { echo "WARNING: Munin payload build failed ($1)" >&2; return 0; }
   munin_tool_call memory_log "$args" >/dev/null || echo "WARNING: Munin log failed ($1)" >&2
 }
-alert() { $DRY_RUN && { echo "  [dry-run] telegram: $1"; return 0; }; notify_telegram "$1"; }
+# notify.sh documents notify_telegram() as best-effort: a notify failure must
+# NEVER fail this report. Guard the call itself (not just notify.sh's own
+# internals) so a future bug inside the notify path degrades to a skipped
+# alert instead of silently aborting the whole maintenance run under `set -e`
+# (see brokkr-maintenance-os exit-1 regression, 2026-07-25).
+alert() { $DRY_RUN && { echo "  [dry-run] telegram: $1"; return 0; }; notify_telegram "$1" || echo "  WARNING: alert dispatch failed (best-effort, continuing)" >&2; }
 
 # ═════════════════════════════════════════════════════════════════════════════
 # OS MODE
