@@ -303,7 +303,9 @@ check assert "$TMP/golden.json" \
   'r.gates.kernel_recovery === "eligible"' \
   'r.gates.workload_hooks === "not_applicable"' \
   'r.blockers.length === 0' \
-  'r.running_kernel === "6.1.0-1-amd64"'
+  'r.running_kernel === "6.1.0-1-amd64"' \
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "no-adapter-detected")' \
+  'r.unmet_policy_classes.length === 0'
 check decision-valid "$TMP/golden.json"
 check no-private "$TMP/golden.json"
 
@@ -423,26 +425,52 @@ if run_plan "$TMP/mock-no-clock" "$TMP/policy-normal.json" "$TMP/inventory-m5.js
   2026-07-23T10:30:00Z 2026-07-22 0 PT0S >"$TMP/noclock.json"; then fail "unsupported clock check passed"; fi
 check assert "$TMP/noclock.json" 'r.blockers.some(b => b.code === "bad-clock")' 'r.gates.clock === "unsupported"'
 
-# ─── 13. Unsupported firmware is reported honestly, never silently dropped ───
+# ─── 13. Unsupported firmware is reported honestly, never silently dropped, and
+#     the shortfall against declared policy intent is visible at the envelope
+#     level regardless of which firmware branch produced it (brokkr#40). ───
 # Policy allows firmware, no adapter present at all.
 run_plan "$TMP/mock-none" "$TMP/policy-firmware-allowed.json" "$TMP/inventory-m5.json" "-" \
   2026-07-23T10:30:00Z 2026-07-22 0 PT0S >"$TMP/fw-none.json"
 check assert "$TMP/fw-none.json" \
   'r.outcome === "planned"' \
-  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "no-adapter-detected")'
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "no-adapter-detected")' \
+  'r.unmet_policy_classes.some(u => u.class === "firmware")'
 
-# rpi-eeprom present, update pending -> candidate is always reported, never eligible.
+# rpi-eeprom present, update pending, policy allows firmware -> candidate is
+# always reported, never eligible, AND the shortfall must now surface at the
+# envelope level (this is the exact gap brokkr#40 was filed for: previously
+# unsupported_classes stayed empty here even though the policy explicitly
+# requested firmware and it cannot be served).
 run_plan "$TMP/mock-eeprom" "$TMP/policy-firmware-allowed.json" "$TMP/inventory-m5.json" "-" \
   2026-07-23T10:30:00Z 2026-07-22 0 PT0S MAINT_FW_PENDING=1 >"$TMP/fw-eeprom.json"
 check assert "$TMP/fw-eeprom.json" \
   'r.candidates.some(c => c.class === "firmware" && c.eligible === false && c.reasons.includes("firmware-recovery-unsupported"))' \
-  'r.unsupported_classes.length === 0'
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "firmware-recovery-unsupported")' \
+  'r.unmet_policy_classes.some(u => u.class === "firmware")' \
+  'r.outcome === "planned"'
+
+# Same adapter-detected/recovery-unsupported situation, but the policy does NOT
+# request firmware at all. unsupported_classes still reports the structural
+# capability gap (a host-capability fact, independent of what the current
+# policy happens to ask for -- the same "always report" convention
+# gates.kernel_recovery already uses regardless of policy.allowed_classes),
+# but it must NOT count as a declared-intent shortfall: unmet_policy_classes
+# must stay empty because the operator never asked for this class.
+run_plan "$TMP/mock-eeprom" "$TMP/policy-normal.json" "$TMP/inventory-m5.json" "-" \
+  2026-07-23T10:30:00Z 2026-07-22 0 PT0S MAINT_FW_PENDING=1 >"$TMP/fw-eeprom-not-requested.json"
+check assert "$TMP/fw-eeprom-not-requested.json" \
+  'r.candidates.some(c => c.class === "firmware" && c.eligible === false && c.reasons.includes("firmware-recovery-unsupported"))' \
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "firmware-recovery-unsupported")' \
+  'r.unmet_policy_classes.length === 0' \
+  'r.outcome === "planned"'
 
 # fwupd present, one device pending -> same honesty guarantee via the other adapter.
 run_plan "$TMP/mock-fwupd" "$TMP/policy-firmware-allowed.json" "$TMP/inventory-m5.json" "-" \
   2026-07-23T10:30:00Z 2026-07-22 0 PT0S MAINT_FW_PENDING=1 >"$TMP/fw-fwupd.json"
 check assert "$TMP/fw-fwupd.json" \
-  'r.candidates.some(c => c.class === "firmware" && c.eligible === false)'
+  'r.candidates.some(c => c.class === "firmware" && c.eligible === false)' \
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "firmware-recovery-unsupported")' \
+  'r.unmet_policy_classes.some(u => u.class === "firmware")'
 
 # ─── 14. Kernel candidates gated by policy AND recovery eligibility ───
 run_plan "$TMP/mock-none" "$TMP/policy-kernel-allowed.json" "$TMP/inventory-m5.json" "-" \
@@ -458,7 +486,7 @@ check assert "$TMP/kernel-no-rollback.json" \
   'r.gates.kernel_recovery === "not_eligible"'
 
 # ─── 15. Redaction: no absolute local paths, credentials, or shell fragments ───
-for f in golden hooks-ready missed overdue max-deferral fw-eeprom fw-fwupd kernel-ok; do
+for f in golden hooks-ready missed overdue max-deferral fw-eeprom fw-eeprom-not-requested fw-fwupd kernel-ok; do
   check no-private "$TMP/$f.json"
 done
 
