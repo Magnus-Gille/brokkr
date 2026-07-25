@@ -195,9 +195,9 @@ EOF
 
 # Variants: which firmware adapter (if any) is present in PATH, and a
 # no-timedatectl variant for the "unsupported clock check" case.
-mkdir -p "$TMP/mock-none" "$TMP/mock-eeprom" "$TMP/mock-fwupd" "$TMP/mock-no-clock"
+mkdir -p "$TMP/mock-none" "$TMP/mock-eeprom" "$TMP/mock-eeprom-failed" "$TMP/mock-fwupd" "$TMP/mock-no-clock"
 for f in apt-get fuser df dpkg-query timedatectl uname; do
-  for variant in none eeprom fwupd; do cp "$BASE_MOCK/$f" "$TMP/mock-$variant/$f"; done
+  for variant in none eeprom eeprom-failed fwupd; do cp "$BASE_MOCK/$f" "$TMP/mock-$variant/$f"; done
   [ "$f" = timedatectl ] || cp "$BASE_MOCK/$f" "$TMP/mock-no-clock/$f"
 done
 
@@ -211,6 +211,18 @@ else
 fi
 EOF
 chmod +x "$TMP/mock-eeprom/rpi-eeprom-update"
+
+# Adapter present but the probe itself fails (nonzero exit, not ENOENT) --
+# execFileSync throws a non-ENOENT error, so readOnly() reports status
+# "failed" (not "missing"), which still sets firmwareAdapter = "rpi-eeprom"
+# (brokkr#41 review: this was the silent case -- probe failure suppressed
+# BOTH the "none" fallback and the old pending-only push).
+cat >"$TMP/mock-eeprom-failed/rpi-eeprom-update" <<'EOF'
+#!/bin/sh
+printf '%s\n' "rpi-eeprom-update" >> "$MAINT_TEST_LOG"
+exit 1
+EOF
+chmod +x "$TMP/mock-eeprom-failed/rpi-eeprom-update"
 
 cat >"$TMP/mock-fwupd/fwupdmgr" <<'EOF'
 #!/bin/sh
@@ -303,7 +315,9 @@ check assert "$TMP/golden.json" \
   'r.gates.kernel_recovery === "eligible"' \
   'r.gates.workload_hooks === "not_applicable"' \
   'r.blockers.length === 0' \
-  'r.running_kernel === "6.1.0-1-amd64"'
+  'r.running_kernel === "6.1.0-1-amd64"' \
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "no-adapter-detected")' \
+  'r.unmet_policy_classes.length === 0'
 check decision-valid "$TMP/golden.json"
 check no-private "$TMP/golden.json"
 
@@ -423,26 +437,100 @@ if run_plan "$TMP/mock-no-clock" "$TMP/policy-normal.json" "$TMP/inventory-m5.js
   2026-07-23T10:30:00Z 2026-07-22 0 PT0S >"$TMP/noclock.json"; then fail "unsupported clock check passed"; fi
 check assert "$TMP/noclock.json" 'r.blockers.some(b => b.code === "bad-clock")' 'r.gates.clock === "unsupported"'
 
-# ─── 13. Unsupported firmware is reported honestly, never silently dropped ───
+# ─── 13. Unsupported firmware is reported honestly, never silently dropped, and
+#     the shortfall against declared policy intent is visible at the envelope
+#     level regardless of which firmware branch produced it (brokkr#40). ───
 # Policy allows firmware, no adapter present at all.
 run_plan "$TMP/mock-none" "$TMP/policy-firmware-allowed.json" "$TMP/inventory-m5.json" "-" \
   2026-07-23T10:30:00Z 2026-07-22 0 PT0S >"$TMP/fw-none.json"
 check assert "$TMP/fw-none.json" \
   'r.outcome === "planned"' \
-  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "no-adapter-detected")'
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "no-adapter-detected")' \
+  'r.unmet_policy_classes.some(u => u.class === "firmware")'
 
-# rpi-eeprom present, update pending -> candidate is always reported, never eligible.
+# rpi-eeprom present, update pending, policy allows firmware -> candidate is
+# always reported, never eligible, AND the shortfall must now surface at the
+# envelope level (this is the exact gap brokkr#40 was filed for: previously
+# unsupported_classes stayed empty here even though the policy explicitly
+# requested firmware and it cannot be served).
 run_plan "$TMP/mock-eeprom" "$TMP/policy-firmware-allowed.json" "$TMP/inventory-m5.json" "-" \
   2026-07-23T10:30:00Z 2026-07-22 0 PT0S MAINT_FW_PENDING=1 >"$TMP/fw-eeprom.json"
 check assert "$TMP/fw-eeprom.json" \
   'r.candidates.some(c => c.class === "firmware" && c.eligible === false && c.reasons.includes("firmware-recovery-unsupported"))' \
-  'r.unsupported_classes.length === 0'
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "firmware-recovery-unsupported")' \
+  'r.unmet_policy_classes.some(u => u.class === "firmware")' \
+  'r.outcome === "planned"'
+
+# Same adapter-detected/recovery-unsupported situation, but the policy does NOT
+# request firmware at all. unsupported_classes still reports the structural
+# capability gap (a host-capability fact, independent of what the current
+# policy happens to ask for -- the same "always report" convention
+# gates.kernel_recovery already uses regardless of policy.allowed_classes),
+# but it must NOT count as a declared-intent shortfall: unmet_policy_classes
+# must stay empty because the operator never asked for this class.
+run_plan "$TMP/mock-eeprom" "$TMP/policy-normal.json" "$TMP/inventory-m5.json" "-" \
+  2026-07-23T10:30:00Z 2026-07-22 0 PT0S MAINT_FW_PENDING=1 >"$TMP/fw-eeprom-not-requested.json"
+check assert "$TMP/fw-eeprom-not-requested.json" \
+  'r.candidates.some(c => c.class === "firmware" && c.eligible === false && c.reasons.includes("firmware-recovery-unsupported"))' \
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "firmware-recovery-unsupported")' \
+  'r.unmet_policy_classes.length === 0' \
+  'r.outcome === "planned"'
 
 # fwupd present, one device pending -> same honesty guarantee via the other adapter.
 run_plan "$TMP/mock-fwupd" "$TMP/policy-firmware-allowed.json" "$TMP/inventory-m5.json" "-" \
   2026-07-23T10:30:00Z 2026-07-22 0 PT0S MAINT_FW_PENDING=1 >"$TMP/fw-fwupd.json"
 check assert "$TMP/fw-fwupd.json" \
-  'r.candidates.some(c => c.class === "firmware" && c.eligible === false)'
+  'r.candidates.some(c => c.class === "firmware" && c.eligible === false)' \
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "firmware-recovery-unsupported")' \
+  'r.unmet_policy_classes.some(u => u.class === "firmware")'
+
+# ─── 13b. Steady-state and probe-failure regressions (brokkr#41 review):
+#     firmware is unservable on every host, ALWAYS -- Brokkr has no automatic
+#     apply adapter for either mechanism, so a firmware candidate is NEVER
+#     eligible, independent of whether anything happens to be pending right
+#     now. The original brokkr#40 fix only pushed unsupported_classes from the
+#     pending-update branches, so the ordinary steady state (adapter present,
+#     nothing pending) and a FAILED probe (which still sets firmwareAdapter,
+#     suppressing the "none" fallback) both silently reported an empty
+#     unsupported_classes/unmet_policy_classes -- exactly the #40 failure mode
+#     the ticket exists to fix. ───
+
+# rpi-eeprom present, probe ok, nothing pending, policy allows firmware ->
+# no per-candidate line item (nothing to enumerate), but the structural
+# incapability and the policy shortfall MUST still be visible.
+run_plan "$TMP/mock-eeprom" "$TMP/policy-firmware-allowed.json" "$TMP/inventory-m5.json" "-" \
+  2026-07-23T10:30:00Z 2026-07-22 0 PT0S MAINT_FW_PENDING=0 >"$TMP/fw-eeprom-idle.json"
+check assert "$TMP/fw-eeprom-idle.json" \
+  '!r.candidates.some(c => c.class === "firmware")' \
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "firmware-recovery-unsupported")' \
+  'r.unmet_policy_classes.some(u => u.class === "firmware")' \
+  'r.outcome === "planned"'
+
+# fwupd present, probe ok, zero devices (Devices: []), policy allows firmware
+# -> same steady-state guarantee via the other adapter.
+run_plan "$TMP/mock-fwupd" "$TMP/policy-firmware-allowed.json" "$TMP/inventory-m5.json" "-" \
+  2026-07-23T10:30:00Z 2026-07-22 0 PT0S MAINT_FW_PENDING=0 >"$TMP/fw-fwupd-idle.json"
+check assert "$TMP/fw-fwupd-idle.json" \
+  '!r.candidates.some(c => c.class === "firmware")' \
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "firmware-recovery-unsupported")' \
+  'r.unmet_policy_classes.some(u => u.class === "firmware")' \
+  'r.outcome === "planned"'
+
+# rpi-eeprom adapter present but the probe itself FAILS (nonzero exit) ->
+# firmwareAdapter is still "rpi-eeprom" (status "failed" counts, per the
+# comment above eepromProbe/fwupdProbe), so this must NOT fall through to
+# "no-adapter-detected"; it must report "firmware-recovery-unsupported" and
+# still count as an unmet policy shortfall. This was the worst silent case:
+# probe failure suppressed both the "none" fallback and the old pending-only
+# push.
+run_plan "$TMP/mock-eeprom-failed" "$TMP/policy-firmware-allowed.json" "$TMP/inventory-m5.json" "-" \
+  2026-07-23T10:30:00Z 2026-07-22 0 PT0S >"$TMP/fw-eeprom-failed.json"
+check assert "$TMP/fw-eeprom-failed.json" \
+  '!r.candidates.some(c => c.class === "firmware")' \
+  'r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "firmware-recovery-unsupported")' \
+  '!r.unsupported_classes.some(u => u.class === "firmware" && u.reason === "no-adapter-detected")' \
+  'r.unmet_policy_classes.some(u => u.class === "firmware")' \
+  'r.outcome === "planned"'
 
 # ─── 14. Kernel candidates gated by policy AND recovery eligibility ───
 run_plan "$TMP/mock-none" "$TMP/policy-kernel-allowed.json" "$TMP/inventory-m5.json" "-" \
@@ -458,7 +546,8 @@ check assert "$TMP/kernel-no-rollback.json" \
   'r.gates.kernel_recovery === "not_eligible"'
 
 # ─── 15. Redaction: no absolute local paths, credentials, or shell fragments ───
-for f in golden hooks-ready missed overdue max-deferral fw-eeprom fw-fwupd kernel-ok; do
+for f in golden hooks-ready missed overdue max-deferral fw-eeprom fw-eeprom-not-requested fw-fwupd \
+  fw-eeprom-idle fw-fwupd-idle fw-eeprom-failed kernel-ok; do
   check no-private "$TMP/$f.json"
 done
 

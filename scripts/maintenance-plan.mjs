@@ -362,6 +362,10 @@ function main() {
     if (!policy.updates.allowed_sources.includes("vendor_signed_firmware_channel")) reasons.push("source-not-allowed-by-policy");
     return reasons;
   };
+  // Candidate emission: only surfaces an explicit firmware candidate when a
+  // detected adapter also reports something pending right now. This governs
+  // ONLY the (optional) per-candidate line item, never unsupportedClasses --
+  // see the unconditional push below.
   if (firmwareAdapter === "rpi-eeprom" && eepromProbe.status === "ok" && /update available/i.test(eepromProbe.out)) {
     candidates.push({ id: "rpi-eeprom-update@pending", name: "rpi-eeprom-update", class: "firmware", source: "vendor_signed_firmware_channel", current_version: null, candidate_version: null, eligible: false, reasons: firmwareReasons() });
   } else if (firmwareAdapter === "fwupd" && fwupdProbe.status === "ok") {
@@ -369,11 +373,44 @@ function main() {
     try { parsed = JSON.parse(fwupdProbe.out); } catch { /* malformed JSON handled as unsupported below */ }
     const devices = plain(parsed) && Array.isArray(parsed.Devices) ? parsed.Devices : null;
     if (devices === null) add(true, "firmware-evidence-unparseable", "brokkr", "fwupdmgr get-upgrades output could not be parsed safely.");
-    else for (const device of devices) candidates.push({ id: `fwupd-device@${idFrom("fw", device).slice(0, 12)}`, name: "fwupd-managed-device", class: "firmware", source: "vendor_signed_firmware_channel", current_version: null, candidate_version: null, eligible: false, reasons: firmwareReasons() });
+    else if (devices.length) {
+      for (const device of devices) candidates.push({ id: `fwupd-device@${idFrom("fw", device).slice(0, 12)}`, name: "fwupd-managed-device", class: "firmware", source: "vendor_signed_firmware_channel", current_version: null, candidate_version: null, eligible: false, reasons: firmwareReasons() });
+    }
   }
-  if (policy.updates.allowed_classes.includes("firmware") && firmwareAdapter === "none") {
+  // unsupportedClasses is a structural, policy-independent statement of what
+  // this planner cannot serve on this host at all -- exactly like
+  // gates.kernel_recovery is reported regardless of whether "kernel" is in
+  // policy.updates.allowed_classes. It must be populated from EVERY branch
+  // that determines a class cannot be served, not just "an update happens to
+  // be pending right now" (brokkr#40 fixed the "no adapter" omission;
+  // brokkr#41 review found the fix still only fired on the pending-update
+  // branches above -- an adapter present with nothing pending, or with a
+  // FAILED probe, pushed nothing, so the ordinary steady state and, worse,
+  // probe failure were both silently invisible). Firmware is unservable on
+  // every host, always: Brokkr has no automatic apply adapter for either
+  // mechanism (see the comment above `eepromProbe`/`fwupdProbe`), so this
+  // push depends only on whether an adapter was detected at all -- never on
+  // probe status (ok/failed) or on whether anything is pending. The two
+  // branches are mutually exclusive by construction (firmwareAdapter has
+  // exactly one value), so no duplicate entry is possible.
+  if (firmwareAdapter === "none") {
     unsupportedClasses.push({ class: "firmware", reason: "no-adapter-detected" });
+  } else {
+    unsupportedClasses.push({ class: "firmware", reason: "firmware-recovery-unsupported" });
   }
+
+  // unmet_policy_classes (brokkr#40) is the policy-requested SUBSET of
+  // unsupportedClasses -- the actual declared-intent shortfall. A class the
+  // policy never asked for landing in unsupportedClasses is a capability fact,
+  // not a shortfall; a class the policy explicitly requested (present in
+  // policy.updates.allowed_classes) that cannot be served is. This is purely
+  // additive to the v1 envelope and does not change `outcome`: blocking every
+  // security patch because one class is unserviceable is the worse
+  // operational outcome, and firmware support is a per-class property, not a
+  // host-safety property. Consumers MUST treat a non-empty
+  // unmet_policy_classes[] as a declared-intent shortfall -- checking
+  // `outcome` alone is NOT sufficient to detect it. See docs/maintenance-plan.md.
+  const unmetPolicyClasses = unsupportedClasses.filter((item) => policy.updates.allowed_classes.includes(item.class));
 
   const sortedCandidates = sortBy(candidates, "id");
   const sortedBlockers = sortBy(blockers, "code");
@@ -403,6 +440,7 @@ function main() {
     hook_gaps: sortBy(hookGaps.map((code) => ({ code })), "code"),
     candidates: sortedCandidates,
     unsupported_classes: sortBy(unsupportedClasses, "class"),
+    unmet_policy_classes: sortBy(unmetPolicyClasses, "class"),
     blockers: sortedBlockers,
     created_at: now,
   };
@@ -427,7 +465,7 @@ function failurePlan(error) {
     inventory_evidence_id: context.inventory?.evidence?.evidence_id ?? "obs-unavailable",
     decision: null, running_kernel: "unknown",
     gates: { package_manager_lock: "unknown", disk: "unknown", power: "unknown", clock: "unknown", workload_hooks: "not_applicable", kernel_recovery: "unknown" },
-    hook_gaps: [], candidates: [], unsupported_classes: [], blockers: [item], created_at: now,
+    hook_gaps: [], candidates: [], unsupported_classes: [], unmet_policy_classes: [], blockers: [item], created_at: now,
   };
   result.plan_digest = hash(result);
   return result;

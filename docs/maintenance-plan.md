@@ -82,6 +82,7 @@ Grimnir `maintenance-decision` record:
      "current_version": "7.88.1-10", "candidate_version": "7.88.1-10+deb12u5", "eligible": true, "reasons": []}
   ],
   "unsupported_classes": [{"class": "firmware", "reason": "no-adapter-detected"}],
+  "unmet_policy_classes": [{"class": "firmware", "reason": "no-adapter-detected"}],
   "blockers": [{"code": "...", "owner": "brokkr|grimnir", "message": "..."}],
   "created_at": "2026-07-23T10:30:00Z"
 }
@@ -124,6 +125,65 @@ honestly. Reviewers who read "fail closed on ... unsupported firmware" in the ti
 requiring a whole-plan block should flag this in review; the per-candidate fail-closed
 (never eligible, always reported) reading is the one implemented here.
 
+## `unsupported_classes[]` vs `unmet_policy_classes[]` (brokkr#40)
+
+PR #39 populated top-level `unsupported_classes[]` from only one of the two firmware
+branches ("no adapter detected"), leaving it empty when an adapter *was* detected but
+recovery was still unsupported — even though a candidate had already been emitted with
+`eligible: false` and `reasons: ["firmware-recovery-unsupported"]`. A consumer checking
+only the obvious envelope-level summary fields (`outcome`, `unsupported_classes`) would
+conclude the policy's declared intent was fully covered when it was not. brokkr#40 fixes
+this and adds a second, purposely distinct field:
+
+- **`unsupported_classes[]`** is a structural, **policy-independent** statement of every
+  class this planner cannot serve on this host at all, regardless of which code path
+  determined that (`no-adapter-detected` or `firmware-recovery-unsupported` today). It is
+  populated the same way whether or not the current policy even requests that class —
+  exactly the same convention `gates.kernel_recovery` already uses (reported regardless of
+  whether `kernel` is in `policy.updates.allowed_classes`). This answers "what can this
+  planner never do on this host," a fact about node capability, not about a specific
+  policy.
+- **`unmet_policy_classes[]`** is the **policy-requested subset** of
+  `unsupported_classes[]` — entries whose `class` is present in
+  `policy.updates.allowed_classes`. This is the actual shortfall against the operator's
+  *declared intent*: the operator explicitly asked for this class and it cannot be
+  served. A class landing in `unsupported_classes[]` that the policy never asked for is
+  **not** a shortfall and correctly does not appear here.
+
+**Design decision (owned by the Grimnir orchestrator, adopted as-is): `outcome: "planned"`
+may still stand when `unmet_policy_classes[]` is non-empty.** Blocking every security
+patch because one class is unserviceable is the worse operational outcome, and firmware
+support is a per-class property, not a host-safety property like a held package-manager
+lock or unsafe power (see the fail-closed matrix below). Instead, the shortfall is made
+visible at the envelope level via this new field.
+
+**Consumer contract — normative:** a consumer of this envelope **MUST** treat a
+non-empty `unmet_policy_classes[]` as a declared-intent shortfall. Checking `outcome`
+alone is **not sufficient** to detect it: `outcome` can be `"planned"` while
+`unmet_policy_classes[]` is non-empty. `unmet_policy_classes[]` being empty means every
+policy-requested class either has no shortfall or was never requested; it does **not** by
+itself mean every requested class was successfully applied — per-candidate eligibility in
+`candidates[]` remains the source of truth for individual outcomes.
+
+**Field-by-field compatibility, corrected:** `unmet_policy_classes[]` is a brand-new
+field — genuinely additive, so it cannot break a not-yet-built consumer (#10/#35) that
+doesn't know it exists. `unsupported_classes[]` is **not** new and this change is **not**
+purely additive to it: brokkr#40 also dropped the old
+`policy.updates.allowed_classes.includes("firmware") &&` guard that previously gated the
+push, changing this existing v1 envelope field's meaning from "policy-requested *and*
+unservable" to "unservable, period" — it now also fires for a class the policy never
+asked for (see `no-adapter-detected`/`firmware-recovery-unsupported` above, and the
+"not requested" test case in `scripts/test/maintenance-plan.test.sh`). That reframing is
+intentional and matches `gates.kernel_recovery`'s existing policy-independent convention,
+but it is a semantic change to an existing field, not an additive one; a hypothetical
+consumer that already read `unsupported_classes[]` under the old, narrower meaning would
+see it populated in cases it previously wasn't. With no real #10/#35 consumers built yet,
+the practical risk of this is ~zero, but the framing should not claim otherwise. If #10
+later finds that real consumers switch on `outcome` alone and never look at
+`unmet_policy_classes[]`, the `outcome` enum can gain a distinct value at that point
+(e.g. an explicit `"planned_with_unmet_classes"`) — this decision is deliberately
+extendable, not a final word on the envelope shape.
+
 ## Fail-closed matrix (whole-plan blockers, `outcome: "blocked"`, exit 3)
 
 | Condition | Blocker code |
@@ -144,8 +204,9 @@ requiring a whole-plan block should flag this in review; the per-candidate fail-
 | Clock not synchronized, or synchronization status unsupported (no `timedatectl`) | `bad-clock` |
 | Vendored Grimnir contract files fail their SHA-256 pins | `pinned-contract-invalid` |
 
-Workload-hook gaps and per-candidate ineligibility (including unsupported firmware) are
-reported in `hook_gaps`/`candidates[].reasons` but do **not** by themselves block the
+Workload-hook gaps and per-candidate ineligibility (including unsupported firmware,
+surfaced at the envelope level in `unsupported_classes[]`/`unmet_policy_classes[]` — see
+above) are reported in `hook_gaps`/`candidates[].reasons` but do **not** by themselves block the
 whole plan — see the design decision above.
 
 ## Provably non-mutating
