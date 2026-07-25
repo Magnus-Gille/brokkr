@@ -362,17 +362,12 @@ function main() {
     if (!policy.updates.allowed_sources.includes("vendor_signed_firmware_channel")) reasons.push("source-not-allowed-by-policy");
     return reasons;
   };
-  // unsupportedClasses is a structural, policy-independent statement of what
-  // this planner cannot serve on this host at all -- exactly like
-  // gates.kernel_recovery is reported regardless of whether "kernel" is in
-  // policy.updates.allowed_classes. It must be populated from EVERY branch
-  // that determines a class cannot be served, not just the "no adapter"
-  // branch (brokkr#40: "adapter detected, recovery unsupported" used to leave
-  // unsupported_classes empty even though the candidate itself was already
-  // marked ineligible with reasons: ["firmware-recovery-unsupported"]).
+  // Candidate emission: only surfaces an explicit firmware candidate when a
+  // detected adapter also reports something pending right now. This governs
+  // ONLY the (optional) per-candidate line item, never unsupportedClasses --
+  // see the unconditional push below.
   if (firmwareAdapter === "rpi-eeprom" && eepromProbe.status === "ok" && /update available/i.test(eepromProbe.out)) {
     candidates.push({ id: "rpi-eeprom-update@pending", name: "rpi-eeprom-update", class: "firmware", source: "vendor_signed_firmware_channel", current_version: null, candidate_version: null, eligible: false, reasons: firmwareReasons() });
-    unsupportedClasses.push({ class: "firmware", reason: "firmware-recovery-unsupported" });
   } else if (firmwareAdapter === "fwupd" && fwupdProbe.status === "ok") {
     let parsed = null;
     try { parsed = JSON.parse(fwupdProbe.out); } catch { /* malformed JSON handled as unsupported below */ }
@@ -380,11 +375,28 @@ function main() {
     if (devices === null) add(true, "firmware-evidence-unparseable", "brokkr", "fwupdmgr get-upgrades output could not be parsed safely.");
     else if (devices.length) {
       for (const device of devices) candidates.push({ id: `fwupd-device@${idFrom("fw", device).slice(0, 12)}`, name: "fwupd-managed-device", class: "firmware", source: "vendor_signed_firmware_channel", current_version: null, candidate_version: null, eligible: false, reasons: firmwareReasons() });
-      unsupportedClasses.push({ class: "firmware", reason: "firmware-recovery-unsupported" });
     }
   }
+  // unsupportedClasses is a structural, policy-independent statement of what
+  // this planner cannot serve on this host at all -- exactly like
+  // gates.kernel_recovery is reported regardless of whether "kernel" is in
+  // policy.updates.allowed_classes. It must be populated from EVERY branch
+  // that determines a class cannot be served, not just "an update happens to
+  // be pending right now" (brokkr#40 fixed the "no adapter" omission;
+  // brokkr#41 review found the fix still only fired on the pending-update
+  // branches above -- an adapter present with nothing pending, or with a
+  // FAILED probe, pushed nothing, so the ordinary steady state and, worse,
+  // probe failure were both silently invisible). Firmware is unservable on
+  // every host, always: Brokkr has no automatic apply adapter for either
+  // mechanism (see the comment above `eepromProbe`/`fwupdProbe`), so this
+  // push depends only on whether an adapter was detected at all -- never on
+  // probe status (ok/failed) or on whether anything is pending. The two
+  // branches are mutually exclusive by construction (firmwareAdapter has
+  // exactly one value), so no duplicate entry is possible.
   if (firmwareAdapter === "none") {
     unsupportedClasses.push({ class: "firmware", reason: "no-adapter-detected" });
+  } else {
+    unsupportedClasses.push({ class: "firmware", reason: "firmware-recovery-unsupported" });
   }
 
   // unmet_policy_classes (brokkr#40) is the policy-requested SUBSET of

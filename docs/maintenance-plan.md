@@ -155,7 +155,7 @@ may still stand when `unmet_policy_classes[]` is non-empty.** Blocking every sec
 patch because one class is unserviceable is the worse operational outcome, and firmware
 support is a per-class property, not a host-safety property like a held package-manager
 lock or unsafe power (see the fail-closed matrix below). Instead, the shortfall is made
-visible at the envelope level via this new, purely additive field.
+visible at the envelope level via this new field.
 
 **Consumer contract — normative:** a consumer of this envelope **MUST** treat a
 non-empty `unmet_policy_classes[]` as a declared-intent shortfall. Checking `outcome`
@@ -165,11 +165,24 @@ policy-requested class either has no shortfall or was never requested; it does *
 itself mean every requested class was successfully applied — per-candidate eligibility in
 `candidates[]` remains the source of truth for individual outcomes.
 
-This field is additive, so it cannot break the not-yet-built consumers (#10/#35). If #10
+**Field-by-field compatibility, corrected:** `unmet_policy_classes[]` is a brand-new
+field — genuinely additive, so it cannot break a not-yet-built consumer (#10/#35) that
+doesn't know it exists. `unsupported_classes[]` is **not** new and this change is **not**
+purely additive to it: brokkr#40 also dropped the old
+`policy.updates.allowed_classes.includes("firmware") &&` guard that previously gated the
+push, changing this existing v1 envelope field's meaning from "policy-requested *and*
+unservable" to "unservable, period" — it now also fires for a class the policy never
+asked for (see `no-adapter-detected`/`firmware-recovery-unsupported` above, and the
+"not requested" test case in `scripts/test/maintenance-plan.test.sh`). That reframing is
+intentional and matches `gates.kernel_recovery`'s existing policy-independent convention,
+but it is a semantic change to an existing field, not an additive one; a hypothetical
+consumer that already read `unsupported_classes[]` under the old, narrower meaning would
+see it populated in cases it previously wasn't. With no real #10/#35 consumers built yet,
+the practical risk of this is ~zero, but the framing should not claim otherwise. If #10
 later finds that real consumers switch on `outcome` alone and never look at
 `unmet_policy_classes[]`, the `outcome` enum can gain a distinct value at that point
 (e.g. an explicit `"planned_with_unmet_classes"`) — this decision is deliberately
-additive and extendable, not a final word on the envelope shape.
+extendable, not a final word on the envelope shape.
 
 ## Fail-closed matrix (whole-plan blockers, `outcome: "blocked"`, exit 3)
 
