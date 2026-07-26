@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Brokkr node-agent negotiation v1",
+  "oneOf": [
+    {"type":"object","additionalProperties":false,"required":["kind","schema_version","agent_version","supported_platform_fault_versions","supported_node_substrate_versions"],"properties":{"kind":{"const":"brokkr-node-agent-handshake"},"schema_version":{"const":"v1"},"agent_version":{"type":"string"},"supported_platform_fault_versions":{"type":"array","items":{"type":"string"}},"supported_node_substrate_versions":{"type":"array","items":{"type":"string"}}}},
+    {"type":"object","additionalProperties":false,"required":["kind","schema_version","required_versions"],"properties":{"kind":{"const":"brokkr-node-agent-deployment"},"schema_version":{"const":"v1"},"required_versions":{"type":"object","additionalProperties":false,"required":["platform_fault","node_substrate"],"properties":{"platform_fault":{"type":"string"},"node_substrate":{"type":"string"}}}}}
+  ]
+}
