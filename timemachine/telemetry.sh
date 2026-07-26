@@ -22,9 +22,13 @@ case "$CONFIG" in /*) ;; *) fail "protected source is invalid" ;; esac
 owner="$(stat_attr '%u' '%u' "$CONFIG")"
 mode="$(stat_attr '%a' '%Lp' "$CONFIG")"
 [ "$owner" = "$(id -u)" ] && [ "$mode" = 600 ] || fail "protected source is unsafe"
-[ "$(grep -Ec '^BROKKR_TM_BANDS_DIR=/[^[:space:]]+$' "$CONFIG")" -eq 1 ] || fail "protected source is invalid"
-[ "$(wc -l < "$CONFIG" | tr -d ' ')" -eq 1 ] || fail "protected source is invalid"
+[ "$(grep -Ec '^BROKKR_TM_BANDS_DIR=/.*$' "$CONFIG")" -eq 1 ] || fail "protected source is invalid"
+awk 'END { exit (NR == 1 ? 0 : 1) }' "$CONFIG" || fail "protected source is invalid"
+if grep -q '[[:cntrl:]]' "$CONFIG"; then
+  fail "protected source is invalid"
+fi
 BROKKR_TM_BANDS_DIR="${CONFIG:+$(sed -n 's/^BROKKR_TM_BANDS_DIR=//p' "$CONFIG")}"
+case "$BROKKR_TM_BANDS_DIR" in /*) ;; *) fail "protected source is invalid" ;; esac
 case "$BROKKR_TM_BANDS_DIR" in /|*/|*'//'*|*'/./'*|*'/../'*|./*|../*|*/.|*/..|.) fail "protected source is invalid" ;; esac
 export BROKKR_TM_BANDS_DIR
 
