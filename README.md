@@ -58,6 +58,7 @@ required to run or understand Brokkr.
 | `systemd/`, `launchd/` | Example timers, service units, and resource limits |
 | `network/cloudflared/config.example.yml` | Placeholder-only tunnel configuration |
 | `profiles/` | Public location/network/storage examples and a non-mutating owner-overlay preflight |
+| `scripts/brokkr.mjs inspect <node>` | Bounded controller inspection of a configured stable node identity |
 | `scripts/relocation-planner.mjs` | Deterministic, no-mutation preflight plan from pinned intent, workload, inventory, detail, and location evidence |
 | `docs/`, `runbooks/` | Backup evidence, recovery, and operations guidance |
 | `scripts/test/` | Hermetic shell regression suite |
