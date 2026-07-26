@@ -23,8 +23,10 @@ public key. A bad transport, identity mismatch, malformed contract record, or
 untrusted detail is emitted only as a closed controller status; no remote
 output is passed through.
 
-`location_secret` is a high-entropy private stable token, not a human location name. Output
-contains only its SHA-256 digest, timestamps, and `known`/`partial`/`unknown`
+`location_secret` is a high-entropy private stable token, not a human location name. It
+must be `locv1_` followed by 43–86 base64url characters (at least 256 bits when
+generated randomly); the tracked placeholder is intentionally rejected. Output
+contains only the token's SHA-256 digest, timestamps, and `known`/`partial`/`unknown`
 provenance. Moving a host changes this opaque evidence while preserving its
 configured stable node identity. Expired node or location evidence is retained
 as `partial` with `freshness: stale`; it is never reported as current.

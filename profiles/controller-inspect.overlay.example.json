@@ -6,7 +6,7 @@
       "remote_dir": "/opt/brokkr",
       "signing_public_key": "-----BEGIN PUBLIC KEY-----\\nREPLACE_WITH_OWNER_NODE_DETAIL_PUBLIC_KEY\\n-----END PUBLIC KEY-----\\n",
       "location": {
-        "location_secret": "replace-with-owner-only-stable-location-token",
+        "location_secret": "REPLACE_WITH_LOCV1_BASE64URL_TOKEN",
         "observed_at": "2026-01-01T00:00:00Z",
         "valid_until": "2026-01-01T01:00:00Z",
         "provenance": "unknown"

@@ -20,20 +20,23 @@ detail.detail_digest = "sha256:" + crypto.createHash("sha256").update(c(detail))
 NODE
 OVERLAY="$TMP/overlay.json"; KEY_JSON="$(node -pe 'JSON.stringify(require("fs").readFileSync(process.argv[1],"utf8"))' "$PUB")"
 write_overlay() { printf '%s\n' "$1" >"$OVERLAY"; chmod 600 "$OVERLAY"; }
-overlay() { printf '{"schema_version":1,"nodes":{"fixture-nas":{"ssh_target":"fixture-agent","remote_dir":"/opt/brokkr","signing_public_key":%s,"location":{"location_secret":"%s","observed_at":"2026-07-23T10:00:00Z","valid_until":"2026-07-23T11:00:00Z","provenance":"%s"}}}}' "$KEY_JSON" "$1" "$2"; }
+LOCATION_A=locv1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+LOCATION_B=locv1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+overlay_interval() { printf '{"schema_version":1,"nodes":{"fixture-nas":{"ssh_target":"fixture-agent","remote_dir":"/opt/brokkr","signing_public_key":%s,"location":{"location_secret":"%s","observed_at":"%s","valid_until":"%s","provenance":"%s"}}}}' "$KEY_JSON" "$1" "$2" "$3" "$4"; }
+overlay() { overlay_interval "$1" 2026-07-23T10:00:00Z 2026-07-23T11:00:00Z "$2"; }
 NODE_BIN="$(command -v node)"
 MOCK="$TMP/mock"; mkdir "$MOCK"
 make_ssh() { printf '%s\n' "$1" >"$MOCK/ssh"; chmod +x "$MOCK/ssh"; }
 run() { env -i PATH="$MOCK:/usr/bin:/bin" BROKKR_INSPECT_OVERLAY="$OVERLAY" BROKKR_INSPECT_NOW="$1" "$NODE_BIN" "$INSPECT" inspect fixture-nas; }
 assert() { node -e 'const r=JSON.parse(require("fs").readFileSync(0,"utf8")); if (!Function("r", "return (" + process.argv[1] + ")")(r)) process.exit(1)' "$1"; }
-write_overlay "$(overlay synthetic-location-a known)"
+write_overlay "$(overlay "$LOCATION_A" known)"
 make_ssh "#!/bin/sh
 printf '%s\\n' \"\$*\" >'$TMP/ssh-args'
 cat '$RECORD'
 printf 'Brokkr node inventory detail JSON: ' >&2; cat '$DETAIL' >&2; printf '\\n' >&2"
 OUT="$(run 2026-07-23T10:30:00Z)" || fail "success inspect failed"
 printf '%s' "$OUT" | assert 'r.inspection_status === "ok" && r.node_capability.node_id === "fixture-nas" && r.detail.kind === "brokkr-node-inventory-detail" && r.location_evidence.location_digest.startsWith("sha256:")'
-printf '%s' "$OUT" | grep -q 'fixture-agent\|synthetic-location-a\|/opt/brokkr' && fail "private overlay leaked into output"
+printf '%s' "$OUT" | grep -q 'fixture-agent\|locv1_A\|/opt/brokkr' && fail "private overlay leaked into output"
 grep -q 'BROKKR_NODE_ID=fixture-nas node scripts/node-inventory.mjs --detail' "$TMP/ssh-args" || fail "transport did not fix remote command"
 make_ssh '#!/bin/sh
 exit 255'
@@ -44,6 +47,23 @@ cat '$RECORD'
 printf 'Brokkr node inventory detail JSON: ' >&2; cat '$DETAIL' >&2; printf '\\n' >&2"
 OUT="$(run 2026-07-23T12:00:00Z)" || fail "stale inspection should remain inspectable"
 printf '%s' "$OUT" | assert 'r.inspection_status === "partial" && r.freshness === "stale"'
+# Mixed freshness: current location evidence cannot make an expired capability
+# look OK. The aggregate is stale and therefore partial.
+write_overlay "$(overlay_interval "$LOCATION_A" 2026-07-23T11:30:00Z 2026-07-23T13:00:00Z known)"
+OUT="$(run 2026-07-23T12:00:00Z)" || fail "mixed-freshness inspection should remain inspectable"
+printf '%s' "$OUT" | assert 'r.inspection_status === "partial" && r.freshness === "stale" && r.location_evidence.valid_until === "2026-07-23T13:00:00Z" && r.node_capability.valid_until === "2026-07-23T11:00:00Z"'
+# Location intervals are real observation intervals. Future observations,
+# reversed intervals and low-entropy placeholder tokens fail before transport.
+expect_overlay_fail() {
+  write_overlay "$1"; local out
+  if out="$(run 2026-07-23T10:30:00Z 2>"$TMP/invalid.err")"; then fail "$2 accepted"; fi
+  [ -z "$out" ] || fail "$2 emitted output"
+  grep -q 'invalid node configuration' "$TMP/invalid.err" || fail "$2 lacked closed diagnostic"
+}
+expect_overlay_fail "$(overlay_interval "$LOCATION_A" 2026-07-23T11:00:00Z 2026-07-23T12:00:00Z known)" "future location observation"
+expect_overlay_fail "$(overlay_interval "$LOCATION_A" 2026-07-23T10:00:00Z 2026-07-23T10:00:00Z known)" "zero location interval"
+expect_overlay_fail "$(overlay_interval REPLACE_WITH_OWNER_TOKEN 2026-07-23T10:00:00Z 2026-07-23T11:00:00Z known)" "placeholder location token"
+write_overlay "$(overlay "$LOCATION_A" known)"
 # A schema-shaped payload whose evidence digest no longer covers its contents
 # is rejected rather than being silently accepted as signed-detail input.
 TAMPERED_RECORD="$TMP/tampered-record.json"
@@ -64,7 +84,7 @@ cat '$BAD_RECORD'
 printf 'Brokkr node inventory detail JSON: ' >&2; cat '$DETAIL' >&2; printf '\\n' >&2"
 if OUT="$(run 2026-07-23T10:30:00Z)"; then fail "identity mismatch succeeded"; fi
 printf '%s' "$OUT" | assert 'r.inspection_status === "identity-mismatch" && !Object.hasOwn(r, "node_capability")'
-write_overlay "$(overlay synthetic-location-b partial)"
+write_overlay "$(overlay "$LOCATION_B" partial)"
 make_ssh "#!/bin/sh
 cat '$RECORD'
 printf 'Brokkr node inventory detail JSON: ' >&2; cat '$DETAIL' >&2; printf '\\n' >&2"
