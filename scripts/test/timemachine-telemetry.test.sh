@@ -83,6 +83,34 @@ check "M5 destination probe does not invoke tmutil" '[[ "$RC" -eq 0 && "$OUT" ==
 check "updated band evidence is fresh" '[[ "$(state "data[\"status\"]")" == pass && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=fresh_band_files"* ]]'
 check "private source is neither printed nor published" '! grep -Fq "$TMP/bands" "$TMP/state/timemachine-health.json" && [[ "$OUT" != *"$TMP/bands"* ]]'
 
+mkdir -p "$TMP/Time Machine Backups/bands/0"
+printf x > "$TMP/Time Machine Backups/bands/0/fresh-band"
+TZ=UTC touch -t 202607131200 "$TMP/Time Machine Backups/bands/0/fresh-band"
+write_config "$TMP/Time Machine Backups/bands"
+run
+check "canonical source with ordinary whitespace is accepted as data" '[[ "$RC" -eq 0 && "$(state "data[\"status\"]")" == pass ]]'
+check "whitespace source is neither printed nor published" '! grep -Fq "$TMP/Time Machine Backups/bands" "$TMP/state/timemachine-health.json" && [[ "$OUT" != *"$TMP/Time Machine Backups/bands"* ]]'
+
+printf 'BROKKR_TM_BANDS_DIR=%s\nBROKKR_TM_BANDS_DIR=%s\n' "$TMP/bands" "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
+run
+check "multiple assignments fail closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+printf 'BROKKR_TM_BANDS_DIR=%s\nBROKKR_TM_BANDS_DIR=%s' "$TMP/bands" "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
+run
+check "multiple assignments without final newline fail closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+printf 'BROKKR_TM_BANDS_DIR=%s\nnot-an-assignment\n' "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
+run
+check "newline injection fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+printf 'BROKKR_TM_BANDS_DIR=%s\tcontrol\n' "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
+run
+check "tab control in source fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+printf 'BROKKR_TM_BANDS_DIR=%s\r\n' "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
+run
+check "carriage-return control in source fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+printf 'BROKKR_TM_BANDS_DIR= %s\n' "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
+run
+check "leading whitespace before an absolute source fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+
+write_config "$TMP/bands"
 TZ=UTC touch -t 202607111200 "$TMP/bands/0/fresh-band"
 run
 check "stale band evidence is fail" '[[ "$RC" -eq 2 && "$(state "data[\"status\"]")" == fail && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=stale_band_files"* ]]'
@@ -121,6 +149,9 @@ check "dot source fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source 
 write_config "$TMP/bands/"
 run
 check "trailing-slash source fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+write_config "$TMP//bands"
+run
+check "duplicate-separator source fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
 
 write_config "$TMP/bands"
 TZ=UTC touch -t 202607131200 "$TMP/bands/0/fresh-band"
