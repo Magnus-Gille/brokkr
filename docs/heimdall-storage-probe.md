@@ -41,9 +41,39 @@ agent, or X11 forwarding, and no PTY. The forced command means an SSH client
 cannot substitute a shell command. The account's home and SSH authorization
 directory are root-owned, so the probe cannot replace its own key. The config
 is root-owned and group-readable only by the dedicated account. The
-provisioner writes a root-owned marker binding the authorization, probe, and
-configuration digests; it refuses to replace or revoke unmarked, symlinked, or
-drifted artifacts.
+provisioner writes a root-owned marker binding the authorization, probe,
+configuration, and SSH-policy digests; it refuses to replace or revoke
+unmarked, symlinked, or drifted artifacts.
+
+### PAM and interactive-login boundary
+
+The account must not be password-locked: PAM rejects a locked account before
+the forced public-key command can run. During `apply`, only after all
+content-bound artifacts and their marker are durable, the remote root
+reconciler generates a fresh random SHA-512 password hash locally and assigns
+that hash to the account. It never prints, transfers, records, or retains the
+password material. That hash exists only to give PAM a non-locked account
+state; it is not an interactive credential.
+
+The tracked SSH daemon `Match User` policy is a second, independently bound
+control. Before authorization is written, the reconciler runs `sshd -t` and
+reads `sshd -T` for the dedicated user. It requires public-key authentication,
+the exact forced command, and explicit denial of password and
+keyboard-interactive authentication, empty passwords, TTYs, TCP, Unix-domain,
+agent, and X11 forwarding, gateway ports, tunnels, and user RC files. Thus
+even possession of the unrecorded random password cannot open an SSH
+interactive session; the authorized key is additionally restricted as defence
+in depth. An SSH daemon that does not include the managed fragment, or whose
+effective policy differs, causes `apply` to fail before the key is replaced.
+Only after this validation does it reload the active `ssh.service` (or
+`sshd.service`); a host without one of those active service units fails closed.
+
+On a first apply, any failure after the provisional policy is installed but
+before the marker is complete removes the authorization, probe, path config,
+marker, and new policy, re-locks the account, and reloads SSH. A reapply must
+be content-identical (including the public key and SSH policy); content changes
+are refused rather than overwriting managed state. This keeps a valid marker as
+the boundary before PAM admission.
 
 Run only from the bound clean checkout:
 
@@ -78,8 +108,11 @@ BROKKR_HEIMDALL_STORAGE_KNOWN_HOSTS=/protected/local/known_hosts \
 ```
 
 `revoke` is deliberately bounded: it requires the root-owned marker, removes
-only the content-bound authorization, forced-command file, and path config,
-then locks the dedicated account. It does not delete the account or any backup
-data. Any artifact drift blocks automatic removal and requires manual review.
-Record the resulting metadata-only command outcome with the Heimdall #23
-evidence.
+only the content-bound authorization, forced-command file, path config, and
+SSH daemon fragment, then locks the dedicated account. It does not delete the
+account or any backup data. Any artifact drift blocks automatic removal and
+requires manual review. It validates and reloads SSH after removal; if that
+reload cannot complete, authorization has already been removed and the account
+has already been locked, so the command fails without claiming a completed
+receipt. Record the resulting metadata-only command outcome with the Heimdall
+#23 evidence.

@@ -13,6 +13,7 @@ git clone -q "$SOURCE_REPO" "$FIXTURE"
 for file in \
   scripts/provision-heimdall-storage-probe.sh \
   scripts/heimdall-storage-probe.sh \
+  scripts/heimdall-storage-probe.sshd.conf \
   scripts/lib/heimdall-storage-probe-reconcile.sh \
   scripts/lib/deploy-source.sh; do
   mkdir -p "$FIXTURE/$(dirname "$file")"
@@ -34,8 +35,8 @@ cat >"$TMP/bin/ssh" <<'EOF'
 printf 'ssh %s\n' "$*" >>"$MOCK_CALLS"
 if [[ "$*" == *"sudo env"* ]]; then
   cat >/dev/null
-  printf 'key_fingerprint=SHA256:fixture probe_sha256=%s config_sha256=%s\n' \
-    "$MOCK_PROBE_SHA256" "$MOCK_CONFIG_SHA256"
+  printf 'key_fingerprint=SHA256:fixture probe_sha256=%s config_sha256=%s sshd_config_sha256=%s\n' \
+    "$MOCK_PROBE_SHA256" "$MOCK_CONFIG_SHA256" "$MOCK_SSHD_CONFIG_SHA256"
   exit 0
 fi
 if [[ "$*" == *"heimdall-storage-probe@"* ]]; then
@@ -79,6 +80,7 @@ run() {
       MOCK_CALLS="$CALLS" \
       MOCK_PROBE_SHA256="$(shasum -a 256 scripts/heimdall-storage-probe.sh | awk '{print $1}')" \
       MOCK_CONFIG_SHA256="$(shasum -a 256 "$TMP/private/probe.conf" | awk '{print $1}')" \
+      MOCK_SSHD_CONFIG_SHA256="$(shasum -a 256 scripts/heimdall-storage-probe.sshd.conf | awk '{print $1}')" \
       BROKKR_EXPECTED_SOURCE="$FIXTURE" \
       BROKKR_EXPECTED_COMMIT="$head" \
       BROKKR_HEIMDALL_STORAGE_KNOWN_HOSTS="$TMP/private/known_hosts" \
