@@ -1,0 +1,17 @@
+[Unit]
+Description=Publish M5-local Time Machine freshness to Heimdall
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/timemachine-telemetry.md
+
+[Service]
+Type=oneshot
+# Rendered by deploy-m5-timemachine-telemetry.sh with an exact full revision.
+WorkingDirectory=%h/.local/lib/brokkr/timemachine-telemetry/releases/@REVISION@
+EnvironmentFile=%h/.config/brokkr/heimdall.env
+ExecStart=%h/.local/lib/brokkr/timemachine-telemetry/releases/@REVISION@/timemachine/telemetry.sh
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+# The producer may write only its own cached snapshot and delivery stamps.
+ReadWritePaths=%h/.local/state/brokkr
+TimeoutStartSec=30

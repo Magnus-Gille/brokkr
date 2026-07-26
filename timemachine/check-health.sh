@@ -22,8 +22,9 @@ fi
 err_file="$(mktemp "${TMPDIR:-/tmp}/brokkr-tm.XXXXXX")"
 trap 'rm -f "$err_file"' EXIT
 if ! latest="$(tmutil latestbackup 2>"$err_file")"; then
-  err="$(tr '\n' ' ' < "$err_file" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-160)"
-  echo "WARN: tmutil latestbackup failed; Time Machine state unknown${err:+ ($err)}"
+  # Do not forward tmutil's diagnostic: it can contain a destination name or
+  # other local locator, and this result may be published to a health panel.
+  echo "WARN: tmutil latestbackup unavailable; Time Machine state unknown"
   exit 1
 fi
 if [ -z "$latest" ]; then
