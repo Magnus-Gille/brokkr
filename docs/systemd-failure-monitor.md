@@ -78,23 +78,33 @@ configuration, never command arguments or output, and does not mutate panels.
 
 ## Install after merge
 
-This pull request does not deploy or restart anything. After it is merged, use
-the normal role deployment from a clean checkout:
+This pull request does not deploy or restart anything. After it is merged, put
+the live host/account/locator values in an owner-only, untracked JSON overlay
+based on [`../profiles/control-node-deploy.overlay.example.json`](../profiles/control-node-deploy.overlay.example.json).
+The schema is versioned and public, but the completed overlay is mode `0600`,
+owned by the invoking operator, and deliberately excluded from Git. This keeps
+the previously undiscoverable invocation reproducible without publishing live
+topology or a root-owned token-source locator:
 
 ```bash
-# control node: choose an independent release target and explicit runtime identity.
-# The token source is created server-side by the operator and is never committed.
-BROKKR_SSH_TARGET=operator@control-node \
-BROKKR_DEPLOY_TARGET=/srv/brokkr-release \
-BROKKR_RUNTIME_USER=operator \
-BROKKR_RUNTIME_HOME=/home/operator \
-BROKKR_REGISTRY_PATH=/srv/grimnir/services.json \
-BROKKR_HEIMDALL_URL=https://heimdall.example/api/panels \
-BROKKR_HEIMDALL_TOKEN_SOURCE=/etc/brokkr/heimdall-fleet-token.env \
-  ./scripts/deploy-control-node.sh
+# `COMMIT` is intentionally explicit and must be the accepted full SHA.
+OVERLAY=/absolute/owner-only/control-node-deploy.overlay.json \
+COMMIT=<accepted-full-commit-sha> \
+  make deploy-control-node
+```
 
+The wrapper validates the closed overlay schema before contacting the host and
+then forwards the same explicit values to `deploy-control-node.sh`. It never
+sources JSON or derives the commit from `HEAD`; sensitive endpoint and
+token-source locators are not printed.
+
+For a one-off deployment, the underlying script remains available with every
+input explicit; the profile wrapper is the reviewed, repeatable path.
+
+```bash
 # NAS (installs the template, sweep, and Brokkr health OnFailure hook)
 BROKKR_SSH_TARGET=brokkr@nas-host ./scripts/deploy-nas.sh
+
 ```
 
 For another host, copy the three versioned files below to

@@ -31,7 +31,7 @@ token="${token#HEIMDALL_FLEET_TOKEN=}"
 # b64token alphabet makes its interpolation into curl's quoted config safe.
 probe_url="${HEIMDALL_URL}?service=brokkr"
 status="$(printf 'header = "Authorization: Bearer %s"\n' "$token" | \
-  curl --disable --silent --show-error --output /dev/null --write-out '%{http_code}' \
+  curl --disable --silent --output /dev/null --write-out '%{http_code}' \
     --connect-timeout 5 --max-time 10 --config - --request GET "$probe_url")" || fail
 
 case "$status" in
