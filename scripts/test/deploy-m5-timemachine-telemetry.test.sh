@@ -15,6 +15,9 @@ EOF
 chmod +x "$TMP/bin/systemctl"
 SCRIPT="$REPO/scripts/deploy-m5-timemachine-telemetry.sh"
 HOST_NAME="$(hostname)"; export HOME="$HOME_DIR" PATH="$TMP/bin:$PATH" BROKKR_M5_HOSTNAME="$HOST_NAME"
+# CI may export XDG_CONFIG_HOME for the runner; this fixture intentionally
+# exercises the HOME-default install layout it created above.
+unset XDG_CONFIG_HOME
 PASS=0; FAIL=0; ok(){ PASS=$((PASS+1)); echo "  PASS  $1"; }; bad(){ FAIL=$((FAIL+1)); echo "  FAIL  $1"; }; check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 run(){ # shellcheck disable=SC2034 # assertions consume OUT/RC through check/eval
   OUT="$("$@" 2>&1)" || RC=$?; RC=${RC:-0}; }
@@ -24,5 +27,6 @@ RC=0; printf dirty >> "$REPO/timemachine/telemetry.sh"; run "$SCRIPT" "$REPO" "$
 RC=0; run "$SCRIPT" "$REPO" "$SHA" --apply
 # shellcheck disable=SC2034 # assertions consume this through check/eval
 UNIT="$HOME_DIR/.config/systemd/user/brokkr-timemachine-telemetry.service"
-check "exact clean source installs release" '[[ "$RC" -eq 0 && -f "$UNIT" ]]'; check "installed unit avoids canonical checkout" '! grep -q "$REPO" "$UNIT" && grep -q "/releases/$SHA/" "$UNIT"'
+if [[ "$RC" -eq 0 && -f "$UNIT" ]]; then ok "exact clean source installs release"; else bad "exact clean source installs release"; printf '  fixture apply output: %s\n' "$OUT"; fi
+check "installed unit avoids canonical checkout" '! grep -q "$REPO" "$UNIT" && grep -q "/releases/$SHA/" "$UNIT"'
 echo "PASS=$PASS FAIL=$FAIL"; [[ "$FAIL" -eq 0 ]]
