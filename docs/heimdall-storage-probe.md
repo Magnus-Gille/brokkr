@@ -22,10 +22,28 @@ For `apply`, supply these protected, local files through the environment:
   stricter. Configure this same host-owned secret surface as
   `HEIMDALL_STORAGE_SSH_KEY` for Heimdall; do not put the path or key in a
   tracked file.
-- `BROKKR_HEIMDALL_STORAGE_PROBE_CONFIG` — six newline-delimited
-  `NAME=/absolute/path` values for the Time Machine, Munin, and Mimir sources,
-  mode `0600` or stricter. The parser accepts a closed key set and paths only;
-  it never sources the file as shell code.
+- `BROKKR_HEIMDALL_STORAGE_PROBE_CONFIG` — owner-only newline-delimited
+  `NAME=/absolute/path` values, mode `0600` or stricter. The parser accepts a
+  closed key set and paths only; it never sources the file as shell code.
+
+For Mimir v1, the overlay contains exactly these two Mimir entries (alongside
+the Time Machine and Munin entries):
+
+```text
+MIMIR_BACKUP_RECORD=/owner-only/mimir/heimdall-freshness/backup.json
+MIMIR_SYNC_RECORD=/owner-only/mimir/heimdall-freshness/sync.json
+```
+
+Those fixed names are the sole Mimir v1 authority. The probe rejects a record
+or any path component that is a symlink, any non-regular record, malformed or
+non-v1 JSON, unknown fields/states, and a configuration that mixes these keys
+with the three legacy Mimir keys. A valid `fresh` record contributes its
+normalized timestamp to its existing positional section (backup ISO timestamp,
+sync epoch timestamp), leaving the 19-section Heimdall protocol unchanged.
+`error`, absent, or invalid publisher evidence remains empty/unknown; a valid
+but old `fresh` timestamp is deliberately emitted so the Heimdall consumer,
+not the publisher record, applies its freshness window.
+Never commit these runtime locators or an overlay containing them.
 
 The forced command itself is the tracked
 `scripts/heimdall-storage-probe.sh` from the exact bound revision. The
