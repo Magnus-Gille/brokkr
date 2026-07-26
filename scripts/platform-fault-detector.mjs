@@ -12,7 +12,8 @@ if (!utc(input.observed_at) || !utc(input.valid_until) || Date.parse(input.valid
 const now = input.now ?? new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 if (!utc(now) || Date.parse(now) > Date.parse(input.valid_until)) die("observation is stale");
 const ref = input.node_substrate_ref;
-if (!ref || ref.contract !== "grimnir.node-substrate/v1" || typeof ref.node_id !== "string" || typeof ref.observation_evidence_id !== "string") die("missing node/substrate v1 reference");
+const nodeId = /^[a-z][a-z0-9-]{2,57}$/;
+if (!ref || ref.contract !== "grimnir.node-substrate/v1" || !nodeId.test(ref.node_id) || typeof ref.observation_evidence_id !== "string") die("missing or unsafe node/substrate v1 reference");
 if (!Array.isArray(input.signals)) die("signals must be an array");
 const rules = {
   filesystem_read_only: ["filesystem-read-only", "critical", "brokkr"],
