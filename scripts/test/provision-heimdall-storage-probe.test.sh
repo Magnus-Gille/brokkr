@@ -133,6 +133,7 @@ write_config() {
     'MIMIR_SYNC_DIR=/x' >"$TMP/stage/config"
 }
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 
 PASS=0
 FAIL=0
@@ -231,7 +232,7 @@ check 'apply installs every managed artifact' \
 check 'config is group-readable only by the dedicated account' \
   'grep -q "install -m 0640 -o root -g heimdall-storage-probe" "$TMP/calls"'
 check 'dedicated UID can traverse and read its root-owned authorization without mutation rights' \
-  'grep -q "install -d -m 0750 -o root -g heimdall-storage-probe .*\.ssh" "$TMP/calls" && grep -q "chown root:heimdall-storage-probe .*authorized_keys.new" "$TMP/calls" && [[ $(stat -f %Lp "$TMP/root/var/lib/heimdall-storage-probe/.ssh") == 750 && $(stat -f %Lp "$TMP/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys") == 640 ]]'
+  'grep -q "install -d -m 0750 -o root -g heimdall-storage-probe .*\.ssh" "$TMP/calls" && grep -q "chown root:heimdall-storage-probe .*authorized_keys.new" "$TMP/calls" && [[ $(mode "$TMP/root/var/lib/heimdall-storage-probe/.ssh") == 750 && $(mode "$TMP/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys") == 640 ]]'
 check 'authorization and marker retain root ownership' \
   'grep -q "chown root:heimdall-storage-probe .*authorized_keys.new" "$TMP/calls" && grep -q "chown root:root .*marker.new" "$TMP/calls"'
 check 'apply makes the PAM account non-locked without exposing a password login' \
