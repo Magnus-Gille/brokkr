@@ -39,10 +39,12 @@ or any path component that is a symlink, any non-regular record, malformed or
 non-v1 JSON, unknown fields/states, and a configuration that mixes these keys
 with the three legacy Mimir keys. A valid `fresh` record contributes its
 normalized timestamp to its existing positional section (backup ISO timestamp,
-sync epoch timestamp), leaving the 19-section Heimdall protocol unchanged.
-`error`, absent, or invalid publisher evidence remains empty/unknown; a valid
-but old `fresh` timestamp is deliberately emitted so the Heimdall consumer,
-not the publisher record, applies its freshness window.
+sync epoch timestamp), leaving the 19-section Heimdall protocol unchanged. A
+valid publisher `error` becomes a non-secret, epoch-1970 backup marker and
+sync epoch `1`, both of which the existing consumer classifies as stale/failed.
+Absent, invalid, or future-dated evidence remains empty/unknown; a valid but
+old `fresh` timestamp is deliberately emitted so the Heimdall consumer, not
+the publisher record, applies its freshness window.
 Never commit these runtime locators or an overlay containing them.
 
 The forced command itself is the tracked

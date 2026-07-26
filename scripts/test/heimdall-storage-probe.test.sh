@@ -77,9 +77,19 @@ check 'fresh backup emits its normalized ISO timestamp in section 9' '[[ $RC -eq
 check 'stale sync still emits normalized epoch for Heimdall freshness policy in section 10' '[[ "$(section 10)" == 946684800 ]]'
 check 'output retains exactly 19 sections' '[[ $(printf "%s\n" "$OUT" | awk '\''$0 == "---" { n++ } END { print n + 1 }'\'') -eq 19 ]]'
 
-write_record backup '{"schema_version":1,"state":"error","observed_at":"2026-07-26T10:00:00Z"}'
+write_record backup '{"schema_version":1,"state":"error","observed_at":"2000-01-01T00:00:00Z"}'
+write_record sync '{"schema_version":1,"state":"error","observed_at":"2000-01-01T00:00:00Z"}'
 run_probe
-check 'explicit publisher error is unknown, never fresh' '[[ $RC -eq 0 && -z "$(section 9)" ]]'
+check 'explicit backup publisher error is an old normalized error line' '[[ $RC -eq 0 && "$(section 9)" == "1970-01-01T00:00:01Z Mimir freshness publisher error" ]]'
+check 'legacy Heimdall backup consumer classifies publisher error as stale' '[[ "$(section 9)" =~ ^1970-01-01T00:00:01Z ]]'
+check 'explicit sync publisher error is an unmistakably stale epoch' '[[ "$(section 10)" == 1 ]]'
+check 'legacy Heimdall sync consumer accepts publisher error as an epoch' '[[ "$(section 10)" =~ ^[1-9][0-9]*$ ]]'
+
+write_record backup '{"schema_version":1,"state":"fresh","observed_at":"2999-01-01T00:00:00Z"}'
+write_record sync '{"schema_version":1,"state":"fresh","observed_at":"2999-01-01T00:00:00Z"}'
+run_probe
+check 'future backup timestamp is unknown rather than fresh' '[[ $RC -eq 0 && -z "$(section 9)" ]]'
+check 'future sync timestamp is unknown rather than fresh' '[[ -z "$(section 10)" ]]'
 
 for invalid in \
   '{not-json}' \

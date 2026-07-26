@@ -54,8 +54,10 @@ fi
 
 # Mimir v1 is deliberately a two-record, metadata-only surface.  This reader
 # refuses links and non-regular inputs, then accepts only the exact public
-# schema.  It prints an ISO timestamp and epoch timestamp only for `fresh`;
-# explicit publisher errors and malformed input are intentionally unknown.
+# schema.  It prints state plus normalized time for `fresh`, state alone for a
+# valid publisher `error`, and nothing for malformed input.  The caller keeps
+# the positional consumer contract while making an explicit error unambiguously
+# stale rather than silently unknown.
 read_mimir_v1_record() {
   local record=$1
   [[ -f "$record" && ! -L "$record" ]] || return 0
@@ -82,13 +84,18 @@ try:
         value = json.load(source)
     if set(value) != {"schema_version", "state", "observed_at"}:
         raise ValueError("shape")
-    if value["schema_version"] != 1 or value["state"] != "fresh":
+    if value["schema_version"] != 1 or value["state"] not in {"fresh", "error"}:
         raise ValueError("state")
     observed_at = value["observed_at"]
     if not isinstance(observed_at, str) or not observed_at.endswith("Z"):
         raise ValueError("timestamp")
     parsed = dt.datetime.strptime(observed_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
-    print(f"{observed_at}\t{int(parsed.timestamp())}")
+    if parsed > dt.datetime.now(dt.timezone.utc):
+        raise ValueError("future")
+    if value["state"] == "fresh":
+        print(f"fresh\t{observed_at}\t{int(parsed.timestamp())}")
+    else:
+        print("error")
 except (OSError, ValueError, TypeError, json.JSONDecodeError):
     pass
 PY
@@ -123,13 +130,21 @@ echo ---
 if (( legacy_mimir )); then
   tail -1 "$MIMIR_LOG" 2>/dev/null || echo ''
 else
-  read_mimir_v1_record "$MIMIR_BACKUP_RECORD" | awk -F '\t' 'NF == 2 { print $1; exit }'
+  mimir_backup_record="$(read_mimir_v1_record "$MIMIR_BACKUP_RECORD")"
+  case "$mimir_backup_record" in
+    $'fresh\t'*) printf '%s\n' "$mimir_backup_record" | awk -F '\t' 'NF == 3 { print $2; exit }' ;;
+    error) printf '%s\n' '1970-01-01T00:00:01Z Mimir freshness publisher error' ;;
+  esac
 fi
 echo ---
 if (( legacy_mimir )); then
   cat "$MIMIR_SYNC_STAMP" 2>/dev/null || find "$MIMIR_SYNC_DIR" -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -1 || echo ''
 else
-  read_mimir_v1_record "$MIMIR_SYNC_RECORD" | awk -F '\t' 'NF == 2 { print $2; exit }'
+  mimir_sync_record="$(read_mimir_v1_record "$MIMIR_SYNC_RECORD")"
+  case "$mimir_sync_record" in
+    $'fresh\t'*) printf '%s\n' "$mimir_sync_record" | awk -F '\t' 'NF == 3 { print $3; exit }' ;;
+    error) printf '%s\n' 1 ;;
+  esac
 fi
 echo ---
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo ''
