@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brokkr.example/schemas/control-node-deploy.overlay.schema.json",
+  "title": "Brokkr owner-only control-node deployment overlay",
+  "$comment": "This schema describes an untracked, mode-0600 owner overlay. No live locator belongs in git.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ssh_target", "deploy_target", "runtime_user", "runtime_home", "registry_path", "heimdall_url", "heimdall_token_source"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "ssh_target": { "type": "string", "pattern": "^(?:[a-z_][a-z0-9_-]{0,31}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,251}$", "$comment": "must be a shell-safe SSH target" },
+    "deploy_target": { "type": "string", "pattern": "^/[A-Za-z0-9._/@:+-]+$", "$comment": "must be an absolute canonical path" },
+    "runtime_user": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]{0,31}$" },
+    "runtime_home": { "type": "string", "pattern": "^/[A-Za-z0-9._/@:+-]+$", "$comment": "must be an absolute canonical path" },
+    "registry_path": { "type": "string", "pattern": "^/[A-Za-z0-9._/@:+-]+$", "$comment": "must be an absolute canonical path" },
+    "heimdall_url": { "type": "string", "pattern": "^https?://[A-Za-z0-9._:/-]+$", "$comment": "must be an explicit non-secret HTTP(S) endpoint" },
+    "heimdall_token_source": { "type": "string", "pattern": "^/[A-Za-z0-9._/@:+-]+$", "$comment": "must be an absolute server-side path, never a token" }
+  }
+}

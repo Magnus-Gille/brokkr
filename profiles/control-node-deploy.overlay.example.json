@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "ssh_target": "operator@example-control-node",
+  "deploy_target": "/srv/example/brokkr",
+  "runtime_user": "operator",
+  "runtime_home": "/home/operator",
+  "registry_path": "/srv/example/grimnir/services.json",
+  "heimdall_url": "https://heimdall.example.invalid/api/panels",
+  "heimdall_token_source": "/etc/brokkr/heimdall-fleet-token.env"
+}

@@ -11,6 +11,10 @@ network/cloudflared/config.yml
 samba/timemachine.conf
 rclone.conf
 
+# Private deployment profiles carry host and account locators.  The committed
+# example is deliberately non-routable and cannot be used to deploy.
+profiles/control-node-deploy.overlay.json
+
 # Logs
 *.log
 logs/

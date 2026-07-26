@@ -11,9 +11,10 @@ git clone -q "$REPO_SOURCE" "$SOURCE"
 git -C "$SOURCE" checkout --detach -q "$BASE_SHA"
 cp "$REPO_SOURCE/scripts/deploy-control-node.sh" "$SOURCE/scripts/deploy-control-node.sh"
 cp "$REPO_SOURCE/scripts/lib/deploy-source.sh" "$SOURCE/scripts/lib/deploy-source.sh"
+cp "$REPO_SOURCE/scripts/verify-heimdall-delivery.sh" "$SOURCE/scripts/verify-heimdall-delivery.sh"
 git -C "$SOURCE" config user.name test
 git -C "$SOURCE" config user.email test@example.invalid
-git -C "$SOURCE" add scripts/deploy-control-node.sh scripts/lib/deploy-source.sh
+git -C "$SOURCE" add scripts/deploy-control-node.sh scripts/lib/deploy-source.sh scripts/verify-heimdall-delivery.sh
 git -C "$SOURCE" commit -qm 'fixture deploy binding'
 DEPLOY="$SOURCE/scripts/deploy-control-node.sh"
 trap 'rm -rf "$TMP"' EXIT
@@ -165,6 +166,7 @@ check "remote release root keeps intentional mode" '[[ "$(mode "$BROKKR_DEPLOY_T
 check "first install prepares the nested release target before rsync" '[[ -d "$BROKKR_DEPLOY_TARGET" ]] && [[ "$(grep -n -F "sudo install -d" "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n -F "rsync " "$CALLS" | head -1 | cut -d: -f1)" ]]'
 check "deployment renders units for the explicit runtime identity and target" 'grep -Fq "BROKKR_RUNTIME_USER=$BROKKR_RUNTIME_USER" "$CALLS" && grep -Fq "BROKKR_RUNTIME_HOME=$BROKKR_RUNTIME_HOME" "$CALLS" && grep -Fq "BROKKR_DEPLOY_TARGET=$BROKKR_DEPLOY_TARGET" "$CALLS" && grep -Fq "BROKKR_REGISTRY_PATH=$BROKKR_REGISTRY_PATH" "$CALLS"'
 check "probe uses authenticated non-mutating readback without leaking token or source path" 'grep -q "curl .*--config -.*--request GET.*service=brokkr" "$CALLS" && ! grep -Fq "secret-sentinel" "$CALLS" && ! grep -Fq "$BROKKR_HEIMDALL_TOKEN_SOURCE" "$CALLS" && [[ "$OUT" != *"secret-sentinel"* && "$OUT" != *"$BROKKR_HEIMDALL_TOKEN_SOURCE"* ]]'
+check "probe suppresses transport diagnostics that could reveal the endpoint" '! grep -Fq -- "--show-error" "$CALLS"'
 
 : >"$CALLS"
 export MOCK_CURL_RESULT=unreachable
