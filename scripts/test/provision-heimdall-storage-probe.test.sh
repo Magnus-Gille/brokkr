@@ -133,6 +133,7 @@ write_config() {
     'MIMIR_SYNC_DIR=/x' >"$TMP/stage/config"
 }
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 
 PASS=0
 FAIL=0
@@ -230,8 +231,10 @@ check 'apply installs every managed artifact' \
   '[[ -f "$TMP/usr/local/lib/brokkr/probe" && -f "$TMP/etc/brokkr/probe.conf" && -f "$TMP/etc/ssh/sshd_config.d/probe.conf" && -f "$TMP/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys" && -f "$TMP/var/lib/brokkr/marker" ]]'
 check 'config is group-readable only by the dedicated account' \
   'grep -q "install -m 0640 -o root -g heimdall-storage-probe" "$TMP/calls"'
-check 'authorization and marker are root-owned' \
-  'grep -q "chown root:root .*authorized_keys.new" "$TMP/calls" && grep -q "chown root:root .*marker.new" "$TMP/calls"'
+check 'dedicated UID can traverse and read its root-owned authorization without mutation rights' \
+  'grep -q "install -d -m 0750 -o root -g heimdall-storage-probe .*\.ssh" "$TMP/calls" && grep -q "chown root:heimdall-storage-probe .*authorized_keys.new" "$TMP/calls" && [[ $(mode "$TMP/root/var/lib/heimdall-storage-probe/.ssh") == 750 && $(mode "$TMP/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys") == 640 ]]'
+check 'authorization and marker retain root ownership' \
+  'grep -q "chown root:heimdall-storage-probe .*authorized_keys.new" "$TMP/calls" && grep -q "chown root:root .*marker.new" "$TMP/calls"'
 check 'apply makes the PAM account non-locked without exposing a password login' \
   'grep -q "chpasswd --encrypted" "$TMP/calls" && ! grep -q "usermod --lock" "$TMP/calls"'
 check 'apply verifies an explicit SSH public-key-only policy for the dedicated account' \
@@ -262,6 +265,8 @@ check 'first-apply post-policy failure leaves no unlocked account without a mark
   '[[ $RC -ne 0 && ! -e "$TMP/rollback/var/lib/brokkr/marker" && ! -e "$TMP/rollback/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys" && $(cat "$TMP/calls") == *"usermod --lock heimdall-storage-probe"* && $(cat "$TMP/calls") != *"chpasswd --encrypted"* ]]'
 check 'first-apply post-policy failure removes and reloads the new SSH policy' \
   '[[ ! -e "$TMP/rollback/etc/ssh/sshd_config.d/probe.conf" && ! -e "$TMP/rollback/usr/local/lib/brokkr/probe" && ! -e "$TMP/rollback/etc/brokkr/probe.conf" && $(grep -c "systemctl reload ssh.service" "$TMP/calls") -eq 2 ]]'
+check 'first-apply rollback leaves no group-readable authorization behind' \
+  '[[ ! -e "$TMP/rollback/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys" && ! -e "$TMP/rollback/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys.new" ]]'
 
 cp "$TMP/usr/local/lib/brokkr/probe" "$TMP/stage/probe"
 cp "$TMP/etc/brokkr/probe.conf" "$TMP/stage/config"
