@@ -311,7 +311,7 @@ const main = () => {
       return { workload_id: id, owner_repo: evidence?.owner_repo ?? item.owner_repo, status: evidence?.status ?? "missing" };
     }))),
     network_tunnel_dependencies: [...requiredNetwork].sort(), health: workload.health,
-    hooks: sorted(hooks.map(({ name, mode, deadline_seconds, compensation_hook }) => ({ name, mode, deadline_seconds, ...(compensation_hook ? { compensation_hook } : {}) }))),
+    hooks: sorted(hooks.map(({ name, mode, deadline_seconds, idempotency_required, compensation_hook }) => ({ name, mode, deadline_seconds, idempotency_required, ...(compensation_hook ? { compensation_hook } : {}) }))),
     interruption: { expected_seconds: hooks.filter(hook => hook.name === "drain").reduce((sum, hook) => sum + hook.deadline_seconds, 0), mode: "no mutation performed" },
     rollback: rollbackHook ? { available: true, hook: rollbackHook.name, mode: rollbackHook.mode } : { available: false },
     blockers: sorted(blockers),

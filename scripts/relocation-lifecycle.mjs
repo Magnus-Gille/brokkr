@@ -39,7 +39,7 @@ const plan = read(args.plan, "plan");
 if (plan.kind !== "brokkr-relocation-plan" || plan.schema_version !== "v1" || plan.outcome !== "promoted" || !DIGEST.test(plan.plan_digest) || !plan.lifecycle_result) die("plan is not a promoted, digest-bound relocation plan");
 const schema = read(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../docs/node-substrate-contract-v1.schema.json"), "pinned contract");
 checkSchema(schema);
-if (schemaErrors(schema, plan.lifecycle_result).length || plan.lifecycle_result.outcome !== "promoted" || plan.lifecycle_result.deadline <= args.now) die("plan lifecycle result is invalid, blocked, or stale");
+if (schemaErrors(schema, plan.lifecycle_result).length || plan.lifecycle_result.outcome !== "promoted" || plan.lifecycle_result.deadline <= args.now || plan.plan_id !== plan.lifecycle_result.plan_id || plan.plan_digest !== plan.lifecycle_result.plan_digest) die("plan lifecycle result is invalid, blocked, stale, or not bound to its top-level plan");
 if (!plan.rollback?.available || typeof plan.rollback.hook !== "string") die("plan has no explicit reversal recipe");
 const operation = read(args.operation, "operation");
 const operationKeys = ["hooks", "id", "irreversible", "kind", "monitoring", "physical_move_required", "platform_fault_refs", "reversal_recipe", "schema_version"];
@@ -49,13 +49,13 @@ if (!Array.isArray(operation.platform_fault_refs) || new Set(operation.platform_
 if (!Array.isArray(operation.hooks) || operation.hooks.length !== HOOKS.length) die("operation must allowlist every lifecycle hook exactly once");
 const hookMap = new Map();
 for (const hook of operation.hooks) {
-  if (!hook || !HOOKS.includes(hook.name) || hookMap.has(hook.name) || !Array.isArray(hook.command) || !hook.command.length || !hook.command.every(item => typeof item === "string" && item.length > 0) || !Number.isInteger(hook.timeout_seconds) || hook.timeout_seconds < 1 || hook.timeout_seconds > 300 || typeof hook.required_output !== "string" || !hook.required_output || !hook.attribution || !ID.test(hook.attribution.owner_repo) || !ID.test(hook.attribution.actor)) die("operation hook allowlist is invalid");
+  if (!hook || !HOOKS.includes(hook.name) || hookMap.has(hook.name) || !Array.isArray(hook.command) || !hook.command.length || !hook.command.every(item => typeof item === "string" && item.length > 0) || !Number.isInteger(hook.timeout_seconds) || hook.timeout_seconds < 1 || hook.timeout_seconds > 300 || hook.idempotency_required !== true || typeof hook.required_output !== "string" || !hook.required_output || !hook.attribution || !ID.test(hook.attribution.owner_repo) || !ID.test(hook.attribution.actor)) die("operation hook allowlist is invalid");
   const stat = (() => { try { return fs.statSync(hook.command[0]); } catch { return null; } })();
   if (!stat?.isFile() || (stat.mode & 0o111) === 0) die(`allowlisted hook executable is unavailable: ${hook.name}`);
   hookMap.set(hook.name, hook);
 }
-const planHookNames = new Set((plan.hooks ?? []).map(hook => hook.name));
-for (const name of ["preflight", "drain", "verify"]) if (!planHookNames.has(name)) die(`plan lacks required ${name} hook`);
+const planHooks = new Map((plan.hooks ?? []).map(hook => [hook.name, hook]));
+for (const name of ["preflight", "drain", "verify"]) if (planHooks.get(name)?.idempotency_required !== true) die(`plan lacks an idempotent ${name} hook`);
 if (plan.rollback.hook !== "rollback") die("only explicit rollback hook is supported by this v1 executor");
 const operationDigest = hash(operation);
 const initial = { kind: "brokkr-relocation-journal", schema_version: "v1", plan_id: plan.plan_id, plan_digest: plan.plan_digest, operation_id: operation.id, operation_digest: operationDigest, reversal_recipe: operation.reversal_recipe, phase: "preflight", outcome: "running", old_placement_retained: true, events: [] };
@@ -68,7 +68,7 @@ if (fs.existsSync(args.journal)) {
 const event = (phase, outcome, detail) => { journal.phase = phase; journal.events.push({ at: args.now, phase, outcome, detail, platform_fault_refs: operation.platform_fault_refs, capability_contract: { version: 1, required: operation.monitoring.required_capabilities, evidence: { "node-capability-freshness": { observed_at: args.now, status: "fresh" }, "lifecycle-result": { observed_at: args.now, result: outcome } } } }); writeJournal(journal); };
 const run = name => {
   const hook = hookMap.get(name); event(name, "started", hook.attribution);
-  const result = spawnSync(hook.command[0], hook.command.slice(1), { encoding: "utf8", timeout: hook.timeout_seconds * 1000, maxBuffer: 64_000 });
+  const result = spawnSync(hook.command[0], hook.command.slice(1), { encoding: "utf8", timeout: hook.timeout_seconds * 1000, maxBuffer: 64_000, env: { ...process.env, BROKKR_LIFECYCLE_IDEMPOTENCY_KEY: plan.lifecycle_result.idempotency_key, BROKKR_RELOCATION_OPERATION_ID: operation.id, BROKKR_RELOCATION_HOOK: name } });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
   // Exit 75 is the sole retryable hook outcome.  It records an interruption
   // without claiming either hook success or rollback; an identical --resume
@@ -79,11 +79,14 @@ const run = name => {
   }
   event(name, "succeeded", hook.attribution); return true;
 };
-const rollback = reason => { event("rollback", "started", { reason }); if (!run("rollback")) { journal.outcome = "blocked"; journal.phase = "rollback"; writeJournal(journal); die("rollback hook failed; old placement remains retained"); } journal.outcome = "blocked"; journal.phase = "rollback"; writeJournal(journal); process.exit(3); };
+const rollback = reason => { event("rollback", "started", { reason }); const outcome = run("rollback"); if (outcome === "interrupted") { journal.outcome = "interrupted"; journal.phase = "rollback"; writeJournal(journal); process.exit(4); } if (!outcome) { journal.outcome = "blocked"; journal.phase = "rollback"; writeJournal(journal); die("rollback hook failed; old placement remains retained"); } journal.outcome = "blocked"; journal.phase = "rollback"; writeJournal(journal); process.exit(3); };
 const order = ["preflight", "drain", "apply", "verify", "representative_data"];
 let start = order.indexOf(journal.phase);
 if (journal.phase === "awaiting_operator") start = order.indexOf("apply");
-else if (journal.phase === "rollback") die("journal is already rolled back; create a new operation for another attempt");
+else if (journal.phase === "rollback") {
+  if (journal.outcome === "interrupted" && journal.events.at(-1)?.phase === "rollback" && journal.events.at(-1)?.outcome === "interrupted") rollback("resume-rollback");
+  die("journal is already rolled back; create a new operation for another attempt");
+}
 else if (journal.events.some(item => item.phase === journal.phase && item.outcome === "succeeded")) start += 1;
 for (let i = Math.max(0, start); i < order.length; i += 1) {
   const phase = order[i];
