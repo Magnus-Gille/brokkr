@@ -10,6 +10,7 @@ source "$HERE/lib/deploy-source.sh"
 PROBE_USER=heimdall-storage-probe
 PROBE_PATH=/usr/local/lib/brokkr/heimdall-storage-probe
 CONFIG_PATH=/etc/brokkr/heimdall-storage-probe.conf
+SSHD_CONFIG_PATH=/etc/ssh/sshd_config.d/90-brokkr-heimdall-storage-probe.conf
 MANAGED_MARKER=/var/lib/brokkr/heimdall-storage-probe.managed
 AUTH_OPTIONS="command=\"$PROBE_PATH\",restrict,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty"
 
@@ -54,6 +55,8 @@ if [[ $MODE == apply ]]; then
   [[ "$FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]+={0,2}$ ]] ||
     die 'could not read public-key fingerprint'
   bash -n "$HERE/heimdall-storage-probe.sh" || die 'tracked probe script has invalid shell syntax'
+  [[ -f "$HERE/heimdall-storage-probe.sshd.conf" && ! -L "$HERE/heimdall-storage-probe.sshd.conf" ]] ||
+    die 'tracked SSH policy is unavailable'
   [[ "$(grep -Ec '^echo ---[[:space:]]*$' "$HERE/heimdall-storage-probe.sh")" -eq 18 ]] ||
     die 'tracked probe script must declare exactly 19 sections'
   BROKKR_STORAGE_PROBE_CONFIG="$BROKKR_HEIMDALL_STORAGE_PROBE_CONFIG" \
@@ -61,34 +64,40 @@ if [[ $MODE == apply ]]; then
     die 'probe configuration is invalid'
   PROBE_SHA256=$(sha256 "$HERE/heimdall-storage-probe.sh")
   CONFIG_SHA256=$(sha256 "$BROKKR_HEIMDALL_STORAGE_PROBE_CONFIG")
+  SSHD_CONFIG_SHA256=$(sha256 "$HERE/heimdall-storage-probe.sshd.conf")
 fi
 SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$BROKKR_HEIMDALL_STORAGE_KNOWN_HOSTS")
 BASE="/tmp/brokkr-storage-probe.$$."
 STAGE_PROBE="${BASE}probe.new"
 STAGE_CONFIG="${BASE}config.new"
+STAGE_SSHD_CONFIG="${BASE}sshd.new"
 cleanup() {
   [[ ${STAGED:-0} == 1 ]] &&
-    "${SSH[@]}" "$TARGET" "rm -f '$STAGE_PROBE' '$STAGE_CONFIG'" >/dev/null 2>&1 || true
+    "${SSH[@]}" "$TARGET" "rm -f '$STAGE_PROBE' '$STAGE_CONFIG' '$STAGE_SSHD_CONFIG'" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 if [[ $MODE == apply ]]; then
   STAGED=1
   scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$BROKKR_HEIMDALL_STORAGE_KNOWN_HOSTS" "$HERE/heimdall-storage-probe.sh" "$TARGET:$STAGE_PROBE" 2>/dev/null || die 'probe staging failed'
   scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$BROKKR_HEIMDALL_STORAGE_KNOWN_HOSTS" "$BROKKR_HEIMDALL_STORAGE_PROBE_CONFIG" "$TARGET:$STAGE_CONFIG" 2>/dev/null || die 'config staging failed'
+  scp -q -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$BROKKR_HEIMDALL_STORAGE_KNOWN_HOSTS" "$HERE/heimdall-storage-probe.sshd.conf" "$TARGET:$STAGE_SSHD_CONFIG" 2>/dev/null || die 'SSH policy staging failed'
 fi
 env_args="$(printf '%q ' \
   "BROKKR_STORAGE_MODE=$MODE" \
   "BROKKR_STORAGE_USER=$PROBE_USER" \
   "BROKKR_STORAGE_PROBE_PATH=$PROBE_PATH" \
   "BROKKR_STORAGE_CONFIG_PATH=$CONFIG_PATH" \
+  "BROKKR_STORAGE_SSHD_CONFIG_PATH=$SSHD_CONFIG_PATH" \
   "BROKKR_STORAGE_MARKER=$MANAGED_MARKER" \
   "BROKKR_STORAGE_AUTH_OPTIONS=$AUTH_OPTIONS" \
   "BROKKR_STORAGE_STAGE_PROBE=$STAGE_PROBE" \
   "BROKKR_STORAGE_STAGE_CONFIG=$STAGE_CONFIG" \
+  "BROKKR_STORAGE_STAGE_SSHD_CONFIG=$STAGE_SSHD_CONFIG" \
   "BROKKR_STORAGE_PUBKEY=${PUBKEY:-}" \
   "BROKKR_STORAGE_FINGERPRINT=${FINGERPRINT:-}" \
   "BROKKR_STORAGE_EXPECTED_PROBE_SHA256=${PROBE_SHA256:-}" \
-  "BROKKR_STORAGE_EXPECTED_CONFIG_SHA256=${CONFIG_SHA256:-}")"
+  "BROKKR_STORAGE_EXPECTED_CONFIG_SHA256=${CONFIG_SHA256:-}" \
+  "BROKKR_STORAGE_EXPECTED_SSHD_CONFIG_SHA256=${SSHD_CONFIG_SHA256:-}")"
 metadata=$("${SSH[@]}" "$TARGET" "sudo env $env_args bash -s" \
   <"$HERE/lib/heimdall-storage-probe-reconcile.sh" 2>/dev/null) ||
   die 'remote reconciliation failed'
@@ -104,7 +113,7 @@ if [[ $MODE == apply ]]; then
   sections=$(printf '%s\n' "$output" | awk '$0=="---"{n++} END{print n+1}')
   [[ $sections == 19 ]] ||
     die 'authenticated probe did not return the 19-section contract'
-  [[ "$metadata" == "key_fingerprint=$FINGERPRINT probe_sha256=$PROBE_SHA256 config_sha256=$CONFIG_SHA256" ]] ||
+  [[ "$metadata" == "key_fingerprint=$FINGERPRINT probe_sha256=$PROBE_SHA256 config_sha256=$CONFIG_SHA256 sshd_config_sha256=$SSHD_CONFIG_SHA256" ]] ||
     die 'remote metadata contract invalid'
   printf 'brokkr storage probe: applied; key_fingerprint=%s probe_sha256=%s config_bound=true sections=%s\n' \
     "$FINGERPRINT" "$PROBE_SHA256" "$sections"
