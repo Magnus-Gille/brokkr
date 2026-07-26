@@ -1,42 +1,95 @@
-# Debian maintenance executor seam (brokkr#35)
+# Debian maintenance executor seam (brokkr#35, brokkr#66)
 
-`scripts/debian-maintenance-executor.mjs` is a library-only, hermetic mutation
-evidence mechanism. `runDebianMaintenance()` composes it with the #66 immutable
-attempt journal: a caller supplies only content-blind IDs/digests for policy,
-plan, inventory, adapter revision, constitution, postconditions, deadline and
-the required `R-forward` recovery class. It does
-not import a package manager, reboot utility, shell runner, or deployment
-client, and Brokkr ships no live adapter.
+`scripts/debian-maintenance-executor.mjs` is a library-only, hermetic execution
+seam for Debian maintenance. It has no package-manager, reboot, shell, remote
+host, deployment, or production-signing capability of its own. Brokkr ships no
+live adapter, no private key, and no armed target. `runDebianMaintenance()`
+composes the executor with Brokkr's authoritative ADR-008 domain journal; this
+PR therefore implements and observes the contract without arming autonomous
+maintenance.
 
-Before inventory or drain, then again before apply and reboot, it reads one
-current policy record and one synchronized clock proof. It verifies the exact
-plan digest, matching policy digest/id, five-minute freshness, selected node,
-open maintenance window, enabled/non-held policy plus external hold evidence,
-and the complete planner gate shape: unlocked package manager, sufficient disk,
-mains/not-applicable power, synchronized clock, legitimate workload state, and
-kernel recovery eligibility for kernel candidates. Every selected package
-class/source must still be allowed by that current policy. A `planned` envelope
-is not sufficient: it must have no blockers and an executable decision effect
-(`on_schedule` or `run_deferred`). Declared `unmet_policy_classes` are retained
-durably in the journal for downstream policy consumers.
+## Authorization and scope
 
-It writes fsynced, bounded and canonicalized before/after inventory and phase
-evidence to a private journal. The preceding attempt journal is fsynced before
-adapter handoff and hash-links lifecycle receipts. An exact retry must
-reconcile the same attempt; only an explicit `not-applied` result may resume.
-`applied` or indeterminate state becomes `unknown`/`terminally-blocked` and
-disarms. Conflicting replay cannot create a second attempt. Neither journal
-records commands, package logs, private locators, credentials, or recovery
-material.
+Every attempt independently verifies the W0.1 owner-authorization bundle before
+writing `prepare` or invoking an adapter:
 
-`workload_hooks: ready` requires drain, drain verification, and a bounded
-restore/undrain hook. Drain failures are compensated and journaled; an absent
-or failed restore becomes operator recovery. `not_applicable` invokes no drain
-effect. A reboot-capable policy requires reboot and post-reboot-health adapters
-before drain/apply. Previous-kernel recovery is used only for reboot/health
-failures with the exact typed `{kind:"previous-kernel",boot_entry:"saved"}`
-contract; apply/dpkg/network failures receive bounded forward-recovery/reprovision
-evidence. There is no retry loop here while controller composition is blocked.
-Success is only recorded
-after substrate health, restore/undrain, workload health, and after-inventory
-evidence all succeed; no-workload runs skip workload hooks.
+- the owner Ed25519 public key must equal the separately pinned key, and the
+  detached authorization signature and protected checkpoint must verify;
+- the signed authorization must bind the exact constitution, coverage intent,
+  Brokkr owner-attestation registry, and recovery-worker registry digests;
+- the maintenance coverage row, exact target binding, writer/configuration
+  owners, five actor identities, and owner attestation must agree;
+- the protected runtime-narrowing tail must verify against the owner-bound
+  recovery key, and a previously signed demotion to `shadow` makes the target
+  ineligible.
+
+Admission is fail closed. A caller must supply a trusted UTC clock, matching
+kill-switch identity and safe state, fresh eligible evidence, healthy liveness
+within the constitutional silence bound, an open maintenance window, and a
+non-pillar Debian target. The plan may contain only unique `security` and/or
+`bugfix` classes from the distribution repository, with `reboot_policy:
+never` and no workload hooks. Constitutional deadline and rate/window limits
+are derived from the verified artifacts rather than caller-selected values.
+
+The executor retains the #35 policy checks as a second, narrower boundary. It
+re-reads current policy and synchronized clock before inventory/drain and
+before apply, verifies exact plan and policy digests, freshness, node
+selection, window, holds, package-manager/disk/power/clock/workload gates, and
+allowed package class/source. The ADR-008 wrapper is stricter than the older
+executor surface: reboot-capable, kernel, third-party, workload-draining, and
+pillar maintenance are outside this autonomous class even where the underlying
+manual executor can represent them.
+
+## Authoritative attempt journal
+
+The journal uses the exact
+`autonomous-mutation-journal` v1 schema copied from Grimnir commit
+`298526972b46d4f8f0c40fbe92e830adb91087a8`; its bytes, schema ID, and supported
+JSON-Schema keywords are pinned. Brokkr adds semantic validation for authority
+bindings, actors, deadlines, phase transitions, receipts, quarantine, and
+target-bound narrowing. Entries contain only bounded IDs, digests, and opaque
+`ref:` handles—never commands, package logs, private locators, credentials, or
+recovery material.
+
+Success follows exactly:
+
+`prepare → apply → verify → watch → commit`
+
+Each transition obtains a new trusted timestamp. `watch` must consume the
+declared interval, the kill switch is checked at admission and between
+mutation phases, and commit additionally requires a maintenance-safe-state
+readback matching the bound postconditions digest. The initial journal uses
+exclusive creation and all durable replacements are fsynced. An exact terminal
+retry under the same verified authorization snapshot is read-only; conflicting
+bindings fail, and a consumed signed demotion blocks later admission.
+
+An existing non-terminal receipt is ambiguous. Only a `prepare` receipt plus an
+independent `not-applied` reconciliation may resume apply. Any later phase,
+applied/indeterminate result, invalid reconciliation, deadline breach, failed
+phase, or kill-switch transition enters recovery. Process-safe recovery
+ownership prevents a second controller from executing the one-shot recovery
+worker.
+
+## Forward recovery and narrowing
+
+This class is permanently `R-forward`: failures follow
+
+`unknown → recover → quarantine → disarm`
+
+The recovery worker must report recovered state, verified maintenance-safe
+state, and active quarantine. It—not the controller—then appends a signed,
+target-bound narrowing entry from the admitted state to `shadow`. Brokkr
+verifies the signature against the owner-authorized recovery registry, the
+authorization digest, append-only chain, protected tail, actor, target, and
+exact disarm receipt before committing the authoritative `disarm` event.
+
+If forward recovery fails its postconditions, the journal records a distinct
+reason and ends `terminally-blocked`, again only after consuming an equivalent
+signed target demotion. Recovery exceptions are surfaced as explicit
+`recovery_error` values. No automatic rollback, reboot, retry loop, protected
+lane mutation, or Verdandi dependency is introduced.
+
+The executor's private before/after evidence journal remains separate and
+content-limited. It records bounded inventory and adapter-result digests for
+diagnosis; the ADR-008 domain journal is authoritative for admission,
+promotion/recovery phases, quarantine, and target state.

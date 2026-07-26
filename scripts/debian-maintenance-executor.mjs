@@ -122,19 +122,25 @@ export function executeDebianMaintenance({ plan, policy, nodeId = plan?.node_id,
   } catch (error) { return terminal(error.code ?? "executor_failed", error); }
 }
 export function runDebianMaintenance(options) {
-  const { attempt, attemptJournalDir, now, reconcile = null, ...executor } = options ?? {};
-  if (!attempt || typeof attemptJournalDir !== "string" || !strictUtc(now)) fail("attempt_journal_contract_invalid");
-  const journalFile = path.join(attemptJournalDir, "mutation", `${attempt.plan?.id ?? "invalid"}.json`);
+  const {
+    binding, attemptJournalDir, artifacts, admission, recovery, reconcile = null,
+    watch, safeStateReadback, ...executor
+  } = options ?? {};
+  if (!binding || typeof attemptJournalDir !== "string" || !artifacts || !admission || !recovery ||
+      typeof watch !== "function" || typeof safeStateReadback !== "function") fail("attempt_journal_contract_invalid");
+  const journalFile = path.join(attemptJournalDir, "mutation", `${binding.attempt_id}.json`);
+  let executionResult = null;
   return runMaintenanceAttempt({
-    journalDir: attemptJournalDir, binding: attempt, now, reconcile,
-    execute: () => {
-      const result = executeDebianMaintenance({ ...executor, journalFile });
-      // The executor deliberately returns failure evidence instead of throwing.
-      // It is not a successful attempt journal commit unless its declared
-      // postconditions completed; the outer journal then records uncertainty
-      // and disarms rather than turning a recovery-needed result into success.
-      if (result.outcome !== "succeeded") fail("executor_postconditions_unmet");
-      return result;
+    journalDir: attemptJournalDir, binding, artifacts, admission, recovery, reconcile,
+    phases: {
+      apply: () => {
+        executionResult = executeDebianMaintenance({ ...executor, journalFile });
+        if (executionResult.outcome !== "succeeded") fail("executor_postconditions_unmet");
+        return { applied: true };
+      },
+      verify: () => ({ verified: executionResult?.outcome === "succeeded" }),
+      watch,
+      safeStateReadback,
     },
   });
 }
