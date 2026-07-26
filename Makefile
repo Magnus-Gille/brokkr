@@ -1,7 +1,7 @@
 BROKKR_SSH_TARGET ?= brokkr@control-node
 BROKKR_REMOTE_DIR ?= /opt/brokkr
 
-.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install node-inventory inspect relocation-plan relocation-apply maintenance-plan test shellcheck
+.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller test shellcheck
 
 patching: ## Install/refresh unattended-upgrades on all Pi hosts (ARGS="--dry-run" or a host)
 	@./scripts/setup-host-patching.sh $(ARGS)
@@ -29,6 +29,9 @@ relocation-apply: ## Execute a bounded relocation lifecycle (explicit plan/opera
 
 maintenance-plan: ## Produce a deterministic, read-only maintenance observation/plan (ARGS="...")
 	@node scripts/maintenance-plan.mjs $(ARGS)
+
+maintenance-controller: ## Inspect fail-closed maintenance-controller admission (ARGS="...")
+	@node scripts/maintenance-controller.mjs $(ARGS)
 
 maintenance-os: ## Run the OS maintenance report on the service host (ARGS="--dry-run --verbose")
 	@ssh $(BROKKR_SSH_TARGET) 'cd $(BROKKR_REMOTE_DIR) && bash scripts/maintenance-report.sh os $(ARGS)'
