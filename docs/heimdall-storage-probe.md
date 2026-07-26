@@ -39,8 +39,12 @@ The remote account is a purpose-specific system account. Its only
 `/usr/local/lib/brokkr/heimdall-storage-probe`, with `restrict`, no port,
 agent, or X11 forwarding, and no PTY. The forced command means an SSH client
 cannot substitute a shell command. The account's home and SSH authorization
-directory are root-owned, so the probe cannot replace its own key. The config
-is root-owned and group-readable only by the dedicated account. The
+directory are root-owned, so the probe cannot replace its own key. Because
+`sshd` temporarily adopts the dedicated UID while reading `AuthorizedKeysFile`,
+the directory is `root:<dedicated-group>` mode `0750` and `authorized_keys` is
+`root:<dedicated-group>` mode `0640`: the dedicated private group can traverse
+the directory and read the key, but has no write permission. The config is
+root-owned and group-readable only by the dedicated account. The
 provisioner writes a root-owned marker binding the authorization, probe,
 configuration, and SSH-policy digests; it refuses to replace or revoke
 unmarked, symlinked, or drifted artifacts.

@@ -109,7 +109,10 @@ apply)
   else
     apply_incomplete=1
     install -d -m 0755 -o root -g root "$home" "$(dirname "$BROKKR_STORAGE_PROBE_PATH")" "$(dirname "$BROKKR_STORAGE_CONFIG_PATH")" "$(dirname "$BROKKR_STORAGE_SSHD_CONFIG_PATH")" "$(dirname "$BROKKR_STORAGE_MARKER")"
-    install -d -m 0700 -o root -g root "$ssh_dir"; chown root:root "$home" "$ssh_dir"; chmod 0755 "$home"; chmod 0700 "$ssh_dir"
+    # sshd temporarily adopts the account UID to read AuthorizedKeysFile.  Keep
+    # root as owner, but give only the account's private group the traverse/read
+    # path; the group has no write bit on either managed authorization artifact.
+    install -d -m 0750 -o root -g "$BROKKR_STORAGE_USER" "$ssh_dir"; chown root:root "$home"; chown root:"$BROKKR_STORAGE_USER" "$ssh_dir"; chmod 0755 "$home"; chmod 0750 "$ssh_dir"
     rm -f "$auth.new" "$BROKKR_STORAGE_MARKER.new"
     new_sshd_policy=1
     install -m 0644 -o root -g root "$BROKKR_STORAGE_STAGE_SSHD_CONFIG" "$BROKKR_STORAGE_SSHD_CONFIG_PATH"
@@ -117,7 +120,7 @@ apply)
     reload_sshd || fail 'could not safely reload SSH daemon'
     install -m 0755 -o root -g root "$BROKKR_STORAGE_STAGE_PROBE" "$BROKKR_STORAGE_PROBE_PATH"
     install -m 0640 -o root -g "$BROKKR_STORAGE_USER" "$BROKKR_STORAGE_STAGE_CONFIG" "$BROKKR_STORAGE_CONFIG_PATH"
-    printf '%s %s\n' "$BROKKR_STORAGE_AUTH_OPTIONS" "$BROKKR_STORAGE_PUBKEY" >"$auth.new"; chown root:root "$auth.new"; chmod 0600 "$auth.new"; mv "$auth.new" "$auth"
+    printf '%s %s\n' "$BROKKR_STORAGE_AUTH_OPTIONS" "$BROKKR_STORAGE_PUBKEY" >"$auth.new"; chown root:"$BROKKR_STORAGE_USER" "$auth.new"; chmod 0640 "$auth.new"; mv "$auth.new" "$auth"
     auth_digest=$(sha256 "$auth"); probe_digest=$(sha256 "$BROKKR_STORAGE_PROBE_PATH"); config_digest=$(sha256 "$BROKKR_STORAGE_CONFIG_PATH")
     sshd_config_digest=$(sha256 "$BROKKR_STORAGE_SSHD_CONFIG_PATH")
     printf 'schema=brokkr-storage-probe-v3\nkey_fingerprint=%s\nauth_sha256=%s\nprobe_sha256=%s\nconfig_sha256=%s\nsshd_config_sha256=%s\n' "$BROKKR_STORAGE_FINGERPRINT" "$auth_digest" "$probe_digest" "$config_digest" "$sshd_config_digest" >"$BROKKR_STORAGE_MARKER.new"; chown root:root "$BROKKR_STORAGE_MARKER.new"; chmod 0600 "$BROKKR_STORAGE_MARKER.new"; mv "$BROKKR_STORAGE_MARKER.new" "$BROKKR_STORAGE_MARKER"
