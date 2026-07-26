@@ -13,14 +13,20 @@ node "$DETECTOR" --input "$ROOT/tests/fixtures/platform-faults/faulty-observatio
 check "detector emits typed, severe, fresh faults linked to node/substrate evidence" \
   'node -e '\''const x=require(process.argv[1]); if (!Array.isArray(x.faults)||x.faults.length!==3)process.exit(1); for(const f of x.faults){if(f.kind!=="brokkr-platform-fault"||f.schema_version!=="v1"||!f.evidence.provenance||!f.freshness.valid_until||f.node_substrate_ref.contract!=="grimnir.node-substrate/v1"||!f.recovery_owner)process.exit(1)} if(!x.faults.some(f=>f.category==="filesystem-read-only"&&f.severity==="critical"))process.exit(1)'\'' "$TMP/faults.json"'
 
-if node "$DETECTOR" --input "$ROOT/tests/fixtures/platform-faults/stale-observation.json" >"$TMP/stale.json" 2>&1; then rc=0; else rc=$?; fi
-check "stale observation fails closed" '[ "$rc" -ne 0 ] && grep -q "stale" "$TMP/stale.json"'
+if node "$DETECTOR" --input "$ROOT/tests/fixtures/platform-faults/stale-observation.json" >"$TMP/stale.json" 2>&1; then
+  check "stale observation fails closed" 'false'
+else
+  check "stale observation fails closed" 'grep -q "stale" "$TMP/stale.json"'
+fi
 
 node "$NEGOTIATE" --agent "$ROOT/tests/fixtures/platform-faults/agent-v1.json" --deployment "$ROOT/tests/fixtures/platform-faults/deployment-v1.json" >"$TMP/compatible.json"
 check "node agent negotiates both contract versions explicitly" \
   'node -e '\''const x=require(process.argv[1]); if(x.outcome!=="compatible"||x.negotiated.platform_fault!=="v1"||x.negotiated.node_substrate!=="v1")process.exit(1)'\'' "$TMP/compatible.json"'
-if node "$NEGOTIATE" --agent "$ROOT/tests/fixtures/platform-faults/agent-v1.json" --deployment "$ROOT/tests/fixtures/platform-faults/deployment-v2.json" >"$TMP/incompatible.json" 2>&1; then rc=0; else rc=$?; fi
-check "unsupported deployment contract is rejected before install" '[ "$rc" -ne 0 ] && grep -q "incompatible" "$TMP/incompatible.json"'
+if node "$NEGOTIATE" --agent "$ROOT/tests/fixtures/platform-faults/agent-v1.json" --deployment "$ROOT/tests/fixtures/platform-faults/deployment-v2.json" >"$TMP/incompatible.json" 2>&1; then
+  check "unsupported deployment contract is rejected before install" 'false'
+else
+  check "unsupported deployment contract is rejected before install" 'grep -q "incompatible" "$TMP/incompatible.json"'
+fi
 
 printf '%s tests, %s failures\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
