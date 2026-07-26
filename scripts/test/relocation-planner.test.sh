@@ -136,7 +136,7 @@ if (v.outcome !== "promoted" || v.workloads.length !== 2) throw new Error("clean
 if (!v.workloads.some(w => w.workload_id === "fixture-hugin" && w.placement === "planned")) throw new Error("requested workload was required to be pre-hosted");
 if (!v.workloads.some(w => w.workload_id === "existing" && w.placement === "current")) throw new Error("current cohost omitted");
 const requested = v.workloads.find(w => w.workload_id === "fixture-hugin");
-if (JSON.stringify(requested.units) !== JSON.stringify(["hugin.service"]) || JSON.stringify(requested.timers) !== JSON.stringify([]) || !requested) throw new Error("requested units/timers omitted");
+if (JSON.stringify(requested.units) !== JSON.stringify(["hugin.service"]) || JSON.stringify(requested.timers) !== JSON.stringify([])) throw new Error("requested units/timers omitted");
 if (v.resources.required_cpu_cores !== 6 || v.resources.required_memory_mib !== 6144) throw new Error("resource minima not totaled");
 if (v.dependencies[0].status !== "available") throw new Error("dependency evidence omitted");
 if (v.backup_roles.required.length !== 4 || !v.backup_roles.required.some(r => r.actor === "existing-backup" && r.role === "consumer")) throw new Error("cohost backup roles omitted");

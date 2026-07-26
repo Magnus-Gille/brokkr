@@ -59,6 +59,7 @@ for (const name of ["preflight", "drain", "verify"]) if (planHooks.get(name)?.id
 if (plan.rollback.hook !== "rollback") die("only explicit rollback hook is supported by this v1 executor");
 const operationDigest = hash(operation);
 const initial = { kind: "brokkr-relocation-journal", schema_version: "v1", plan_id: plan.plan_id, plan_digest: plan.plan_digest, operation_id: operation.id, operation_digest: operationDigest, reversal_recipe: operation.reversal_recipe, phase: "preflight", outcome: "running", old_placement_retained: true, events: [] };
+const journalId = `journal-${hash({ plan_id: plan.plan_id, plan_digest: plan.plan_digest, operation_id: operation.id, operation_digest: operationDigest }).slice(7, 47)}`;
 let journal;
 if (fs.existsSync(args.journal)) {
   if (!args.resume) die("journal exists; use --resume to continue or roll back the same operation");
@@ -66,6 +67,40 @@ if (fs.existsSync(args.journal)) {
   if (journal.plan_digest !== plan.plan_digest || journal.operation_digest !== operationDigest || journal.outcome === "promoted") die("journal does not describe a resumable identical operation");
 } else { if (args.resume) die("no journal exists to resume"); journal = initial; writeJournal(journal); }
 const event = (phase, outcome, detail) => { journal.phase = phase; journal.events.push({ at: args.now, phase, outcome, detail, platform_fault_refs: operation.platform_fault_refs, capability_contract: { version: 1, required: operation.monitoring.required_capabilities, evidence: { "node-capability-freshness": { observed_at: args.now, status: "fresh" }, "lifecycle-result": { observed_at: args.now, result: outcome } } } }); writeJournal(journal); };
+const terminalHookOutcome = outcome => ({ succeeded: "success", failed: "failed", interrupted: "partial" }[outcome]);
+const terminalLifecycle = ({ phase, outcome, substrateOutcome, rollback }) => {
+  const hookResults = ["preflight", "drain", "verify", "rollback", "compensate"].flatMap(name => {
+    const events = journal.events.filter(item => item.phase === name && terminalHookOutcome(item.outcome));
+    if (!events.length) return [];
+    const latest = events.at(-1);
+    return [{
+      result_id: `hook-${name}-${hash({ name, outcome: latest.outcome, plan_id: plan.lifecycle_result.plan_id, attempt_id: plan.lifecycle_result.attempt_id, idempotency_key: plan.lifecycle_result.idempotency_key }).slice(7, 31)}`,
+      hook: name,
+      attempt_id: plan.lifecycle_result.attempt_id,
+      plan_id: plan.lifecycle_result.plan_id,
+      plan_digest: plan.lifecycle_result.plan_digest,
+      desired_revision: plan.lifecycle_result.desired_revision,
+      observation_evidence_id: plan.lifecycle_result.observation_evidence_id,
+      action: "relocate",
+      deadline: plan.lifecycle_result.deadline,
+      idempotency_key: plan.lifecycle_result.idempotency_key,
+      outcome: terminalHookOutcome(latest.outcome)
+    }];
+  });
+  const result = { ...plan.lifecycle_result, action: "relocate", phase, outcome, hook_results: hookResults, substrate: { outcome: substrateOutcome, rollback, pre_state_evidence_id: plan.lifecycle_result.observation_evidence_id }, created_at: args.now };
+  if (schemaErrors(schema, result).length) die("derived terminal lifecycle result violates the pinned contract");
+  return result;
+};
+const recordRollbackTerminal = state => {
+  const details = {
+    verified: { substrateOutcome: "failed", rollback: "verified" },
+    failed: { substrateOutcome: "failed", rollback: "failed" },
+    interrupted: { substrateOutcome: "partial", rollback: "failed" }
+  }[state];
+  journal.lifecycle_result = terminalLifecycle({ phase: "substrate_rollback", outcome: "blocked", ...details });
+  journal.rollback_status = state;
+  writeJournal(journal);
+};
 const run = name => {
   const hook = hookMap.get(name); event(name, "started", hook.attribution);
   const result = spawnSync(hook.command[0], hook.command.slice(1), { encoding: "utf8", timeout: hook.timeout_seconds * 1000, maxBuffer: 64_000, env: { ...process.env, BROKKR_LIFECYCLE_IDEMPOTENCY_KEY: plan.lifecycle_result.idempotency_key, BROKKR_RELOCATION_OPERATION_ID: operation.id, BROKKR_RELOCATION_HOOK: name } });
@@ -79,7 +114,7 @@ const run = name => {
   }
   event(name, "succeeded", hook.attribution); return true;
 };
-const rollback = reason => { event("rollback", "started", { reason }); const outcome = run("rollback"); if (outcome === "interrupted") { journal.outcome = "interrupted"; journal.phase = "rollback"; writeJournal(journal); process.exit(4); } if (!outcome) { journal.outcome = "blocked"; journal.phase = "rollback"; writeJournal(journal); die("rollback hook failed; old placement remains retained"); } journal.outcome = "blocked"; journal.phase = "rollback"; writeJournal(journal); process.exit(3); };
+const rollback = reason => { event("rollback", "started", { reason }); const outcome = run("rollback"); if (outcome === "interrupted") { journal.outcome = "interrupted"; journal.phase = "rollback"; recordRollbackTerminal("interrupted"); process.exit(4); } if (!outcome) { journal.outcome = "blocked"; journal.phase = "rollback"; recordRollbackTerminal("failed"); die("rollback hook failed; old placement remains retained"); } journal.outcome = "blocked"; journal.phase = "rollback"; recordRollbackTerminal("verified"); process.exit(3); };
 const order = ["preflight", "drain", "apply", "verify", "representative_data"];
 let start = order.indexOf(journal.phase);
 if (journal.phase === "awaiting_operator") start = order.indexOf("apply");
@@ -97,4 +132,5 @@ for (let i = Math.max(0, start); i < order.length; i += 1) {
   if (!outcome) rollback(`${phase}-failed`);
 }
 journal.phase = "promoted"; journal.outcome = "promoted"; journal.old_placement_retained = false; event("promoted", "succeeded", { representative_data: "verified", irreversible: "not-performed" });
-process.stdout.write(`${canonicalJson({ kind: "brokkr-relocation-result", schema_version: "v1", outcome: "promoted", journal: args.journal, lifecycle_result: { ...plan.lifecycle_result, phase: "verify", outcome: "promoted", action: "relocate" }, monitoring: { contract: operation.monitoring.contract, capability_contract: { version: 1, required: operation.monitoring.required_capabilities, evidence: { "node-capability-freshness": { observed_at: args.now, status: "fresh" }, "lifecycle-result": { observed_at: args.now, result: "promoted" } } }, platform_fault_refs: operation.platform_fault_refs } })}\n`);
+journal.lifecycle_result = terminalLifecycle({ phase: "verify", outcome: "promoted", substrateOutcome: "success", rollback: "not_needed" }); writeJournal(journal);
+process.stdout.write(`${canonicalJson({ kind: "brokkr-relocation-result", schema_version: "v1", outcome: "promoted", journal: { id: journalId, digest: hash(journal) }, lifecycle_result: journal.lifecycle_result, monitoring: { contract: operation.monitoring.contract, capability_contract: { version: 1, required: operation.monitoring.required_capabilities, evidence: { "node-capability-freshness": { observed_at: args.now, status: "fresh" }, "lifecycle-result": { observed_at: args.now, result: "promoted" } } }, platform_fault_refs: operation.platform_fault_refs } })}\n`);

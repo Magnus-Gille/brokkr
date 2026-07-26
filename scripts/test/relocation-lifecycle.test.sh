@@ -10,6 +10,7 @@ case "\${HOOK_MODE:-ok}" in
   failed-hook) [ "$name" = verify ] && exit 7 ;;
   interrupt) [ "$name" = drain ] && exit 75 ;;
   rollback-interrupt) [ "$name" = verify ] && exit 7; [ "$name" = rollback ] && exit 75 ;;
+  rollback-failed) [ "$name" = verify ] && exit 7; [ "$name" = rollback ] && exit 7 ;;
 esac
 printf '%s:%s:%s\n' "\${BROKKR_LIFECYCLE_IDEMPOTENCY_KEY:?}" "\${BROKKR_RELOCATION_OPERATION_ID:?}" "\${BROKKR_RELOCATION_HOOK:?}" >>"$TMP/hook-keys"
 echo "$name-ok"
@@ -28,6 +29,13 @@ run success >"$TMP/success.out" || fail success
 node - "$TMP/success.json" <<'NODE'
 const j=require(process.argv[2]);if(j.outcome!=='promoted'||j.old_placement_retained||!j.events.some(x=>x.phase==='representative_data'&&x.outcome==='succeeded')||!j.events.every(x=>x.platform_fault_refs[0]==='fault-fixture-nas-1'&&x.capability_contract?.required?.includes('lifecycle-result')))process.exit(1)
 NODE
+node --input-type=module - "$TMP/success.out" "$TMP/success.json" "$ROOT" <<'NODE'
+import fs from 'node:fs';
+const [out,journal,root]=process.argv.slice(2); const { canonicalJson, schemaErrors }=await import(`${root}/scripts/lib/node-substrate-contract.mjs`); const { createHash }=await import('node:crypto'); const result=JSON.parse(fs.readFileSync(out)); const j=JSON.parse(fs.readFileSync(journal)); const schema=JSON.parse(fs.readFileSync(`${root}/docs/node-substrate-contract-v1.schema.json`));
+if (typeof result.journal !== 'object' || !/^journal-[a-f0-9]+$/.test(result.journal.id) || !/^sha256:[a-f0-9]{64}$/.test(result.journal.digest) || JSON.stringify(result).includes('/private/')) throw new Error('portable result leaked journal path');
+const life=result.lifecycle_result; if (schemaErrors(schema, life).length || life.substrate.outcome !== 'success' || life.substrate.rollback !== 'not_needed' || life.hook_results.map(x => x.hook).join(',') !== 'preflight,drain,verify' || !life.hook_results.every(x => x.plan_id === life.plan_id && x.attempt_id === life.attempt_id && x.idempotency_key === life.idempotency_key)) throw new Error('promoted terminal lifecycle is incomplete');
+if (JSON.stringify(j.lifecycle_result) !== JSON.stringify(life) || result.journal.digest !== `sha256:${createHash('sha256').update(canonicalJson(j)).digest('hex')}`) throw new Error('journal did not retain portable terminal lifecycle evidence');
+NODE
 node - "$TMP/plan.json" "$TMP/stale-plan.json" <<'NODE'
 const fs=require('fs');const [a,b]=process.argv.slice(2);const x=require(a);x.lifecycle_result.deadline='2026-07-26T10:29:59Z';fs.writeFileSync(b,JSON.stringify(x));
 NODE
@@ -39,8 +47,10 @@ NODE
 if node "$EXEC" --plan "$TMP/mismatched-plan.json" --operation "$TMP/op.json" --journal "$TMP/mismatched.json" --now 2026-07-26T10:30:00Z >"$TMP/mismatched.out" 2>&1; then fail 'mismatched plan passed'; fi
 [[ ! -e "$TMP/mismatched.json" ]] || fail 'mismatched plan created a mutation journal'
 if HOOK_MODE=lost-network run network >"$TMP/network.out" 2>&1; then fail 'lost network passed'; fi
-node - "$TMP/network.json" <<'NODE'
-const j=require(process.argv[2]);if(j.phase!=='rollback'||j.outcome!=='blocked'||!j.old_placement_retained||!j.events.some(x=>x.phase==='rollback'&&x.outcome==='succeeded'))process.exit(1)
+node --input-type=module - "$TMP/network.json" "$ROOT" <<'NODE'
+import fs from 'node:fs';
+const [journal,root]=process.argv.slice(2); const { schemaErrors }=await import(`${root}/scripts/lib/node-substrate-contract.mjs`); const j=JSON.parse(fs.readFileSync(journal)); const schema=JSON.parse(fs.readFileSync(`${root}/docs/node-substrate-contract-v1.schema.json`)); const l=j.lifecycle_result;
+if(j.phase!=='rollback'||j.outcome!=='blocked'||j.rollback_status!=='verified'||!j.old_placement_retained||!j.events.some(x=>x.phase==='rollback'&&x.outcome==='succeeded')||l?.phase!=='substrate_rollback'||l?.outcome!=='blocked'||l?.substrate?.rollback!=='verified'||l?.substrate?.outcome!=='failed'||schemaErrors(schema,l).length)process.exit(1)
 NODE
 if HOOK_MODE=failed-hook run failed >"$TMP/failed.out" 2>&1; then fail 'failed hook passed'; fi
 node - "$TMP/failed.json" <<'NODE'
@@ -54,12 +64,20 @@ NODE
 if [ "$(sort -u "$TMP/hook-keys" | wc -l | tr -d ' ')" -ne 6 ]; then fail 'hooks did not receive stable attributed idempotency environment'; fi
 if [ "$(grep -cx 'idem-001:operation-001:drain' "$TMP/hook-keys")" -lt 2 ]; then fail 'interrupted drain retry did not receive the same idempotency identity'; fi
 if HOOK_MODE=rollback-interrupt run rollback-resume >"$TMP/rollback-interrupted.out" 2>&1; then fail 'rollback interruption passed'; fi
-node - "$TMP/rollback-resume.json" <<'NODE'
-const j=require(process.argv[2]);if(j.phase!=='rollback'||j.outcome!=='interrupted'||!j.old_placement_retained)process.exit(1)
+node --input-type=module - "$TMP/rollback-resume.json" "$ROOT" <<'NODE'
+import fs from 'node:fs';
+const [journal,root]=process.argv.slice(2); const { schemaErrors }=await import(`${root}/scripts/lib/node-substrate-contract.mjs`); const j=JSON.parse(fs.readFileSync(journal)); const schema=JSON.parse(fs.readFileSync(`${root}/docs/node-substrate-contract-v1.schema.json`)); const l=j.lifecycle_result;
+if(j.phase!=='rollback'||j.outcome!=='interrupted'||j.rollback_status!=='interrupted'||!j.old_placement_retained||l?.substrate?.rollback!=='failed'||l?.substrate?.outcome!=='partial'||schemaErrors(schema,l).length)process.exit(1)
 NODE
 run rollback-resume --resume >"$TMP/rollback-resumed.out" 2>&1 || test "$?" -eq 3 || fail 'rollback resume did not finish its blocked terminal state'
 node - "$TMP/rollback-resume.json" <<'NODE'
-const j=require(process.argv[2]);if(j.phase!=='rollback'||j.outcome!=='blocked'||!j.events.some(x=>x.phase==='rollback'&&x.outcome==='succeeded'))process.exit(1)
+const j=require(process.argv[2]);const l=j.lifecycle_result;if(j.phase!=='rollback'||j.outcome!=='blocked'||j.rollback_status!=='verified'||!j.events.some(x=>x.phase==='rollback'&&x.outcome==='succeeded')||l?.substrate?.rollback!=='verified')process.exit(1)
+NODE
+if HOOK_MODE=rollback-failed run rollback-failed >"$TMP/rollback-failed.out" 2>&1; then fail 'rollback failure passed'; fi
+node --input-type=module - "$TMP/rollback-failed.json" "$ROOT" <<'NODE'
+import fs from 'node:fs';
+const [journal,root]=process.argv.slice(2); const { schemaErrors }=await import(`${root}/scripts/lib/node-substrate-contract.mjs`); const j=JSON.parse(fs.readFileSync(journal)); const schema=JSON.parse(fs.readFileSync(`${root}/docs/node-substrate-contract-v1.schema.json`)); const l=j.lifecycle_result;
+if (j.rollback_status !== 'failed' || l?.substrate?.rollback !== 'failed' || l?.substrate?.outcome !== 'failed' || !l.hook_results.some(x => x.hook === 'rollback' && x.outcome === 'failed') || schemaErrors(schema,l).length) throw new Error('failed rollback lacked schema-valid terminal evidence');
 NODE
 node - "$TMP/op.json" "$TMP/physical.json" <<'NODE'
 const fs=require('fs');const [a,b]=process.argv.slice(2);const x=require(a);x.physical_move_required=true;fs.writeFileSync(b,JSON.stringify(x));
