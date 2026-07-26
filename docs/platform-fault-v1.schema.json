@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Brokkr platform fault v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "fault_id", "category", "severity", "node_substrate_ref", "evidence", "freshness", "recovery_owner"],
+  "properties": {
+    "kind": {"const": "brokkr-platform-fault"}, "schema_version": {"const": "v1"},
+    "fault_id": {"type": "string", "pattern": "^fault-[a-z0-9-]+-[0-9]+$"},
+    "category": {"enum": ["filesystem-read-only", "clock-unsynchronised", "boot-identity-changed"]},
+    "severity": {"enum": ["warning", "critical"]},
+    "node_substrate_ref": {"type": "object", "additionalProperties": false, "required": ["contract", "node_id", "observation_evidence_id"], "properties": {"contract": {"const": "grimnir.node-substrate/v1"}, "node_id": {"type": "string"}, "observation_evidence_id": {"type": "string"}}},
+    "evidence": {"type": "object", "additionalProperties": false, "required": ["provenance", "assertion"], "properties": {"provenance": {"type": "string", "minLength": 1}, "assertion": {"type": "string"}}},
+    "freshness": {"type": "object", "additionalProperties": false, "required": ["observed_at", "valid_until"], "properties": {"observed_at": {"type": "string", "format": "date-time"}, "valid_until": {"type": "string", "format": "date-time"}}},
+    "recovery_owner": {"enum": ["brokkr", "node-agent", "operator"]}
+  }
+}

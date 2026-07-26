@@ -1,0 +1,1 @@
+{"kind":"brokkr-platform-observation","schema_version":"v1","now":"2026-07-26T10:10:00Z","observed_at":"2026-07-26T09:59:00Z","valid_until":"2026-07-26T10:04:00Z","node_substrate_ref":{"contract":"grimnir.node-substrate/v1","node_id":"fixture-node","observation_evidence_id":"obs-fixture-001"},"signals":[]}
