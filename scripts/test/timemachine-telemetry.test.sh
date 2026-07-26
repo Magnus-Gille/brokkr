@@ -100,6 +100,9 @@ check "multiple assignments without final newline fail closed" '[[ "$RC" -eq 2 &
 printf 'BROKKR_TM_BANDS_DIR=%s\nnot-an-assignment\n' "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
 run
 check "newline injection fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+printf 'BROKKR_TM_BANDS_DIR=%s\nnot-an-assignment' "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
+run
+check "unterminated second line fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
 printf 'BROKKR_TM_BANDS_DIR=%s\tcontrol\n' "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
 run
 check "tab control in source fails closed" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
