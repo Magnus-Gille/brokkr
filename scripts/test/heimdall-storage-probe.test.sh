@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # Regression coverage for the Mimir v1 fixed-record consumer.
-set -uo pipefail
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 PROBE="$REPO/scripts/heimdall-storage-probe.sh"
-TMP="$(mktemp -d /private/tmp/brokkr-heimdall-storage-probe.XXXXXX)"
+TMP=
+if ! TMP="$(mktemp -d "${TMPDIR:-/tmp}/brokkr-heimdall-storage-probe.XXXXXX")"; then
+  echo 'could not allocate temporary test directory' >&2
+  exit 1
+fi
+if [[ -z "$TMP" || ! -d "$TMP" ]]; then
+  echo 'temporary test directory is empty or unavailable' >&2
+  exit 1
+fi
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 cat >"$TMP/bin/cat" <<'EOF'
@@ -118,12 +126,22 @@ MIMIR_LOG=$TMP/legacy.log
 MIMIR_SYNC_STAMP=$TMP/legacy.stamp
 MIMIR_SYNC_DIR=$TMP/legacy-tree
 EOF
-BROKKR_STORAGE_PROBE_CONFIG="$TMP/probe.conf" bash "$PROBE" --validate-config >/dev/null 2>&1
-check 'mixed legacy and v1 Mimir configuration is refused' '[[ $? -ne 0 ]]'
+if BROKKR_STORAGE_PROBE_CONFIG="$TMP/probe.conf" bash "$PROBE" --validate-config >/dev/null 2>&1; then
+  CONFIG_RC=0
+else
+  # shellcheck disable=SC2034 # Assertion consumes CONFIG_RC through check/eval.
+  CONFIG_RC=$?
+fi
+check 'mixed legacy and v1 Mimir configuration is refused' '[[ $CONFIG_RC -ne 0 ]]'
 
 sed -i.bak 's|MIMIR_BACKUP_RECORD=.*|MIMIR_BACKUP_RECORD=/tmp/../backup.json|' "$TMP/probe.conf"
-BROKKR_STORAGE_PROBE_CONFIG="$TMP/probe.conf" bash "$PROBE" --validate-config >/dev/null 2>&1
-check 'traversal in configured record path is refused' '[[ $? -ne 0 ]]'
+if BROKKR_STORAGE_PROBE_CONFIG="$TMP/probe.conf" bash "$PROBE" --validate-config >/dev/null 2>&1; then
+  CONFIG_RC=0
+else
+  # shellcheck disable=SC2034 # Assertion consumes CONFIG_RC through check/eval.
+  CONFIG_RC=$?
+fi
+check 'traversal in configured record path is refused' '[[ $CONFIG_RC -ne 0 ]]'
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
