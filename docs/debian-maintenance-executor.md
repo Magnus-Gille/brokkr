@@ -1,8 +1,10 @@
 # Debian maintenance executor seam (brokkr#35)
 
 `scripts/debian-maintenance-executor.mjs` is a library-only, hermetic mutation
-evidence mechanism. Controller composition is blocked until #34 retry attempts
-have a shared attempt-ID to immutable-journal binding. It does
+evidence mechanism. `runDebianMaintenance()` composes it with the #66 immutable
+attempt journal: a caller supplies only content-blind IDs/digests for policy,
+plan, inventory, adapter revision, constitution, postconditions, deadline and
+the required `R-forward` recovery class. It does
 not import a package manager, reboot utility, shell runner, or deployment
 client, and Brokkr ships no live adapter.
 
@@ -19,9 +21,13 @@ is not sufficient: it must have no blockers and an executable decision effect
 durably in the journal for downstream policy consumers.
 
 It writes fsynced, bounded and canonicalized before/after inventory and phase
-evidence to a private journal. Any existing journal fails closed—there is no
-automatic replay or overwrite, so crashes require operator recovery rather
-than guessing.
+evidence to a private journal. The preceding attempt journal is fsynced before
+adapter handoff and hash-links lifecycle receipts. An exact retry must
+reconcile the same attempt; only an explicit `not-applied` result may resume.
+`applied` or indeterminate state becomes `unknown`/`terminally-blocked` and
+disarms. Conflicting replay cannot create a second attempt. Neither journal
+records commands, package logs, private locators, credentials, or recovery
+material.
 
 `workload_hooks: ready` requires drain, drain verification, and a bounded
 restore/undrain hook. Drain failures are compensated and journaled; an absent

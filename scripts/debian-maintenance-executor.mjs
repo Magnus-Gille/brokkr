@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { canonicalJson, durationToMs, policyDigest, strictUtc } from "./lib/maintenance-policy-contract.mjs";
 import { windowStatus } from "./maintenance-controller.mjs";
+import { runMaintenanceAttempt } from "./maintenance-attempt-journal.mjs";
 
 const MAX_PLAN_AGE_MS = 5 * 60 * 1000;
 const MAX_EVENTS = 32;
@@ -121,8 +122,19 @@ export function executeDebianMaintenance({ plan, policy, nodeId = plan?.node_id,
   } catch (error) { return terminal(error.code ?? "executor_failed", error); }
 }
 export function runDebianMaintenance(options) {
-  // #34 retry attempts and immutable #10 journals need a shared attempt-ID
-  // contract before they can be safely composed. Refuse rather than pretending
-  // a retry can reuse a journal that may cross an ambiguous mutation boundary.
-  void options; fail("controller_retry_journal_contract_unimplemented");
+  const { attempt, attemptJournalDir, now, reconcile = null, ...executor } = options ?? {};
+  if (!attempt || typeof attemptJournalDir !== "string" || !strictUtc(now)) fail("attempt_journal_contract_invalid");
+  const journalFile = path.join(attemptJournalDir, "mutation", `${attempt.plan?.id ?? "invalid"}.json`);
+  return runMaintenanceAttempt({
+    journalDir: attemptJournalDir, binding: attempt, now, reconcile,
+    execute: () => {
+      const result = executeDebianMaintenance({ ...executor, journalFile });
+      // The executor deliberately returns failure evidence instead of throwing.
+      // It is not a successful attempt journal commit unless its declared
+      // postconditions completed; the outer journal then records uncertainty
+      // and disarms rather than turning a recovery-needed result into success.
+      if (result.outcome !== "succeeded") fail("executor_postconditions_unmet");
+      return result;
+    },
+  });
 }
