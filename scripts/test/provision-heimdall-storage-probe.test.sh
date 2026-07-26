@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Execute the root reconciler against a hermetic filesystem (brokkr#51).
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+RECONCILER="$REPO/scripts/lib/heimdall-storage-probe-reconcile.sh"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+mkdir -p "$TMP/bin" "$TMP/stage" "$TMP/etc/brokkr" \
+  "$TMP/usr/local/lib/brokkr" "$TMP/var/lib/brokkr"
+: >"$TMP/calls"
+
+cat >"$TMP/bin/id" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-gn" ]]; then
+  printf '%s\n' "${2:-}"
+fi
+exit 0
+EOF
+cat >"$TMP/bin/getent" <<'EOF'
+#!/usr/bin/env bash
+printf 'probe:x:999:999::%s/var/lib/heimdall-storage-probe:/bin/sh\n' "$BROKKR_STORAGE_TEST_ROOT"
+EOF
+cat >"$TMP/bin/usermod" <<'EOF'
+#!/usr/bin/env bash
+printf 'usermod %s\n' "$*" >>"$TEST_CALLS"
+EOF
+cat >"$TMP/bin/chown" <<'EOF'
+#!/usr/bin/env bash
+printf 'chown %s\n' "$*" >>"$TEST_CALLS"
+EOF
+cat >"$TMP/bin/install" <<'EOF'
+#!/usr/bin/env bash
+printf 'install %s\n' "$*" >>"$TEST_CALLS"
+mode=
+directory=0
+args=("$@")
+index=0
+while (( index < ${#args[@]} )); do
+  case "${args[$index]}" in
+    -d) directory=1; index=$((index + 1)) ;;
+    -m) mode=${args[$((index + 1))]}; index=$((index + 2)) ;;
+    -o|-g) index=$((index + 2)) ;;
+    -*) index=$((index + 1)) ;;
+    *) break ;;
+  esac
+done
+if (( directory )); then
+  while (( index < ${#args[@]} )); do
+    mkdir -p "${args[$index]}"
+    [[ -z "$mode" ]] || chmod "$mode" "${args[$index]}"
+    index=$((index + 1))
+  done
+else
+  source_path=${args[$((${#args[@]} - 2))]}
+  destination=${args[$((${#args[@]} - 1))]}
+  cp "$source_path" "$destination"
+  [[ -z "$mode" ]] || chmod "$mode" "$destination"
+fi
+EOF
+chmod +x "$TMP/bin/"*
+
+write_probe() {
+  {
+    echo '#!/usr/bin/env bash'
+    echo '[[ "${1:-}" == "--validate-config" ]] && exit 0'
+    for _ in {1..18}; do echo 'echo ---'; done
+  } >"$TMP/stage/probe"
+}
+write_config() {
+  printf '%s\n' \
+    'TM_SNAPSHOT_PATH=/x' \
+    'TM_ROOT=/x' \
+    'MUNIN_BACKUP_DIR=/x' \
+    'MIMIR_LOG=/x' \
+    'MIMIR_SYNC_STAMP=/x' \
+    'MIMIR_SYNC_DIR=/x' >"$TMP/stage/config"
+}
+sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+
+PASS=0
+FAIL=0
+ok() { PASS=$((PASS + 1)); printf '  PASS %s\n' "$1"; }
+bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1" >&2; }
+check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+run() {
+  local mode=$1
+  local probe_sha=${EXPECTED_PROBE_OVERRIDE:-}
+  local config_sha=${EXPECTED_CONFIG_OVERRIDE:-}
+  if [[ -z "$probe_sha" && -f "$TMP/stage/probe" ]]; then probe_sha=$(sha256 "$TMP/stage/probe"); fi
+  if [[ -z "$config_sha" && -f "$TMP/stage/config" ]]; then config_sha=$(sha256 "$TMP/stage/config"); fi
+  # shellcheck disable=SC2034 # OUT and RC are consumed by the eval-based checks below.
+  OUT="$(
+    PATH="$TMP/bin:$PATH" \
+      TEST_CALLS="$TMP/calls" \
+      BROKKR_STORAGE_TEST_ROOT="$TMP/root" \
+      BROKKR_STORAGE_MODE="$mode" \
+      BROKKR_STORAGE_USER=heimdall-storage-probe \
+      BROKKR_STORAGE_PROBE_PATH="$TMP/usr/local/lib/brokkr/probe" \
+      BROKKR_STORAGE_CONFIG_PATH="$TMP/etc/brokkr/probe.conf" \
+      BROKKR_STORAGE_MARKER="$TMP/var/lib/brokkr/marker" \
+      BROKKR_STORAGE_AUTH_OPTIONS='command="/usr/local/lib/brokkr/probe",restrict,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty' \
+      BROKKR_STORAGE_STAGE_PROBE="$TMP/stage/probe" \
+      BROKKR_STORAGE_STAGE_CONFIG="$TMP/stage/config" \
+      BROKKR_STORAGE_PUBKEY='ssh-ed25519 AAAAfixture' \
+      BROKKR_STORAGE_FINGERPRINT='SHA256:fixture' \
+      BROKKR_STORAGE_EXPECTED_PROBE_SHA256="$probe_sha" \
+      BROKKR_STORAGE_EXPECTED_CONFIG_SHA256="$config_sha" \
+      bash "$RECONCILER" 2>&1
+  )"
+  # shellcheck disable=SC2034 # OUT and RC are consumed by the eval-based checks below.
+  RC=$?
+}
+
+echo provision-heimdall-storage-probe.test.sh
+write_probe
+write_config
+
+touch "$TMP/usr/local/lib/brokkr/probe"
+run apply
+check 'unmarked artifact refuses before overwrite' \
+  '[[ $RC -ne 0 && "$OUT" == *"unmanaged or drifted"* ]]'
+rm -f "$TMP/usr/local/lib/brokkr/probe"
+
+EXPECTED_PROBE_OVERRIDE=$(printf '0%.0s' {1..64})
+run apply
+check 'staged digest mismatch refuses before mutation' \
+  '[[ $RC -ne 0 && "$OUT" == *"digest mismatch"* && ! -e "$TMP/var/lib/brokkr/marker" ]]'
+unset EXPECTED_PROBE_OVERRIDE
+
+run apply
+check 'apply writes content-bound metadata' \
+  '[[ $RC -eq 0 && "$OUT" == *"probe_sha256="* && "$OUT" == *"config_sha256="* ]]'
+check 'apply installs every managed artifact' \
+  '[[ -f "$TMP/usr/local/lib/brokkr/probe" && -f "$TMP/etc/brokkr/probe.conf" && -f "$TMP/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys" && -f "$TMP/var/lib/brokkr/marker" ]]'
+check 'config is group-readable only by the dedicated account' \
+  'grep -q "install -m 0640 -o root -g heimdall-storage-probe" "$TMP/calls"'
+check 'authorization and marker are root-owned' \
+  'grep -q "chown root:root .*authorized_keys.new" "$TMP/calls" && grep -q "chown root:root .*marker.new" "$TMP/calls"'
+
+cp "$TMP/usr/local/lib/brokkr/probe" "$TMP/stage/probe"
+cp "$TMP/etc/brokkr/probe.conf" "$TMP/stage/config"
+run apply
+check 'content-identical reapply is idempotent' '[[ $RC -eq 0 ]]'
+
+cp "$TMP/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys" "$TMP/auth.saved"
+ln -sf /tmp/other "$TMP/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys"
+cp "$TMP/usr/local/lib/brokkr/probe" "$TMP/stage/probe"
+cp "$TMP/etc/brokkr/probe.conf" "$TMP/stage/config"
+run apply
+check 'symlinked authorization refuses' '[[ $RC -ne 0 && "$OUT" == *"unsafe"* ]]'
+rm -f "$TMP/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys"
+mv "$TMP/auth.saved" "$TMP/root/var/lib/heimdall-storage-probe/.ssh/authorized_keys"
+
+printf '\n# drift\n' >>"$TMP/usr/local/lib/brokkr/probe"
+run revoke
+check 'drifted managed content blocks bounded revoke' \
+  '[[ $RC -ne 0 && "$OUT" == *"absent or drifted"* ]]'
+sed -i.bak '$d' "$TMP/usr/local/lib/brokkr/probe"
+sed -i.bak '$d' "$TMP/usr/local/lib/brokkr/probe"
+rm -f "$TMP/usr/local/lib/brokkr/probe.bak"
+
+run revoke
+check 'bounded revoke removes only managed artifacts and locks account' \
+  '[[ $RC -eq 0 && "$OUT" == "revoked=1" && ! -e "$TMP/usr/local/lib/brokkr/probe" && ! -e "$TMP/etc/brokkr/probe.conf" && ! -e "$TMP/var/lib/brokkr/marker" && $(cat "$TMP/calls") == *"usermod --lock heimdall-storage-probe"* ]]'
+
+if (( FAIL )); then exit 1; fi
+printf '%s passed\n' "$PASS"
