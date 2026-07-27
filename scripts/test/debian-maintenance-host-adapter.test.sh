@@ -40,6 +40,10 @@ const request = {
     budget_seconds: 240,
   },
 };
+const aptPolicy = "openssl:\n  Installed: 3.0.17-1~deb12u1\n  Candidate: 3.0.17-1~deb12u2\n  Version table:\n     3.0.17-1~deb12u2 500\n        500 http://deb.debian.org/debian-security bookworm-security/main amd64 Packages\n";
+const aptTrust = "APT::Get::Assume-Yes \"false\";\n";
+request.apt_source_evidence = { kind: "brokkr-debian-apt-source-evidence", schema_version: "v1", plan_digest: request.plan_digest, policy_digest: request.execution_request.config.policy_digest, trust_config_digest: digest(aptTrust), candidates: [{ name: "openssl", policy_output_digest: digest(aptPolicy) }] };
+request.apt_source_evidence_digest = digest(request.apt_source_evidence);
 request.execution_request_digest = digest(request.execution_request);
 request.recovery_descriptor_digest = digest(request.recovery_descriptor);
 request.lease_fence = {
@@ -58,7 +62,7 @@ const registration = {
   attempt_id: request.attempt_id, binding_digest: request.binding_digest,
   plan_digest: request.plan_digest, constitution_digest: request.constitution_digest,
   release_digest: request.release_digest, execution_request_digest: request.execution_request_digest,
-  recovery_descriptor_digest: request.recovery_descriptor_digest, lease_fence_digest: request.lease_fence_digest,
+  recovery_descriptor_digest: request.recovery_descriptor_digest, lease_fence_digest: request.lease_fence_digest, apt_source_evidence_digest: request.apt_source_evidence_digest,
 };
 
 const state = { entries: [], terminal: null };
@@ -75,13 +79,15 @@ const run = (argv) => {
   if (key === "/usr/bin/uname -r") return { status: 0, stdout: "6.1.0-test\n" };
   if (key === "/usr/bin/dpkg --audit") return { status: 0, stdout: "" };
   if (argv[0] === "/usr/bin/dpkg-query") return { status: 0, stdout: `openssl=${applied ? "3.0.17-1~deb12u2" : "3.0.17-1~deb12u1"}\n` };
+  if (argv[0] === "/usr/bin/apt-cache") return { status: 0, stdout: aptPolicy };
+  if (argv[0] === "/usr/bin/apt-config") return { status: 0, stdout: aptTrust };
   if (argv[0] === "/usr/bin/apt-get" && argv.includes("--simulate")) return { status: 0, stdout: "Inst openssl [3.0.17-1~deb12u1] (3.0.17-1~deb12u2 Debian:stable-security [amd64])\n" };
   if (argv[0] === "/usr/bin/apt-get") { applied = true; return { status: 0, stdout: "" }; }
   throw new Error(`unexpected fixed command: ${key}`);
 };
 const env = { uid: 0, now: () => "2026-07-27T12:00:00Z", run, rebootRequired: () => false,
   adapterReleaseDigest: () => request.release_digest,
-  activateFence: fence => ({ accepted: true, lease_fence_digest: digest(fence) }),
+  activateFence: fence => ({ activated: true, lease_fence_digest: digest(fence) }),
   readRecoveryActivation: () => structuredClone(recoveryActivation),
   applyFenced: ({ fence, lease_fence_digest, apply }) => {
     assert.equal(lease_fence_digest, digest(fence)); return apply();
@@ -139,6 +145,18 @@ for (const [name, simulation] of [
   assert.equal(widened.outcome, "terminally-blocked", `${name} simulation must not apply`);
   assert.equal(widened.reason, "host_exact_upgrade_widened", `${name} is terminal/recovery-only`);
 }
+applied = false;
+const changedSource = adapter.runHostAdapter({ action: "apply", request, registration, env: { ...env, readJournal: () => null,
+  run: argv => argv[0] === "/usr/bin/apt-cache" ? { status: 0, stdout: aptPolicy.replace("deb.debian.org/debian-security", "mirror.example.invalid/debian") } : run(argv),
+}});
+assert.equal(changedSource.outcome, "terminally-blocked");
+assert.equal(changedSource.reason, "host_apt_source_changed");
+applied = false;
+const changedTrust = adapter.runHostAdapter({ action: "apply", request, registration, env: { ...env, readJournal: () => null,
+  run: argv => argv[0] === "/usr/bin/apt-config" ? { status: 0, stdout: "APT::Get::AllowInsecureRepositories true\n" } : run(argv),
+}});
+assert.equal(changedTrust.outcome, "terminally-blocked");
+assert.equal(changedTrust.reason, "host_apt_trust_changed");
 
 const recoveryEntry = ({ phase, previous_digest, detail }) => {
   const base = { phase, at: "2026-07-27T12:00:00Z", binding_digest: request.binding_digest,
@@ -173,10 +191,33 @@ assert(calls.every(argv => argv[0] !== "/bin/sh"));
 const staleRecoveryState = structuredClone(recoveryTemplate);
 const stale = adapter.runHostAdapter({ action: "recover", request, registration, env: {
   ...env, readJournal: () => structuredClone(staleRecoveryState), writeJournal: value => Object.assign(staleRecoveryState, structuredClone(value)),
-  activateFence: fence => fence.epoch <= 2 ? { accepted: false, lease_fence_digest: digest(fence) } : { accepted: true, lease_fence_digest: digest(fence) },
+  activateFence: fence => fence.epoch <= 2 ? { activated: false, lease_fence_digest: digest(fence) } : { activated: true, lease_fence_digest: digest(fence) },
 }});
 assert.equal(stale.outcome, "terminally-blocked", "an old recovery activation cannot effect after successor takeover");
 assert.equal(stale.reason, "host_revalidation_activation_failed");
+for (const [field, value] of [["target_scope_digest", "sha256:" + "f".repeat(64)], ["mutation_id", "other-mutation"], ["domain", "other-domain"]]) {
+  const mismatched = structuredClone(recoveryActivation); mismatched.fence[field] = value; mismatched.fence_digest = digest(mismatched.fence);
+  const local = structuredClone(recoveryTemplate);
+  const result = adapter.runHostAdapter({ action: "recover", request, registration, env: {
+    ...env, readJournal: () => structuredClone(local), writeJournal: value => Object.assign(local, structuredClone(value)), readRecoveryActivation: () => mismatched,
+  }});
+  assert.equal(result.outcome, "terminally-blocked", `${field} successor mismatch terminalizes`);
+  assert.equal(result.reason, "host_revalidation_fence_invalid");
+}
+const deadlineState = structuredClone(recoveryTemplate);
+const deadline = adapter.runHostAdapter({ action: "recover", request, registration, env: {
+  ...env, now: () => "2026-07-27T12:05:00Z", readJournal: () => structuredClone(deadlineState), writeJournal: value => Object.assign(deadlineState, structuredClone(value)),
+}});
+assert.equal(deadline.outcome, "terminally-blocked");
+assert.equal(deadline.reason, "host_recovery_budget_exhausted");
 console.log("debian host adapter: root-only exact allowlist, preflight, forward recovery and disarm OK");
 NODE
 env ROOT="$ROOT" node "$TMP/test.mjs"
+UNIT="$ROOT/systemd/brokkr-debian-maintenance-recovery@.service"
+if command -v systemd-analyze >/dev/null 2>&1; then
+  systemd-analyze verify "$UNIT"
+else
+  rg -q '^User=root$' "$UNIT"
+  rg -q '^NoNewPrivileges=yes$' "$UNIT"
+  rg -q '^ExecStart=/usr/local/lib/brokkr/debian-maintenance-host-adapter --action recover --attempt %i$' "$UNIT"
+fi

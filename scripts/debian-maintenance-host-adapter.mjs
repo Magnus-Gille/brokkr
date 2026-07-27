@@ -67,19 +67,19 @@ function validateRequest(request, registration, action) {
   if (!exactKeys(request, [
     "kind", "schema_version", "action", "attempt_id", "binding_digest", "plan_digest",
     "constitution_digest", "release_digest", "execution_request", "execution_request_digest",
-    "recovery_descriptor", "recovery_descriptor_digest", "lease_fence", "lease_fence_digest",
+    "recovery_descriptor", "recovery_descriptor_digest", "lease_fence", "lease_fence_digest", "apt_source_evidence", "apt_source_evidence_digest",
   ]) || request.kind !== "brokkr-debian-host-adapter-request" || request.schema_version !== "v1" ||
     request.action !== "apply" || !ID.test(request.attempt_id) || ![
       request.binding_digest, request.plan_digest, request.constitution_digest, request.release_digest,
-      request.execution_request_digest, request.recovery_descriptor_digest, request.lease_fence_digest,
+      request.execution_request_digest, request.recovery_descriptor_digest, request.lease_fence_digest, request.apt_source_evidence_digest,
     ].every(value => DIGEST.test(value)) || request.execution_request_digest !== digest(request.execution_request) ||
-    request.recovery_descriptor_digest !== digest(request.recovery_descriptor) || request.lease_fence_digest !== digest(request.lease_fence)) fail("host_request_invalid");
+    request.recovery_descriptor_digest !== digest(request.recovery_descriptor) || request.lease_fence_digest !== digest(request.lease_fence) || request.apt_source_evidence_digest !== digest(request.apt_source_evidence)) fail("host_request_invalid");
   if (!exactKeys(registration, [
     "kind", "schema_version", "attempt_id", "binding_digest", "plan_digest", "constitution_digest",
-    "release_digest", "execution_request_digest", "recovery_descriptor_digest", "lease_fence_digest",
+    "release_digest", "execution_request_digest", "recovery_descriptor_digest", "lease_fence_digest", "apt_source_evidence_digest",
   ]) || registration.kind !== "brokkr-debian-host-adapter-registration" || registration.schema_version !== "v1" ||
     !Object.keys(registration).filter(key => key.endsWith("digest")).every(key => DIGEST.test(registration[key])) ||
-    ["attempt_id", "binding_digest", "plan_digest", "constitution_digest", "release_digest", "execution_request_digest", "recovery_descriptor_digest", "lease_fence_digest"].some(key => registration[key] !== request[key])) {
+    ["attempt_id", "binding_digest", "plan_digest", "constitution_digest", "release_digest", "execution_request_digest", "recovery_descriptor_digest", "lease_fence_digest", "apt_source_evidence_digest"].some(key => registration[key] !== request[key])) {
     fail("host_registration_mismatch");
   }
   const execution = request.execution_request;
@@ -93,6 +93,7 @@ function validateRequest(request, registration, action) {
     execution.config.no_reboot !== true || execution.config.no_drain !== true) fail("host_request_scope_invalid");
   if (request.lease_fence?.target_scope_digest !== digest({ node_id: execution.target.node_id, platform: execution.target.platform })) fail("host_fence_target_invalid");
   const candidates = candidateSet(request);
+  if (!exactKeys(request.apt_source_evidence, ["kind", "schema_version", "plan_digest", "policy_digest", "trust_config_digest", "candidates"]) || request.apt_source_evidence.kind !== "brokkr-debian-apt-source-evidence" || request.apt_source_evidence.schema_version !== "v1" || request.apt_source_evidence.plan_digest !== request.plan_digest || request.apt_source_evidence.policy_digest !== execution.config.policy_digest || !DIGEST.test(request.apt_source_evidence.trust_config_digest) || !Array.isArray(request.apt_source_evidence.candidates) || request.apt_source_evidence.candidates.length !== candidates.length || canonicalJson(request.apt_source_evidence.candidates.map(item => item.name)) !== canonicalJson(candidates.map(item => item.name)) || !request.apt_source_evidence.candidates.every(item => exactKeys(item, ["name", "policy_output_digest"]) && DIGEST.test(item.policy_output_digest))) fail("host_apt_evidence_invalid");
   validateInventory(execution.pre_state, candidates, "host_pre_state_invalid");
   validateInventory(execution.expected_postconditions, candidates, "host_postconditions_invalid");
   const descriptor = request.recovery_descriptor;
@@ -114,7 +115,7 @@ function validateRequest(request, registration, action) {
     Date.parse(fence.activated_at) > Date.parse(fence.expires_at)) fail(code);
   };
   const fence = request.lease_fence; assertFence(fence, "host_fence_invalid");
-  return { execution, candidates, descriptor, assertFence };
+  return { execution, candidates, descriptor, assertFence, aptEvidence: request.apt_source_evidence };
 }
 
 function validateInventory(inventory, candidates, code) {
@@ -136,6 +137,18 @@ function preflight(env) {
   const disk = ok(env, ["/bin/df", "-Pk", "/var"], "host_disk_unverified").trim().split("\n").at(-1).trim().split(/\s+/);
   if (!/^\d+$/.test(disk[3] ?? "") || Number(disk[3]) < MIN_AVAILABLE_KIB) fail("host_disk_exhausted");
   ok(env, ["/usr/bin/getent", "ahostsv4", "deb.debian.org"], "host_network_unreachable");
+}
+function withinRecoveryBudget(env, deadline) {
+  const now = Date.parse(env.now());
+  if (!Number.isFinite(now) || now >= deadline) fail("host_recovery_budget_exhausted");
+  return Math.max(1, deadline - now);
+}
+function recoveryOk(env, deadline, argv, code) {
+  const before = withinRecoveryBudget(env, deadline);
+  const result = env.run(argv, { timeoutMs: before });
+  if (!plain(result) || !Number.isInteger(result.status) || typeof result.stdout !== "string" || result.status !== 0) fail(code);
+  withinRecoveryBudget(env, deadline);
+  return result.stdout;
 }
 
 function hostInventory(env, candidates) {
@@ -161,6 +174,15 @@ function exactSimulation(env, candidates) {
     if (!installations.some(line => expected.test(line) && /\bDebian:/.test(line))) fail("host_exact_upgrade_widened");
   }
   if (output.split("\n").some(line => /^(Remv|Del) /.test(line))) fail("host_exact_upgrade_widened");
+}
+function verifyAptEvidence(env, candidates, evidence) {
+  const trust = ok(env, ["/usr/bin/apt-config", "dump"], "host_apt_trust_unverifiable");
+  if (digest(trust) !== evidence.trust_config_digest || /(?:AllowInsecureRepositories|AllowDowngradeToInsecureRepositories|Trusted)\s+"?true"?/i.test(trust)) fail("host_apt_trust_changed");
+  for (const candidate of candidates) {
+    const expected = evidence.candidates.find(item => item.name === candidate.name);
+    const output = ok(env, ["/usr/bin/apt-cache", "policy", candidate.name], "host_apt_source_unverifiable");
+    if (digest(output) !== expected.policy_output_digest || !new RegExp(`\\n\\s*${candidate.candidate_version.replace(/[.+~-]/g, "\\$&")} \\d+\\n\\s+\\d+ https?://[^\\s]*debian\\.org/debian(?:-security)?\\b`).test(output)) fail("host_apt_source_changed");
+  }
 }
 
 const NEXT_PHASES = Object.freeze({
@@ -219,7 +241,7 @@ export function runHostAdapter({ action, request, registration, env }) {
   if (typeof safeEnv.now !== "function" || typeof safeEnv.run !== "function" || typeof safeEnv.rebootRequired !== "function" ||
     typeof safeEnv.readJournal !== "function" || typeof safeEnv.writeJournal !== "function" || typeof safeEnv.writeTerminal !== "function" ||
     typeof env?.adapterReleaseDigest !== "function" || typeof env?.activateFence !== "function" || typeof env?.applyFenced !== "function" || typeof env?.readRecoveryActivation !== "function") fail("host_environment_invalid");
-  const { execution, candidates, descriptor, assertFence } = validateRequest(request, registration, action);
+  const { execution, candidates, descriptor, assertFence, aptEvidence } = validateRequest(request, registration, action);
   if (env.adapterReleaseDigest() !== request.release_digest) fail("host_release_unbound");
   let state = safeEnv.readJournal();
   if (state !== null && !validJournal(state, request.binding_digest)) {
@@ -231,16 +253,17 @@ export function runHostAdapter({ action, request, registration, env }) {
     if (state.entries.length !== 0) return terminal(state, safeEnv, "host_apply_replay_forbidden");
     try {
       const fenceReceipt = env.activateFence(clone(request.lease_fence));
-      if (!plain(fenceReceipt) || fenceReceipt.accepted !== true || fenceReceipt.lease_fence_digest !== request.lease_fence_digest) fail("host_fence_activation_failed");
+      if (!plain(fenceReceipt) || fenceReceipt.activated !== true || fenceReceipt.lease_fence_digest !== request.lease_fence_digest) fail("host_fence_activation_failed");
       preflight(safeEnv); append(state, "preflight", safeEnv, { binding_digest: request.binding_digest }, request.binding_digest);
       const before = hostInventory(safeEnv, candidates);
       if (canonicalJson(before) !== canonicalJson(execution.pre_state)) fail("host_baseline_drifted");
       append(state, "inventory_before", safeEnv, before, request.binding_digest);
-      preflight(safeEnv); exactSimulation(safeEnv, candidates);
+      preflight(safeEnv); verifyAptEvidence(safeEnv, candidates, aptEvidence); exactSimulation(safeEnv, candidates);
       append(state, "apply", safeEnv, { execution_request_digest: request.execution_request_digest }, request.binding_digest);
       env.applyFenced({ fence: clone(request.lease_fence), lease_fence_digest: request.lease_fence_digest, apply: () => {
         const checkedAt = safeEnv.now();
         if (!iso(checkedAt) || Date.parse(checkedAt) < Date.parse(request.lease_fence.activated_at) || Date.parse(checkedAt) > Date.parse(request.lease_fence.expires_at)) fail("host_fence_expired");
+        verifyAptEvidence(safeEnv, candidates, aptEvidence);
         return ok(safeEnv, ["/usr/bin/apt-get", "--assume-yes", "--no-install-recommends", "--no-remove", "--only-upgrade", "install", ...candidates.map(item => `${item.name}=${item.candidate_version}`)], "host_apply_failed");
       } });
       const after = hostInventory(safeEnv, candidates);
@@ -264,17 +287,22 @@ export function runHostAdapter({ action, request, registration, env }) {
     const activation = env.readRecoveryActivation();
     if (!exactKeys(activation, ["kind", "schema_version", "attempt_id", "binding_digest", "recovery_descriptor_digest", "fence", "fence_digest"]) || activation.kind !== "brokkr-debian-recovery-activation" || activation.schema_version !== "v1" || activation.attempt_id !== request.attempt_id || activation.binding_digest !== request.binding_digest || activation.recovery_descriptor_digest !== request.recovery_descriptor_digest || activation.fence_digest !== digest(activation.fence)) fail("host_revalidation_fence_invalid");
     assertFence(activation.fence, "host_revalidation_fence_invalid");
-    if (activation.fence.epoch <= request.lease_fence.epoch) fail("host_revalidation_fence_invalid");
+    if (activation.fence.epoch <= request.lease_fence.epoch || activation.fence.domain !== request.lease_fence.domain ||
+      activation.fence.target_scope_digest !== request.lease_fence.target_scope_digest ||
+      activation.fence.attempt_id !== request.lease_fence.attempt_id || activation.fence.mutation_id !== request.lease_fence.mutation_id ||
+      activation.fence.binding_digest !== request.lease_fence.binding_digest || activation.fence.holder_token === request.lease_fence.holder_token ||
+      Date.parse(activation.fence.activated_at) < Date.parse(request.lease_fence.activated_at) || Date.parse(activation.fence.expires_at) <= Date.parse(activation.fence.activated_at)) fail("host_revalidation_fence_invalid");
     const recoveryFenceReceipt = env.activateFence(clone(activation.fence));
-    if (!plain(recoveryFenceReceipt) || recoveryFenceReceipt.accepted !== true || recoveryFenceReceipt.lease_fence_digest !== activation.fence_digest) fail("host_revalidation_activation_failed");
+    if (!plain(recoveryFenceReceipt) || recoveryFenceReceipt.activated !== true || recoveryFenceReceipt.lease_fence_digest !== activation.fence_digest) fail("host_revalidation_activation_failed");
     append(state, "recover", safeEnv, { recovery_descriptor_digest: request.recovery_descriptor_digest }, request.binding_digest);
+    const deadline = Math.min(started + descriptor.budget_seconds * 1000, Date.parse(activation.fence.expires_at));
     env.applyFenced({ fence: clone(activation.fence), lease_fence_digest: activation.fence_digest, apply: () => {
       const checkedAt = safeEnv.now(); if (!iso(checkedAt) || Date.parse(checkedAt) < Date.parse(activation.fence.activated_at) || Date.parse(checkedAt) > Date.parse(activation.fence.expires_at)) fail("host_revalidation_fence_expired");
-      ok(safeEnv, ["/usr/bin/dpkg", "--configure", "-a"], "host_recovery_repair_failed");
-      for (const unit of descriptor.restart_units) ok(safeEnv, ["/usr/bin/systemctl", "try-restart", unit], "host_recovery_restart_failed");
-      for (const packageName of descriptor.packages) ok(safeEnv, ["/usr/bin/apt-mark", "hold", packageName], "host_recovery_hold_failed");
+      recoveryOk(safeEnv, deadline, ["/usr/bin/dpkg", "--configure", "-a"], "host_recovery_repair_failed");
+      for (const unit of descriptor.restart_units) recoveryOk(safeEnv, deadline, ["/usr/bin/systemctl", "try-restart", unit], "host_recovery_restart_failed");
+      for (const packageName of descriptor.packages) recoveryOk(safeEnv, deadline, ["/usr/bin/apt-mark", "hold", packageName], "host_recovery_hold_failed");
     }});
-    if ((Date.parse(safeEnv.now()) - started) > descriptor.budget_seconds * 1000) fail("host_recovery_budget_exhausted");
+    withinRecoveryBudget(safeEnv, deadline);
     const after = hostInventory(safeEnv, candidates);
     if (canonicalJson(after) !== canonicalJson(execution.expected_postconditions)) fail("host_postconditions_unverifiable");
     append(state, "quarantine", safeEnv, { descriptor_id: descriptor.descriptor_id }, request.binding_digest);
@@ -332,7 +360,7 @@ function cli() {
       if (existing.fence.epoch > fence.epoch || (existing.fence.epoch === fence.epoch && existing.lease_fence_digest !== digest(fence))) fail("host_fence_superseded");
     }
     atomicWrite(fenceFile, { fence: clone(fence), lease_fence_digest: digest(fence) });
-    return { accepted: true, lease_fence_digest: digest(fence) };
+    return { activated: true, lease_fence_digest: digest(fence) };
   };
   const applyFenced = ({ fence, lease_fence_digest, apply }) => {
     if (lease_fence_digest !== digest(fence)) fail("host_fence_digest_invalid");
@@ -342,7 +370,7 @@ function cli() {
   };
   const result = runHostAdapter({ action, request, registration, env: {
     uid: process.getuid(), now: () => new Date().toISOString().replace(".000Z", "Z"),
-    run: argv => { const result = spawnSync(argv[0], argv.slice(1), { encoding: "utf8", timeout: 120_000 }); return { status: result.status ?? 1, stdout: result.stdout ?? "" }; },
+    run: (argv, options = {}) => { const result = spawnSync(argv[0], argv.slice(1), { encoding: "utf8", timeout: options.timeoutMs ?? 120_000 }); return { status: result.status ?? 1, stdout: result.stdout ?? "" }; },
     rebootRequired: () => fs.existsSync("/var/run/reboot-required"),
     adapterReleaseDigest: () => rawDigest, activateFence, applyFenced,
     readRecoveryActivation: () => readJson(path.join(STATE_ROOT, "recovery-activations", `${attempt}.json`)),

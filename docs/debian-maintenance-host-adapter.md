@@ -41,6 +41,14 @@ So a new package, dependency expansion, removal, unbound version, reboot, drain,
 or unreachable/unknown precondition is a terminal, disarmed outcome before or
 after no further automatic reapply.
 
+The request also carries a closed, canonical apt-policy evidence object: for
+each already-bound candidate it records the SHA-256 of the exact `apt-cache
+policy <package>` output. The adapter re-reads that output immediately before
+simulation and again immediately before apt effect, requiring the requested
+version and a Debian archive URL. This is a verifiable local apt trust-property
+and exact byte binding, not an invented signature scheme; changed source,
+candidate, plan/policy digest, or evidence fails closed.
+
 The adapter atomically persists a compact phase journal (`preflight`, inventory
 before/after, apply, verify) using fsync-and-rename. It records only digests and
 phase timestamps, never commands or package logs. A corrupt or replayed journal
@@ -54,6 +62,13 @@ creates a replacement request. It must verify the original declared
 postconditions inside the descriptor's at-most-300-second budget, then journals
 quarantine and disarm. Any repair, restart, hold, journal, or verification
 failure terminalizes and writes a disarm record.
+
+An `unknown` result is recovery-eligible evidence, not an automatic recovery
+dispatch: the W2a watchdog/recovery owner must issue the strictly newer
+protected activation and invoke the separate recovery unit. This adapter never
+manufactures that authority. Consequently this PR supplies the safe host seam
+but does not by itself close the system-level automatic-dispatch acceptance
+criterion of brokkr#67.
 
 `systemd/brokkr-debian-maintenance-recovery@.service` is a separate hardened
 root capability because dpkg repair itself requires root. Its sole executable
