@@ -4,30 +4,151 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cat >"$TMP/test.mjs" <<'NODE'
-import fs from "node:fs"; import assert from "node:assert/strict"; import crypto from "node:crypto";
-const { policyDigest, canonicalJson } = await import(process.env.ROOT + "/scripts/lib/maintenance-policy-contract.mjs");
-const { executeDebianMaintenance, runDebianMaintenance } = await import(process.env.ROOT + "/scripts/debian-maintenance-executor.mjs");
-const now="2026-07-26T01:00:00Z", base=JSON.parse(fs.readFileSync(process.env.ROOT+"/tests/fixtures/maintenance-policy/normal-window.json","utf8")).records.find(x=>x.kind==="maintenance-policy");
-base.timezone="UTC";base.window.days_of_week=["sun"];base.window.start_local_time="00:00";base.window.duration="PT2H";base.selector.node_ids=["node-a"];delete base.policy_digest;base.policy_digest=policyDigest(base);
-const digest=x=>`sha256:${crypto.createHash("sha256").update(canonicalJson(x)).digest("hex")}`;
-// This mirrors the planner's emitted v1 gate object rather than a hand-waved subset.
-const plan=()=>{const x={kind:"brokkr-maintenance-plan",schema_version:"v1",plan_id:"maint-plan-x",outcome:"planned",node_id:"node-a",policy_id:base.policy_id,policy_digest:base.policy_digest,inventory_evidence_id:"obs-test",running_kernel:"test-kernel",decision:{effect:"on_schedule"},blockers:[],hook_gaps:[],unmet_policy_classes:[{class:"firmware",reason:"unsupported"}],created_at:now,gates:{package_manager_lock:"unlocked",disk:"sufficient",power:"mains",clock:"synchronized",workload_hooks:"ready",kernel_recovery:"eligible"},candidates:[{eligible:true,source:base.updates.allowed_sources[0],class:base.updates.allowed_classes[0]}]};x.plan_digest=digest(x);return x;};
-const adapters=(overrides={})=>({inventory:()=>({kernel:"old",packages:["a"]}),drain:()=>({ok:true}),verifyDrain:()=>({ok:true}),restoreDrain:()=>({ok:true}),apply:()=>({ok:true,elapsed_ms:1}),afterInventory:()=>({kernel:"new",packages:["b"]}),currentPolicy:()=>base,clock:()=>({synchronized:true,now}),hold:()=>({active:false}),reboot:()=>({ok:true,elapsed_ms:1}),healthAfterReboot:()=>({ok:true,elapsed_ms:1}),substrateHealth:()=>({ok:true}),workloadHealth:()=>({ok:true}),previousKernelRecovery:()=>({recovered:true,evidence:"previous",recipe:{kind:"previous-kernel",boot_entry:"saved"}}),...overrides});
-const run=(name,p=plan(),a=adapters())=>executeDebianMaintenance({plan:p,policy:base,nodeId:"node-a",journalFile:`${process.env.TMP}/${name}.json`,adapters:a});
-const success=run("ok");assert.equal(success.outcome,"succeeded");assert.deepEqual(success.journal.events.map(x=>x.phase).filter(x=>["apply","substrate_health","restore_drain","workload_health","inventory_after"].includes(x)),["apply","substrate_health","restore_drain","workload_health","inventory_after"]);assert.equal(success.journal.unmet_policy_classes[0].class,"firmware");for (const state of ["succeeded","failed_before_mutation","operator_recovery_required"]) { const f=`${process.env.TMP}/replay-${state}.json`;fs.writeFileSync(f,JSON.stringify({plan_digest:plan().plan_digest,outcome:state}));assert.throws(()=>executeDebianMaintenance({plan:plan(),policy:base,nodeId:"node-a",journalFile:f,adapters:adapters()}),/journal_already_exists/); } const other=`${process.env.TMP}/different.json`;fs.writeFileSync(other,JSON.stringify({plan_digest:"sha256:"+"a".repeat(64),outcome:"failed_before_mutation"}));assert.throws(()=>executeDebianMaintenance({plan:plan(),policy:base,nodeId:"node-a",journalFile:other,adapters:adapters()}),/journal_already_exists/);
-for (const effect of ["held","escalate_operator_gate","deferred_to_next_window","skip_occurrence"]) { const denied=plan();denied.decision.effect=effect;denied.plan_digest=digest(Object.fromEntries(Object.entries(denied).filter(([k])=>k!=="plan_digest")));assert.throws(()=>run(`effect-${effect}`,denied),/plan_not_authorized/); }
-assert.equal(run("drain",plan(),adapters({drain:()=>({ok:false})})).outcome,"failed_after_drain_restored");assert.equal(run("verify",plan(),adapters({verifyDrain:()=>({ok:false})})).reason,"drain_verify_failed");const restoreFail=run("restore-fail",plan(),adapters({drain:()=>({ok:false}),restoreDrain:()=>({ok:false})}));assert.equal(restoreFail.outcome,"operator_recovery_required");
-let stale=plan();stale.created_at="2026-07-26T00:54:59Z";stale.plan_digest=digest(Object.fromEntries(Object.entries(stale).filter(([k])=>k!=="plan_digest")));assert.throws(()=>run("stale",stale),/plan_stale/);let bad=plan();bad.gates.workload_hooks="unknown";bad.plan_digest=digest(Object.fromEntries(Object.entries(bad).filter(([k])=>k!=="plan_digest")));assert.throws(()=>run("gate",bad),/plan_gates_not_safe/);
-let drainCalls=0;let clockCalls=0;const closing=adapters({drain:()=>{drainCalls++;return {ok:true};},clock:()=>({synchronized:true,now:++clockCalls===1?now:"2026-07-26T03:00:00Z"})});assert.equal(run("closed-during-drain",plan(),closing).reason,"window_closed_before_mutation");assert.equal(drainCalls,1);assert.equal(JSON.parse(fs.readFileSync(`${process.env.TMP}/closed-during-drain.json`)).events.some(x=>x.phase==="apply_started"),false);
-let kernelCalls=0;const interrupted=run("dpkg",plan(),adapters({apply:()=>({ok:false,interrupted:true}),previousKernelRecovery:()=>{kernelCalls++;return {recovered:true};}}));assert.equal(interrupted.outcome,"operator_recovery_required");assert.equal(interrupted.journal.events.find(x=>x.phase==="apply_started").outcome,"started");assert.equal(interrupted.journal.events.find(x=>x.phase==="recovery_started").outcome,"started");assert.equal(kernelCalls,0,"apply failures never claim kernel recovery");
-assert.throws(()=>run("missing-reboot",plan(),adapters({reboot:undefined})),/reboot_adapter_missing_preflight/);
-const reboot=run("reboot",plan(),adapters({apply:()=>({ok:true,reboot_required:true,elapsed_ms:1}),reboot:()=>({ok:false}),healthAfterReboot:()=>({ok:true})}));assert.equal(reboot.reason,"reboot_timeout");assert.equal(reboot.journal.events.find(x=>x.phase==="reboot_started").outcome,"started");
-const recovered=run("previous-kernel",plan(),adapters({apply:()=>({ok:true,reboot_required:true,elapsed_ms:1}),healthAfterReboot:()=>({ok:false,elapsed_ms:1})}));assert.equal(recovered.outcome,"recovered_previous_kernel");assert.equal(recovered.journal.reversal.boot_entry,"saved");const arbitrary=run("arbitrary",plan(),adapters({apply:()=>({ok:true,reboot_required:true,elapsed_ms:1}),healthAfterReboot:()=>({ok:false,elapsed_ms:1}),previousKernelRecovery:()=>({recovered:true,recipe:{kind:"previous-kernel",argv:["/bin/sh","-c","bad"]}})}));assert.equal(arbitrary.journal.reversal.mode,"forward_recovery_or_reprovision");assert.throws(()=>runDebianMaintenance({}),/controller_retry_journal_contract_unimplemented/);
-const recoveryThrows=run("recovery-throws",plan(),adapters({apply:()=>({ok:false}),previousKernelRecovery:()=>{throw Error("recover");}}));assert.equal(recoveryThrows.outcome,"operator_recovery_required");assert.equal(recoveryThrows.journal.reversal.mode,"forward_recovery_or_reprovision");const inventoryThrows=run("inventory-throws",plan(),adapters({afterInventory:()=>{throw Error("after");}}));assert.equal(inventoryThrows.outcome,"operator_recovery_required");
-let heldDrain=0;assert.throws(()=>run("hold",plan(),adapters({hold:()=>({active:true}),drain:()=>{heldDrain++;return {ok:true};}})),/held/);assert.equal(heldDrain,0);const disabled=structuredClone(base);disabled.state.enabled=false;delete disabled.policy_digest;disabled.policy_digest=policyDigest(disabled);assert.throws(()=>executeDebianMaintenance({plan:plan(),policy:disabled,nodeId:"node-a",journalFile:`${process.env.TMP}/disabled`,adapters:adapters({currentPolicy:()=>disabled})}),/held/);
-const noWork=plan();noWork.gates.workload_hooks="not_applicable";noWork.plan_digest=digest(Object.fromEntries(Object.entries(noWork).filter(([k])=>k!=="plan_digest")));let noDrain=0;assert.equal(run("no-work",noWork,adapters({drain:()=>{noDrain++;return {ok:true};}})).outcome,"succeeded");assert.equal(noDrain,0);
-const always=structuredClone(base);always.reboot.policy="always_after_window";delete always.policy_digest;always.policy_digest=policyDigest(always);let effects=0;
-assert.throws(()=>executeDebianMaintenance({plan:plan(),policy:always,nodeId:"node-a",journalFile:`${process.env.TMP}/always`,adapters:adapters({currentPolicy:()=>always,apply:()=>{effects++;return {ok:true,elapsed_ms:1};}})}),/always_after_window_unsupported/);assert.equal(effects,0);
-console.log("debian executor: admission, immutable journals, boundaries, phase evidence and bounded recovery OK");
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+const module = await import(`${process.env.ROOT}/scripts/debian-maintenance-executor.mjs`);
+const journalModule = await import(
+  `${process.env.ROOT}/scripts/maintenance-attempt-journal.mjs`
+);
+const { deriveDebianAutonomyExecution, runDebianMaintenance } = module;
+const { canonicalJson, policyDigest } = await import(
+  `${process.env.ROOT}/scripts/lib/maintenance-policy-contract.mjs`
+);
+const digest = value => `sha256:${crypto.createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
+
+assert.deepEqual(
+  Object.keys(module).sort(),
+  ["deriveDebianAutonomyExecution", "runDebianMaintenance"],
+  "the raw drain/reboot executor is not an exported journal-bypass capability",
+);
+assert.deepEqual(
+  Object.keys(journalModule).sort(),
+  [
+    "attemptIdentity", "loadPinnedJournalSchema",
+    "validateJournalConformance",
+  ],
+  "direct imports cannot reach a generic arbitrary-callback mutation runner",
+);
+assert.equal(journalModule.runMaintenanceAttempt, undefined);
+assert.throws(() => runDebianMaintenance({}), /attempt_journal_contract_invalid/);
+
+const policy = JSON.parse(fs.readFileSync(
+  `${process.env.ROOT}/tests/fixtures/maintenance-policy/normal-window.json`, "utf8",
+)).records.find(record => record.kind === "maintenance-policy");
+policy.timezone = "UTC";
+policy.window.days_of_week = ["sun"];
+policy.window.start_local_time = "00:00";
+policy.window.duration = "PT2H";
+policy.selector.node_ids = ["node-a"];
+policy.reboot.policy = "never";
+policy.updates.allowed_sources = ["distro_repository"];
+policy.updates.allowed_classes = ["security", "bugfix"];
+delete policy.policy_digest;
+policy.policy_digest = policyDigest(policy);
+const plan = {
+  kind: "brokkr-maintenance-plan", schema_version: "v1", plan_id: "bounded-plan",
+  outcome: "planned", node_id: "node-a", policy_id: policy.policy_id,
+  policy_digest: policy.policy_digest, inventory_evidence_id: "observation-test",
+  running_kernel: "kernel-old", decision: { effect: "on_schedule" }, blockers: [],
+  hook_gaps: [], unmet_policy_classes: [], created_at: "2026-07-26T00:00:00Z",
+  gates: {
+    package_manager_lock: "unlocked", disk: "sufficient", power: "mains",
+    clock: "synchronized", workload_hooks: "not_applicable",
+    kernel_recovery: "not_applicable",
+  },
+  candidates: [{
+    id: "openssl@3.0.17-1~deb12u2", name: "openssl", class: "security",
+    source: "distro_repository", current_version: "3.0.17-1~deb12u1",
+    candidate_version: "3.0.17-1~deb12u2", eligible: true, reasons: [],
+  }],
+};
+plan.plan_digest = digest(plan);
+const target = { node_id: "node-a", platform: "debian", non_pillar: true };
+const before = { kernel: "old", packages: ["a"], reboot_required: false, dpkg_status: "clean" };
+const after = { kernel: "new", packages: ["b"], reboot_required: false, dpkg_status: "clean" };
+const adapterRevision = "sha256:" + "9".repeat(64);
+const execution = deriveDebianAutonomyExecution({
+  plan, policy, target, inventory: before,
+  adapterRevisionDigest: adapterRevision, postconditions: after,
+});
+assert.equal(execution.execution_request_digest, digest(execution.execution_request));
+assert.deepEqual(execution.execution_request.target, target);
+assert.deepEqual(execution.execution_request.candidates, plan.candidates);
+assert.deepEqual(execution.execution_request.config, {
+  adapter_revision_digest: adapterRevision,
+  plan_digest: plan.plan_digest,
+  policy_digest: policy.policy_digest,
+  no_reboot: true,
+  no_drain: true,
+});
+
+for (const [name, input, expected] of [
+  ["empty inventory", {
+    plan, policy, target, inventory: {}, adapterRevisionDigest: adapterRevision,
+    postconditions: after,
+  }, /inventory_shape_invalid/],
+  ["unsafe reboot postcondition", {
+    plan, policy, target, inventory: before, adapterRevisionDigest: adapterRevision,
+    postconditions: { ...after, reboot_required: true },
+  }, /inventory_reboot_unsafe/],
+  ["unhealthy dpkg postcondition", {
+    plan, policy, target, inventory: before, adapterRevisionDigest: adapterRevision,
+    postconditions: { ...after, dpkg_status: "broken" },
+  }, /inventory_dpkg_unsafe/],
+  ["candidate extra field", {
+    plan: {
+      ...plan,
+      candidates: [{ ...plan.candidates[0], command: "apt-get install arbitrary" }],
+    },
+    policy, target, inventory: before, adapterRevisionDigest: adapterRevision,
+    postconditions: after,
+  }, /debian_candidate_invalid/],
+  ["duplicate package candidate", {
+    plan: { ...plan, candidates: [plan.candidates[0], plan.candidates[0]] },
+    policy, target, inventory: before, adapterRevisionDigest: adapterRevision,
+    postconditions: after,
+  }, /debian_candidate_duplicate/],
+]) {
+  const candidate = structuredClone(input);
+  if (candidate.plan !== plan) {
+    delete candidate.plan.plan_digest;
+    candidate.plan.plan_digest = digest(candidate.plan);
+  }
+  assert.throws(
+    () => deriveDebianAutonomyExecution(candidate),
+    expected,
+    name,
+  );
+}
+
+for (const [name, mutate] of [
+  ["pillar", input => { input.target.non_pillar = false; }],
+  ["drain", input => { input.plan.gates.workload_hooks = "ready"; }],
+  ["kernel", input => { input.plan.candidates[0].class = "kernel"; }],
+  ["source", input => { input.plan.candidates[0].source = "third_party"; }],
+  ["reboot", input => { input.policy.reboot.policy = "if_required"; }],
+]) {
+  const input = {
+    plan: structuredClone(plan), policy: structuredClone(policy),
+    target: structuredClone(target), inventory: before,
+    adapterRevisionDigest: adapterRevision, postconditions: after,
+  };
+  mutate(input);
+  if (["drain", "kernel", "source"].includes(name)) {
+    delete input.plan.plan_digest;
+    input.plan.plan_digest = digest(input.plan);
+  }
+  if (name === "reboot") {
+    delete input.policy.policy_digest;
+    input.policy.policy_digest = policyDigest(input.policy);
+  }
+  assert.throws(
+    () => deriveDebianAutonomyExecution(input),
+    /autonomy_execution_out_of_scope|debian_candidate_invalid/,
+    name,
+  );
+}
+console.log("debian executor: closed export surface and immutable no-reboot/no-drain request OK");
 NODE
-env ROOT="$ROOT" TMP="$TMP" node "$TMP/test.mjs"
+env ROOT="$ROOT" node "$TMP/test.mjs"
