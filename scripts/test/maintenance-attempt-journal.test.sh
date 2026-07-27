@@ -492,6 +492,8 @@ if (process.env.WORKER_MODE) {
   }
   while (process.env.BARRIER && !fs.existsSync(process.env.BARRIER)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
   const workerArtifacts = bundle();
+  const overBudgetWorkerTimes = process.env.OVER_BUDGET_WATCH_ANCHOR ?
+    Array(12).fill("2026-07-26T00:00:00Z") : null;
   const workerRecoveryState = `${process.env.WORKER_DIR}/mock-recovery-state.json`;
   const withWorkerLock = (lock, operation) => {
     while (true) {
@@ -603,6 +605,10 @@ if (process.env.WORKER_MODE) {
       writeWorkerRecoveryState(state);
     },
     fault: point => {
+      if (point === "after-watch-journal-readback" &&
+          overBudgetWorkerTimes) {
+        overBudgetWorkerTimes.fill("2026-07-26T00:05:01Z");
+      }
       if (process.env.FAULT_POINT === point) process.exit(78);
     },
   });
@@ -621,7 +627,7 @@ if (process.env.WORKER_MODE) {
     "2026-07-26T00:16:00Z", "2026-07-26T00:16:01Z", "2026-07-26T00:16:02Z",
     "2026-07-26T00:16:03Z", "2026-07-26T00:16:04Z", "2026-07-26T00:16:05Z",
     "2026-07-26T00:16:06Z", "2026-07-26T00:16:07Z",
-  ]) : admission();
+  ]) : admission(overBudgetWorkerTimes ?? baseTimes);
   if (resumedWorker) workerAdmission.liveness = () => ({
     healthy: true, observed_at: process.env.VERY_LATE_LEASE_TRANSFER ?
       "2026-07-26T00:55:59Z" : process.env.LATE_LEASE_TRANSFER ?
@@ -647,7 +653,7 @@ if (process.env.WORKER_MODE) {
         fs.rmdirSync(effectTransactionLock);
       }
     };
-    run({
+    const workerResult = run({
       dir: process.env.WORKER_DIR, artifacts: workerArtifacts,
       admit: workerAdmission,
       phase: phases({
@@ -706,6 +712,11 @@ if (process.env.WORKER_MODE) {
         process.env.WORKER_MODE === "resume" ?
           () => ({ state: "not-applied" }) : null,
     });
+    if (process.env.WORKER_RESULT) {
+      fs.writeFileSync(process.env.WORKER_RESULT, JSON.stringify({
+        ran: workerResult.ran, reason: workerResult.reason,
+      }));
+    }
   } catch (error) {
     if (process.env.WORKER_ERROR_LOG) {
       fs.appendFileSync(
@@ -826,6 +837,24 @@ assert.throws(() => validateJournalConformance(
   },
 ), /journal_schema_invalid:.*date-time/,
 "v2 rejects noncanonical .000Z timestamps exactly like Grimnir");
+const terminalAnchorArtifacts = bundle();
+const terminalAnchorBinding = binding(
+  "terminal-anchor", terminalAnchorArtifacts.coverage,
+);
+const terminalAnchorDir = `${tmp}/terminal-anchor`;
+assert.equal(run({
+  dir: terminalAnchorDir, artifacts: terminalAnchorArtifacts,
+  bind: terminalAnchorBinding,
+}).reason, "committed");
+fs.unlinkSync(
+  `${terminalAnchorDir}/${terminalAnchorBinding.idempotency_key}` +
+  ".json.watch-anchor.json",
+);
+assert.throws(() => run({
+  dir: terminalAnchorDir, artifacts: terminalAnchorArtifacts,
+  bind: terminalAnchorBinding,
+}), /watch_anchor_ENOENT/,
+"an exact terminal commit retry still requires its durable anchor");
 const wrongJournalIdentity = clone(happy.journal);
 wrongJournalIdentity.journal_id = "different-mutation";
 assert.throws(() => validateJournalConformance(wrongJournalIdentity, {
@@ -1805,6 +1834,46 @@ assert.equal(fs.existsSync(preAnchorCrashFile), false,
   "recovery never recreates a missing anchor from the earlier journal time");
 assert.equal(bounded(preAnchorCrashJournal).entries.at(-1).phase, "disarm",
   "an unanchored watch is fail-closed through forward recovery");
+
+const overBudgetAnchorCrashDir = `${tmp}/over-budget-anchor-crash`;
+assert.equal(await runWorker({
+  WORKER_MODE: "fault", WORKER_DIR: overBudgetAnchorCrashDir,
+  OVER_BUDGET_WATCH_ANCHOR: "1", FAULT_POINT: "after-watch-anchor",
+}), 78, "the process can crash after persisting a 301-second anchor");
+const overBudgetAnchorCrashJournal =
+  `${overBudgetAnchorCrashDir}/${binding().idempotency_key}.json`;
+const overBudgetAnchorCrashFile =
+  `${overBudgetAnchorCrashJournal}.watch-anchor.json`;
+assert.equal(bounded(overBudgetAnchorCrashFile).anchored_at,
+  "2026-07-26T00:05:01Z",
+  "the crash fixture durably records the authenticated over-budget anchor");
+assert.equal(bounded(overBudgetAnchorCrashJournal).entries.at(-1).phase,
+  "watch", "the crash precedes the initial runtime budget assertion");
+assert.equal(await runWorker({
+  WORKER_MODE: "resume", WORKER_DIR: overBudgetAnchorCrashDir,
+}), 0, "restart routes the authenticated over-budget anchor into recovery");
+assert.equal(bounded(overBudgetAnchorCrashJournal).entries.at(-1).phase,
+  "disarm", "the over-budget anchor can never resume watch or commit");
+const overBudgetTerminalJournal =
+  bounded(overBudgetAnchorCrashJournal);
+const overBudgetTerminalResult =
+  `${tmp}/over-budget-anchor-terminal-result.json`;
+const overBudgetTerminalRecoveryLog =
+  `${tmp}/over-budget-anchor-terminal-recovery.log`;
+assert.equal(await runWorker({
+  WORKER_MODE: "resume", WORKER_DIR: overBudgetAnchorCrashDir,
+  WORKER_RESULT: overBudgetTerminalResult,
+  RECOVERY_CALL_LOG: overBudgetTerminalRecoveryLog,
+}), 0, "an exact terminal retry accepts the authenticated recovery history");
+assert.deepEqual(bounded(overBudgetTerminalResult), {
+  ran: false, reason: "terminal-disarm",
+}, "the exact post-recovery retry is read-only");
+assert.deepEqual(
+  bounded(overBudgetAnchorCrashJournal), overBudgetTerminalJournal,
+  "the exact terminal retry does not append another recovery receipt",
+);
+assert.equal(fs.existsSync(overBudgetTerminalRecoveryLog), false,
+  "the exact terminal retry causes no new recovery effect");
 
 for (const anchorDamage of ["malformed", "torn"]) {
   const damagedAnchorDir = `${tmp}/${anchorDamage}-anchor`;

@@ -136,12 +136,17 @@ lease in target state `watching`. Earlier invocations remain `watching` and
 release again. Every restart validates and reuses the immutable anchor; it
 cannot replace or backdate it. A crash after the journal readback but before
 anchor creation leaves no eligible watch clock and therefore enters forward
-recovery rather than deriving one from the earlier journal timestamp. At or
-after the anchor-derived earliest commit instant, the same attempt reacquires
-a new epoch without consuming another proposal/rate slot, installs that epoch
-in the effect and recovery resources, and performs the final
-safe-state/authority checks. A continuation beyond commit grace recovers. No
-process or lease is held synchronously during the one-hour watch.
+recovery rather than deriving one from the earlier journal timestamp. A crash
+after persisting an authenticated anchor that exceeds the 300-second budget
+likewise resumes into bounded forward recovery instead of throwing outside the
+attempt state machine. The resulting recovery history and terminal disarm stay
+readable and exactly replayable without another recovery effect, but a journal
+containing `commit` always requires the anchor and all anchor-derived timing to
+remain valid. At or after the anchor-derived earliest commit instant, the same
+attempt reacquires a new epoch without consuming another proposal/rate slot,
+installs that epoch in the effect and recovery resources, and performs the
+final safe-state/authority checks. A continuation beyond commit grace
+recovers. No process or lease is held synchronously during the one-hour watch.
 
 The kill switch is checked at admission and between mutation phases, and commit
 additionally requires a maintenance-safe-state readback from a fresh host

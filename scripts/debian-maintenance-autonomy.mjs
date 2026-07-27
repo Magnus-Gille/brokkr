@@ -1259,6 +1259,7 @@ function runMaintenanceAttempt({
   };
   let durableWatchAnchor = null;
   let watchAnchorError = null;
+  let watchAnchorTimingError = null;
   if (existing?.entries.some(entry => entry.phase === "watch")) {
     try { durableWatchAnchor = readWatchAnchor(file, existing); }
     catch (error) { watchAnchorError = diagnosticCode(error); }
@@ -1268,9 +1269,22 @@ function runMaintenanceAttempt({
       `watch_anchor_${watchAnchorError ?? "missing"}`);
   }
   if (existing) {
-    validateJournalSemantics(existing, conformance, {
-      allowActive: true, watchAnchor: durableWatchAnchor,
-    });
+    try {
+      validateJournalSemantics(existing, conformance, {
+        allowActive: true, watchAnchor: durableWatchAnchor,
+      });
+    } catch (error) {
+      const code = diagnosticCode(error);
+      // A durable late anchor invalidates success timing, not the R-forward
+      // receipts produced to contain it. Commit-bearing histories stay strict.
+      const recoverableWatchTimingFailure =
+        durableWatchAnchor !== null &&
+        !existing.entries.some(entry => entry.phase === "commit") &&
+        code === "journal_apply_verify_budget_exceeded";
+      if (!recoverableWatchTimingFailure) throw error;
+      validateJournalSemantics(existing, conformance, { allowActive: true });
+      watchAnchorTimingError = code;
+    }
     const conflicting = canonicalJson(existing.binding) !== canonicalJson(binding);
     pendingOutbox = readOptional(`${file}.recovery-outbox.json`);
     if (pendingOutbox) {
@@ -1369,7 +1383,8 @@ function runMaintenanceAttempt({
   const activeBindingDigest = existing?.binding_digest ?? bindingDigest;
   const watchStateResume = existing?.entries.at(-1).phase === "watch" &&
     pendingOutbox === null;
-  const watchContinuation = watchStateResume && durableWatchAnchor !== null;
+  const watchContinuation = watchStateResume &&
+    durableWatchAnchor !== null && watchAnchorTimingError === null;
   const claimed = claimTarget({
     journalDir, binding: activeBinding, bindingDigest: activeBindingDigest,
     now: admitted.now, policy: context.policy, resumeWatch: watchStateResume,
@@ -1435,7 +1450,9 @@ function runMaintenanceAttempt({
     if (watchStateResume && !watchContinuation) {
       return enterRecovery({
         file, journal, context, admission, recovery, lease,
-        code: `watch-anchor-${watchAnchorError ?? "missing"}`,
+        code: `watch-anchor-${
+          watchAnchorError ?? watchAnchorTimingError ?? "missing"
+        }`,
         lastAt: journal.entries.at(-1).recorded_at,
       });
     }
