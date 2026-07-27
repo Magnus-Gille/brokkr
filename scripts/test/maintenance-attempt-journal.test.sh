@@ -23,9 +23,6 @@ const {
 const {
   policyDigest,
 } = await import(`${root}/scripts/lib/maintenance-policy-contract.mjs`);
-const { createBoundedRecoveryHost } = await import(
-  `${root}/scripts/lib/bounded-recovery-dispatch.mjs`
-);
 
 const fixture = name => JSON.parse(fs.readFileSync(`${root}/tests/fixtures/autonomy-contract-v2/${name}`, "utf8"));
 const legacyFixture = name => JSON.parse(fs.readFileSync(
@@ -360,7 +357,7 @@ function recovery(artifacts, overrides = {}) {
       if (!receipts.has(request.idempotency_key)) {
         receipts.set(request.idempotency_key, {
           idempotency_key: request.idempotency_key,
-          effect_lease_fence_digest: request.revalidation_fence_digest,
+          effect_lease_fence_digest: request.lease_fence_digest,
           recovered: true,
           safe_state_verified: true, quarantine_active: true, reason_code: null,
         });
@@ -394,7 +391,7 @@ function recovery(artifacts, overrides = {}) {
     ...capabilityOverrides,
   };
   const activations = new Map();
-  api.host = createBoundedRecoveryHost({
+  globalThis.__BROKKR_TEST_FIXED_RECOVERY_HOST__ = {
     persistActivation: activation => {
       const activationDigest = autonomyDigest(activation);
       const existing = activations.get(activation.attempt_id);
@@ -405,7 +402,7 @@ function recovery(artifacts, overrides = {}) {
       return { activation_digest: activationDigest, idempotent: existing !== undefined };
     },
     runFixedAdapter: input => api.recover(input.recovery_request),
-  });
+  };
   return api;
 }
 function exactAdapters(phase = phases(), overrides = {}) {
@@ -478,11 +475,12 @@ function exactAdapters(phase = phases(), overrides = {}) {
 const run = ({
   dir, artifacts = bundle(), bind = binding(), admit = admission(),
   phase = phases(), recover = null, reconcile = null, adapters = null,
-  autoResume = true,
+  autoResume = true, publicOptions = {},
 }) => {
   const selectedRecovery = recover ?? recovery(artifacts);
   const selectedAdapters = adapters ?? exactAdapters(phase);
   const input = {
+    ...publicOptions,
     binding: bind, attemptJournalDir: dir, artifacts, admission: admit,
     recovery: selectedRecovery, reconcile, target: executionTarget,
     expectedPostconditions: executionAfter, plan: executionPlan,
@@ -593,7 +591,7 @@ if (process.env.WORKER_MODE) {
           }
           state.receipts[request.idempotency_key] = {
             idempotency_key: request.idempotency_key,
-            effect_lease_fence_digest: request.revalidation_fence_digest,
+            effect_lease_fence_digest: request.lease_fence_digest,
             recovered: true,
             safe_state_verified: true, quarantine_active: true,
             reason_code: null,
@@ -1200,9 +1198,26 @@ const expiredRecoveryOutbox = bounded(
 assert.equal(expiredRecoveryOutbox.authorized_recovery_fence_digests.length, 2);
 assert.equal(
   expiredRecoveryOutbox.recovery_result.effect_lease_fence_digest,
-  expiredRecoveryOutbox.recovery_result.revalidated_lease_fence_digest,
-  "when no old effect occurred, the successor owns both effect and revalidation",
+  expiredRecoveryOutbox.recovery_request.lease_fence_digest,
+  "the terminal receipt preserves the original effect-lease identity",
 );
+assert.notEqual(
+  expiredRecoveryOutbox.recovery_result.effect_lease_fence_digest,
+  expiredRecoveryOutbox.recovery_result.revalidated_lease_fence_digest,
+  "the successor revalidation fence remains a distinct durable authority",
+);
+const callerMintedHost = {
+  persistActivation: () => { throw Error("caller host must never run"); },
+  runFixedAdapter: () => { throw Error("caller adapter must never run"); },
+};
+const publicBoundary = run({
+  dir: `${tmp}/public-boundary`, artifacts: bundle(),
+  phase: phases({ applyFenced: () => { throw Error("force-recovery"); } }),
+  autoResume: false,
+  publicOptions: { host: callerMintedHost, recoveryHostFactory: () => callerMintedHost },
+});
+assert.equal(publicBoundary.reason, "recovered-disarmed",
+  "public look-alikes and factories cannot replace the fixed recovery host");
 const shortWatchArtifacts = bundle();
 const shortWatch = run({
   dir: `${tmp}/short-watch`, artifacts: shortWatchArtifacts,
@@ -1456,11 +1471,11 @@ assert.throws(() => run({
 
 const crashDir = `${tmp}/crash`;
 const runWorker = env => new Promise(resolve => {
-  const child = spawn(process.execPath, [process.argv[1]], { env: { ...process.env, ...env } });
+  const child = spawn(process.execPath, [...process.execArgv, process.argv[1]], { env: { ...process.env, ...env } });
   child.on("exit", code => resolve(code));
 });
 const staleLockDir = `${tmp}/stale-lock`, staleLockReady = `${tmp}/stale-lock-ready`;
-const staleLockChild = spawn(process.execPath, [process.argv[1]], {
+const staleLockChild = spawn(process.execPath, [...process.execArgv, process.argv[1]], {
   env: {
     ...process.env, WORKER_MODE: "hold-lock", WORKER_DIR: staleLockDir,
     READY: staleLockReady,
@@ -1605,7 +1620,7 @@ const failed = run({
   phase: phases({ applyFenced: () => { throw Object.assign(new Error("apply-failed"), { code: "apply-failed" }); } }),
   recover: recovery(failureArtifacts, { recover: request => ({
     idempotency_key: request.idempotency_key,
-    effect_lease_fence_digest: request.revalidation_fence_digest,
+    effect_lease_fence_digest: request.lease_fence_digest,
     revalidated_lease_fence_digest: request.revalidation_fence_digest,
     revalidated_at: request.revalidation_fence.activated_at, recovered: false,
     safe_state_verified: false, quarantine_active: true, reason_code: "forward-repair-failed",
@@ -1786,10 +1801,10 @@ for (const faultPoint of [
       ),
       "the recovery receipt remains bound to a recorded, authorized effect fence",
     );
-    assert.notEqual(
+    assert.equal(
       replayedOutbox.recovery_result.effect_lease_fence_digest,
       originalRecoveryFenceDigest,
-      "the initial recovery effect uses its explicit successor rather than the old lease",
+      "the recovery terminal receipt preserves the immutable original effect lease",
     );
     assert.notEqual(
       replayedOutbox.recovery_result.effect_lease_fence_digest,
@@ -2053,4 +2068,4 @@ assert.throws(() => run({
 console.log("maintenance attempt journal: W0.2 authorization, admission, v2 timing, recovery, demotion and rate gates OK");
 NODE
 
-env ROOT="$ROOT" TMP="$TMP" node "$TMP/test.mjs"
+env ROOT="$ROOT" TMP="$TMP" node --experimental-loader "$ROOT/scripts/test/fixtures/fixed-recovery-host/loader.mjs" "$TMP/test.mjs"

@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 
 const adapter = await import(`${process.env.ROOT}/scripts/debian-maintenance-host-adapter.mjs`);
-const { createBoundedRecoveryDispatcher, createBoundedRecoveryHost } = await import(
+const { createBoundedRecoveryDispatcher } = await import(
   `${process.env.ROOT}/scripts/lib/bounded-recovery-dispatch.mjs`
 );
 const digest = value => `sha256:${crypto.createHash("sha256").update(adapter.canonicalJson(value)).digest("hex")}`;
@@ -189,6 +189,8 @@ const recovered = adapter.runHostAdapter({ action: "recover", request, registrat
 if (recovered.outcome !== "disarmed") console.error(recovered);
 assert.equal(recovered.outcome, "disarmed");
 assert(recoveryState.entries.some(entry => entry.phase === "quarantine"));
+assert.equal(recoveryState.terminal.activation_digest, digest(recoveryActivation));
+assert.equal(recoveryState.terminal.revalidation_fence_digest, recoveryActivation.fence_digest);
 assert(calls.every(argv => argv[0] !== "/bin/sh"));
 
 const staleRecoveryState = structuredClone(recoveryTemplate);
@@ -213,18 +215,24 @@ const deadline = adapter.runHostAdapter({ action: "recover", request, registrati
 }});
 assert.equal(deadline.outcome, "terminally-blocked");
 assert.equal(deadline.reason, "host_recovery_budget_exhausted");
-assert.throws(() => createBoundedRecoveryDispatcher({
+const callerMintedLookalike = {
+  persistActivation: () => { throw Error("caller callback must stay unreachable"); },
+  runFixedAdapter: () => { throw Error("caller callback must stay unreachable"); },
+};
+assert.deepEqual(
+  Object.keys(await import(`${process.env.ROOT}/scripts/lib/bounded-recovery-dispatch.mjs`)).sort(),
+  ["createBoundedRecoveryDispatcher"],
+  "the bridge exports no recovery host factory or runner",
+);
+assert.doesNotThrow(() => createBoundedRecoveryDispatcher({
   recovery: {}, expected: {
     attemptId: request.attempt_id, bindingDigest: request.binding_digest,
     descriptorDigest: request.recovery_descriptor_digest,
     idempotencyKey: "recovery-67", mutationId: request.lease_fence.mutation_id,
     targetScopeDigest: request.lease_fence.target_scope_digest,
   },
-  host: {
-    persistActivation: () => ({ activation_digest: "sha256:" + "0".repeat(64), idempotent: false }),
-    runFixedAdapter: () => ({ recovered: true }),
-  },
-}), /bounded_recovery_dispatch_contract_invalid/, "look-alike caller callbacks are not a recovery host capability");
+  host: callerMintedLookalike,
+}), "a caller look-alike is ignored; it cannot mint production recovery authority");
 const published = [];
 let bridgeActivation = null;
 let fixedHostAdapterExecutions = 0;
@@ -236,7 +244,8 @@ const bridge = createBoundedRecoveryDispatcher({
     idempotencyKey: "recovery-67", mutationId: request.lease_fence.mutation_id,
     targetScopeDigest: request.lease_fence.target_scope_digest,
   },
-  host: createBoundedRecoveryHost({
+});
+globalThis.__BROKKR_TEST_FIXED_RECOVERY_HOST__ = {
     persistActivation: activation => {
       published.push(activation); bridgeActivation = structuredClone(activation);
       return { activation_digest: digest(activation), idempotent: published.length > 1 };
@@ -260,14 +269,17 @@ const bridge = createBoundedRecoveryDispatcher({
       assert.equal(result.outcome, "disarmed", "the fixed host adapter must durably complete recovery");
       return { idempotency_key: input.recovery_request.idempotency_key, effect_lease_fence_digest: request.lease_fence_digest, revalidated_lease_fence_digest: bridgeActivation.fence_digest, revalidated_at: "2026-07-27T12:00:00Z", recovered: true, safe_state_verified: true, quarantine_active: true, reason_code: null };
     },
-  }),
-});
+};
 const bridgeRequest = { idempotency_key: "recovery-67", descriptor_digest: request.recovery_descriptor_digest, target_scope_digest: request.lease_fence.target_scope_digest, binding_digest: request.binding_digest, lease_fence: request.lease_fence, lease_fence_digest: request.lease_fence_digest, revalidation_fence: recoveryActivation.fence, revalidation_fence_digest: recoveryActivation.fence_digest };
 const bridgeResult = bridge.recover(bridgeRequest);
 assert.equal(bridgeResult.recovered, true);
 assert.equal(published.length, 1, "the bridge persists one successor activation before dispatch");
 assert.equal(fixedHostAdapterExecutions, 1, "recovery success requires fixed host-adapter execution, not a shape-only callback");
 assert(bridgeHostState.entries.some(entry => entry.phase === "disarm"), "the host adapter durably disarmed the recovered attempt");
+assert.equal(bridgeHostState.terminal.activation_digest, bridgeResult.activation_digest,
+  "the durable terminal record binds the dispatcher activation");
+assert.equal(bridgeHostState.terminal.revalidation_fence_digest, bridgeRequest.revalidation_fence_digest,
+  "the durable terminal record binds the successor fence");
 for (const [name, mutate] of [
   ["binding", value => { value.binding_digest = "sha256:" + "f".repeat(64); }],
   ["target", value => { value.revalidation_fence.target_scope_digest = "sha256:" + "f".repeat(64); }],
@@ -282,7 +294,7 @@ for (const [name, mutate] of [
 }
 console.log("debian host adapter: root-only exact allowlist, preflight, forward recovery and disarm OK");
 NODE
-env ROOT="$ROOT" node "$TMP/test.mjs"
+env ROOT="$ROOT" node --experimental-loader "$ROOT/scripts/test/fixtures/fixed-recovery-host/loader.mjs" "$TMP/test.mjs"
 UNIT="$ROOT/systemd/brokkr-debian-maintenance-recovery@.service"
 rg -q '^ExecStart=/usr/local/lib/brokkr/debian-maintenance-host-adapter --action recover --attempt %i$' "$UNIT"
 if command -v systemd-analyze >/dev/null 2>&1; then

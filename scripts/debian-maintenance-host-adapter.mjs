@@ -201,10 +201,15 @@ function journalEntry({ phase, at, bindingDigest, previousDigest, detail }) {
 }
 function validJournal(state, bindingDigest) {
   if (!exactKeys(state, ["entries", "terminal"]) || !Array.isArray(state.entries)) return false;
-  if (state.terminal !== null && (!exactKeys(state.terminal, ["kind", "schema_version", "state", "reason", "at", "binding_digest"]) ||
-    state.terminal.kind !== "brokkr-debian-host-adapter-terminal" || state.terminal.schema_version !== "v1" ||
-    !["terminally-blocked", "disarmed"].includes(state.terminal.state) || typeof state.terminal.reason !== "string" ||
-    !iso(state.terminal.at) || state.terminal.binding_digest !== bindingDigest)) return false;
+  if (state.terminal !== null) {
+    const terminal = state.terminal;
+    const legacy = exactKeys(terminal, ["kind", "schema_version", "state", "reason", "at", "binding_digest"]);
+    const disarmed = exactKeys(terminal, ["kind", "schema_version", "state", "reason", "at", "binding_digest", "activation_digest", "revalidation_fence_digest"]);
+    if ((!legacy && !disarmed) || terminal.kind !== "brokkr-debian-host-adapter-terminal" ||
+      terminal.schema_version !== "v1" || !["terminally-blocked", "disarmed"].includes(terminal.state) ||
+      typeof terminal.reason !== "string" || !iso(terminal.at) || terminal.binding_digest !== bindingDigest ||
+      (terminal.state === "disarmed" && (!disarmed || !DIGEST.test(terminal.activation_digest) || !DIGEST.test(terminal.revalidation_fence_digest)))) return false;
+  }
   let previous = null;
   for (let index = 0; index < state.entries.length; index += 1) {
     const entry = state.entries[index];
@@ -307,7 +312,7 @@ export function runHostAdapter({ action, request, registration, env }) {
     if (canonicalJson(after) !== canonicalJson(execution.expected_postconditions)) fail("host_postconditions_unverifiable");
     append(state, "quarantine", safeEnv, { descriptor_id: descriptor.descriptor_id }, request.binding_digest);
     append(state, "disarm", safeEnv, { binding_digest: request.binding_digest }, request.binding_digest);
-    state.terminal = { kind: "brokkr-debian-host-adapter-terminal", schema_version: "v1", state: "disarmed", reason: "forward_recovery_verified", at: safeEnv.now(), binding_digest: request.binding_digest };
+    state.terminal = { kind: "brokkr-debian-host-adapter-terminal", schema_version: "v1", state: "disarmed", reason: "forward_recovery_verified", at: safeEnv.now(), binding_digest: request.binding_digest, activation_digest: digest(activation), revalidation_fence_digest: activation.fence_digest };
     safeEnv.writeJournal(clone(state)); safeEnv.writeTerminal(clone(state.terminal));
     return { outcome: "disarmed", journal: state };
   } catch (error) { return terminal(state, safeEnv, String(error?.code ?? error?.message ?? "host_recovery_failed"), request.binding_digest); }

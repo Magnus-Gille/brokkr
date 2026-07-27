@@ -2151,8 +2151,7 @@ export function runDebianMaintenance(options = {}) {
   if (!plain(binding) || !plain(recovery) || !ID.test(binding.attempt_id) ||
     !ID.test(binding.mutation_id) || !ID.test(binding.recovery_disarm_id) ||
     !DIGEST.test(binding.target_scope_digest) ||
-    !DIGEST.test(binding.recovery?.descriptor_digest) ||
-    !plain(recovery.host)) {
+    !DIGEST.test(binding.recovery?.descriptor_digest)) {
     fail("bounded_recovery_dispatch_required");
   }
   const boundedRecoveryFactory = ({ binding: recoveredBinding, bindingDigest }) => {
@@ -2175,7 +2174,6 @@ export function runDebianMaintenance(options = {}) {
         mutationId: recoveredBinding.mutation_id,
         targetScopeDigest: recoveredBinding.target_scope_digest,
       },
-      host: recovery.host,
     });
   };
   return DEBIAN_API.runBoundDebianMaintenance({

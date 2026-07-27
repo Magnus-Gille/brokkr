@@ -2,6 +2,7 @@
 // lease and signed narrowing; this bridge owns only publishing the already
 // authorized successor activation and dispatching the one fixed recovery action.
 import crypto from "node:crypto";
+import { runFixedBoundedRecoveryHost } from "./fixed-bounded-recovery-host.mjs";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,62}$/;
@@ -11,23 +12,6 @@ const canonicalJson = value => value === null || typeof value !== "object" ? JSO
 const digest = value => `sha256:${crypto.createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
 const fail = code => { const error = new Error(code); error.code = code; throw error; };
 const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
-// A recovery host is deliberately opaque to the public W2a runner.  In
-// particular, a pair of look-alike publish/dispatch callbacks is not a host
-// capability: only this module can recognise a capability it constructed.
-const RECOVERY_HOSTS = new WeakSet();
-
-export function createBoundedRecoveryHost({ persistActivation, runFixedAdapter }) {
-  if (typeof persistActivation !== "function" || typeof runFixedAdapter !== "function") {
-    fail("bounded_recovery_host_contract_invalid");
-  }
-  const host = Object.freeze({
-    persistActivation: activation => persistActivation(structuredClone(activation)),
-    runFixedAdapter: input => runFixedAdapter(structuredClone(input)),
-  });
-  RECOVERY_HOSTS.add(host);
-  return host;
-}
-
 function validFence(fence, expected) {
   return exactKeys(fence, [
     "kind", "schema_version", "domain", "target_scope_digest", "attempt_id",
@@ -48,14 +32,13 @@ function validFence(fence, expected) {
     Date.parse(fence.activated_at) <= Date.parse(fence.expires_at);
 }
 
-export function createBoundedRecoveryDispatcher({ recovery, expected, host }) {
+export function createBoundedRecoveryDispatcher({ recovery, expected }) {
   if (!plain(recovery) || !exactKeys(expected, [
     "attemptId", "bindingDigest", "descriptorDigest", "idempotencyKey",
     "mutationId", "targetScopeDigest",
   ]) || !ID.test(expected.attemptId) || !ID.test(expected.mutationId) ||
     !ID.test(expected.idempotencyKey) || !DIGEST.test(expected.bindingDigest) ||
-    !DIGEST.test(expected.descriptorDigest) || !DIGEST.test(expected.targetScopeDigest) ||
-    !plain(host) || !RECOVERY_HOSTS.has(host)) {
+    !DIGEST.test(expected.descriptorDigest) || !DIGEST.test(expected.targetScopeDigest)) {
     fail("bounded_recovery_dispatch_contract_invalid");
   }
   return {
@@ -83,22 +66,25 @@ export function createBoundedRecoveryDispatcher({ recovery, expected, host }) {
         binding_digest: expected.bindingDigest, recovery_descriptor_digest: expected.descriptorDigest,
         fence: structuredClone(request.revalidation_fence), fence_digest: request.revalidation_fence_digest,
       };
-      const published = host.persistActivation(structuredClone(activation));
-      if (!exactKeys(published, ["activation_digest", "idempotent"]) || published.activation_digest !== digest(activation) || typeof published.idempotent !== "boolean") fail("bounded_recovery_activation_unverified");
-      const dispatched = host.runFixedAdapter({ action: "recover", attempt_id: expected.attemptId, activation_digest: published.activation_digest, recovery_request: structuredClone(request) });
-      if (!exactKeys(dispatched, ["idempotency_key", "effect_lease_fence_digest", "revalidated_lease_fence_digest", "revalidated_at", "recovered", "safe_state_verified", "quarantine_active", "reason_code"]) || dispatched.idempotency_key !== request.idempotency_key || !DIGEST.test(dispatched.effect_lease_fence_digest) || dispatched.revalidated_lease_fence_digest !== request.revalidation_fence_digest || !ISO.test(dispatched.revalidated_at) || !Number.isFinite(Date.parse(dispatched.revalidated_at)) || typeof dispatched.recovered !== "boolean" || typeof dispatched.safe_state_verified !== "boolean" || typeof dispatched.quarantine_active !== "boolean" || (dispatched.reason_code !== null && typeof dispatched.reason_code !== "string")) fail("bounded_recovery_dispatch_receipt_invalid");
+      const dispatched = runFixedBoundedRecoveryHost({
+        action: "recover", attempt_id: expected.attemptId,
+        activation: structuredClone(activation), recovery_request: structuredClone(request),
+      });
+      if (!plain(dispatched) || dispatched.activation_digest !== digest(activation)) fail("bounded_recovery_activation_unverified");
+      const { activation_digest: activationDigest, ...receipt } = dispatched;
+      if (!exactKeys(receipt, ["idempotency_key", "effect_lease_fence_digest", "revalidated_lease_fence_digest", "revalidated_at", "recovered", "safe_state_verified", "quarantine_active", "reason_code"]) || receipt.idempotency_key !== request.idempotency_key || receipt.effect_lease_fence_digest !== request.lease_fence_digest || receipt.revalidated_lease_fence_digest !== request.revalidation_fence_digest || !ISO.test(receipt.revalidated_at) || !Number.isFinite(Date.parse(receipt.revalidated_at)) || typeof receipt.recovered !== "boolean" || typeof receipt.safe_state_verified !== "boolean" || typeof receipt.quarantine_active !== "boolean" || (receipt.reason_code !== null && typeof receipt.reason_code !== "string")) fail("bounded_recovery_dispatch_receipt_invalid");
       // The outbox receipt carries the durable activation identity as well as
       // a digest of the fixed-adapter terminal receipt.  Both are explicitly
       // bound to the successor fence; a successful-looking adapter response
       // cannot be replayed under another successor lease.
       const terminalReceipt = {
-        activation_digest: published.activation_digest,
+        activation_digest: activationDigest,
         revalidation_fence_digest: request.revalidation_fence_digest,
-        host_receipt_digest: digest(dispatched),
+        host_receipt_digest: digest(receipt),
       };
       return {
-        ...dispatched,
-        activation_digest: published.activation_digest,
+        ...receipt,
+        activation_digest: activationDigest,
         terminal_receipt_digest: digest(terminalReceipt),
       };
     },
