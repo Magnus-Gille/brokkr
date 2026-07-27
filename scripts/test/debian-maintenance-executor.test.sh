@@ -8,6 +8,9 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 const module = await import(`${process.env.ROOT}/scripts/debian-maintenance-executor.mjs`);
+const journalModule = await import(
+  `${process.env.ROOT}/scripts/maintenance-attempt-journal.mjs`
+);
 const { deriveDebianAutonomyExecution, runDebianMaintenance } = module;
 const { canonicalJson, policyDigest } = await import(
   `${process.env.ROOT}/scripts/lib/maintenance-policy-contract.mjs`
@@ -19,6 +22,15 @@ assert.deepEqual(
   ["deriveDebianAutonomyExecution", "runDebianMaintenance"],
   "the raw drain/reboot executor is not an exported journal-bypass capability",
 );
+assert.deepEqual(
+  Object.keys(journalModule).sort(),
+  [
+    "attemptIdentity", "loadPinnedJournalSchema",
+    "validateJournalConformance",
+  ],
+  "direct imports cannot reach a generic arbitrary-callback mutation runner",
+);
+assert.equal(journalModule.runMaintenanceAttempt, undefined);
 assert.throws(() => runDebianMaintenance({}), /attempt_journal_contract_invalid/);
 
 const policy = JSON.parse(fs.readFileSync(

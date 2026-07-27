@@ -12,7 +12,7 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 const root = process.env.ROOT, tmp = process.env.TMP;
 const {
-  loadPinnedJournalSchema, runMaintenanceAttempt, validateJournalConformance,
+  loadPinnedJournalSchema, validateJournalConformance,
 } = await import(`${root}/scripts/maintenance-attempt-journal.mjs`);
 const {
   deriveDebianAutonomyExecution, runDebianMaintenance,
@@ -26,6 +26,63 @@ const {
 
 const fixture = name => JSON.parse(fs.readFileSync(`${root}/tests/fixtures/autonomy-contract/${name}`, "utf8"));
 const clone = value => structuredClone(value);
+function resignJournal(journal) {
+  journal.binding_digest = autonomyDigest(journal.binding);
+  let previous = null;
+  for (const entry of journal.entries) {
+    entry.binding_digest = journal.binding_digest;
+    entry.previous_receipt_digest = previous;
+    entry.receipt_digest = autonomyDigest(entry, "receipt_digest");
+    previous = entry.receipt_digest;
+  }
+  return journal;
+}
+const autonomousPolicy = JSON.parse(fs.readFileSync(
+  `${root}/tests/fixtures/maintenance-policy/normal-window.json`, "utf8",
+)).records.find(record => record.kind === "maintenance-policy");
+autonomousPolicy.timezone = "UTC";
+autonomousPolicy.window.days_of_week = ["sun"];
+autonomousPolicy.window.start_local_time = "00:00";
+autonomousPolicy.window.duration = "PT2H";
+autonomousPolicy.selector.node_ids = ["node-a"];
+autonomousPolicy.reboot.policy = "never";
+delete autonomousPolicy.policy_digest;
+autonomousPolicy.policy_digest = policyDigest(autonomousPolicy);
+const executionPlan = {
+  kind: "brokkr-maintenance-plan", schema_version: "v1",
+  plan_id: "autonomous-plan", outcome: "planned", node_id: "node-a",
+  policy_id: autonomousPolicy.policy_id,
+  policy_digest: autonomousPolicy.policy_digest,
+  inventory_evidence_id: "observation-test", running_kernel: "kernel-old",
+  decision: { effect: "on_schedule" }, blockers: [], hook_gaps: [],
+  unmet_policy_classes: [], created_at: "2026-07-26T00:00:00Z",
+  gates: {
+    package_manager_lock: "unlocked", disk: "sufficient", power: "mains",
+    clock: "synchronized", workload_hooks: "not_applicable",
+    kernel_recovery: "not_applicable",
+  },
+  candidates: [{
+    eligible: true, source: "distro_repository", class: "security",
+  }],
+};
+executionPlan.plan_digest = autonomyDigest(executionPlan);
+const executionTarget = {
+  node_id: "node-a", platform: "debian", non_pillar: true,
+};
+const executionBefore = {
+  kernel: "kernel-old", packages: ["a"], reboot_required: false,
+  dpkg_status: "clean",
+};
+const executionAfter = {
+  kernel: "kernel-new", packages: ["b"], reboot_required: false,
+  dpkg_status: "clean",
+};
+const adapterRevision = "sha256:" + "9".repeat(64);
+const execution = deriveDebianAutonomyExecution({
+  plan: executionPlan, policy: autonomousPolicy, target: executionTarget,
+  inventory: executionBefore, adapterRevisionDigest: adapterRevision,
+  postconditions: executionAfter,
+});
 const loadOrCreateKeys = envName => {
   if (process.env[envName]) {
     const privateKey = crypto.createPrivateKey({
@@ -46,7 +103,7 @@ const recoveryPublicPem = publicPem(recoveryKeys.publicKey);
 const fingerprint = publicKey => `sha256:${crypto.createHash("sha256").update(crypto.createPublicKey(publicKey).export({ type: "spki", format: "der" })).digest("hex")}`;
 const sign = (value, privateKey) => crypto.sign(null, Buffer.from(canonicalJson(value)), privateKey).toString("base64");
 
-function bundle(targetScopeDigest = null) {
+function bundle(targetScopeDigest = execution.target_scope_digest) {
   const constitution = fixture("constitution.json");
   const coverage = fixture("coverage-armed-canary.json");
   const ownerAttestations = fixture("owner-attestations.json");
@@ -66,7 +123,7 @@ function bundle(targetScopeDigest = null) {
     kind: "autonomy-recovery-worker-registry", schema_version: "v1", registry_id: "maintenance-recovery-workers",
     entries: [{
       domain: "no-reboot-security-bugfix-maintenance",
-      target_scope_digest: targetScopeDigest ?? "sha256:" + "5".repeat(64),
+      target_scope_digest: targetScopeDigest,
       recovery_worker_identity: "maintenance-recovery-worker",
       public_key_pem: recoveryPublic,
       public_key_fingerprint: fingerprint(recoveryPublic),
@@ -148,7 +205,11 @@ function rotateOwnerAuthorization(artifacts = bundle()) {
   };
   return artifacts;
 }
-function binding(id = "maintenance-attempt", coverage = fixture("coverage-armed-canary.json"), fields = {}) {
+function binding(
+  id = "maintenance-attempt",
+  coverage = bundle(execution.target_scope_digest).coverage,
+  fields = {},
+) {
   const owner = coverage.domains.find(row => row.domain === "no-reboot-security-bugfix-maintenance").bindings[0];
   return {
     mutation_id: `${id}-mutation`, attempt_id: id, recovery_disarm_id: `${id}-disarm`, idempotency_key: `${id}-idem`,
@@ -159,9 +220,12 @@ function binding(id = "maintenance-attempt", coverage = fixture("coverage-armed-
     owner_identity: owner.identities.owner, controller_identity: owner.identities.controller,
     watchdog_identity: owner.identities.watchdog, kill_switch_identity: owner.identities.kill_switch,
     recovery_worker_identity: owner.identities.recovery_worker, risk_scope: "no-reboot-security-bugfix-maintenance",
-    candidate_digest: "sha256:" + "a".repeat(64), config_digest: "sha256:" + "b".repeat(64),
-    evidence_digest: "sha256:" + "c".repeat(64), policy_digest: "sha256:" + "d".repeat(64),
-    baseline_digest: "sha256:" + "e".repeat(64), postconditions_digest: "sha256:" + "f".repeat(64),
+    candidate_digest: execution.candidate_digest,
+    config_digest: execution.config_digest,
+    evidence_digest: execution.evidence_digest,
+    policy_digest: execution.policy_digest,
+    baseline_digest: execution.baseline_digest,
+    postconditions_digest: execution.postconditions_digest,
     deadline: "2026-07-26T01:00:00Z",
     canary: { scope_digest: owner.target_scope_digest, target_count: 1, watch_deadline: "2026-07-26T00:10:00Z" },
     recovery: { class: "R-forward", worker_identity: owner.identities.recovery_worker, descriptor_digest: "sha256:" + "2".repeat(64), disarms_after_action: true },
@@ -174,7 +238,9 @@ function admission(times = baseTimes, kill = () => true) {
   return {
     trustedClock: () => ({ trusted: true, now: times[Math.min(index++, times.length - 1)] }),
     killSwitch: () => ({ safe: kill(), identity: "maintenance-kill-switch" }),
-    evidence: () => ({ fresh: true, eligible: true, digest: "sha256:" + "c".repeat(64) }),
+    evidence: () => ({
+      fresh: true, eligible: true, digest: execution.evidence_digest,
+    }),
     liveness: () => ({ healthy: true, observed_at: "2026-07-26T00:00:00Z" }),
     maintenance: () => ({
       window: { start: "2026-07-26T00:00:00Z", end: "2026-07-26T00:59:59Z" },
@@ -223,15 +289,30 @@ function phases(overrides = {}) {
       return { applied: true };
     },
     verify: () => ({ verified: true }), watch: () => {},
-    safeStateReadback: () => ({ safe: true, postconditions_digest: "sha256:" + "f".repeat(64) }),
+    safeStateReadback: () => ({
+      safe: true, postconditions_digest: execution.postconditions_digest,
+    }),
     ...overrides,
   };
 }
 function recovery(artifacts, overrides = {}) {
   const receipts = new Map();
+  let activeFence = null;
   return {
     workerIdentity: "maintenance-recovery-worker",
     publicKeyFingerprint: fingerprint(recoveryPublicPem),
+    activateFence: fence => {
+      if (activeFence) {
+        assert.ok(fence.epoch >= activeFence.epoch);
+        if (fence.epoch === activeFence.epoch) {
+          assert.equal(autonomyDigest(fence), autonomyDigest(activeFence));
+        }
+      }
+      activeFence = clone(fence);
+      return {
+        activated: true, lease_fence_digest: autonomyDigest(fence),
+      };
+    },
     readNarrowingHistory: ({ authorization_digest }) => {
       assert.equal(artifacts.runtimeNarrowing.owner_authorization_digest, authorization_digest);
       return {
@@ -240,11 +321,19 @@ function recovery(artifacts, overrides = {}) {
       };
     },
     recover: request => {
+      assert.equal(
+        request.lease_fence_digest, autonomyDigest(activeFence),
+        "recovery effect validates the current resource fence",
+      );
       if (!receipts.has(request.idempotency_key)) receipts.set(request.idempotency_key, {
-        idempotency_key: request.idempotency_key, recovered: true,
+        idempotency_key: request.idempotency_key,
+        lease_fence_digest: request.lease_fence_digest, recovered: true,
         safe_state_verified: true, quarantine_active: true, reason_code: null,
       });
-      return clone(receipts.get(request.idempotency_key));
+      return {
+        ...clone(receipts.get(request.idempotency_key)),
+        lease_fence_digest: request.lease_fence_digest,
+      };
     },
     appendSignedNarrowing: input => {
       const entryWithoutSignature = {
@@ -269,8 +358,78 @@ function recovery(artifacts, overrides = {}) {
     ...overrides,
   };
 }
-const run = ({ dir, artifacts = bundle(), bind = binding(), admit = admission(), phase = phases(), recover = null, reconcile = null }) =>
-  runMaintenanceAttempt({ journalDir: dir, binding: bind, artifacts, admission: admit, phases: phase, recovery: recover ?? recovery(artifacts), reconcile });
+function exactAdapters(phase = phases(), overrides = {}) {
+  const state = { applied: false, activeFence: null };
+  return {
+    inventory: () => {
+      const safe = phase.safeStateReadback?.();
+      return clone(state.applied && safe?.safe !== false ?
+        executionAfter : executionBefore);
+    },
+    activateFence: fence => {
+      if (state.activeFence) {
+        assert.ok(fence.epoch >= state.activeFence.epoch);
+        if (fence.epoch === state.activeFence.epoch) {
+          assert.equal(autonomyDigest(fence), autonomyDigest(state.activeFence));
+        }
+      }
+      state.activeFence = clone(fence);
+      phase.activateFence?.(fence);
+      return {
+        activated: true, lease_fence_digest: autonomyDigest(fence),
+      };
+    },
+    applyFenced: invocation => {
+      assert.equal(
+        invocation.lease_fence_digest, autonomyDigest(state.activeFence),
+      );
+      const result = phase.applyFenced?.({
+        lease_fence: invocation.lease_fence,
+        lease_fence_digest: invocation.lease_fence_digest,
+      }) ?? { applied: true };
+      if (result.applied !== true) throw Error("phase-apply-failed");
+      state.applied = true;
+      const receipt = {
+        ok: true, elapsed_ms: 1,
+        execution_request_digest: invocation.execution_request_digest,
+        lease_fence_digest: invocation.lease_fence_digest,
+        reboot_required: false,
+      };
+      return { ...receipt, receipt_digest: autonomyDigest(receipt) };
+    },
+    afterInventory: () => clone(executionAfter),
+    currentPolicy: () => clone(autonomousPolicy),
+    clock: () => ({
+      synchronized: true, now: "2026-07-26T00:00:00Z",
+    }),
+    hold: () => ({ active: false }),
+    substrateHealth: () => ({
+      ok: phase.verify?.().verified === true,
+    }),
+    revisionDigest: () => adapterRevision,
+    targetMetadata: () => clone(executionTarget),
+    ...overrides,
+  };
+}
+const run = ({
+  dir, artifacts = bundle(), bind = binding(), admit = admission(),
+  phase = phases(), recover = null, reconcile = null, adapters = null,
+  autoResume = true,
+}) => {
+  const selectedRecovery = recover ?? recovery(artifacts);
+  const selectedAdapters = adapters ?? exactAdapters(phase);
+  const input = {
+    binding: bind, attemptJournalDir: dir, artifacts, admission: admit,
+    recovery: selectedRecovery, reconcile, target: executionTarget,
+    expectedPostconditions: executionAfter, plan: executionPlan,
+    policy: autonomousPolicy, nodeId: "node-a", adapters: selectedAdapters,
+  };
+  let result = runDebianMaintenance(input);
+  if (autoResume && result.reason === "watching") {
+    result = runDebianMaintenance(input);
+  }
+  return result;
+};
 
 if (process.env.WORKER_MODE) {
   if (process.env.WORKER_MODE === "hold-lock") {
@@ -287,32 +446,79 @@ if (process.env.WORKER_MODE) {
   while (process.env.BARRIER && !fs.existsSync(process.env.BARRIER)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
   const workerArtifacts = bundle();
   const workerRecoveryState = `${process.env.WORKER_DIR}/mock-recovery-state.json`;
+  const withWorkerLock = (lock, operation) => {
+    while (true) {
+      try { fs.mkdirSync(lock); break; }
+      catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+      }
+    }
+    try { return operation(); } finally { fs.rmdirSync(lock); }
+  };
+  const recoveryTransactionLock = `${workerRecoveryState}.transaction`;
   const readWorkerRecoveryState = () => fs.existsSync(workerRecoveryState) ?
     JSON.parse(fs.readFileSync(workerRecoveryState, "utf8")) : {
       ledger: clone(workerArtifacts.runtimeNarrowing),
       checkpoint: clone(workerArtifacts.runtimeNarrowingCheckpoint),
-      receipts: {},
+      receipts: {}, active_fence: null,
     };
-  const writeWorkerRecoveryState = state => fs.writeFileSync(
-    workerRecoveryState, JSON.stringify(state),
-  );
+  const writeWorkerRecoveryState = state => {
+    const temporary = `${workerRecoveryState}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(state));
+    fs.renameSync(temporary, workerRecoveryState);
+  };
   const workerRecovery = recovery(workerArtifacts, {
+    activateFence: fence => withWorkerLock(recoveryTransactionLock, () => {
+      const state = readWorkerRecoveryState();
+      if (state.active_fence) {
+        assert.ok(fence.epoch >= state.active_fence.epoch,
+          "recovery resource rejects a lower epoch");
+        if (fence.epoch === state.active_fence.epoch) {
+          assert.equal(autonomyDigest(fence), autonomyDigest(state.active_fence));
+        }
+      }
+      state.active_fence = clone(fence);
+      writeWorkerRecoveryState(state);
+      return {
+        activated: true, lease_fence_digest: autonomyDigest(fence),
+      };
+    }),
     readNarrowingHistory: () => {
       const state = readWorkerRecoveryState();
       return { ledger: clone(state.ledger), tailCheckpoint: clone(state.checkpoint) };
     },
     recover: request => {
-      const state = readWorkerRecoveryState();
-      if (!state.receipts[request.idempotency_key]) {
-        if (process.env.RECOVERY_LOG) fs.appendFileSync(process.env.RECOVERY_LOG, "recover\n");
-        state.receipts[request.idempotency_key] = {
-          idempotency_key: request.idempotency_key, recovered: true,
-          safe_state_verified: true, quarantine_active: true, reason_code: null,
-        };
-        writeWorkerRecoveryState(state);
+      if (process.env.RECOVERY_CALL_LOG) {
+        fs.appendFileSync(process.env.RECOVERY_CALL_LOG, "recovery-call\n");
       }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-      return clone(state.receipts[request.idempotency_key]);
+      while (process.env.HOLD_BEFORE_RECOVERY_EFFECT &&
+          !fs.existsSync(process.env.HOLD_BEFORE_RECOVERY_EFFECT)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+      }
+      return withWorkerLock(recoveryTransactionLock, () => {
+        const state = readWorkerRecoveryState();
+        assert.equal(
+          request.lease_fence_digest, autonomyDigest(state.active_fence),
+          "stale recovery is fenced inside the recovery resource transaction",
+        );
+        if (!state.receipts[request.idempotency_key]) {
+          if (process.env.RECOVERY_LOG) {
+            fs.appendFileSync(process.env.RECOVERY_LOG, "recover\n");
+          }
+          state.receipts[request.idempotency_key] = {
+            idempotency_key: request.idempotency_key,
+            lease_fence_digest: request.lease_fence_digest, recovered: true,
+            safe_state_verified: true, quarantine_active: true,
+            reason_code: null,
+          };
+          writeWorkerRecoveryState(state);
+        }
+        return {
+          ...clone(state.receipts[request.idempotency_key]),
+          lease_fence_digest: request.lease_fence_digest,
+        };
+      });
     },
     appendSignedNarrowing: input => {
       const state = readWorkerRecoveryState();
@@ -336,7 +542,11 @@ if (process.env.WORKER_MODE) {
     },
   });
   const resumedWorker = ["resume", "recover"].includes(process.env.WORKER_MODE);
-  const workerAdmission = process.env.LATE_LEASE_TRANSFER ? admission([
+  const workerAdmission = process.env.VERY_LATE_LEASE_TRANSFER ? admission([
+    "2026-07-26T00:56:00Z", "2026-07-26T00:56:01Z",
+    "2026-07-26T00:56:02Z", "2026-07-26T00:56:03Z",
+    "2026-07-26T00:56:04Z",
+  ]) : process.env.LATE_LEASE_TRANSFER ? admission([
     "2026-07-26T00:40:00Z", "2026-07-26T00:40:01Z", "2026-07-26T00:40:02Z",
     "2026-07-26T00:40:03Z", "2026-07-26T00:40:04Z",
   ]) : process.env.WORKER_MODE === "recover" ? admission([
@@ -348,7 +558,8 @@ if (process.env.WORKER_MODE) {
     "2026-07-26T00:16:06Z", "2026-07-26T00:16:07Z",
   ]) : admission();
   if (resumedWorker) workerAdmission.liveness = () => ({
-    healthy: true, observed_at: process.env.LATE_LEASE_TRANSFER ?
+    healthy: true, observed_at: process.env.VERY_LATE_LEASE_TRANSFER ?
+      "2026-07-26T00:55:59Z" : process.env.LATE_LEASE_TRANSFER ?
       "2026-07-26T00:39:59Z" : process.env.WORKER_MODE === "recover" ?
       "2026-07-26T00:19:59Z" : "2026-07-26T00:15:59Z",
   });
@@ -434,40 +645,25 @@ assert.equal(validateJournalConformance(happy.journal, {
   schema: happyArtifacts.journalSchema, constitution: happyArtifacts.constitution,
   coverage: happyArtifacts.coverage, ownerAttestations: happyArtifacts.ownerAttestations,
 }), true);
+const aliasedTerminalIdentity = resignJournal(clone(happy.journal));
+aliasedTerminalIdentity.binding.recovery_disarm_id =
+  aliasedTerminalIdentity.binding.attempt_id;
+resignJournal(aliasedTerminalIdentity);
+assert.throws(() => validateJournalConformance(aliasedTerminalIdentity, {
+  schema: happyArtifacts.journalSchema, constitution: happyArtifacts.constitution,
+  coverage: happyArtifacts.coverage,
+  ownerAttestations: happyArtifacts.ownerAttestations,
+}), /journal_attempt_recovery_identity_aliased/);
+const duplicateEntryIdentity = clone(happy.journal);
+duplicateEntryIdentity.entries[1].entry_id =
+  duplicateEntryIdentity.entries[0].entry_id;
+resignJournal(duplicateEntryIdentity);
+assert.throws(() => validateJournalConformance(duplicateEntryIdentity, {
+  schema: happyArtifacts.journalSchema, constitution: happyArtifacts.constitution,
+  coverage: happyArtifacts.coverage,
+  ownerAttestations: happyArtifacts.ownerAttestations,
+}), /journal_entry_identity_replayed/);
 
-const policyFixture = fixturePath => JSON.parse(fs.readFileSync(fixturePath, "utf8"));
-const autonomousPolicy = policyFixture(`${root}/tests/fixtures/maintenance-policy/normal-window.json`)
-  .records.find(record => record.kind === "maintenance-policy");
-autonomousPolicy.timezone = "UTC";
-autonomousPolicy.window.days_of_week = ["sun"];
-autonomousPolicy.window.start_local_time = "00:00";
-autonomousPolicy.window.duration = "PT2H";
-autonomousPolicy.selector.node_ids = ["node-a"];
-autonomousPolicy.reboot.policy = "never";
-delete autonomousPolicy.policy_digest;
-autonomousPolicy.policy_digest = policyDigest(autonomousPolicy);
-const executionPlan = {
-  kind: "brokkr-maintenance-plan", schema_version: "v1", plan_id: "autonomous-plan",
-  outcome: "planned", node_id: "node-a", policy_id: autonomousPolicy.policy_id,
-  policy_digest: autonomousPolicy.policy_digest, inventory_evidence_id: "observation-test",
-  running_kernel: "kernel-old", decision: { effect: "on_schedule" }, blockers: [],
-  hook_gaps: [], unmet_policy_classes: [], created_at: "2026-07-26T00:00:00Z",
-  gates: {
-    package_manager_lock: "unlocked", disk: "sufficient", power: "mains",
-    clock: "synchronized", workload_hooks: "not_applicable", kernel_recovery: "not_applicable",
-  },
-  candidates: [{ eligible: true, source: "distro_repository", class: "security" }],
-};
-executionPlan.plan_digest = autonomyDigest(executionPlan);
-const executionTarget = { node_id: "node-a", platform: "debian", non_pillar: true };
-const executionBefore = { kernel: "kernel-old", packages: ["a"], reboot_required: false, dpkg_status: "clean" };
-const executionAfter = { kernel: "kernel-new", packages: ["b"], reboot_required: false, dpkg_status: "clean" };
-const adapterRevision = "sha256:" + "9".repeat(64);
-const execution = deriveDebianAutonomyExecution({
-  plan: executionPlan, policy: autonomousPolicy, target: executionTarget,
-  inventory: executionBefore, adapterRevisionDigest: adapterRevision,
-  postconditions: executionAfter,
-});
 const wrapperArtifacts = bundle(execution.target_scope_digest);
 const wrapperBinding = binding("wrapper-integration", wrapperArtifacts.coverage, Object.fromEntries([
   "target_scope_digest", "candidate_digest", "config_digest", "evidence_digest",
@@ -475,6 +671,11 @@ const wrapperBinding = binding("wrapper-integration", wrapperArtifacts.coverage,
 ].map(field => [field, execution[field]])));
 const wrapperAdmission = admission();
 wrapperAdmission.evidence = () => ({ fresh: true, eligible: true, digest: execution.evidence_digest });
+const completeDebian = input => {
+  let result = runDebianMaintenance(input);
+  if (result.reason === "watching") result = runDebianMaintenance(input);
+  return result;
+};
 const wrapperAdapters = overrides => {
   let applied = false;
   let activeFenceDigest = null;
@@ -513,7 +714,7 @@ const wrapperAdapters = overrides => {
     ...overrides,
   };
 };
-const wrapperResult = runDebianMaintenance({
+const wrapperResult = completeDebian({
   binding: wrapperBinding, attemptJournalDir: `${tmp}/wrapper`, artifacts: wrapperArtifacts,
   admission: wrapperAdmission, recovery: recovery(wrapperArtifacts), watch: () => {},
   target: executionTarget, expectedPostconditions: executionAfter, plan: executionPlan,
@@ -580,7 +781,7 @@ const staleHostAdmission = admission();
 staleHostAdmission.evidence = () => ({
   fresh: true, eligible: true, digest: execution.evidence_digest,
 });
-const staleHostResult = runDebianMaintenance({
+const staleHostResult = completeDebian({
   binding: staleHostBinding, attemptJournalDir: `${tmp}/wrapper-stale-host`,
   artifacts: staleHostArtifacts, admission: staleHostAdmission,
   recovery: recovery(staleHostArtifacts), watch: () => {}, target: executionTarget,
@@ -603,7 +804,7 @@ const unboundReceiptAdmission = admission();
 unboundReceiptAdmission.evidence = () => ({
   fresh: true, eligible: true, digest: execution.evidence_digest,
 });
-const unboundReceipt = runDebianMaintenance({
+const unboundReceipt = completeDebian({
   binding: unboundReceiptBinding, attemptJournalDir: `${tmp}/wrapper-unbound-receipt`,
   artifacts: unboundReceiptArtifacts, admission: unboundReceiptAdmission,
   recovery: recovery(unboundReceiptArtifacts), watch: () => {}, target: executionTarget,
@@ -695,7 +896,105 @@ const shortWatch = run({
   dir: `${tmp}/short-watch`, artifacts: shortWatchArtifacts,
   admit: admission(["2026-07-26T00:00:00Z", "2026-07-26T00:00:01Z", "2026-07-26T00:00:02Z", "2026-07-26T00:00:03Z", "2026-07-26T00:00:04Z", "2026-07-26T00:09:59Z", "2026-07-26T00:10:00Z"]),
 });
-assert.equal(shortWatch.reason, "recovered-disarmed", "watch must actually reach its bound before commit");
+assert.equal(shortWatch.reason, "watching",
+  "an early continuation stays nonterminal instead of recovering healthy work");
+assert.equal(shortWatch.journal.entries.at(-1).phase, "watch");
+const longWatchArtifacts = bundle();
+const longWatchBinding = binding(
+  "long-watch", longWatchArtifacts.coverage, {
+    canary: {
+      scope_digest: execution.target_scope_digest, target_count: 1,
+      watch_deadline: "2026-07-26T00:20:00Z",
+    },
+  },
+);
+const longWatchAdapters = exactAdapters();
+const longWatchRecovery = recovery(longWatchArtifacts);
+const longWatchInitial = run({
+  dir: `${tmp}/long-watch`, artifacts: longWatchArtifacts,
+  bind: longWatchBinding,
+  admit: admission([
+    "2026-07-26T00:00:00Z", "2026-07-26T00:00:01Z",
+    "2026-07-26T00:00:02Z", "2026-07-26T00:00:03Z",
+    "2026-07-26T00:00:04Z", "2026-07-26T00:00:05Z",
+  ]),
+  recover: longWatchRecovery, adapters: longWatchAdapters,
+  autoResume: false,
+});
+assert.equal(longWatchInitial.reason, "watching");
+const longWatchStateAfterInitial = bounded(
+  `${tmp}/long-watch/.autonomy-state/domain-state.json`,
+);
+const longWatchTargetKey = Object.keys(
+  longWatchStateAfterInitial.targets,
+)[0];
+assert.equal(
+  longWatchStateAfterInitial.targets[longWatchTargetKey].lease_epoch, 1,
+);
+const overlapAdmission = admission([
+  "2026-07-26T00:16:00Z", "2026-07-26T00:16:01Z",
+  "2026-07-26T00:16:02Z", "2026-07-26T00:16:03Z",
+]);
+overlapAdmission.liveness = () => ({
+  healthy: true, observed_at: "2026-07-26T00:15:59Z",
+});
+const longWatchOverlap = run({
+  dir: `${tmp}/long-watch`, artifacts: longWatchArtifacts,
+  bind: longWatchBinding, admit: overlapAdmission,
+  recover: longWatchRecovery, adapters: longWatchAdapters,
+  autoResume: false,
+});
+assert.equal(longWatchOverlap.reason, "watching",
+  "an invocation after the 900-second lease but before watch completion does not recover");
+assert.equal(longWatchOverlap.journal.entries.at(-1).phase, "watch");
+assert.equal(longWatchArtifacts.runtimeNarrowing.entries.length, 0);
+const longWatchStateAfterOverlap = bounded(
+  `${tmp}/long-watch/.autonomy-state/domain-state.json`,
+);
+assert.equal(
+  longWatchStateAfterOverlap.targets[longWatchTargetKey].lease_epoch, 2,
+  "a watch continuation acquires a fresh monotonically advanced fence",
+);
+assert.equal(
+  longWatchStateAfterOverlap.targets[longWatchTargetKey].execution_lease,
+  null,
+  "the persisted watch releases its short execution lease",
+);
+const dueAdmission = admission([
+  "2026-07-26T00:20:01Z", "2026-07-26T00:20:02Z",
+  "2026-07-26T00:20:03Z", "2026-07-26T00:20:04Z",
+  "2026-07-26T00:20:05Z",
+]);
+dueAdmission.liveness = () => ({
+  healthy: true, observed_at: "2026-07-26T00:20:00Z",
+});
+const longWatchCommit = run({
+  dir: `${tmp}/long-watch`, artifacts: longWatchArtifacts,
+  bind: longWatchBinding, admit: dueAdmission,
+  recover: longWatchRecovery, adapters: longWatchAdapters,
+  autoResume: false,
+});
+assert.equal(longWatchCommit.reason, "committed");
+const killedWatchArtifacts = bundle();
+const killedWatchRecovery = recovery(killedWatchArtifacts);
+const killedWatchAdapters = exactAdapters();
+const killedWatchInitial = run({
+  dir: `${tmp}/killed-watch`, artifacts: killedWatchArtifacts,
+  admit: admission(), recover: killedWatchRecovery,
+  adapters: killedWatchAdapters, autoResume: false,
+});
+assert.equal(killedWatchInitial.reason, "watching");
+const killedWatchContinuation = run({
+  dir: `${tmp}/killed-watch`, artifacts: killedWatchArtifacts,
+  admit: admission([
+    "2026-07-26T00:10:01Z", "2026-07-26T00:10:02Z",
+    "2026-07-26T00:10:03Z", "2026-07-26T00:10:04Z",
+  ], () => false),
+  recover: killedWatchRecovery, adapters: killedWatchAdapters,
+  autoResume: false,
+});
+assert.equal(killedWatchContinuation.reason, "recovered-disarmed",
+  "a killed continuation recovers instead of waiting or committing");
 const unsafeReadbackArtifacts = bundle();
 const unsafeReadback = run({
   dir: `${tmp}/unsafe-readback`, artifacts: unsafeReadbackArtifacts,
@@ -751,8 +1050,8 @@ const resumeWorkers = [
 ];
 fs.writeFileSync(resumeBarrier, "");
 await Promise.all(resumeWorkers);
-assert.equal(fs.readFileSync(resumeApplyLog, "utf8").trim().split("\n").length, 1,
-  "two expired-lease contenders cannot both actuate");
+assert.equal(fs.existsSync(resumeApplyLog), false,
+  "an ambiguous private executor journal prevents resumed re-actuation");
 assert.equal(bounded(`${resumeDir}/${binding().idempotency_key}.json`).entries.at(-1).phase, "disarm");
 
 const conflictDir = `${tmp}/conflicting-replay`;
@@ -772,11 +1071,8 @@ assert.equal(conflictResult.journal.entries.at(-1).phase, "disarm",
 const staleWriterDir = `${tmp}/stale-writer`, staleWriterLog = `${tmp}/stale-writer-apply.log`;
 const staleWriterHostEffects = `${tmp}/stale-writer-host-effects.log`;
 const staleWriterRelease = `${tmp}/stale-writer-release`;
-assert.equal(await runWorker({
-  WORKER_MODE: "crash", WORKER_DIR: staleWriterDir, APPLY_LOG: `${tmp}/stale-writer-crash.log`,
-}), 77);
 const staleWriter = runWorker({
-  WORKER_MODE: "resume", WORKER_DIR: staleWriterDir, APPLY_LOG: staleWriterLog,
+  WORKER_MODE: "race", WORKER_DIR: staleWriterDir, APPLY_LOG: staleWriterLog,
   HOST_EFFECT_LOG: staleWriterHostEffects, HOLD_BEFORE_EFFECT: staleWriterRelease,
 });
 while (!fs.existsSync(staleWriterLog)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
@@ -809,6 +1105,41 @@ await Promise.all(recoveryWorkers);
 assert.equal(fs.readFileSync(recoveryLog, "utf8").trim().split("\n").length, 1, "recovery claim is process-safe and one-shot");
 assert.equal(bounded(`${crashDir}/${binding().idempotency_key}.json`).entries.at(-1).phase, "disarm");
 
+const staleRecoveryDir = `${tmp}/stale-recovery`;
+const staleRecoveryCalls = `${tmp}/stale-recovery-calls.log`;
+const staleRecoveryEffects = `${tmp}/stale-recovery-effects.log`;
+const staleRecoveryRelease = `${tmp}/stale-recovery-release`;
+const staleRecovery = runWorker({
+  WORKER_MODE: "fault", WORKER_DIR: staleRecoveryDir,
+  FORCE_RECOVERY: "1", RECOVERY_CALL_LOG: staleRecoveryCalls,
+  RECOVERY_LOG: staleRecoveryEffects,
+  HOLD_BEFORE_RECOVERY_EFFECT: staleRecoveryRelease,
+});
+while (!fs.existsSync(staleRecoveryCalls)) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+}
+assert.equal(await runWorker({
+  WORKER_MODE: "recover", WORKER_DIR: staleRecoveryDir,
+  LATE_LEASE_TRANSFER: "1",
+}), 79, "the successor advances the resource fence while the old outbox lock is live");
+fs.writeFileSync(staleRecoveryRelease, "");
+assert.equal(await staleRecovery, 79,
+  "the old recovery writer is rejected after the resource fence advances");
+assert.equal(await runWorker({
+  WORKER_MODE: "recover", WORKER_DIR: staleRecoveryDir,
+  VERY_LATE_LEASE_TRANSFER: "1", RECOVERY_CALL_LOG: staleRecoveryCalls,
+  RECOVERY_LOG: staleRecoveryEffects,
+}), 0);
+assert.equal(
+  fs.readFileSync(staleRecoveryEffects, "utf8").trim().split("\n").length,
+  1, "only the current recovery fence can produce the recovery effect",
+);
+assert.equal(
+  bounded(`${staleRecoveryDir}/${binding().idempotency_key}.json`)
+    .entries.at(-1).phase,
+  "disarm",
+);
+
 const raceDir = `${tmp}/prepare-race`, applyLog = `${tmp}/race-apply.log`, prepareBarrier = `${tmp}/prepare-barrier`;
 const prepareWorkers = [
   runWorker({ WORKER_MODE: "race", WORKER_DIR: raceDir, APPLY_LOG: applyLog, BARRIER: prepareBarrier }),
@@ -823,13 +1154,23 @@ const failed = run({
   dir: `${tmp}/recovery-failure`, artifacts: failureArtifacts,
   phase: phases({ applyFenced: () => { throw Object.assign(new Error("apply-failed"), { code: "apply-failed" }); } }),
   recover: recovery(failureArtifacts, { recover: request => ({
-    idempotency_key: request.idempotency_key, recovered: false,
+    idempotency_key: request.idempotency_key,
+    lease_fence_digest: request.lease_fence_digest, recovered: false,
     safe_state_verified: false, quarantine_active: true, reason_code: "forward-repair-failed",
   }) }),
 });
 assert.equal(failed.reason, "terminally-blocked");
 assert.equal(failed.recovery_error, "forward-repair-failed");
 assert.equal(failed.journal.entries.at(-1).phase, "terminally-blocked");
+const inactiveBlocked = clone(failed.journal);
+inactiveBlocked.entries.at(-1).quarantine.state = "not-applicable";
+resignJournal(inactiveBlocked);
+assert.throws(() => validateJournalConformance(inactiveBlocked, {
+  schema: failureArtifacts.journalSchema,
+  constitution: failureArtifacts.constitution,
+  coverage: failureArtifacts.coverage,
+  ownerAttestations: failureArtifacts.ownerAttestations,
+}), /journal_terminally_blocked_not_quarantined/);
 assert.notEqual(failed.journal.entries.at(-1).terminal_reason_digest, failed.journal.entries.at(-2).terminal_reason_digest);
 const failedReplay = run({
   dir: `${tmp}/recovery-failure`, artifacts: failureArtifacts,
@@ -862,6 +1203,89 @@ assert.throws(() => run({
   recover: wrongFromRecovery,
 }), /runtime_narrowing_append_unverified/,
 "signed terminal narrowing must match the exact authorized from-state");
+
+const rebaseArtifacts = bundle();
+const unrelatedTargetScope = "sha256:" + "4".repeat(64);
+const unrelatedRecoveryKeys = crypto.generateKeyPairSync("ed25519");
+const unrelatedRecoveryPublic = publicPem(unrelatedRecoveryKeys.publicKey);
+rebaseArtifacts.recoveryRegistry.entries.push({
+  ...clone(rebaseArtifacts.recoveryRegistry.entries[0]),
+  target_scope_digest: unrelatedTargetScope,
+  recovery_worker_identity: "unrelated-recovery-worker",
+  public_key_pem: unrelatedRecoveryPublic,
+  public_key_fingerprint: fingerprint(unrelatedRecoveryPublic),
+});
+resignArtifacts(rebaseArtifacts);
+const rebaseBaseRecovery = recovery(rebaseArtifacts);
+let unrelatedInjected = false;
+const rebaseRecovery = {
+  ...rebaseBaseRecovery,
+  readNarrowingHistory: input => {
+    if (!unrelatedInjected) {
+      unrelatedInjected = true;
+      const unsigned = {
+        sequence: 1, recorded_at: "2026-07-26T00:00:03Z",
+        domain: "no-reboot-security-bugfix-maintenance",
+        target_scope_digest: unrelatedTargetScope,
+        from_state: "armed-canary", to_state: "shadow",
+        recovery_worker_identity: "unrelated-recovery-worker",
+        journal_receipt_digest: "sha256:" + "3".repeat(64),
+        previous_entry_digest: null,
+      };
+      const entry = {
+        ...unsigned, entry_digest: autonomyDigest(unsigned),
+      };
+      entry.signature = {
+        algorithm: "Ed25519",
+        value_base64: sign(entry, unrelatedRecoveryKeys.privateKey),
+      };
+      rebaseArtifacts.runtimeNarrowing.entries.push(entry);
+    }
+    return rebaseBaseRecovery.readNarrowingHistory(input);
+  },
+};
+const rebased = run({
+  dir: `${tmp}/narrowing-rebase`, artifacts: rebaseArtifacts,
+  phase: phases({ applyFenced: () => { throw Error("force-recovery"); } }),
+  recover: rebaseRecovery,
+});
+assert.equal(rebased.reason, "recovered-disarmed");
+assert.equal(rebaseArtifacts.runtimeNarrowing.entries.length, 2);
+assert.equal(
+  rebaseArtifacts.runtimeNarrowing.entries[1].previous_entry_digest,
+  rebaseArtifacts.runtimeNarrowing.entries[0].entry_digest,
+  "recovery rebases onto the freshly verified historical-epoch tail",
+);
+
+const pendingPostureArtifacts = bundle();
+let pendingPostureFaulted = false;
+const pendingPostureRecovery = recovery(pendingPostureArtifacts, {
+  fault: point => {
+    if (point === "after-recovery-intent" && !pendingPostureFaulted) {
+      pendingPostureFaulted = true;
+      throw Error("crash-after-recovery-intent");
+    }
+  },
+});
+assert.throws(() => run({
+  dir: `${tmp}/pending-posture`, artifacts: pendingPostureArtifacts,
+  phase: phases({ applyFenced: () => { throw Error("force-recovery"); } }),
+  recover: pendingPostureRecovery, autoResume: false,
+}), /crash-after-recovery-intent/);
+let pendingKillReads = 0;
+const pendingAdmission = recoveryTakeoverAdmission();
+const originalPendingKill = pendingAdmission.killSwitch;
+pendingAdmission.killSwitch = () => {
+  pendingKillReads += 1;
+  return originalPendingKill();
+};
+const pendingReplay = run({
+  dir: `${tmp}/pending-posture`, artifacts: pendingPostureArtifacts,
+  admit: pendingAdmission, recover: pendingPostureRecovery,
+});
+assert.equal(pendingReplay.reason, "recovered-disarmed");
+assert.ok(pendingKillReads >= 1,
+  "pending outbox replay consults the current protected kill posture");
 
 for (const faultPoint of [
   "after-recovery-intent", "after-unknown-append", "after-unknown-journal",
@@ -957,6 +1381,22 @@ assert.equal(
   bounded(`${preparedRotationDir}/${binding().idempotency_key}.json`).entries.at(-1).phase,
   "disarm",
 );
+const corruptCurrentDir = `${tmp}/prepared-corrupt-current`;
+assert.equal(await runWorker({
+  WORKER_MODE: "fault", WORKER_DIR: corruptCurrentDir,
+  FAULT_POINT: "after-prepare-journal",
+}), 78);
+const corruptHistoricalArtifacts = bundle();
+corruptHistoricalArtifacts.read = () => {
+  throw Error("current-authority-unavailable");
+};
+const corruptCurrentReplay = run({
+  dir: corruptCurrentDir, artifacts: corruptHistoricalArtifacts,
+  admit: recoveryTakeoverAdmission(),
+  recover: recovery(corruptHistoricalArtifacts),
+});
+assert.equal(corruptCurrentReplay.reason, "recovered-disarmed",
+  "current bundle corruption cannot strand authenticated historical recovery");
 
 const rotationDir = `${tmp}/outbox-owner-rotation`;
 const rotationLog = `${tmp}/outbox-owner-rotation-recover.log`;

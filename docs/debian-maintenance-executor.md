@@ -1,12 +1,15 @@
 # Debian maintenance executor seam (brokkr#35, brokkr#66)
 
-`scripts/debian-maintenance-executor.mjs` is a library-only, hermetic execution
-seam for Debian maintenance. It has no package-manager, reboot, shell, remote
+`scripts/debian-maintenance-executor.mjs` is the closed, library-only public
+surface for Debian maintenance. It exports only immutable derivation and
+`runDebianMaintenance()`. The raw effect seam and generic journal state machine
+are private in `scripts/debian-maintenance-autonomy.mjs`;
+`scripts/maintenance-attempt-journal.mjs` exposes conformance helpers only.
+A direct importer therefore cannot supply arbitrary phase callbacks behind a
+valid lease and bypass the exact Debian plan, policy, target, inventory, or
+execution request. The library has no package-manager, reboot, shell, remote
 host, deployment, or production-signing capability of its own. Brokkr ships no
-live adapter, no private key, and no armed target. `runDebianMaintenance()`
-composes the executor with Brokkr's authoritative ADR-008 domain journal; this
-PR therefore implements and observes the contract without arming autonomous
-maintenance.
+live adapter, no private key, and no armed target.
 
 ## Authorization and scope
 
@@ -63,7 +66,8 @@ any initial, resumed, or recovery work, the effect owner must
 implement `activateFence()` for the full target/binding/attempt/mutation/epoch/
 token/expiry capability. Mutation is available only through `applyFenced()`,
 whose effect-owning transaction must atomically compare that entire active
-capability immediately before and together with host actuation. Its receipt
+capability immediately before and together with host actuation. Lower epochs
+and same-epoch/different-token activations are invalid. Its receipt
 binds both the immutable request and full fence digests. Controller-side
 before/after assertions are defense in depth, not the fencing mechanism. The
 older drain/reboot executor is module-private and is not an exported
@@ -88,14 +92,29 @@ target-bound narrowing. Entries contain only bounded IDs, digests, and opaque
 `ref:` handles—never commands, package logs, private locators, credentials, or
 recovery material.
 
+The local verifier also enforces the canonical cross-field semantics that JSON
+Schema cannot express: attempt and recovery-disarm identities differ, entry
+IDs are unique within the journal, and `terminally-blocked` remains actively
+quarantined. Re-digesting an adversarial journal cannot bypass these checks.
+
 Success follows exactly:
 
 `prepare → apply → verify → watch → commit`
 
-Each transition obtains a new trusted timestamp. `watch` must consume the
-declared interval, the kill switch is checked at admission and between
-mutation phases, and commit additionally requires a maintenance-safe-state
-readback from a fresh host inventory matching the bound postconditions digest.
+Each transition obtains a new trusted timestamp. `watch` is a persisted,
+nonblocking continuation: after writing the watch receipt the controller
+atomically releases its execution/resource lease in target state `watching`.
+A later invocation before the deadline remains `watching` and releases again;
+it does not recover healthy work merely because the prior 900-second lease
+expired. At or after the watch deadline, the same attempt reacquires a new
+epoch without consuming another proposal/rate slot, installs that epoch in the
+effect and recovery resources, and performs the final safe-state/authority
+checks before commit. No process or lease is held synchronously for the
+constitution's possible one-hour watch.
+
+The kill switch is checked at admission and between mutation phases, and commit
+additionally requires a maintenance-safe-state readback from a fresh host
+inventory matching the bound postconditions digest.
 The cached post-apply inventory is diagnosis only and can never satisfy commit.
 The initial journal uses
 exclusive creation and all durable replacements are fsynced. Every append is a
@@ -128,8 +147,10 @@ An existing non-terminal receipt is ambiguous. Only a `prepare` receipt plus an
 independent `not-applied` reconciliation may resume apply after the persisted
 lease expires and transfers. Any later phase,
 applied/indeterminate result, invalid reconciliation, deadline breach, failed
-phase, or kill-switch transition enters recovery. The same fenced lease
-prevents concurrent initial, resume, and recovery actuators.
+phase, or kill-switch transition enters recovery. The one exception is the
+explicit persisted `watch` continuation described above; it never reapplies.
+The same fenced lease prevents concurrent initial, resume, and recovery
+actuators.
 
 ## Forward recovery and narrowing
 
@@ -151,7 +172,20 @@ digest. An existing prepared attempt enters recovery from that authenticated
 historical envelope even after current owner authorization rotates. Current
 authority is consulted only for a valid signed narrowing posture and the kill
 switch; it cannot rewrite the old attempt's mutation authority or make it
-resume actuation. Recovery then fsyncs its idempotent request and `unknown`
+resume actuation. A corrupt or unavailable current bundle likewise forces
+historical recovery rather than stranding the attempt; it can never authorize
+resume. Pending outboxes still consult the current kill/signed-narrowing
+posture.
+
+Recovery has the same resource-bound fencing requirement as apply. Every lease
+activation is installed monotonically in the recovery resource. The durable
+outbox request carries the full target/binding/attempt/mutation/epoch/token/
+expiry fence and digest; `recover()` must atomically compare it with the
+resource's current fence inside the idempotent recovery transaction. A
+transferred attempt rebinds a still-pending request to the new epoch, so an old
+blocked recovery writer cannot actuate after transfer.
+
+Recovery then fsyncs its idempotent request and `unknown`
 receipt in a staged outbox before any recovery effect. Every later boundary is restartable:
 unknown append, target transition, recovery invocation/result, recover and
 quarantine receipts, signed-ledger append, protected-checkpoint advance,
@@ -160,8 +194,12 @@ before advancing the outbox stage is repaired from the authenticated terminal
 journal before any new claim or rate-limit check. Before appending narrowing, a
 retry verifies current signed history and consumes an already-present exact
 domain/target/from-state/to-state/worker/terminal tuple instead of duplicating
-it. A later owner-key or registry rotation therefore cannot strand an already
-prepared or recovered attempt.
+it. If another valid target was appended in the same historical authorization
+epoch, recovery rebases on that freshly verified tail before signing rather
+than trusting the attempt's initial snapshot. Concurrent exact outbox creation
+adopts the already-created matching binding/idempotency record. A later
+owner-key or registry rotation therefore cannot strand an already prepared or
+recovered attempt.
 
 Commit release is equally crash-safe. The commit receipt is CAS-appended first;
 target, domain and lease release then happen in one domain-state replacement,
