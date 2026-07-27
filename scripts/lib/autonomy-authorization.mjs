@@ -34,10 +34,8 @@ export const autonomyDigest = (value, omit = null) => {
 export const strictUtc = value => (
   typeof value === "string" &&
   /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/.test(value) &&
-  (
-    new Date(value).toISOString() === value ||
-    new Date(value).toISOString().replace(".000Z", "Z") === value
-  )
+  !Number.isNaN(Date.parse(value)) &&
+  new Date(value).toISOString().replace(".000Z", "Z") === value
 );
 const keyFingerprint = key => `sha256:${crypto.createHash("sha256").update(key.export({ type: "spki", format: "der" })).digest("hex")}`;
 const boundedStructure = value => {

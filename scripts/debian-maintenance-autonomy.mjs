@@ -501,6 +501,61 @@ function appendFenced(file, journal, options, leaseContext) {
     return append(file, journal, options);
   });
 }
+const watchAnchorFile = file => `${file}.watch-anchor.json`;
+function validateWatchAnchor(anchor, journal) {
+  const watch = journal.entries.find(entry => entry.phase === "watch");
+  assert(exactKeys(anchor, [
+    "kind", "schema_version", "journal_id", "mutation_id", "attempt_id",
+    "target_scope_digest", "candidate_digest", "binding_digest",
+    "journal_tail_digest", "anchored_at", "anchor_digest",
+  ]) && anchor.kind === "brokkr-durable-watch-anchor" &&
+    anchor.schema_version === "v1" && watch &&
+    anchor.journal_id === journal.journal_id &&
+    anchor.mutation_id === journal.binding.mutation_id &&
+    anchor.attempt_id === journal.binding.attempt_id &&
+    anchor.target_scope_digest === journal.binding.target_scope_digest &&
+    anchor.candidate_digest === journal.binding.candidate_digest &&
+    anchor.binding_digest === journal.binding_digest &&
+    anchor.journal_tail_digest === watch.receipt_digest &&
+    strictUtc(anchor.anchored_at) &&
+    Date.parse(anchor.anchored_at) >= Date.parse(watch.recorded_at) &&
+    anchor.anchor_digest === autonomyDigest(anchor, "anchor_digest"),
+  "watch_anchor_invalid");
+  return anchor;
+}
+function readWatchAnchor(file, journal) {
+  return validateWatchAnchor(boundedJson(watchAnchorFile(file)), journal);
+}
+function persistWatchAnchor({
+  file, journal, admission, recovery, previousAt,
+}) {
+  const durableJournal = boundedJson(file);
+  assert(canonicalJson(durableJournal) === canonicalJson(journal) &&
+    durableJournal.entries.at(-1)?.phase === "watch",
+  "watch_journal_readback_invalid");
+  recovery.fault?.("after-watch-journal-readback");
+  const anchoredAt = trustedNow(admission.trustedClock, previousAt);
+  const anchor = {
+    kind: "brokkr-durable-watch-anchor", schema_version: "v1",
+    journal_id: journal.journal_id,
+    mutation_id: journal.binding.mutation_id,
+    attempt_id: journal.binding.attempt_id,
+    target_scope_digest: journal.binding.target_scope_digest,
+    candidate_digest: journal.binding.candidate_digest,
+    binding_digest: journal.binding_digest,
+    journal_tail_digest: journal.entries.at(-1).receipt_digest,
+    anchored_at: anchoredAt,
+    anchor_digest: "sha256:".padEnd(71, "0"),
+  };
+  anchor.anchor_digest = autonomyDigest(anchor, "anchor_digest");
+  assert(createExclusive(watchAnchorFile(file), anchor),
+    "watch_anchor_conflict");
+  const readback = readWatchAnchor(file, journal);
+  assert(canonicalJson(readback) === canonicalJson(anchor),
+    "watch_anchor_readback_invalid");
+  recovery.fault?.("after-watch-anchor");
+  return readback;
+}
 function ensureFencedEntry(file, entry, leaseContext) {
   return withExclusiveDirectory(domainLockDir(leaseContext.journalDir), "domain_state_contended", () => {
     const current = boundedJson(file);
@@ -525,7 +580,11 @@ function coverageTransition(binding) {
     actor_identity: binding.recovery_worker_identity,
   };
 }
-function validateJournalSemantics(journal, { schema, constitution, coverage, ownerAttestations }, { allowActive = false } = {}) {
+function validateJournalSemantics(
+  journal,
+  { schema, constitution, coverage, ownerAttestations },
+  { allowActive = false, watchAnchor = null } = {},
+) {
   assert(PINNED_SCHEMAS.has(schema) && schema.$id === SCHEMA_ID, "journal_schema_not_pinned");
   const shapeErrors = schemaChecker(schema)(journal);
   if (!(allowActive && journal.entries.length === 1 && shapeErrors.every(error => error.endsWith(":minItems")))) {
@@ -534,6 +593,7 @@ function validateJournalSemantics(journal, { schema, constitution, coverage, own
   assert(journal.constitution_digest === constitution.constitution_digest, "journal_constitution_mismatch");
   const policy = classPolicy(constitution);
   const binding = journal.binding;
+  if (watchAnchor !== null) validateWatchAnchor(watchAnchor, journal);
   ownerBindingFor({ coverage, ownerAttestations, binding });
   assert(journal.binding_digest === autonomyDigest(binding), "journal_binding_digest_invalid");
   assert(journal.journal_id === binding.mutation_id,
@@ -573,7 +633,10 @@ function validateJournalSemantics(journal, { schema, constitution, coverage, own
       "journal_deadline_exceeded");
     }
     if (entry.phase === "watch") {
-      assert(Date.parse(entry.recorded_at) - preparedAt <=
+      const durableWatchAt = Date.parse(
+        watchAnchor?.anchored_at ?? entry.recorded_at,
+      );
+      assert(durableWatchAt - preparedAt <=
         policy.bounds.apply_verify_budget_seconds * 1000,
       "journal_apply_verify_budget_exceeded");
     }
@@ -581,10 +644,13 @@ function validateJournalSemantics(journal, { schema, constitution, coverage, own
       const watch = journal.entries.slice(0, index).find(
         candidate => candidate.phase === "watch",
       );
-      assert(watch && Date.parse(entry.recorded_at) - Date.parse(watch.recorded_at) >=
+      const durableWatchAt = Date.parse(
+        watchAnchor?.anchored_at ?? watch?.recorded_at,
+      );
+      assert(watch && Date.parse(entry.recorded_at) - durableWatchAt >=
         policy.bounds.minimum_watch_seconds * 1000,
       "journal_watch_incomplete");
-      assert(Date.parse(entry.recorded_at) - Date.parse(watch.recorded_at) <=
+      assert(Date.parse(entry.recorded_at) - durableWatchAt <=
         (policy.bounds.minimum_watch_seconds +
           policy.bounds.commit_grace_seconds) * 1000,
       "journal_commit_grace_exceeded");
@@ -615,8 +681,8 @@ export function loadPinnedJournalSchema(schemaPath) {
   PINNED_SCHEMAS.add(schema);
   return schema;
 }
-export function validateJournalConformance(journal, context) {
-  return validateJournalSemantics(journal, context);
+export function validateJournalConformance(journal, context, options = {}) {
+  return validateJournalSemantics(journal, context, options);
 }
 export function attemptIdentity(binding) {
   assert(ID.test(binding?.idempotency_key), "attempt_identity_invalid");
@@ -1191,8 +1257,20 @@ function runMaintenanceAttempt({
     ...persistedAuthority, policy: classPolicy(persistedAuthority.bundle.constitution),
     contentRef, conformance, journalDir, authoritySnapshot,
   };
+  let durableWatchAnchor = null;
+  let watchAnchorError = null;
+  if (existing?.entries.some(entry => entry.phase === "watch")) {
+    try { durableWatchAnchor = readWatchAnchor(file, existing); }
+    catch (error) { watchAnchorError = diagnosticCode(error); }
+  }
+  if (existing?.entries.at(-1)?.phase === "commit") {
+    assert(durableWatchAnchor !== null,
+      `watch_anchor_${watchAnchorError ?? "missing"}`);
+  }
   if (existing) {
-    validateJournalSemantics(existing, conformance, { allowActive: true });
+    validateJournalSemantics(existing, conformance, {
+      allowActive: true, watchAnchor: durableWatchAnchor,
+    });
     const conflicting = canonicalJson(existing.binding) !== canonicalJson(binding);
     pendingOutbox = readOptional(`${file}.recovery-outbox.json`);
     if (pendingOutbox) {
@@ -1289,11 +1367,12 @@ function runMaintenanceAttempt({
   }
   const activeBinding = existing?.binding ?? binding;
   const activeBindingDigest = existing?.binding_digest ?? bindingDigest;
-  const watchContinuation = existing?.entries.at(-1).phase === "watch" &&
+  const watchStateResume = existing?.entries.at(-1).phase === "watch" &&
     pendingOutbox === null;
+  const watchContinuation = watchStateResume && durableWatchAnchor !== null;
   const claimed = claimTarget({
     journalDir, binding: activeBinding, bindingDigest: activeBindingDigest,
-    now: admitted.now, policy: context.policy, resumeWatch: watchContinuation,
+    now: admitted.now, policy: context.policy, resumeWatch: watchStateResume,
   });
   if (!claimed.acquired) return {
     journal: existing, ran: false, reason: "execution-lease-active",
@@ -1353,6 +1432,13 @@ function runMaintenanceAttempt({
         lastAt: journal.entries.at(-1).recorded_at,
       });
     }
+    if (watchStateResume && !watchContinuation) {
+      return enterRecovery({
+        file, journal, context, admission, recovery, lease,
+        code: `watch-anchor-${watchAnchorError ?? "missing"}`,
+        lastAt: journal.entries.at(-1).recorded_at,
+      });
+    }
     if (!watchContinuation) {
       let reconciliation;
       try {
@@ -1388,7 +1474,7 @@ function runMaintenanceAttempt({
   let at = trustedNow(admission.trustedClock, journal.entries.at(-1).recorded_at);
   try {
     if (watchContinuation) {
-      const watchAt = Date.parse(journal.entries.at(-1).recorded_at);
+      const watchAt = Date.parse(durableWatchAnchor.anchored_at);
       const commitEarliest = watchAt +
         context.policy.bounds.minimum_watch_seconds * 1000;
       const commitLatest = commitEarliest +
@@ -1433,22 +1519,27 @@ function runMaintenanceAttempt({
         phase: "verify", at, actor: binding.controller_identity, contentRef,
       }, { journalDir, lease });
       checkKillSwitch(admission.killSwitch, binding);
-      assert(Date.parse(at) - Date.parse(journal.entries[0].recorded_at) <=
-        context.policy.bounds.apply_verify_budget_seconds * 1000,
-      "maintenance_apply_verify_budget_exceeded");
-      assert(Date.parse(binding.deadline) - Date.parse(at) >=
-        context.policy.bounds.minimum_watch_seconds * 1000,
-      "maintenance_watch_deadline_unreachable");
       journal = appendFenced(file, journal, {
         phase: "watch", at, actor: binding.controller_identity, contentRef,
       }, { journalDir, lease });
+      durableWatchAnchor = persistWatchAnchor({
+        file, journal, admission, recovery, previousAt: at,
+      });
+      assert(Date.parse(durableWatchAnchor.anchored_at) -
+          Date.parse(journal.entries[0].recorded_at) <=
+        context.policy.bounds.apply_verify_budget_seconds * 1000,
+      "maintenance_apply_verify_budget_exceeded");
+      assert(Date.parse(binding.deadline) -
+          Date.parse(durableWatchAnchor.anchored_at) >=
+        context.policy.bounds.minimum_watch_seconds * 1000,
+      "maintenance_watch_deadline_unreachable");
       transitionTarget({
         journalDir, binding, bindingDigest, lease,
         state: "watching", release: true,
       });
       return { journal, ran: true, reason: "watching" };
     }
-    const watchAt = Date.parse(journal.entries.at(-1).recorded_at);
+    const watchAt = Date.parse(durableWatchAnchor.anchored_at);
     assert(Date.parse(at) - watchAt >=
       context.policy.bounds.minimum_watch_seconds * 1000,
     "maintenance_watch_incomplete");
@@ -1473,7 +1564,9 @@ function runMaintenanceAttempt({
       phase: "commit", at, actor: binding.controller_identity, contentRef,
     }, { journalDir, lease });
     recovery.fault?.("after-commit-journal");
-    validateJournalSemantics(journal, conformance);
+    validateJournalSemantics(journal, conformance, {
+      watchAnchor: durableWatchAnchor,
+    });
     transitionTarget({
       journalDir, binding, bindingDigest, lease,
       state: binding.admission_binding_state, release: true,

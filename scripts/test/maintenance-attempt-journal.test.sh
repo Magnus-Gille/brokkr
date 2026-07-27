@@ -240,7 +240,8 @@ function binding(
 const baseTimes = [
   "2026-07-26T00:00:00Z", "2026-07-26T00:00:01Z",
   "2026-07-26T00:00:02Z", "2026-07-26T00:00:03Z",
-  "2026-07-26T00:05:00Z", "2026-07-26T01:05:00Z",
+  "2026-07-26T00:04:00Z", "2026-07-26T00:05:00Z",
+  "2026-07-26T01:05:00Z",
 ];
 function admission(times = baseTimes, kill = () => true) {
   let index = 0;
@@ -729,11 +730,31 @@ const happyPrepareAt = Date.parse(happy.journal.entries[0].recorded_at);
 const happyWatchAt = Date.parse(
   happy.journal.entries.find(entry => entry.phase === "watch").recorded_at,
 );
+const happyWatchAnchor = bounded(
+  `${tmp}/happy/${happy.journal.binding.idempotency_key}.json.watch-anchor.json`,
+);
+const happyAnchorAt = Date.parse(happyWatchAnchor.anchored_at);
 const happyCommitAt = Date.parse(happy.journal.entries.at(-1).recorded_at);
-assert.equal(happyWatchAt - happyPrepareAt, 300_000,
-  "the v2 happy path reaches the durable watch receipt at the exact 300-second budget");
-assert.equal(happyCommitAt - happyWatchAt, 3_600_000,
+assert.ok(happyWatchAt <= happyAnchorAt,
+  "the journal watch entry cannot postdate its post-fsync anchor");
+assert.equal(happyAnchorAt - happyPrepareAt, 300_000,
+  "the v2 happy path anchors the durable watch receipt at the exact 300-second budget");
+assert.equal(happyCommitAt - happyAnchorAt, 3_600_000,
   "the v2 happy path commits at the exact 3600-second post-receipt watch floor");
+assert.equal(
+  happyWatchAnchor.journal_tail_digest,
+  happy.journal.entries.find(entry => entry.phase === "watch").receipt_digest,
+  "the durable anchor binds the exact authenticated watch journal tail",
+);
+assert.equal(happyWatchAnchor.attempt_id, happy.journal.binding.attempt_id);
+assert.equal(
+  happyWatchAnchor.target_scope_digest,
+  happy.journal.binding.target_scope_digest,
+);
+assert.equal(
+  happyWatchAnchor.candidate_digest,
+  happy.journal.binding.candidate_digest,
+);
 assert.equal(Object.hasOwn(happy.journal.binding.canary, "watch_deadline"), false,
   "v2 derives watch completion from the durable receipt");
 assert.throws(() => loadPinnedJournalSchema(
@@ -778,7 +799,8 @@ for (const [name, mutate, expected] of [
     constitution: happyArtifacts.constitution,
     coverage: happyArtifacts.coverage,
     ownerAttestations: happyArtifacts.ownerAttestations,
-  }), expected, name);
+  }, name === "short post-receipt watch" ?
+    { watchAnchor: happyWatchAnchor } : {}), expected, name);
 }
 const preboundWatchDeadline = clone(happy.journal);
 preboundWatchDeadline.binding.canary.watch_deadline =
@@ -790,6 +812,20 @@ assert.throws(() => validateJournalConformance(preboundWatchDeadline, {
   coverage: happyArtifacts.coverage,
   ownerAttestations: happyArtifacts.ownerAttestations,
 }), /journal_schema_invalid/, "v2 rejects caller-prebound watch deadlines");
+const noncanonicalZeroMilliseconds = clone(happy.journal);
+noncanonicalZeroMilliseconds.binding.deadline =
+  "2026-07-26T01:10:00.000Z";
+resignJournal(noncanonicalZeroMilliseconds);
+assert.throws(() => validateJournalConformance(
+  noncanonicalZeroMilliseconds,
+  {
+    schema: happyArtifacts.journalSchema,
+    constitution: happyArtifacts.constitution,
+    coverage: happyArtifacts.coverage,
+    ownerAttestations: happyArtifacts.ownerAttestations,
+  },
+), /journal_schema_invalid:.*date-time/,
+"v2 rejects noncanonical .000Z timestamps exactly like Grimnir");
 const wrongJournalIdentity = clone(happy.journal);
 wrongJournalIdentity.journal_id = "different-mutation";
 assert.throws(() => validateJournalConformance(wrongJournalIdentity, {
@@ -1127,7 +1163,12 @@ assert.equal(
 const shortWatchArtifacts = bundle();
 const shortWatch = run({
   dir: `${tmp}/short-watch`, artifacts: shortWatchArtifacts,
-  admit: admission(["2026-07-26T00:00:00Z", "2026-07-26T00:00:01Z", "2026-07-26T00:00:02Z", "2026-07-26T00:00:03Z", "2026-07-26T00:00:04Z", "2026-07-26T00:09:59Z", "2026-07-26T00:10:00Z"]),
+  admit: admission([
+    "2026-07-26T00:00:00Z", "2026-07-26T00:00:01Z",
+    "2026-07-26T00:00:02Z", "2026-07-26T00:00:03Z",
+    "2026-07-26T00:00:04Z", "2026-07-26T00:00:05Z",
+    "2026-07-26T00:09:59Z", "2026-07-26T00:10:00Z",
+  ]),
 });
 assert.equal(shortWatch.reason, "watching",
   "an early continuation stays nonterminal instead of recovering healthy work");
@@ -1189,12 +1230,12 @@ assert.equal(
   "the persisted watch releases its short execution lease",
 );
 const dueAdmission = admission([
-  "2026-07-26T01:00:04Z", "2026-07-26T01:00:05Z",
-  "2026-07-26T01:00:06Z", "2026-07-26T01:00:07Z",
-  "2026-07-26T01:00:08Z",
+  "2026-07-26T01:00:05Z", "2026-07-26T01:00:06Z",
+  "2026-07-26T01:00:07Z", "2026-07-26T01:00:08Z",
+  "2026-07-26T01:00:09Z",
 ]);
 dueAdmission.liveness = () => ({
-  healthy: true, observed_at: "2026-07-26T01:00:03Z",
+  healthy: true, observed_at: "2026-07-26T01:00:04Z",
 });
 const longWatchCommit = run({
   dir: `${tmp}/long-watch`, artifacts: longWatchArtifacts,
@@ -1227,6 +1268,78 @@ const watchAdmissionAt = (now, end = "2026-07-26T01:10:01Z") => {
   });
   return result;
 };
+const delayedWatchArtifacts = bundle();
+const delayedWatchBinding = binding(
+  "delayed-watch", delayedWatchArtifacts.coverage,
+);
+const delayedWatchTimes = Array(12).fill("2026-07-26T00:00:00Z");
+const delayedWatchRecovery = recovery(delayedWatchArtifacts, {
+  fault: point => {
+    if (point === "after-watch-journal-readback") {
+      delayedWatchTimes.fill("2026-07-26T00:05:00Z");
+    }
+  },
+});
+const delayedWatchAdapters = exactAdapters();
+let delayedWatchResult = run({
+  dir: `${tmp}/delayed-watch`, artifacts: delayedWatchArtifacts,
+  bind: delayedWatchBinding, admit: admission(delayedWatchTimes),
+  recover: delayedWatchRecovery, adapters: delayedWatchAdapters,
+  autoResume: false,
+});
+assert.equal(delayedWatchResult.reason, "watching");
+const delayedWatchEntry = delayedWatchResult.journal.entries.find(
+  entry => entry.phase === "watch",
+);
+const delayedWatchAnchorFile =
+  `${tmp}/delayed-watch/${delayedWatchBinding.idempotency_key}` +
+  ".json.watch-anchor.json";
+const delayedWatchAnchor = bounded(delayedWatchAnchorFile);
+assert.equal(delayedWatchEntry.recorded_at, "2026-07-26T00:00:00Z",
+  "the injected durable-write delay occurs after the journal timestamp");
+assert.equal(delayedWatchAnchor.anchored_at, "2026-07-26T00:05:00Z",
+  "the authoritative watch clock starts only after durable journal readback");
+const overBudgetWatchArtifacts = bundle();
+const overBudgetWatchTimes = Array(12).fill("2026-07-26T00:00:00Z");
+const overBudgetWatchResult = run({
+  dir: `${tmp}/over-budget-watch`, artifacts: overBudgetWatchArtifacts,
+  admit: admission(overBudgetWatchTimes),
+  recover: recovery(overBudgetWatchArtifacts, {
+    fault: point => {
+      if (point === "after-watch-journal-readback") {
+        overBudgetWatchTimes.fill("2026-07-26T00:05:01Z");
+      }
+    },
+  }),
+  autoResume: false,
+});
+assert.equal(overBudgetWatchResult.journal.entries.at(-1).phase, "disarm",
+  "a post-durability anchor 301 seconds after prepare fails closed");
+assert.equal(overBudgetWatchResult.journal.entries.find(
+  entry => entry.phase === "unknown",
+).terminal_reason_digest, autonomyDigest({
+  code: "maintenance_apply_verify_budget_exceeded",
+}), "the 300-second prepare-to-anchor budget is enforced on the runtime path");
+delayedWatchResult = run({
+  dir: `${tmp}/delayed-watch`, artifacts: delayedWatchArtifacts,
+  bind: delayedWatchBinding,
+  admit: watchAdmissionAt("2026-07-26T01:04:59Z"),
+  recover: delayedWatchRecovery, adapters: delayedWatchAdapters,
+  autoResume: false,
+});
+assert.equal(delayedWatchResult.reason, "watching",
+  "pre-durability time does not count toward the 3600-second watch");
+assert.deepEqual(bounded(delayedWatchAnchorFile), delayedWatchAnchor,
+  "watch continuation preserves the exact durable anchor");
+delayedWatchResult = run({
+  dir: `${tmp}/delayed-watch`, artifacts: delayedWatchArtifacts,
+  bind: delayedWatchBinding,
+  admit: watchAdmissionAt("2026-07-26T01:05:00Z"),
+  recover: delayedWatchRecovery, adapters: delayedWatchAdapters,
+  autoResume: false,
+});
+assert.equal(delayedWatchResult.reason, "committed",
+  "commit becomes eligible exactly 3600 seconds after the durable anchor");
 let fullWatchResult = run({
   dir: `${tmp}/full-watch`, artifacts: fullWatchArtifacts,
   bind: fullWatchBinding, admit: watchAdmissionAt("2026-07-26T00:00:00Z"),
@@ -1649,6 +1762,71 @@ for (const faultPoint of ["after-commit-journal", "after-commit-release"]) {
     state.targets[binding().target_scope_digest.slice(7)].execution_lease,
     null, `${faultPoint}: terminal replay releases lease`,
   );
+}
+
+const watchAnchorCrashDir = `${tmp}/watch-anchor-crash`;
+assert.equal(await runWorker({
+  WORKER_MODE: "fault", WORKER_DIR: watchAnchorCrashDir,
+  FAULT_POINT: "after-watch-anchor",
+}), 78, "the process can crash after the durable anchor but before lease release");
+const watchAnchorCrashFile =
+  `${watchAnchorCrashDir}/${binding().idempotency_key}` +
+  ".json.watch-anchor.json";
+const watchAnchorBeforeReplay = bounded(watchAnchorCrashFile);
+assert.equal(
+  bounded(`${watchAnchorCrashDir}/${binding().idempotency_key}.json`)
+    .entries.at(-1).phase,
+  "watch", "the watch journal is durable before the anchor crash point",
+);
+assert.equal(await runWorker({
+  WORKER_MODE: "resume", WORKER_DIR: watchAnchorCrashDir,
+}), 0, "restart reconstructs the watch clock from the durable anchor");
+assert.deepEqual(
+  bounded(watchAnchorCrashFile), watchAnchorBeforeReplay,
+  "crash replay neither backdates nor replaces the durable watch anchor",
+);
+
+const preAnchorCrashDir = `${tmp}/pre-anchor-crash`;
+assert.equal(await runWorker({
+  WORKER_MODE: "fault", WORKER_DIR: preAnchorCrashDir,
+  FAULT_POINT: "after-watch-journal-readback",
+}), 78, "the process can crash after journal durability but before anchor issue");
+const preAnchorCrashJournal =
+  `${preAnchorCrashDir}/${binding().idempotency_key}.json`;
+const preAnchorCrashFile = `${preAnchorCrashJournal}.watch-anchor.json`;
+assert.equal(bounded(preAnchorCrashJournal).entries.at(-1).phase, "watch",
+  "the pre-anchor crash leaves the durable watch journal tail");
+assert.equal(fs.existsSync(preAnchorCrashFile), false,
+  "the pre-anchor crash cannot leave an invented or backdated anchor");
+assert.equal(await runWorker({
+  WORKER_MODE: "resume", WORKER_DIR: preAnchorCrashDir,
+}), 0, "restart recovers rather than reconstructing an absent watch anchor");
+assert.equal(fs.existsSync(preAnchorCrashFile), false,
+  "recovery never recreates a missing anchor from the earlier journal time");
+assert.equal(bounded(preAnchorCrashJournal).entries.at(-1).phase, "disarm",
+  "an unanchored watch is fail-closed through forward recovery");
+
+for (const anchorDamage of ["malformed", "torn"]) {
+  const damagedAnchorDir = `${tmp}/${anchorDamage}-anchor`;
+  assert.equal(await runWorker({
+    WORKER_MODE: "fault", WORKER_DIR: damagedAnchorDir,
+    FAULT_POINT: "after-watch-anchor",
+  }), 78, `the ${anchorDamage} anchor fixture starts from a durable anchor`);
+  const damagedAnchorJournal =
+    `${damagedAnchorDir}/${binding().idempotency_key}.json`;
+  const damagedAnchorFile = `${damagedAnchorJournal}.watch-anchor.json`;
+  if (anchorDamage === "torn") {
+    fs.writeFileSync(damagedAnchorFile, '{"kind":');
+  } else {
+    const malformedAnchor = bounded(damagedAnchorFile);
+    malformedAnchor.journal_tail_digest = autonomyDigest("wrong-watch-tail");
+    fs.writeFileSync(damagedAnchorFile, JSON.stringify(malformedAnchor));
+  }
+  assert.equal(await runWorker({
+    WORKER_MODE: "resume", WORKER_DIR: damagedAnchorDir,
+  }), 0, `${anchorDamage} anchor restart enters fail-closed recovery`);
+  assert.equal(bounded(damagedAnchorJournal).entries.at(-1).phase, "disarm",
+    `${anchorDamage} anchor state cannot continue or commit`);
 }
 
 const leaseClaimDir = `${tmp}/lease-claim-crash`;

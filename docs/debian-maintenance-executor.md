@@ -116,20 +116,30 @@ Success follows exactly:
 `prepare → apply → verify → watch → commit`
 
 Each transition obtains a new trusted timestamp. Prepare through apply,
-readback, verify, and the durable authenticated `watch` receipt is limited to
-300 seconds. That receipt—not a caller-prebound deadline—starts the minimum
-3600-second watch. Commit has at most 300 seconds of grace after the earliest
-valid commit instant, while every success phase and the immutable attempt
-deadline remain within 4200 seconds of prepare. A start that cannot fit the
-minimum watch before its bound deadline recovers instead of creating an
-unfinishable success path.
+readback, verify, and the durable authenticated `watch` receipt plus its
+post-readback clock anchor are limited to 300 seconds. The controller fsyncs
+and reads back the exact watch journal tail before it samples the anchor's
+trusted timestamp. It then exclusively creates, fsyncs, and reads back a
+closed anchor sidecar bound to the exact journal tail, journal, mutation,
+attempt, target, candidate, and binding digests. That post-durability
+anchor—not the earlier journal timestamp or a caller-prebound deadline—starts
+the minimum 3600-second watch. Commit has at most 300 seconds of grace after
+the earliest valid commit instant, while every success phase and the immutable
+attempt deadline remain within 4200 seconds of prepare. Timestamps use the
+exact canonical UTC form pinned by Grimnir; zero milliseconds are written as
+`Z`, never `.000Z`. A start that cannot fit the minimum watch before its bound
+deadline recovers instead of creating an unfinishable success path.
 
 `watch` is a persisted, nonblocking continuation: after writing the receipt
-the controller atomically releases its execution/resource lease in target
-state `watching`. Earlier invocations remain `watching` and release again. At
-or after the receipt-derived earliest commit instant, the same attempt
-reacquires a new epoch without consuming another proposal/rate slot, installs
-that epoch in the effect and recovery resources, and performs the final
+and durable anchor the controller atomically releases its execution/resource
+lease in target state `watching`. Earlier invocations remain `watching` and
+release again. Every restart validates and reuses the immutable anchor; it
+cannot replace or backdate it. A crash after the journal readback but before
+anchor creation leaves no eligible watch clock and therefore enters forward
+recovery rather than deriving one from the earlier journal timestamp. At or
+after the anchor-derived earliest commit instant, the same attempt reacquires
+a new epoch without consuming another proposal/rate slot, installs that epoch
+in the effect and recovery resources, and performs the final
 safe-state/authority checks. A continuation beyond commit grace recovers. No
 process or lease is held synchronously during the one-hour watch.
 
