@@ -47,16 +47,20 @@ outer envelope and the fresh evidence proof. The wrapper re-reads the target,
 policy, adapter revision and inventory immediately before apply, then rechecks
 the immutable authority/admission material before apply and commit. A caller
 cannot substitute a different plan, policy, node, target, inventory, adapter,
-or postcondition behind a valid-looking outer claim.
+or postcondition behind a valid-looking outer claim. The adapter receives one
+deep-frozen, closed no-reboot/no-drain request containing the exact target,
+candidates, policy/plan/adapter configuration, pre-state and expected
+postconditions, together with the current execution-lease epoch. Its receipt
+must bind that request digest and epoch exactly. The older drain/reboot executor
+is module-private and is not an exported journal-bypass capability.
 
-The executor retains the #35 policy checks as a second, narrower boundary. It
-re-reads current policy and synchronized clock before inventory/drain and
+The private executor retains the #35 policy checks as a second, narrower boundary. It
+re-reads current policy and synchronized clock before inventory and
 before apply, verifies exact plan and policy digests, freshness, node
 selection, window, holds, package-manager/disk/power/clock/workload gates, and
-allowed package class/source. The ADR-008 wrapper is stricter than the older
-executor surface: reboot-capable, kernel, third-party, workload-draining, and
-pillar maintenance are outside this autonomous class even where the underlying
-manual executor can represent them.
+allowed package class/source. Reboot-capable, kernel, third-party,
+workload-draining, and pillar maintenance are structurally outside the only
+exported autonomous execution path.
 
 ## Authoritative attempt journal
 
@@ -76,7 +80,9 @@ Success follows exactly:
 Each transition obtains a new trusted timestamp. `watch` must consume the
 declared interval, the kill switch is checked at admission and between
 mutation phases, and commit additionally requires a maintenance-safe-state
-readback matching the bound postconditions digest. The initial journal uses
+readback from a fresh host inventory matching the bound postconditions digest.
+The cached post-apply inventory is diagnosis only and can never satisfy commit.
+The initial journal uses
 exclusive creation and all durable replacements are fsynced. Every append is a
 tail-digest compare-and-swap under a monotonic, exclusive-create lock ticket.
 A successor may advance past an incomplete ticket only after its owning
@@ -92,14 +98,19 @@ record in one atomic replacement, so no split domain/target transaction can be
 left by a crash. Distinct proposal IDs for the same target, a second active
 target, an exhausted proposal, or a rate-window breach fail before actuation.
 Unknown, disarmed and terminally blocked targets remain unavailable pending
-owner action.
+owner action. That same record owns the single execution lease: a monotonic
+epoch, holder token and trusted-time expiry. There are no separate initial and
+resume claims and no caller assertion that a claim was abandoned. An expired
+lease may transfer mechanically; every journal append and target transition is
+fenced by the exact epoch/token, and the adapter request/receipt carries the
+epoch so a stale actuator cannot later publish success.
 
 An existing non-terminal receipt is ambiguous. Only a `prepare` receipt plus an
-independent `not-applied` reconciliation may resume apply. Any later phase,
+independent `not-applied` reconciliation may resume apply after the persisted
+lease expires and transfers. Any later phase,
 applied/indeterminate result, invalid reconciliation, deadline breach, failed
-phase, or kill-switch transition enters recovery. Process-safe recovery
-ownership prevents a second controller from executing the one-shot recovery
-worker.
+phase, or kill-switch transition enters recovery. The same fenced lease
+prevents concurrent initial, resume, and recovery actuators.
 
 ## Forward recovery and narrowing
 
@@ -114,18 +125,29 @@ verifies the signature against the owner-authorized recovery registry, the
 authorization digest, append-only chain, protected tail, actor, target, and
 exact disarm receipt before committing the authoritative `disarm` event.
 
-Recovery uses a durable two-phase outbox. It first fixes the exact terminal
-receipt, appends and verifies its signed narrowing plus protected checkpoint,
-and only then CAS-appends the terminal journal receipt. A retry at any boundary
-finishes the same outbox without invoking forward recovery twice. Historical
-owner authorization and narrowing are retrieved by the prepared authorization
-digest, so a later owner-key or registry rotation can narrow but cannot strand
-an already recovered attempt.
+Before the execution lease is claimed, Brokkr fsyncs an exact historical
+authority snapshot containing the signed authorization, owner-bound artifacts,
+recovery-key fingerprint, initial narrowing tail and immutable admission
+digest. Recovery then fsyncs its idempotent request and `unknown` receipt in a
+staged outbox before any recovery effect. Every later boundary is restartable:
+unknown append, target transition, recovery invocation/result, recover and
+quarantine receipts, signed-ledger append, protected-checkpoint advance,
+terminal append and atomic terminal release. Before appending narrowing, a
+retry verifies current signed history and consumes an already-present exact
+domain/target/from-state/to-state/worker/terminal tuple instead of duplicating
+it. A later owner-key or registry rotation therefore cannot strand an already
+prepared or recovered attempt.
+
+Commit release is equally crash-safe. The commit receipt is CAS-appended first;
+target, domain and lease release then happen in one domain-state replacement,
+and exact terminal replay repairs a crash in that gap without actuating again.
 
 If forward recovery fails its postconditions, the journal records a distinct
 reason and ends `terminally-blocked`, again only after consuming an equivalent
 signed target demotion. Recovery exceptions are surfaced as explicit
-`recovery_error` values. No automatic rollback, reboot, retry loop, protected
+`recovery_error` values. Transport uncertainty leaves the staged,
+idempotency-keyed recovery request restartable rather than inventing a terminal
+result. No automatic rollback, reboot, retry loop, protected
 lane mutation, or Verdandi dependency is introduced.
 
 The executor's private before/after evidence journal remains separate and

@@ -13,6 +13,10 @@ const MAX_EVENTS = 32;
 const MAX_INVENTORY_BYTES = 16_384;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const hash = value => `sha256:${crypto.createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
+const exactKeys = (value, keys) => (
+  value !== null && typeof value === "object" && !Array.isArray(value) &&
+  Object.keys(value).sort().join(",") === [...keys].sort().join(",")
+);
 const fail = (code, cause) => { const error = new Error(code); error.code = code; error.cause = cause; throw error; };
 const parseUtc = value => strictUtc(value) ? Date.parse(value) : fail("invalid_timestamp");
 const read = file => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch (error) { if (error.code === "ENOENT") return null; throw error; } };
@@ -37,6 +41,13 @@ function inventory(value) {
   }
   if (Buffer.byteLength(canonicalJson(output)) > MAX_INVENTORY_BYTES) fail("inventory_too_large");
   return output;
+}
+function deepFreeze(value) {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
 }
 export function deriveDebianAutonomyExecution({
   plan, policy, target, inventory: preState, adapterRevisionDigest, postconditions,
@@ -83,6 +94,20 @@ export function deriveDebianAutonomyExecution({
     config_digest: configDigest,
     policy_digest: policy.policy_digest,
   });
+  const executionRequest = {
+    kind: "brokkr-bounded-debian-maintenance-request", schema_version: "v1",
+    target: structuredClone(target),
+    candidates: structuredClone(plan.candidates),
+    config: {
+      adapter_revision_digest: adapterRevisionDigest,
+      plan_digest: suppliedPlanDigest,
+      policy_digest: policy.policy_digest,
+      no_reboot: true,
+      no_drain: true,
+    },
+    pre_state: normalizedPreState,
+    expected_postconditions: normalizedPostconditions,
+  };
   return {
     node_id: target.node_id,
     target_scope_digest: targetScopeDigest,
@@ -95,6 +120,8 @@ export function deriveDebianAutonomyExecution({
     pre_state: normalizedPreState,
     postconditions: normalizedPostconditions,
     adapter_revision_digest: adapterRevisionDigest,
+    execution_request: executionRequest,
+    execution_request_digest: hash(executionRequest),
   };
 }
 function assertPolicy(policy) {
@@ -129,8 +156,9 @@ function currentAdmission({ plan, policy, nodeId, adapters }) {
 // All effects are injected, synchronous and individually bounded by the host
 // adapter. This layer never retries: #34's finite controller retry budget owns
 // retries. `currentPolicy` and `clock` are read once per admission boundary.
-export function executeDebianMaintenance({
+function executeDebianMaintenance({
   plan, policy, nodeId = plan?.node_id, journalFile, adapters, boundInitialInventory = null,
+  boundExecutionRequest = null, leaseEpoch = null,
 }) {
   for (const name of ["inventory", "apply", "afterInventory", "currentPolicy", "clock", "hold"]) if (typeof adapters?.[name] !== "function") fail("adapter_contract_invalid");
   assertPolicy(policy); if (read(journalFile) !== null) fail("journal_already_exists");
@@ -139,10 +167,20 @@ export function executeDebianMaintenance({
   // until plan, current policy, clock and window are all freshly accepted.
   const initial = currentAdmission({ plan, policy, nodeId, adapters });
   const workload = plan.gates.workload_hooks;
+  if (boundExecutionRequest !== null) {
+    if (!Number.isSafeInteger(leaseEpoch) || leaseEpoch < 1 ||
+        boundExecutionRequest.kind !== "brokkr-bounded-debian-maintenance-request" ||
+        boundExecutionRequest.schema_version !== "v1" ||
+        boundExecutionRequest.config?.no_reboot !== true ||
+        boundExecutionRequest.config?.no_drain !== true ||
+        workload !== "not_applicable" || initial.policy.reboot?.policy !== "never") {
+      fail("autonomous_adapter_capability_invalid");
+    }
+  }
   if (workload === "ready") for (const name of ["drain", "verifyDrain", "restoreDrain"]) if (typeof adapters[name] !== "function") fail("drain_adapter_missing");
   if (initial.policy.reboot?.policy !== "never") for (const name of ["reboot", "healthAfterReboot"]) if (typeof adapters[name] !== "function") fail("reboot_adapter_missing_preflight");
   if (typeof adapters.substrateHealth !== "function" || (workload === "ready" && typeof adapters.workloadHealth !== "function")) fail("health_adapter_missing_preflight");
-  const journal = { kind: "brokkr-debian-mutation-journal", schema_version: "v1", plan_id: plan.plan_id, plan_digest: plan.plan_digest, policy_digest: initial.policy.policy_digest, node_id: nodeId, unmet_policy_classes: plan.unmet_policy_classes.map(item => ({ class: String(item.class ?? "unknown").slice(0, 64), reason: String(item.reason ?? "unspecified").slice(0, 96) })), outcome: "running", events: [], before_inventory: null, after_inventory: null, reversal: null, failure: null };
+  const journal = { kind: "brokkr-debian-mutation-journal", schema_version: "v1", plan_id: plan.plan_id, plan_digest: plan.plan_digest, policy_digest: initial.policy.policy_digest, node_id: nodeId, execution_request_digest: boundExecutionRequest === null ? null : hash(boundExecutionRequest), lease_epoch: leaseEpoch, adapter_receipt_digest: null, unmet_policy_classes: plan.unmet_policy_classes.map(item => ({ class: String(item.class ?? "unknown").slice(0, 64), reason: String(item.reason ?? "unspecified").slice(0, 96) })), outcome: "running", events: [], before_inventory: null, after_inventory: null, reversal: null, failure: null };
   let eventAt = initial.now;
   const event = (phase, outcome, detail) => { if (journal.events.length >= MAX_EVENTS) fail("journal_event_limit"); journal.events.push({ at: eventAt, phase, outcome, detail: safeDetail(detail) }); write(journalFile, journal); };
   let mutationBoundary = false; let drainBoundary = false; let rebootAttempted = false;
@@ -173,7 +211,25 @@ export function executeDebianMaintenance({
     // The exact second boundary closes any race while drain was running.
     eventAt = currentAdmission({ plan, policy, nodeId, adapters }).now; event("admission_revalidated", "succeeded", {});
     const applyLimit = { timeout_ms: durationToMs(initial.policy.execution_limits.timeout), remaining_window_ms: eventAt ? currentAdmission({ plan, policy, nodeId, adapters }).remaining_window_ms : 0 };
-    event("apply_started", "started", applyLimit); mutationBoundary = true; const applied = adapters.apply(applyLimit); event("apply", applied?.ok ? "succeeded" : "failed", applied); if (!applied?.ok || !Number.isFinite(applied.elapsed_ms) || applied.elapsed_ms < 0 || applied.elapsed_ms > Math.min(applyLimit.timeout_ms, applyLimit.remaining_window_ms)) fail(applied?.interrupted ? "dpkg_interrupted" : "apply_failed");
+    const adapterRequest = boundExecutionRequest === null ? applyLimit : deepFreeze({
+      kind: "brokkr-bounded-debian-adapter-invocation", schema_version: "v1",
+      execution_request: structuredClone(boundExecutionRequest),
+      execution_request_digest: hash(boundExecutionRequest),
+      lease_epoch: leaseEpoch, limits: applyLimit,
+    });
+    event("apply_started", "started", adapterRequest); mutationBoundary = true; const applied = adapters.apply(adapterRequest);
+    if (boundExecutionRequest !== null) {
+      const receipt = structuredClone(applied);
+      const suppliedReceiptDigest = receipt?.receipt_digest;
+      delete receipt?.receipt_digest;
+      if (!exactKeys(receipt, [
+        "ok", "elapsed_ms", "execution_request_digest", "lease_epoch", "reboot_required",
+      ]) || receipt.ok !== true || receipt.execution_request_digest !== hash(boundExecutionRequest) ||
+          receipt.lease_epoch !== leaseEpoch || receipt.reboot_required !== false ||
+          suppliedReceiptDigest !== hash(receipt)) fail("adapter_receipt_unbound");
+      journal.adapter_receipt_digest = suppliedReceiptDigest;
+    }
+    event("apply", applied?.ok ? "succeeded" : "failed", applied); if (!applied?.ok || !Number.isFinite(applied.elapsed_ms) || applied.elapsed_ms < 0 || applied.elapsed_ms > Math.min(applyLimit.timeout_ms, applyLimit.remaining_window_ms)) fail(applied?.interrupted ? "dpkg_interrupted" : "apply_failed");
     if (applied.reboot_required) {
       eventAt = currentAdmission({ plan, policy, nodeId, adapters }).now;
       if (initial.policy.reboot?.policy === "never") fail("reboot_forbidden_by_policy");
@@ -197,6 +253,7 @@ export function runDebianMaintenance(options) {
   }
   const journalFile = path.join(attemptJournalDir, "mutation", `${binding.attempt_id}.json`);
   let executionResult = null;
+  const initialInventory = inventory(adapters.inventory());
   let captured = null;
   const capture = () => {
     const actualTarget = adapters.targetMetadata();
@@ -206,7 +263,7 @@ export function runDebianMaintenance(options) {
     }
     const actual = deriveDebianAutonomyExecution({
       plan, policy, target: actualTarget,
-      inventory: executionResult?.journal?.before_inventory ?? adapters.inventory(),
+      inventory: initialInventory,
       adapterRevisionDigest: adapters.revisionDigest(), postconditions: expectedPostconditions,
     });
     for (const field of [
@@ -228,21 +285,26 @@ export function runDebianMaintenance(options) {
     journalDir: attemptJournalDir, binding, artifacts, admission, recovery, reconcile,
     phases: {
       preflight: capture,
-      apply: () => {
+      apply: ({ lease_epoch }) => {
         executionResult = executeDebianMaintenance({
           plan, policy, nodeId, journalFile, adapters,
           boundInitialInventory: captured.pre_state,
+          boundExecutionRequest: deepFreeze(structuredClone(captured.execution_request)),
+          leaseEpoch: lease_epoch,
         });
         if (executionResult.outcome !== "succeeded") fail("executor_postconditions_unmet");
         return { applied: true };
       },
       verify: () => ({ verified: executionResult?.outcome === "succeeded" }),
       watch,
-      safeStateReadback: () => ({
-        safe: executionResult?.outcome === "succeeded",
-        postconditions_digest: executionResult?.journal?.after_inventory ?
-          hash(executionResult.journal.after_inventory) : null,
-      }),
+      safeStateReadback: () => {
+        const fresh = inventory(adapters.inventory());
+        return {
+          safe: executionResult?.outcome === "succeeded" &&
+            hash(fresh) === binding.postconditions_digest,
+          postconditions_digest: hash(fresh),
+        };
+      },
     },
   });
 }
