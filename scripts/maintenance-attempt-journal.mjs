@@ -225,6 +225,29 @@ function assertExecutionLease({ journalDir, binding, bindingDigest, lease }) {
     assertLeaseRecord(readOptional(domainStateFile(journalDir)), binding, bindingDigest, lease)
   ));
 }
+function executionLeaseFence(binding, bindingDigest, lease) {
+  const fence = {
+    kind: "brokkr-effect-lease-fence", schema_version: "v1", domain: DOMAIN,
+    target_scope_digest: binding.target_scope_digest,
+    attempt_id: binding.attempt_id, mutation_id: binding.mutation_id,
+    binding_digest: bindingDigest, epoch: lease.epoch,
+    holder_token: lease.holder_token, expires_at: lease.expires_at,
+  };
+  assert(DIGEST.test(fence.target_scope_digest) && DIGEST.test(fence.binding_digest) &&
+    Number.isSafeInteger(fence.epoch) && fence.epoch >= 1 &&
+    typeof fence.holder_token === "string" && fence.holder_token.length >= 16 &&
+    strictUtc(fence.expires_at), "execution_lease_fence_invalid");
+  return Object.freeze(fence);
+}
+function activateEffectFence(phases, binding, bindingDigest, lease) {
+  const fence = executionLeaseFence(binding, bindingDigest, lease);
+  const receipt = phases.activateFence(structuredClone(fence));
+  const fenceDigest = autonomyDigest(fence);
+  assert(exactKeys(receipt, ["activated", "lease_fence_digest"]) &&
+    receipt.activated === true && receipt.lease_fence_digest === fenceDigest,
+  "effect_lease_fence_unconfirmed");
+  return fence;
+}
 function transitionTarget({ journalDir, binding, bindingDigest, lease, state, release = false }) {
   return withExclusiveDirectory(domainLockDir(journalDir), "domain_state_contended", () => {
     const domainFile = domainStateFile(journalDir);
@@ -611,6 +634,26 @@ function verifyAdmission({ binding, snapshot, admission, recovery, journalDir, c
     }),
   };
 }
+function verifyRecoveryPosture({ binding, snapshot, admission }) {
+  const bundle = verifyOwnerAuthorizationBundle(snapshot);
+  const narrowing = verifyRuntimeNarrowingLedger({
+    ledger: snapshot.runtimeNarrowing,
+    recoveryRegistry: bundle.recoveryRegistry,
+    authorizationDigest: bundle.authorizationDigest,
+    tailCheckpoint: snapshot.runtimeNarrowingCheckpoint,
+  });
+  const proof = admission.killSwitch();
+  assert(exactKeys(proof, ["safe", "identity"]) &&
+    typeof proof.safe === "boolean" && proof.identity === binding.kill_switch_identity,
+  "kill_switch_invalid");
+  return {
+    now: trustedNow(admission.trustedClock),
+    mustRecover: proof.safe !== true,
+    authorityDigest: bundle.authorizationDigest,
+    coverageDigest: bundle.coverage.registry_digest,
+    narrowingTailDigest: narrowing.tailDigest,
+  };
+}
 function reasonDigest(code) {
   return autonomyDigest({ code: String(code || "unknown").slice(0, 96) });
 }
@@ -811,6 +854,7 @@ function finishRecoveryOutbox({ file, journal, context, admission, recovery, out
         journalDir: context.journalDir, binding: journal.binding,
         bindingDigest: journal.binding_digest, lease, state: terminalState, release: true,
       });
+      recovery.fault?.("after-terminal-release-before-stage");
       outboxCheckpoint(outboxFile, outbox, "released", recovery, "after-terminal-release");
     }
     if (outbox.stage === "released") {
@@ -878,6 +922,11 @@ function verifyExecutionPreflight(phases, binding) {
   assert(exactKeys(result, ["execution_digest"]) &&
     result.execution_digest === executionBindingDigest(binding), "execution_binding_substituted");
 }
+function verifyExecutionCommitBinding(phases, binding) {
+  const result = phases.commitBinding();
+  assert(exactKeys(result, ["execution_digest"]) &&
+    result.execution_digest === executionBindingDigest(binding), "execution_binding_substituted");
+}
 export function runMaintenanceAttempt({
   journalDir, binding, artifacts, admission, phases, recovery, contentRef = "ref:maintenance-candidate",
   reconcile = null,
@@ -886,7 +935,10 @@ export function runMaintenanceAttempt({
   assert(plain(binding) && plain(artifacts) && typeof artifacts.read === "function" &&
     plain(admission) && plain(phases) && plain(recovery), "attempt_arguments_invalid");
   for (const fn of ["trustedClock", "killSwitch", "evidence", "liveness", "maintenance"]) assert(typeof admission[fn] === "function", "admission_verifier_missing");
-  for (const fn of ["preflight", "apply", "verify", "watch", "safeStateReadback"]) assert(typeof phases[fn] === "function", "maintenance_phase_missing");
+  for (const fn of [
+    "preflight", "commitBinding", "activateFence", "applyFenced",
+    "verify", "watch", "safeStateReadback",
+  ]) assert(typeof phases[fn] === "function", "maintenance_phase_missing");
   for (const fn of ["recover", "appendSignedNarrowing", "advanceNarrowingCheckpoint", "readNarrowingHistory"]) {
     assert(typeof recovery[fn] === "function", "maintenance_recovery_missing");
   }
@@ -956,6 +1008,29 @@ export function runMaintenanceAttempt({
         recovery_error: pendingOutbox.recovery_error,
       };
     }
+    if (pendingOutbox?.stage === "terminal-journaled") {
+      assert(!conflicting && TERMINAL.has(existing.entries.at(-1).phase),
+        "recovery_outbox_terminal_missing");
+      const state = existing.entries.at(-1).phase === "disarm" ?
+        "shadow" : "terminally-blocked";
+      assert(repairTerminalRelease({
+        journalDir, binding: existing.binding, bindingDigest: existing.binding_digest, state,
+      }), "execution_lease_active");
+      outboxCheckpoint(
+        `${file}.recovery-outbox.json`, pendingOutbox, "released", recovery,
+        "after-terminal-release",
+      );
+      outboxCheckpoint(
+        `${file}.recovery-outbox.json`, pendingOutbox, "complete", recovery,
+        "after-outbox-complete",
+      );
+      return {
+        journal: existing, ran: false,
+        reason: existing.entries.at(-1).phase === "disarm" ?
+          "recovered-disarmed" : "terminally-blocked",
+        recovery_error: pendingOutbox.recovery_error,
+      };
+    }
     if (TERMINAL.has(existing.entries.at(-1).phase) && !pendingOutbox) {
       assert(!conflicting, "attempt_conflicting_replay");
       const state = existing.entries.at(-1).phase === "commit" ?
@@ -968,18 +1043,26 @@ export function runMaintenanceAttempt({
     }
   }
 
+  let recoveryOnly = false;
   if (!admitted && pendingOutbox) {
     admitted = {
       now: trustedNow(admission.trustedClock, existing.entries.at(-1).recorded_at),
       immutableAdmissionDigest: authoritySnapshot.immutableAdmissionDigest,
     };
   } else if (!admitted) {
-    admitted = verifyAdmission({
-      binding: existing?.binding ?? binding, snapshot: initialSnapshot, admission, recovery,
-      journalDir, conformance,
+    const recoveryPosture = verifyRecoveryPosture({
+      binding: existing?.binding ?? binding, snapshot: initialSnapshot, admission,
     });
-    assert(admitted.immutableAdmissionDigest === authoritySnapshot.immutableAdmissionDigest,
-      "immutable_admission_drifted");
+    admitted = {
+      now: recoveryPosture.now,
+      immutableAdmissionDigest: authoritySnapshot.immutableAdmissionDigest,
+    };
+    recoveryOnly = recoveryPosture.mustRecover ||
+      recoveryPosture.authorityDigest !==
+        persistedAuthority.bundle.authorizationDigest ||
+      recoveryPosture.coverageDigest !==
+        persistedAuthority.bundle.coverage.registry_digest ||
+      recoveryPosture.narrowingTailDigest !== persistedAuthority.narrowing.tailDigest;
   }
   const activeBinding = existing?.binding ?? binding;
   const activeBindingDigest = existing?.binding_digest ?? bindingDigest;
@@ -1006,7 +1089,11 @@ export function runMaintenanceAttempt({
     validateJournalSemantics(journal, conformance, { allowActive: true });
     assert(createExclusive(file, journal), "journal_prepare_conflict");
     recovery.fault?.("after-prepare-journal");
-  } else {
+  }
+  const leaseFence = activateEffectFence(
+    phases, activeBinding, activeBindingDigest, lease,
+  );
+  if (existing) {
     if (canonicalJson(journal.binding) !== canonicalJson(binding)) {
       return enterRecovery({
         file, journal, context, admission, recovery, lease,
@@ -1017,6 +1104,25 @@ export function runMaintenanceAttempt({
       return finishRecoveryOutbox({
         file, journal, context, admission, recovery,
         outboxFile: `${file}.recovery-outbox.json`, lease,
+      });
+    }
+    if (!recoveryOnly) {
+      try {
+        const resumedAdmission = verifyAdmission({
+          binding: journal.binding, snapshot: initialSnapshot, admission, recovery,
+          journalDir, conformance,
+        });
+        recoveryOnly = resumedAdmission.immutableAdmissionDigest !==
+          authoritySnapshot.immutableAdmissionDigest;
+      } catch {
+        recoveryOnly = true;
+      }
+    }
+    if (recoveryOnly) {
+      return enterRecovery({
+        file, journal, context, admission, recovery, lease,
+        code: "current-posture-requires-recovery",
+        lastAt: journal.entries.at(-1).recorded_at,
       });
     }
     let reconciliation;
@@ -1055,7 +1161,10 @@ export function runMaintenanceAttempt({
     verifyExecutionPreflight(phases, binding);
     checkKillSwitch(admission.killSwitch, binding);
     assertExecutionLease({ journalDir, binding, bindingDigest, lease });
-    const applied = phases.apply({ lease_epoch: lease.epoch });
+    const applied = phases.applyFenced({
+      lease_fence: structuredClone(leaseFence),
+      lease_fence_digest: autonomyDigest(leaseFence),
+    });
     assertExecutionLease({ journalDir, binding, bindingDigest, lease });
     assert(applied?.applied === true, "maintenance_apply_failed");
     at = trustedNow(admission.trustedClock, at);
@@ -1087,7 +1196,7 @@ export function runMaintenanceAttempt({
     });
     assert(beforeCommit.immutableAdmissionDigest === authoritySnapshot.immutableAdmissionDigest,
       "immutable_admission_drifted");
-    verifyExecutionPreflight(phases, binding);
+    verifyExecutionCommitBinding(phases, binding);
     at = trustedNow(admission.trustedClock, at);
     assert(Date.parse(at) <= Date.parse(binding.deadline), "attempt_deadline_closed");
     journal = appendFenced(file, journal, {

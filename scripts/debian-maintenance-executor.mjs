@@ -157,30 +157,37 @@ function currentAdmission({ plan, policy, nodeId, adapters }) {
 // adapter. This layer never retries: #34's finite controller retry budget owns
 // retries. `currentPolicy` and `clock` are read once per admission boundary.
 function executeDebianMaintenance({
-  plan, policy, nodeId = plan?.node_id, journalFile, adapters, boundInitialInventory = null,
-  boundExecutionRequest = null, leaseEpoch = null,
+  plan, policy, nodeId = plan?.node_id, journalFile, adapters,
+  boundInitialInventory, boundExecutionRequest, leaseFence,
 }) {
-  for (const name of ["inventory", "apply", "afterInventory", "currentPolicy", "clock", "hold"]) if (typeof adapters?.[name] !== "function") fail("adapter_contract_invalid");
+  for (const name of [
+    "inventory", "applyFenced", "afterInventory", "currentPolicy", "clock", "hold",
+  ]) if (typeof adapters?.[name] !== "function") fail("adapter_contract_invalid");
   assertPolicy(policy); if (read(journalFile) !== null) fail("journal_already_exists");
   if (policy.reboot?.policy === "always_after_window") fail("always_after_window_unsupported");
   // This first boundary is before inventory/drain: no workload mutation happens
   // until plan, current policy, clock and window are all freshly accepted.
   const initial = currentAdmission({ plan, policy, nodeId, adapters });
   const workload = plan.gates.workload_hooks;
-  if (boundExecutionRequest !== null) {
-    if (!Number.isSafeInteger(leaseEpoch) || leaseEpoch < 1 ||
-        boundExecutionRequest.kind !== "brokkr-bounded-debian-maintenance-request" ||
-        boundExecutionRequest.schema_version !== "v1" ||
-        boundExecutionRequest.config?.no_reboot !== true ||
-        boundExecutionRequest.config?.no_drain !== true ||
-        workload !== "not_applicable" || initial.policy.reboot?.policy !== "never") {
-      fail("autonomous_adapter_capability_invalid");
-    }
+  if (!leaseFence || leaseFence.kind !== "brokkr-effect-lease-fence" ||
+      leaseFence.schema_version !== "v1" ||
+      !Number.isSafeInteger(leaseFence.epoch) || leaseFence.epoch < 1 ||
+      !DIGEST.test(leaseFence.target_scope_digest) ||
+      !DIGEST.test(leaseFence.binding_digest) ||
+      typeof leaseFence.holder_token !== "string" ||
+      !strictUtc(leaseFence.expires_at) ||
+      !boundExecutionRequest ||
+      boundExecutionRequest.kind !== "brokkr-bounded-debian-maintenance-request" ||
+      boundExecutionRequest.schema_version !== "v1" ||
+      boundExecutionRequest.config?.no_reboot !== true ||
+      boundExecutionRequest.config?.no_drain !== true ||
+      workload !== "not_applicable" || initial.policy.reboot?.policy !== "never") {
+    fail("autonomous_adapter_capability_invalid");
   }
   if (workload === "ready") for (const name of ["drain", "verifyDrain", "restoreDrain"]) if (typeof adapters[name] !== "function") fail("drain_adapter_missing");
   if (initial.policy.reboot?.policy !== "never") for (const name of ["reboot", "healthAfterReboot"]) if (typeof adapters[name] !== "function") fail("reboot_adapter_missing_preflight");
   if (typeof adapters.substrateHealth !== "function" || (workload === "ready" && typeof adapters.workloadHealth !== "function")) fail("health_adapter_missing_preflight");
-  const journal = { kind: "brokkr-debian-mutation-journal", schema_version: "v1", plan_id: plan.plan_id, plan_digest: plan.plan_digest, policy_digest: initial.policy.policy_digest, node_id: nodeId, execution_request_digest: boundExecutionRequest === null ? null : hash(boundExecutionRequest), lease_epoch: leaseEpoch, adapter_receipt_digest: null, unmet_policy_classes: plan.unmet_policy_classes.map(item => ({ class: String(item.class ?? "unknown").slice(0, 64), reason: String(item.reason ?? "unspecified").slice(0, 96) })), outcome: "running", events: [], before_inventory: null, after_inventory: null, reversal: null, failure: null };
+  const journal = { kind: "brokkr-debian-mutation-journal", schema_version: "v1", plan_id: plan.plan_id, plan_digest: plan.plan_digest, policy_digest: initial.policy.policy_digest, node_id: nodeId, execution_request_digest: hash(boundExecutionRequest), lease_epoch: leaseFence.epoch, adapter_receipt_digest: null, unmet_policy_classes: plan.unmet_policy_classes.map(item => ({ class: String(item.class ?? "unknown").slice(0, 64), reason: String(item.reason ?? "unspecified").slice(0, 96) })), outcome: "running", events: [], before_inventory: null, after_inventory: null, reversal: null, failure: null };
   let eventAt = initial.now;
   const event = (phase, outcome, detail) => { if (journal.events.length >= MAX_EVENTS) fail("journal_event_limit"); journal.events.push({ at: eventAt, phase, outcome, detail: safeDetail(detail) }); write(journalFile, journal); };
   let mutationBoundary = false; let drainBoundary = false; let rebootAttempted = false;
@@ -204,31 +211,33 @@ function executeDebianMaintenance({
     write(journalFile, journal); return { outcome: journal.outcome, reason: code, journal };
   };
   try {
-    journal.before_inventory = boundInitialInventory === null ?
-      inventory(adapters.inventory()) : inventory(boundInitialInventory);
+    journal.before_inventory = inventory(boundInitialInventory);
     event("inventory_before", "succeeded", journal.before_inventory);
     if (workload === "ready") { event("drain_started", "started", {}); drainBoundary = true; const drained = adapters.drain(); event("drain", drained?.ok ? "succeeded" : "failed", drained); if (!drained?.ok) fail("drain_failed"); const verified = adapters.verifyDrain(); event("drain_verify", verified?.ok ? "succeeded" : "failed", verified); if (!verified?.ok) fail("drain_verify_failed"); }
     // The exact second boundary closes any race while drain was running.
     eventAt = currentAdmission({ plan, policy, nodeId, adapters }).now; event("admission_revalidated", "succeeded", {});
     const applyLimit = { timeout_ms: durationToMs(initial.policy.execution_limits.timeout), remaining_window_ms: eventAt ? currentAdmission({ plan, policy, nodeId, adapters }).remaining_window_ms : 0 };
-    const adapterRequest = boundExecutionRequest === null ? applyLimit : deepFreeze({
+    const adapterRequest = deepFreeze({
       kind: "brokkr-bounded-debian-adapter-invocation", schema_version: "v1",
       execution_request: structuredClone(boundExecutionRequest),
       execution_request_digest: hash(boundExecutionRequest),
-      lease_epoch: leaseEpoch, limits: applyLimit,
+      lease_fence: structuredClone(leaseFence),
+      lease_fence_digest: hash(leaseFence), limits: applyLimit,
     });
-    event("apply_started", "started", adapterRequest); mutationBoundary = true; const applied = adapters.apply(adapterRequest);
-    if (boundExecutionRequest !== null) {
-      const receipt = structuredClone(applied);
-      const suppliedReceiptDigest = receipt?.receipt_digest;
-      delete receipt?.receipt_digest;
-      if (!exactKeys(receipt, [
-        "ok", "elapsed_ms", "execution_request_digest", "lease_epoch", "reboot_required",
-      ]) || receipt.ok !== true || receipt.execution_request_digest !== hash(boundExecutionRequest) ||
-          receipt.lease_epoch !== leaseEpoch || receipt.reboot_required !== false ||
-          suppliedReceiptDigest !== hash(receipt)) fail("adapter_receipt_unbound");
-      journal.adapter_receipt_digest = suppliedReceiptDigest;
-    }
+    event("apply_started", "started", adapterRequest);
+    mutationBoundary = true;
+    const applied = adapters.applyFenced(adapterRequest);
+    const receipt = structuredClone(applied);
+    const suppliedReceiptDigest = receipt?.receipt_digest;
+    delete receipt?.receipt_digest;
+    if (!exactKeys(receipt, [
+      "ok", "elapsed_ms", "execution_request_digest", "lease_fence_digest",
+      "reboot_required",
+    ]) || receipt.ok !== true || receipt.execution_request_digest !== hash(boundExecutionRequest) ||
+        receipt.lease_fence_digest !== hash(leaseFence) ||
+        receipt.reboot_required !== false ||
+        suppliedReceiptDigest !== hash(receipt)) fail("adapter_receipt_unbound");
+    journal.adapter_receipt_digest = suppliedReceiptDigest;
     event("apply", applied?.ok ? "succeeded" : "failed", applied); if (!applied?.ok || !Number.isFinite(applied.elapsed_ms) || applied.elapsed_ms < 0 || applied.elapsed_ms > Math.min(applyLimit.timeout_ms, applyLimit.remaining_window_ms)) fail(applied?.interrupted ? "dpkg_interrupted" : "apply_failed");
     if (applied.reboot_required) {
       eventAt = currentAdmission({ plan, policy, nodeId, adapters }).now;
@@ -253,17 +262,20 @@ export function runDebianMaintenance(options) {
   }
   const journalFile = path.join(attemptJournalDir, "mutation", `${binding.attempt_id}.json`);
   let executionResult = null;
-  const initialInventory = inventory(adapters.inventory());
   let captured = null;
-  const capture = () => {
+  const captureStatic = () => {
     const actualTarget = adapters.targetMetadata();
     if (canonicalJson(actualTarget) !== canonicalJson(target) || actualTarget.node_id !== nodeId ||
         canonicalJson(adapters.currentPolicy()) !== canonicalJson(policy)) {
       fail("execution_binding_substituted");
     }
+    return actualTarget;
+  };
+  const capture = () => {
+    const actualTarget = captureStatic();
     const actual = deriveDebianAutonomyExecution({
       plan, policy, target: actualTarget,
-      inventory: initialInventory,
+      inventory: inventory(adapters.inventory()),
       adapterRevisionDigest: adapters.revisionDigest(), postconditions: expectedPostconditions,
     });
     for (const field of [
@@ -280,17 +292,44 @@ export function runDebianMaintenance(options) {
       }),
     };
   };
-  capture();
+  const commitBinding = () => {
+    captureStatic();
+    if (adapters.revisionDigest() !== captured?.adapter_revision_digest) {
+      fail("execution_binding_substituted");
+    }
+    return {
+      execution_digest: hash({
+        baseline_digest: captured.baseline_digest,
+        candidate_digest: captured.candidate_digest,
+        config_digest: captured.config_digest,
+        evidence_digest: captured.evidence_digest,
+        policy_digest: captured.policy_digest,
+        postconditions_digest: captured.postconditions_digest,
+        target_scope_digest: captured.target_scope_digest,
+      }),
+    };
+  };
   return runMaintenanceAttempt({
     journalDir: attemptJournalDir, binding, artifacts, admission, recovery, reconcile,
     phases: {
       preflight: capture,
-      apply: ({ lease_epoch }) => {
+      commitBinding,
+      activateFence: leaseFence => {
+        if (typeof adapters.activateFence !== "function") {
+          fail("adapter_fence_capability_missing");
+        }
+        const immutableFence = deepFreeze(structuredClone(leaseFence));
+        return adapters.activateFence(immutableFence);
+      },
+      applyFenced: ({ lease_fence, lease_fence_digest }) => {
+        if (lease_fence_digest !== hash(lease_fence)) {
+          fail("effect_lease_fence_unconfirmed");
+        }
         executionResult = executeDebianMaintenance({
           plan, policy, nodeId, journalFile, adapters,
           boundInitialInventory: captured.pre_state,
           boundExecutionRequest: deepFreeze(structuredClone(captured.execution_request)),
-          leaseEpoch: lease_epoch,
+          leaseFence: deepFreeze(structuredClone(lease_fence)),
         });
         if (executionResult.outcome !== "succeeded") fail("executor_postconditions_unmet");
         return { applied: true };

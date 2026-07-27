@@ -45,14 +45,29 @@ normalized pre-inventory and expected safe-state inventory become the baseline
 and postcondition digests. Their combined evidence digest must match both the
 outer envelope and the fresh evidence proof. The wrapper re-reads the target,
 policy, adapter revision and inventory immediately before apply, then rechecks
-the immutable authority/admission material before apply and commit. A caller
-cannot substitute a different plan, policy, node, target, inventory, adapter,
-or postcondition behind a valid-looking outer claim. The adapter receives one
-deep-frozen, closed no-reboot/no-drain request containing the exact target,
-candidates, policy/plan/adapter configuration, pre-state and expected
-postconditions, together with the current execution-lease epoch. Its receipt
-must bind that request digest and epoch exactly. The older drain/reboot executor
-is module-private and is not an exported journal-bypass capability.
+the immutable authority/admission material before apply and commit. Every
+immediate pre-mutation preflight obtains a new host inventory; the exact last
+accepted snapshot becomes both the baseline digest and the `pre_state` passed
+to the executor. Inventory drift therefore stops before the adapter is called.
+Commit uses a separate binding check plus a fresh postcondition readback, so
+post-mutation inventory cannot be reinterpreted as the admitted baseline.
+
+A caller cannot substitute a different plan, policy, node, target, inventory,
+adapter, or postcondition behind a valid-looking outer claim. The adapter
+receives one deep-frozen, closed no-reboot/no-drain request containing the
+exact target, candidates, policy/plan/adapter configuration, pre-state and
+expected postconditions. There is deliberately no autonomous `apply`
+fallback. Durable `prepare` remains the first adapter-facing attempt record.
+Immediately after it (or after loading an existing prepared journal) and before
+any initial, resumed, or recovery work, the effect owner must
+implement `activateFence()` for the full target/binding/attempt/mutation/epoch/
+token/expiry capability. Mutation is available only through `applyFenced()`,
+whose effect-owning transaction must atomically compare that entire active
+capability immediately before and together with host actuation. Its receipt
+binds both the immutable request and full fence digests. Controller-side
+before/after assertions are defense in depth, not the fencing mechanism. The
+older drain/reboot executor is module-private and is not an exported
+journal-bypass capability.
 
 The private executor retains the #35 policy checks as a second, narrower boundary. It
 re-reads current policy and synchronized clock before inventory and
@@ -102,8 +117,12 @@ owner action. That same record owns the single execution lease: a monotonic
 epoch, holder token and trusted-time expiry. There are no separate initial and
 resume claims and no caller assertion that a claim was abandoned. An expired
 lease may transfer mechanically; every journal append and target transition is
-fenced by the exact epoch/token, and the adapter request/receipt carries the
-epoch so a stale actuator cannot later publish success.
+fenced by the exact epoch/token. Lease acquisition also installs the full
+capability in the effect owner. A later epoch/token supersedes it, so an old
+writer blocked before its transaction cannot produce the host effect after
+transfer, irrespective of whether it could later publish a journal receipt.
+The hermetic concurrency test uses one fake resource transaction for fence
+activation and check-plus-effect to prove this property.
 
 An existing non-terminal receipt is ambiguous. Only a `prepare` receipt plus an
 independent `not-applied` reconciliation may resume apply after the persisted
@@ -128,11 +147,17 @@ exact disarm receipt before committing the authoritative `disarm` event.
 Before the execution lease is claimed, Brokkr fsyncs an exact historical
 authority snapshot containing the signed authorization, owner-bound artifacts,
 recovery-key fingerprint, initial narrowing tail and immutable admission
-digest. Recovery then fsyncs its idempotent request and `unknown` receipt in a
-staged outbox before any recovery effect. Every later boundary is restartable:
+digest. An existing prepared attempt enters recovery from that authenticated
+historical envelope even after current owner authorization rotates. Current
+authority is consulted only for a valid signed narrowing posture and the kill
+switch; it cannot rewrite the old attempt's mutation authority or make it
+resume actuation. Recovery then fsyncs its idempotent request and `unknown`
+receipt in a staged outbox before any recovery effect. Every later boundary is restartable:
 unknown append, target transition, recovery invocation/result, recover and
 quarantine receipts, signed-ledger append, protected-checkpoint advance,
-terminal append and atomic terminal release. Before appending narrowing, a
+terminal append and terminal release. A crash after the durable release but
+before advancing the outbox stage is repaired from the authenticated terminal
+journal before any new claim or rate-limit check. Before appending narrowing, a
 retry verifies current signed history and consumes an already-present exact
 domain/target/from-state/to-state/worker/terminal tuple instead of duplicating
 it. A later owner-key or registry rotation therefore cannot strand an already

@@ -130,6 +130,24 @@ function resignArtifacts(artifacts) {
   artifacts.runtimeNarrowingCheckpoint.owner_authorization_digest = authorizationDigest;
   return artifacts;
 }
+function rotateOwnerAuthorization(artifacts = bundle()) {
+  artifacts.authorization.authorization_id = "rotated-owner-authorization";
+  delete artifacts.authorization.signature;
+  artifacts.authorization.signature = {
+    algorithm: "Ed25519",
+    value_base64: sign(artifacts.authorization, ownerKeys.privateKey),
+  };
+  const authorizationDigest = autonomyDigest(artifacts.authorization);
+  artifacts.authorizationCheckpoint.authorization_digest = authorizationDigest;
+  artifacts.runtimeNarrowing.owner_authorization_digest = authorizationDigest;
+  artifacts.runtimeNarrowing.entries = [];
+  artifacts.runtimeNarrowingCheckpoint = {
+    kind: "autonomy-runtime-narrowing-checkpoint", schema_version: "v1",
+    owner_authorization_digest: authorizationDigest,
+    ledger_tail_digest: null, minimum_entries: 0,
+  };
+  return artifacts;
+}
 function binding(id = "maintenance-attempt", coverage = fixture("coverage-armed-canary.json"), fields = {}) {
   const owner = coverage.domains.find(row => row.domain === "no-reboot-security-bugfix-maintenance").bindings[0];
   return {
@@ -182,6 +200,7 @@ function recoveryTakeoverAdmission() {
   return result;
 }
 function phases(overrides = {}) {
+  let activeFenceDigest = null;
   return {
     preflight: () => ({ execution_digest: autonomyDigest({
       baseline_digest: binding().baseline_digest, candidate_digest: binding().candidate_digest,
@@ -189,7 +208,21 @@ function phases(overrides = {}) {
       policy_digest: binding().policy_digest, postconditions_digest: binding().postconditions_digest,
       target_scope_digest: binding().target_scope_digest,
     }) }),
-    apply: () => ({ applied: true }), verify: () => ({ verified: true }), watch: () => {},
+    commitBinding: () => ({ execution_digest: autonomyDigest({
+      baseline_digest: binding().baseline_digest, candidate_digest: binding().candidate_digest,
+      config_digest: binding().config_digest, evidence_digest: binding().evidence_digest,
+      policy_digest: binding().policy_digest, postconditions_digest: binding().postconditions_digest,
+      target_scope_digest: binding().target_scope_digest,
+    }) }),
+    activateFence: fence => {
+      activeFenceDigest = autonomyDigest(fence);
+      return { activated: true, lease_fence_digest: activeFenceDigest };
+    },
+    applyFenced: invocation => {
+      assert.equal(invocation.lease_fence_digest, activeFenceDigest);
+      return { applied: true };
+    },
+    verify: () => ({ verified: true }), watch: () => {},
     safeStateReadback: () => ({ safe: true, postconditions_digest: "sha256:" + "f".repeat(64) }),
     ...overrides,
   };
@@ -320,14 +353,62 @@ if (process.env.WORKER_MODE) {
       "2026-07-26T00:19:59Z" : "2026-07-26T00:15:59Z",
   });
   try {
+    const effectFenceFile = `${process.env.WORKER_DIR}/mock-effect-fence.json`;
+    const effectTransactionLock = `${effectFenceFile}.transaction`;
+    const effectTransaction = operation => {
+      while (true) {
+        try {
+          fs.mkdirSync(effectTransactionLock);
+          break;
+        } catch (error) {
+          if (error.code !== "EEXIST") throw error;
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+        }
+      }
+      try {
+        return operation();
+      } finally {
+        fs.rmdirSync(effectTransactionLock);
+      }
+    };
     run({
       dir: process.env.WORKER_DIR, artifacts: workerArtifacts,
       admit: workerAdmission,
       phase: phases({
-        apply: () => {
+        activateFence: fence => {
+          if (process.env.FENCE_LOG) fs.appendFileSync(process.env.FENCE_LOG, "fence\n");
+          assert.equal(
+            fs.existsSync(`${process.env.WORKER_DIR}/${binding().idempotency_key}.json`),
+            true, "the effect fence is not installed before durable prepare",
+          );
+          effectTransaction(() => {
+            const temporary = `${effectFenceFile}.${process.pid}.tmp`;
+            fs.writeFileSync(temporary, JSON.stringify(fence));
+            fs.renameSync(temporary, effectFenceFile);
+          });
+          return {
+            activated: true, lease_fence_digest: autonomyDigest(fence),
+          };
+        },
+        applyFenced: invocation => {
           if (process.env.APPLY_LOG) fs.appendFileSync(process.env.APPLY_LOG, "apply\n");
           if (process.env.WORKER_MODE === "crash") process.exit(77);
           if (process.env.FORCE_RECOVERY) throw Error("force-recovery");
+          while (process.env.HOLD_BEFORE_EFFECT &&
+              !fs.existsSync(process.env.HOLD_BEFORE_EFFECT)) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+          }
+          effectTransaction(() => {
+            const activeFence = JSON.parse(fs.readFileSync(effectFenceFile, "utf8"));
+            if (autonomyDigest(activeFence) !== invocation.lease_fence_digest) {
+              throw Object.assign(new Error("effect-lease-fenced"), {
+                code: "effect_lease_fenced",
+              });
+            }
+            if (process.env.HOST_EFFECT_LOG) {
+              fs.appendFileSync(process.env.HOST_EFFECT_LOG, "host-effect\n");
+            }
+          });
           while (process.env.HOLD_AFTER_APPLY && !fs.existsSync(process.env.HOLD_AFTER_APPLY)) {
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
           }
@@ -396,12 +477,22 @@ const wrapperAdmission = admission();
 wrapperAdmission.evidence = () => ({ fresh: true, eligible: true, digest: execution.evidence_digest });
 const wrapperAdapters = overrides => {
   let applied = false;
+  let activeFenceDigest = null;
   return {
     inventory: () => clone(applied ? executionAfter : executionBefore),
-    apply: invocation => {
+    activateFence: fence => {
+      assert.equal(Object.isFrozen(fence), true);
+      activeFenceDigest = autonomyDigest(fence);
+      return { activated: true, lease_fence_digest: activeFenceDigest };
+    },
+    applyFenced: invocation => {
       assert.equal(Object.isFrozen(invocation), true);
       assert.equal(Object.isFrozen(invocation.execution_request), true);
       assert.equal(invocation.execution_request_digest, execution.execution_request_digest);
+      assert.equal(invocation.lease_fence_digest, activeFenceDigest);
+      assert.equal(
+        autonomyDigest(invocation.lease_fence), invocation.lease_fence_digest,
+      );
       assert.deepEqual(invocation.execution_request.target, executionTarget);
       assert.deepEqual(invocation.execution_request.candidates, executionPlan.candidates);
       assert.equal(invocation.execution_request.config.no_reboot, true);
@@ -410,7 +501,7 @@ const wrapperAdapters = overrides => {
       const receipt = {
         ok: true, elapsed_ms: 1,
         execution_request_digest: invocation.execution_request_digest,
-        lease_epoch: invocation.lease_epoch, reboot_required: false,
+        lease_fence_digest: invocation.lease_fence_digest, reboot_required: false,
       };
       return { ...receipt, receipt_digest: autonomyDigest(receipt) };
     },
@@ -429,6 +520,42 @@ const wrapperResult = runDebianMaintenance({
   policy: autonomousPolicy, nodeId: "node-a", adapters: wrapperAdapters(),
 });
 assert.equal(wrapperResult.reason, "committed", "actual executor inputs compose through the authoritative journal");
+let freshInventoryReads = 0, freshInventoryApplyCalls = 0;
+const freshInventoryArtifacts = bundle(execution.target_scope_digest);
+const freshInventoryBinding = binding(
+  "wrapper-fresh-inventory", freshInventoryArtifacts.coverage,
+  Object.fromEntries([
+    "target_scope_digest", "candidate_digest", "config_digest", "evidence_digest",
+    "policy_digest", "baseline_digest", "postconditions_digest",
+  ].map(field => [field, execution[field]])),
+);
+const freshInventoryAdmission = admission();
+freshInventoryAdmission.evidence = () => ({
+  fresh: true, eligible: true, digest: execution.evidence_digest,
+});
+const freshInventoryResult = runDebianMaintenance({
+  binding: freshInventoryBinding,
+  attemptJournalDir: `${tmp}/wrapper-fresh-inventory`,
+  artifacts: freshInventoryArtifacts, admission: freshInventoryAdmission,
+  recovery: recovery(freshInventoryArtifacts), watch: () => {},
+  target: executionTarget, expectedPostconditions: executionAfter,
+  plan: executionPlan, policy: autonomousPolicy, nodeId: "node-a",
+  adapters: wrapperAdapters({
+    inventory: () => {
+      freshInventoryReads += 1;
+      return clone(freshInventoryReads === 1 ? executionBefore : {
+        ...executionBefore, packages: ["drifted"],
+      });
+    },
+    applyFenced: () => {
+      freshInventoryApplyCalls += 1;
+      throw Error("must-not-apply");
+    },
+  }),
+});
+assert.equal(freshInventoryResult.reason, "recovered-disarmed");
+assert.equal(freshInventoryApplyCalls, 0,
+  "fresh inventory drift immediately before mutation stops before applyFenced");
 for (const [name, options] of [
   ["plan", { plan: { ...executionPlan, plan_id: "substituted-plan" } }],
   ["policy", { policy: { ...autonomousPolicy, policy_id: "substituted-policy" } }],
@@ -482,9 +609,9 @@ const unboundReceipt = runDebianMaintenance({
   recovery: recovery(unboundReceiptArtifacts), watch: () => {}, target: executionTarget,
   expectedPostconditions: executionAfter, plan: executionPlan, policy: autonomousPolicy,
   nodeId: "node-a", adapters: wrapperAdapters({
-    apply: invocation => ({
+    applyFenced: invocation => ({
       ok: true, elapsed_ms: 1, execution_request_digest: "sha256:" + "0".repeat(64),
-      lease_epoch: invocation.lease_epoch, reboot_required: false,
+      lease_fence_digest: invocation.lease_fence_digest, reboot_required: false,
       receipt_digest: "sha256:" + "0".repeat(64),
     }),
   }),
@@ -643,13 +770,14 @@ assert.equal(conflictResult.journal.entries.at(-1).phase, "disarm",
   "a conflicting nonterminal replay is terminalized in the original envelope");
 
 const staleWriterDir = `${tmp}/stale-writer`, staleWriterLog = `${tmp}/stale-writer-apply.log`;
+const staleWriterHostEffects = `${tmp}/stale-writer-host-effects.log`;
 const staleWriterRelease = `${tmp}/stale-writer-release`;
 assert.equal(await runWorker({
   WORKER_MODE: "crash", WORKER_DIR: staleWriterDir, APPLY_LOG: `${tmp}/stale-writer-crash.log`,
 }), 77);
 const staleWriter = runWorker({
   WORKER_MODE: "resume", WORKER_DIR: staleWriterDir, APPLY_LOG: staleWriterLog,
-  HOLD_AFTER_APPLY: staleWriterRelease,
+  HOST_EFFECT_LOG: staleWriterHostEffects, HOLD_BEFORE_EFFECT: staleWriterRelease,
 });
 while (!fs.existsSync(staleWriterLog)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
 await runWorker({
@@ -661,6 +789,8 @@ const staleWriterJournal = bounded(`${staleWriterDir}/${binding().idempotency_ke
 assert.equal(staleWriterJournal.entries.at(-1).phase, "disarm");
 assert.equal(staleWriterJournal.entries.some(entry => entry.phase === "apply"), false,
   "an expired holder is fenced before it can journal over recovery");
+assert.equal(fs.existsSync(staleWriterHostEffects), false,
+  "the effect owner rejects the old token inside its mutation transaction");
 
 const crashApplyLog = `${tmp}/crash-apply.log`;
 assert.equal(await runWorker({ WORKER_MODE: "crash", WORKER_DIR: crashDir, APPLY_LOG: crashApplyLog }), 77);
@@ -691,7 +821,7 @@ assert.equal(fs.readFileSync(applyLog, "utf8").trim().split("\n").length, 1, "ex
 const failureArtifacts = bundle();
 const failed = run({
   dir: `${tmp}/recovery-failure`, artifacts: failureArtifacts,
-  phase: phases({ apply: () => { throw Object.assign(new Error("apply-failed"), { code: "apply-failed" }); } }),
+  phase: phases({ applyFenced: () => { throw Object.assign(new Error("apply-failed"), { code: "apply-failed" }); } }),
   recover: recovery(failureArtifacts, { recover: request => ({
     idempotency_key: request.idempotency_key, recovered: false,
     safe_state_verified: false, quarantine_active: true, reason_code: "forward-repair-failed",
@@ -728,7 +858,7 @@ const wrongFromRecovery = recovery(wrongFromArtifacts, {
 });
 assert.throws(() => run({
   dir: `${tmp}/wrong-terminal-from-state`, artifacts: wrongFromArtifacts,
-  phase: phases({ apply: () => { throw Error("force-recovery"); } }),
+  phase: phases({ applyFenced: () => { throw Error("force-recovery"); } }),
   recover: wrongFromRecovery,
 }), /runtime_narrowing_append_unverified/,
 "signed terminal narrowing must match the exact authorized from-state");
@@ -739,7 +869,8 @@ for (const faultPoint of [
   "before-recover-invocation", "after-recover-return", "after-recovery-result",
   "after-ledger-return", "after-ledger-append",
   "after-checkpoint-return", "after-checkpoint-advance",
-  "after-terminal-journal", "after-terminal-release", "after-outbox-complete",
+  "after-terminal-journal", "after-terminal-release-before-stage",
+  "after-terminal-release", "after-outbox-complete",
 ]) {
   const faultDir = `${tmp}/outbox-${faultPoint}`;
   const faultRecoveryLog = `${faultDir}-recover.log`;
@@ -778,8 +909,10 @@ for (const faultPoint of ["after-commit-journal", "after-commit-release"]) {
 }
 
 const leaseClaimDir = `${tmp}/lease-claim-crash`;
+const leaseClaimFenceLog = `${tmp}/lease-claim-fence.log`;
 assert.equal(await runWorker({
   WORKER_MODE: "fault", WORKER_DIR: leaseClaimDir, FAULT_POINT: "after-lease-claim",
+  FENCE_LOG: leaseClaimFenceLog,
 }), 78);
 assert.equal(
   fs.existsSync(`${leaseClaimDir}/${binding().idempotency_key}.json.authority.json`),
@@ -789,6 +922,8 @@ assert.equal(
   fs.existsSync(`${leaseClaimDir}/${binding().idempotency_key}.json`),
   false, "claim crash precedes prepare and actuation",
 );
+assert.equal(fs.existsSync(leaseClaimFenceLog), false,
+  "a claim crash calls neither the effect fence nor apply before durable prepare");
 assert.equal(await runWorker({
   WORKER_MODE: "resume", WORKER_DIR: leaseClaimDir,
   FAULT_POINT: "after-lease-transfer",
@@ -798,6 +933,28 @@ assert.equal(await runWorker({
 }), 0, "an expired transferred epoch can be mechanically reclaimed");
 assert.equal(
   bounded(`${leaseClaimDir}/${binding().idempotency_key}.json`).entries.at(-1).phase,
+  "disarm",
+);
+
+const preparedRotationDir = `${tmp}/prepared-owner-rotation`;
+const preparedRotationFenceLog = `${tmp}/prepared-owner-rotation-fence.log`;
+assert.equal(await runWorker({
+  WORKER_MODE: "fault", WORKER_DIR: preparedRotationDir,
+  FAULT_POINT: "after-prepare-journal", FENCE_LOG: preparedRotationFenceLog,
+}), 78);
+assert.equal(fs.existsSync(preparedRotationFenceLog), false,
+  "durable prepare precedes effect-fence installation");
+const preparedHistoricalArtifacts = bundle();
+const preparedRecovery = recovery(preparedHistoricalArtifacts);
+preparedHistoricalArtifacts.read = () => rotateOwnerAuthorization();
+const preparedRotationReplay = run({
+  dir: preparedRotationDir, artifacts: preparedHistoricalArtifacts,
+  admit: recoveryTakeoverAdmission(), recover: preparedRecovery,
+});
+assert.equal(preparedRotationReplay.reason, "recovered-disarmed",
+  "a durable prepared attempt recovers under historical authority after current rotation");
+assert.equal(
+  bounded(`${preparedRotationDir}/${binding().idempotency_key}.json`).entries.at(-1).phase,
   "disarm",
 );
 
@@ -846,7 +1003,7 @@ let artifactReads = 0, driftApplyCalls = 0;
 driftArtifacts.read = () => (++artifactReads === 1 ? driftArtifacts : driftedCurrent);
 const drifted = run({
   dir: `${tmp}/authorization-drift`, artifacts: driftArtifacts,
-  phase: phases({ apply: () => { driftApplyCalls += 1; return { applied: true }; } }),
+  phase: phases({ applyFenced: () => { driftApplyCalls += 1; return { applied: true }; } }),
   recover: recovery(driftArtifacts),
 });
 assert.equal(drifted.journal.entries.at(-1).phase, "disarm");
