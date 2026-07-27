@@ -8,7 +8,9 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 
 const adapter = await import(`${process.env.ROOT}/scripts/debian-maintenance-host-adapter.mjs`);
-const executor = await import(`${process.env.ROOT}/scripts/debian-maintenance-executor.mjs`);
+const { createBoundedRecoveryDispatcher } = await import(
+  `${process.env.ROOT}/scripts/lib/bounded-recovery-dispatch.mjs`
+);
 const digest = value => `sha256:${crypto.createHash("sha256").update(adapter.canonicalJson(value)).digest("hex")}`;
 const candidate = {
   id: "openssl@3.0.17-1~deb12u2", name: "openssl", class: "security",
@@ -212,10 +214,13 @@ const deadline = adapter.runHostAdapter({ action: "recover", request, registrati
 assert.equal(deadline.outcome, "terminally-blocked");
 assert.equal(deadline.reason, "host_recovery_budget_exhausted");
 const published = [];
-const bridge = executor.createBoundedRecoveryDispatcher({
-  recovery: {}, attemptId: request.attempt_id,
-  descriptorDigest: request.recovery_descriptor_digest,
-  authorizeBinding: () => true,
+const bridge = createBoundedRecoveryDispatcher({
+  recovery: {}, expected: {
+    attemptId: request.attempt_id, bindingDigest: request.binding_digest,
+    descriptorDigest: request.recovery_descriptor_digest,
+    idempotencyKey: "recovery-67", mutationId: request.lease_fence.mutation_id,
+    targetScopeDigest: request.lease_fence.target_scope_digest,
+  },
   publishActivation: activation => { published.push(activation); return { activation_digest: digest(activation), idempotent: published.length > 1 }; },
   dispatch: input => ({ idempotency_key: input.idempotency_key ?? "recovery-67", effect_lease_fence_digest: request.lease_fence_digest, revalidated_lease_fence_digest: recoveryActivation.fence_digest, revalidated_at: "2026-07-27T12:00:00Z", recovered: true, safe_state_verified: true, quarantine_active: true, reason_code: null }),
 });
@@ -223,14 +228,31 @@ const bridgeRequest = { idempotency_key: "recovery-67", descriptor_digest: reque
 const bridgeResult = bridge.recover(bridgeRequest);
 assert.equal(bridgeResult.recovered, true);
 assert.equal(published.length, 1, "real public executor seam publishes one protected activation before fixed dispatch");
+for (const [name, mutate] of [
+  ["binding", value => { value.binding_digest = "sha256:" + "f".repeat(64); }],
+  ["target", value => { value.revalidation_fence.target_scope_digest = "sha256:" + "f".repeat(64); }],
+  ["attempt", value => { value.revalidation_fence.attempt_id = "other-attempt"; }],
+  ["mutation", value => { value.revalidation_fence.mutation_id = "other-mutation"; }],
+  ["holder", value => { value.revalidation_fence.holder_token = value.lease_fence.holder_token; }],
+]) {
+  const unsafe = structuredClone(bridgeRequest); mutate(unsafe);
+  unsafe.lease_fence_digest = digest(unsafe.lease_fence);
+  unsafe.revalidation_fence_digest = digest(unsafe.revalidation_fence);
+  assert.throws(() => bridge.recover(unsafe), /bounded_recovery_dispatch_(binding|fence)_invalid/, name);
+}
 console.log("debian host adapter: root-only exact allowlist, preflight, forward recovery and disarm OK");
 NODE
 env ROOT="$ROOT" node "$TMP/test.mjs"
 UNIT="$ROOT/systemd/brokkr-debian-maintenance-recovery@.service"
+rg -q '^ExecStart=/usr/local/lib/brokkr/debian-maintenance-host-adapter --action recover --attempt %i$' "$UNIT"
 if command -v systemd-analyze >/dev/null 2>&1; then
-  systemd-analyze verify "$UNIT"
+  UNIT_ROOT="$TMP/systemd-root"
+  mkdir -p "$UNIT_ROOT/etc/systemd/system" "$UNIT_ROOT/usr/local/lib/brokkr"
+  cp "$UNIT" "$UNIT_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery@.service"
+  printf '#!/bin/sh\nexit 0\n' >"$UNIT_ROOT/usr/local/lib/brokkr/debian-maintenance-host-adapter"
+  chmod 0755 "$UNIT_ROOT/usr/local/lib/brokkr/debian-maintenance-host-adapter"
+  systemd-analyze verify --root="$UNIT_ROOT" brokkr-debian-maintenance-recovery@.service
 else
   rg -q '^User=root$' "$UNIT"
   rg -q '^NoNewPrivileges=yes$' "$UNIT"
-  rg -q '^ExecStart=/usr/local/lib/brokkr/debian-maintenance-host-adapter --action recover --attempt %i$' "$UNIT"
 fi

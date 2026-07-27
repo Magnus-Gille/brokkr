@@ -63,14 +63,16 @@ postconditions inside the descriptor's at-most-300-second budget, then journals
 quarantine and disarm. Any repair, restart, hold, journal, or verification
 failure terminalizes and writes a disarm record.
 
-`createBoundedRecoveryDispatcher()` is the public typed composition seam used
-by W2a callers. W2a's durable outbox supplies its authenticated, monotonic
-successor fence; the bridge persists the matching host activation idempotently
-and dispatches only `{action: "recover", attempt_id}` to the fixed unit. A
-restart reads the same W2a outbox and repeats the same idempotency key; it
-cannot synthesize a plan, re-arm, or widen scope. The production installer is
-still intentionally absent, so this remains a hermetic/disarmed contract until
-the separate owner ceremony installs the fixed state root and unit.
+The mandatory, private recovery bridge is co-located with the only exported
+W2a runner. W2a's durable outbox supplies its authenticated, monotonic
+successor fence; before publishing an activation the bridge structurally binds
+the exact attempt, binding, target scope, mutation, descriptor, idempotency
+key, and successor epoch/token. It then dispatches only `{action: "recover",
+attempt_id}` to the fixed unit. A restart reads the same W2a outbox and repeats
+the same idempotency key; it cannot synthesize a plan, re-arm, or widen scope.
+The production installer is still intentionally absent, so this remains a
+hermetic/disarmed contract until the separate owner ceremony installs the fixed
+state root and unit.
 
 `systemd/brokkr-debian-maintenance-recovery@.service` is a separate hardened
 root capability because dpkg repair itself requires root. Its sole executable

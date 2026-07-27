@@ -13,6 +13,7 @@ import {
 import {
   durationToMs, policyDigest,
 } from "./lib/maintenance-policy-contract.mjs";
+import { createBoundedRecoveryDispatcher } from "./lib/bounded-recovery-dispatch.mjs";
 import { windowStatus } from "./maintenance-controller.mjs";
 
 const DOMAIN = "no-reboot-security-bugfix-maintenance";
@@ -28,6 +29,7 @@ const ID = /^[a-z][a-z0-9-]{2,62}$/;
 const REF = /^ref:[a-z][a-z0-9-]{2,120}$/;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const TERMINAL = new Set(["commit", "disarm", "terminally-blocked"]);
+const BOUNDED_RECOVERY_FACTORY = Symbol("bounded-recovery-factory");
 const OUTCOME = Object.freeze({
   prepare: "prepared", apply: "applied", verify: "verified", watch: "watching",
   commit: "committed", unknown: "unknown", recover: "recovered",
@@ -237,6 +239,31 @@ function claimTarget({
     domain.revision += 1;
     writeAtomic(domainFile, domain);
     return { acquired: true, transferred: false, lease: current.execution_lease, target: current };
+  });
+}
+function supersedeExecutionLease({
+  journalDir, binding, bindingDigest, lease, now, policy,
+}) {
+  return withExclusiveDirectory(domainLockDir(journalDir), "domain_state_contended", () => {
+    const domainFile = domainStateFile(journalDir);
+    const domain = readOptional(domainFile);
+    const current = assertLeaseRecord(domain, binding, bindingDigest, lease);
+    const expiresAt = new Date(Math.min(
+      Date.parse(binding.deadline),
+      Date.parse(now) + policy.bounds.max_silence_seconds * 1000,
+    )).toISOString().replace(".000Z", "Z");
+    assert(Date.parse(now) <= Date.parse(lease.expires_at) &&
+      Date.parse(now) <= Date.parse(expiresAt), "recovery_successor_lease_expired");
+    current.lease_epoch += 1;
+    current.execution_lease = {
+      attempt_id: binding.attempt_id, mutation_id: binding.mutation_id,
+      binding_digest: bindingDigest, epoch: current.lease_epoch,
+      holder_pid: process.pid, holder_token: crypto.randomUUID(),
+      activated_at: now, expires_at: expiresAt,
+    };
+    domain.revision += 1;
+    writeAtomic(domainFile, domain);
+    return current.execution_lease;
   });
 }
 function assertLeaseRecord(domain, binding, bindingDigest, lease) {
@@ -1114,7 +1141,15 @@ function finishRecoveryOutbox({ file, journal, context, admission, recovery, out
     };
   });
 }
-function enterRecovery({ file, journal, context, admission, recovery, code, lastAt, lease }) {
+function recoveryForBinding(recovery, binding, bindingDigest) {
+  const factory = recovery?.[BOUNDED_RECOVERY_FACTORY];
+  assert(typeof factory === "function", "bounded_recovery_dispatch_required");
+  const bounded = factory({ binding: structuredClone(binding), bindingDigest });
+  assert(plain(bounded) && typeof bounded.recover === "function",
+    "bounded_recovery_dispatch_required");
+  return bounded;
+}
+function enterRecovery({ file, journal, context, admission, phases, recovery, code, lastAt, lease }) {
   const outboxFile = `${file}.recovery-outbox.json`;
   if (!readOptional(outboxFile)) {
     const at = trustedNow(admission.trustedClock, lastAt);
@@ -1169,8 +1204,24 @@ function enterRecovery({ file, journal, context, admission, recovery, code, last
       "recovery_outbox_conflict");
     }
   }
+  const boundedRecovery = recoveryForBinding(
+    recovery, journal.binding, journal.binding_digest,
+  );
+  const successorAt = trustedNow(admission.trustedClock, lastAt);
+  const successorLease = supersedeExecutionLease({
+    journalDir: context.journalDir, binding: journal.binding,
+    bindingDigest: journal.binding_digest, lease, now: successorAt,
+    policy: context.policy,
+  });
+  activateResourceFence(
+    phases, journal.binding, journal.binding_digest, successorLease,
+  );
+  activateResourceFence(
+    boundedRecovery, journal.binding, journal.binding_digest, successorLease,
+  );
   return finishRecoveryOutbox({
-    file, journal, context, admission, recovery, outboxFile, lease,
+    file, journal, context, admission, recovery: boundedRecovery, outboxFile,
+    lease: successorLease,
   });
 }
 
@@ -1416,13 +1467,16 @@ function runMaintenanceAttempt({
   if (existing) {
     if (canonicalJson(journal.binding) !== canonicalJson(binding)) {
       return enterRecovery({
-        file, journal, context, admission, recovery, lease,
+        file, journal, context, admission, phases, recovery, lease,
         code: "attempt-conflicting-replay", lastAt: journal.entries.at(-1).recorded_at,
       });
     }
     if (readOptional(`${file}.recovery-outbox.json`)) {
+      const boundedRecovery = recoveryForBinding(
+        recovery, journal.binding, journal.binding_digest,
+      );
       return finishRecoveryOutbox({
-        file, journal, context, admission, recovery,
+        file, journal, context, admission, recovery: boundedRecovery,
         outboxFile: `${file}.recovery-outbox.json`, lease,
       });
     }
@@ -1442,14 +1496,14 @@ function runMaintenanceAttempt({
     }
     if (recoveryOnly) {
       return enterRecovery({
-        file, journal, context, admission, recovery, lease,
+        file, journal, context, admission, phases, recovery, lease,
         code: recoveryOnlyCode,
         lastAt: journal.entries.at(-1).recorded_at,
       });
     }
     if (watchStateResume && !watchContinuation) {
       return enterRecovery({
-        file, journal, context, admission, recovery, lease,
+        file, journal, context, admission, phases, recovery, lease,
         code: `watch-anchor-${
           watchAnchorError ?? watchAnchorTimingError ?? "missing"
         }`,
@@ -1471,7 +1525,7 @@ function runMaintenanceAttempt({
           ), "attempt_reconciliation_invalid");
       } catch (error) {
         return enterRecovery({
-          file, journal, context, admission, recovery, lease,
+          file, journal, context, admission, phases, recovery, lease,
           code: String(error?.code ?? error?.message ??
             "attempt-reconciliation-failed"),
           lastAt: journal.entries.at(-1).recorded_at,
@@ -1480,7 +1534,7 @@ function runMaintenanceAttempt({
       if (journal.entries.at(-1).phase !== "prepare" ||
           reconciliation.state !== "not-applied") {
         return enterRecovery({
-          file, journal, context, admission, recovery, lease,
+          file, journal, context, admission, phases, recovery, lease,
           code: `reconcile-${journal.entries.at(-1).phase}-${reconciliation.state}`,
           lastAt: journal.entries.at(-1).recorded_at,
         });
@@ -1592,7 +1646,7 @@ function runMaintenanceAttempt({
     return { journal, ran: true, reason: "committed" };
   } catch (error) {
     return enterRecovery({
-      file, journal, context, admission, recovery, lease,
+      file, journal, context, admission, phases, recovery, lease,
       code: String(error?.code ?? error?.message ?? "maintenance-phase-error"),
       lastAt: at,
     });
@@ -1968,7 +2022,7 @@ const DEBIAN_API = (() => {
     }
   };
 
-  function runDebianMaintenance(options) {
+  function runBoundDebianMaintenance(options) {
     const {
       binding, attemptJournalDir, artifacts, admission, recovery,
       reconcile = null, target, expectedPostconditions, plan, policy,
@@ -2082,10 +2136,50 @@ const DEBIAN_API = (() => {
       },
     });
   }
-  return { deriveDebianAutonomyExecution, runDebianMaintenance };
+  return { deriveDebianAutonomyExecution, runBoundDebianMaintenance };
 })();
 
-export const {
-  deriveDebianAutonomyExecution,
-  runDebianMaintenance,
-} = DEBIAN_API;
+export const { deriveDebianAutonomyExecution } = DEBIAN_API;
+
+// The raw W2a runner stays in DEBIAN_API's closure.  This is intentionally the
+// only exported production runner so every ambiguous effect must cross the
+// target-bound W2a -> W2b activation and fixed-recover dispatcher.
+export function runDebianMaintenance(options = {}) {
+  const { binding, recovery } = options;
+  if (!plain(binding) || !plain(recovery) || !ID.test(binding.attempt_id) ||
+    !ID.test(binding.mutation_id) || !ID.test(binding.recovery_disarm_id) ||
+    !DIGEST.test(binding.target_scope_digest) ||
+    !DIGEST.test(binding.recovery?.descriptor_digest) ||
+    typeof recovery.publishActivation !== "function" ||
+    typeof recovery.dispatch !== "function") {
+    fail("bounded_recovery_dispatch_required");
+  }
+  const boundedRecoveryFactory = ({ binding: recoveredBinding, bindingDigest }) => {
+    if (!plain(recoveredBinding) || !DIGEST.test(bindingDigest) ||
+      bindingDigest !== autonomyDigest(recoveredBinding) ||
+      !ID.test(recoveredBinding.attempt_id) ||
+      !ID.test(recoveredBinding.mutation_id) ||
+      !ID.test(recoveredBinding.recovery_disarm_id) ||
+      !DIGEST.test(recoveredBinding.target_scope_digest) ||
+      !DIGEST.test(recoveredBinding.recovery?.descriptor_digest)) {
+      fail("bounded_recovery_dispatch_required");
+    }
+    return createBoundedRecoveryDispatcher({
+      recovery,
+      expected: {
+        attemptId: recoveredBinding.attempt_id,
+        bindingDigest,
+        descriptorDigest: recoveredBinding.recovery.descriptor_digest,
+        idempotencyKey: recoveredBinding.recovery_disarm_id,
+        mutationId: recoveredBinding.mutation_id,
+        targetScopeDigest: recoveredBinding.target_scope_digest,
+      },
+      publishActivation: recovery.publishActivation,
+      dispatch: recovery.dispatch,
+    });
+  };
+  return DEBIAN_API.runBoundDebianMaintenance({
+    ...options,
+    recovery: { ...recovery, [BOUNDED_RECOVERY_FACTORY]: boundedRecoveryFactory },
+  });
+}

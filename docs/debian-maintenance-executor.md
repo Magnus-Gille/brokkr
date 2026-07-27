@@ -3,7 +3,9 @@
 `scripts/debian-maintenance-executor.mjs` is the closed, library-only public
 surface for Debian maintenance. It exports only immutable derivation and
 `runDebianMaintenance()`. The raw effect seam and generic journal state machine
-are private in `scripts/debian-maintenance-autonomy.mjs`;
+are closure-private inside `scripts/debian-maintenance-autonomy.mjs`; direct
+imports of that module expose the same mandatory public wrapper rather than an
+unbridged runner.
 `scripts/maintenance-attempt-journal.mjs` exposes conformance helpers only.
 A direct importer therefore cannot supply arbitrary phase callbacks behind a
 valid lease and bypass the exact Debian plan, policy, target, inventory, or
