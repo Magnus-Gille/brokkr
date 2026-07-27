@@ -57,7 +57,11 @@ const plan = {
     clock: "synchronized", workload_hooks: "not_applicable",
     kernel_recovery: "not_applicable",
   },
-  candidates: [{ eligible: true, source: "distro_repository", class: "security" }],
+  candidates: [{
+    id: "openssl@3.0.17-1~deb12u2", name: "openssl", class: "security",
+    source: "distro_repository", current_version: "3.0.17-1~deb12u1",
+    candidate_version: "3.0.17-1~deb12u2", eligible: true, reasons: [],
+  }],
 };
 plan.plan_digest = digest(plan);
 const target = { node_id: "node-a", platform: "debian", non_pillar: true };
@@ -78,6 +82,45 @@ assert.deepEqual(execution.execution_request.config, {
   no_reboot: true,
   no_drain: true,
 });
+
+for (const [name, input, expected] of [
+  ["empty inventory", {
+    plan, policy, target, inventory: {}, adapterRevisionDigest: adapterRevision,
+    postconditions: after,
+  }, /inventory_shape_invalid/],
+  ["unsafe reboot postcondition", {
+    plan, policy, target, inventory: before, adapterRevisionDigest: adapterRevision,
+    postconditions: { ...after, reboot_required: true },
+  }, /inventory_reboot_unsafe/],
+  ["unhealthy dpkg postcondition", {
+    plan, policy, target, inventory: before, adapterRevisionDigest: adapterRevision,
+    postconditions: { ...after, dpkg_status: "broken" },
+  }, /inventory_dpkg_unsafe/],
+  ["candidate extra field", {
+    plan: {
+      ...plan,
+      candidates: [{ ...plan.candidates[0], command: "apt-get install arbitrary" }],
+    },
+    policy, target, inventory: before, adapterRevisionDigest: adapterRevision,
+    postconditions: after,
+  }, /debian_candidate_invalid/],
+  ["duplicate package candidate", {
+    plan: { ...plan, candidates: [plan.candidates[0], plan.candidates[0]] },
+    policy, target, inventory: before, adapterRevisionDigest: adapterRevision,
+    postconditions: after,
+  }, /debian_candidate_duplicate/],
+]) {
+  const candidate = structuredClone(input);
+  if (candidate.plan !== plan) {
+    delete candidate.plan.plan_digest;
+    candidate.plan.plan_digest = digest(candidate.plan);
+  }
+  assert.throws(
+    () => deriveDebianAutonomyExecution(candidate),
+    expected,
+    name,
+  );
+}
 
 for (const [name, mutate] of [
   ["pillar", input => { input.target.non_pillar = false; }],
@@ -102,7 +145,7 @@ for (const [name, mutate] of [
   }
   assert.throws(
     () => deriveDebianAutonomyExecution(input),
-    /autonomy_execution_out_of_scope/,
+    /autonomy_execution_out_of_scope|debian_candidate_invalid/,
     name,
   );
 }

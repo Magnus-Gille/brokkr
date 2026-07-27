@@ -24,7 +24,10 @@ const {
   policyDigest,
 } = await import(`${root}/scripts/lib/maintenance-policy-contract.mjs`);
 
-const fixture = name => JSON.parse(fs.readFileSync(`${root}/tests/fixtures/autonomy-contract/${name}`, "utf8"));
+const fixture = name => JSON.parse(fs.readFileSync(`${root}/tests/fixtures/autonomy-contract-v2/${name}`, "utf8"));
+const legacyFixture = name => JSON.parse(fs.readFileSync(
+  `${root}/tests/fixtures/autonomy-contract/${name}`, "utf8",
+));
 const clone = value => structuredClone(value);
 function resignJournal(journal) {
   journal.binding_digest = autonomyDigest(journal.binding);
@@ -62,7 +65,9 @@ const executionPlan = {
     kernel_recovery: "not_applicable",
   },
   candidates: [{
-    eligible: true, source: "distro_repository", class: "security",
+    id: "openssl@3.0.17-1~deb12u2", name: "openssl", class: "security",
+    source: "distro_repository", current_version: "3.0.17-1~deb12u1",
+    candidate_version: "3.0.17-1~deb12u2", eligible: true, reasons: [],
   }],
 };
 executionPlan.plan_digest = autonomyDigest(executionPlan);
@@ -146,7 +151,7 @@ function bundle(targetScopeDigest = execution.target_scope_digest) {
   authorization.signature = { algorithm: "Ed25519", value_base64: sign(authorization, ownerKeys.privateKey) };
   const authorizationDigest = autonomyDigest(authorization);
   const result = {
-    journalSchema: loadPinnedJournalSchema(`${root}/docs/autonomous-mutation-journal-v1.schema.json`),
+    journalSchema: loadPinnedJournalSchema(`${root}/docs/autonomous-mutation-journal-v2.schema.json`),
     authorization, constitution, coverage, ownerAttestations, recoveryRegistry,
     pinnedOwnerPublicKeyPem: ownerPublic,
     authorizationCheckpoint: {
@@ -226,24 +231,32 @@ function binding(
     policy_digest: execution.policy_digest,
     baseline_digest: execution.baseline_digest,
     postconditions_digest: execution.postconditions_digest,
-    deadline: "2026-07-26T01:00:00Z",
-    canary: { scope_digest: owner.target_scope_digest, target_count: 1, watch_deadline: "2026-07-26T00:10:00Z" },
+    deadline: "2026-07-26T01:10:00Z",
+    canary: { scope_digest: owner.target_scope_digest, target_count: 1 },
     recovery: { class: "R-forward", worker_identity: owner.identities.recovery_worker, descriptor_digest: "sha256:" + "2".repeat(64), disarms_after_action: true },
     ...fields,
   };
 }
-const baseTimes = ["2026-07-26T00:00:00Z", "2026-07-26T00:00:01Z", "2026-07-26T00:00:02Z", "2026-07-26T00:00:03Z", "2026-07-26T00:10:00Z", "2026-07-26T00:10:01Z"];
+const baseTimes = [
+  "2026-07-26T00:00:00Z", "2026-07-26T00:00:01Z",
+  "2026-07-26T00:00:02Z", "2026-07-26T00:00:03Z",
+  "2026-07-26T00:05:00Z", "2026-07-26T01:05:00Z",
+];
 function admission(times = baseTimes, kill = () => true) {
   let index = 0;
+  let latest = times[0];
   return {
-    trustedClock: () => ({ trusted: true, now: times[Math.min(index++, times.length - 1)] }),
+    trustedClock: () => {
+      latest = times[Math.min(index++, times.length - 1)];
+      return { trusted: true, now: latest };
+    },
     killSwitch: () => ({ safe: kill(), identity: "maintenance-kill-switch" }),
     evidence: () => ({
       fresh: true, eligible: true, digest: execution.evidence_digest,
     }),
-    liveness: () => ({ healthy: true, observed_at: "2026-07-26T00:00:00Z" }),
+    liveness: () => ({ healthy: true, observed_at: latest }),
     maintenance: () => ({
-      window: { start: "2026-07-26T00:00:00Z", end: "2026-07-26T00:59:59Z" },
+      window: { start: "2026-07-26T00:00:00Z", end: "2026-07-26T01:10:01Z" },
       target: { platform: "debian", non_pillar: true },
       plan: { classes: ["security", "bugfix"], reboot_policy: "never", source: "distro_repository", workload_hooks: "not_applicable" },
     }),
@@ -296,6 +309,10 @@ function phases(overrides = {}) {
   };
 }
 function recovery(artifacts, overrides = {}) {
+  const {
+    resourceNow = null,
+    ...capabilityOverrides
+  } = overrides;
   const receipts = new Map();
   let activeFence = null;
   return {
@@ -322,17 +339,32 @@ function recovery(artifacts, overrides = {}) {
     },
     recover: request => {
       assert.equal(
-        request.lease_fence_digest, autonomyDigest(activeFence),
+        request.revalidation_fence_digest, autonomyDigest(activeFence),
         "recovery effect validates the current resource fence",
       );
-      if (!receipts.has(request.idempotency_key)) receipts.set(request.idempotency_key, {
-        idempotency_key: request.idempotency_key,
-        lease_fence_digest: request.lease_fence_digest, recovered: true,
-        safe_state_verified: true, quarantine_active: true, reason_code: null,
-      });
+      assert.equal(
+        autonomyDigest(request.revalidation_fence), request.revalidation_fence_digest,
+        "recovery revalidation carries the current immutable resource fence",
+      );
+      const revalidatedAt = resourceNow?.() ?? activeFence.activated_at;
+      if (Date.parse(revalidatedAt) < Date.parse(activeFence.activated_at) ||
+          Date.parse(revalidatedAt) > Date.parse(activeFence.expires_at)) {
+        throw Object.assign(new Error("recovery-fence-expired"), {
+          code: "recovery_fence_expired",
+        });
+      }
+      if (!receipts.has(request.idempotency_key)) {
+        receipts.set(request.idempotency_key, {
+          idempotency_key: request.idempotency_key,
+          effect_lease_fence_digest: request.revalidation_fence_digest,
+          recovered: true,
+          safe_state_verified: true, quarantine_active: true, reason_code: null,
+        });
+      }
       return {
         ...clone(receipts.get(request.idempotency_key)),
-        lease_fence_digest: request.lease_fence_digest,
+        revalidated_lease_fence_digest: request.revalidation_fence_digest,
+        revalidated_at: revalidatedAt,
       };
     },
     appendSignedNarrowing: input => {
@@ -355,10 +387,14 @@ function recovery(artifacts, overrides = {}) {
         minimum_entries: input.minimum_entries,
       };
     },
-    ...overrides,
+    ...capabilityOverrides,
   };
 }
 function exactAdapters(phase = phases(), overrides = {}) {
+  const {
+    resourceNow = null,
+    ...adapterOverrides
+  } = overrides;
   const state = { applied: false, activeFence: null };
   return {
     inventory: () => {
@@ -383,6 +419,15 @@ function exactAdapters(phase = phases(), overrides = {}) {
       assert.equal(
         invocation.lease_fence_digest, autonomyDigest(state.activeFence),
       );
+      const fenceCheckedAt =
+        resourceNow?.() ?? state.activeFence.activated_at;
+      if (Date.parse(fenceCheckedAt) < Date.parse(state.activeFence.activated_at) ||
+          Date.parse(fenceCheckedAt) >
+          Date.parse(state.activeFence.expires_at)) {
+        throw Object.assign(new Error("effect-lease-expired"), {
+          code: "effect_lease_expired",
+        });
+      }
       const result = phase.applyFenced?.({
         lease_fence: invocation.lease_fence,
         lease_fence_digest: invocation.lease_fence_digest,
@@ -393,6 +438,7 @@ function exactAdapters(phase = phases(), overrides = {}) {
         ok: true, elapsed_ms: 1,
         execution_request_digest: invocation.execution_request_digest,
         lease_fence_digest: invocation.lease_fence_digest,
+        fence_checked_at: fenceCheckedAt,
         reboot_required: false,
       };
       return { ...receipt, receipt_digest: autonomyDigest(receipt) };
@@ -408,7 +454,7 @@ function exactAdapters(phase = phases(), overrides = {}) {
     }),
     revisionDigest: () => adapterRevision,
     targetMetadata: () => clone(executionTarget),
-    ...overrides,
+    ...adapterOverrides,
   };
 }
 const run = ({
@@ -457,6 +503,11 @@ if (process.env.WORKER_MODE) {
     try { return operation(); } finally { fs.rmdirSync(lock); }
   };
   const recoveryTransactionLock = `${workerRecoveryState}.transaction`;
+  const workerResourceNow = () => process.env.VERY_LATE_LEASE_TRANSFER ?
+    "2026-07-26T00:56:01Z" : process.env.LATE_LEASE_TRANSFER ?
+    "2026-07-26T00:40:01Z" : process.env.WORKER_MODE === "recover" ?
+    "2026-07-26T00:20:01Z" : ["resume", "race"].includes(process.env.WORKER_MODE) ?
+    "2026-07-26T00:16:01Z" : "2026-07-26T00:00:01Z";
   const readWorkerRecoveryState = () => fs.existsSync(workerRecoveryState) ?
     JSON.parse(fs.readFileSync(workerRecoveryState, "utf8")) : {
       ledger: clone(workerArtifacts.runtimeNarrowing),
@@ -498,17 +549,29 @@ if (process.env.WORKER_MODE) {
       }
       return withWorkerLock(recoveryTransactionLock, () => {
         const state = readWorkerRecoveryState();
-        assert.equal(
-          request.lease_fence_digest, autonomyDigest(state.active_fence),
-          "stale recovery is fenced inside the recovery resource transaction",
-        );
+        if (request.revalidation_fence_digest !==
+            autonomyDigest(state.active_fence)) {
+          throw Object.assign(new Error("recovery-lease-fenced"), {
+            code: "recovery_lease_fenced",
+          });
+        }
+        const revalidatedAt = workerResourceNow();
+        if (Date.parse(revalidatedAt) <
+              Date.parse(state.active_fence.activated_at) ||
+            Date.parse(revalidatedAt) >
+            Date.parse(state.active_fence.expires_at)) {
+          throw Object.assign(new Error("recovery-fence-expired"), {
+            code: "recovery_fence_expired",
+          });
+        }
         if (!state.receipts[request.idempotency_key]) {
           if (process.env.RECOVERY_LOG) {
             fs.appendFileSync(process.env.RECOVERY_LOG, "recover\n");
           }
           state.receipts[request.idempotency_key] = {
             idempotency_key: request.idempotency_key,
-            lease_fence_digest: request.lease_fence_digest, recovered: true,
+            effect_lease_fence_digest: request.revalidation_fence_digest,
+            recovered: true,
             safe_state_verified: true, quarantine_active: true,
             reason_code: null,
           };
@@ -516,7 +579,8 @@ if (process.env.WORKER_MODE) {
         }
         return {
           ...clone(state.receipts[request.idempotency_key]),
-          lease_fence_digest: request.lease_fence_digest,
+          revalidated_lease_fence_digest: request.revalidation_fence_digest,
+          revalidated_at: revalidatedAt,
         };
       });
     },
@@ -616,6 +680,14 @@ if (process.env.WORKER_MODE) {
                 code: "effect_lease_fenced",
               });
             }
+            const checkedAt = workerResourceNow();
+            if (Date.parse(checkedAt) <
+                  Date.parse(activeFence.activated_at) ||
+                Date.parse(checkedAt) > Date.parse(activeFence.expires_at)) {
+              throw Object.assign(new Error("effect-lease-expired"), {
+                code: "effect_lease_expired",
+              });
+            }
             if (process.env.HOST_EFFECT_LOG) {
               fs.appendFileSync(process.env.HOST_EFFECT_LOG, "host-effect\n");
             }
@@ -633,7 +705,15 @@ if (process.env.WORKER_MODE) {
         process.env.WORKER_MODE === "resume" ?
           () => ({ state: "not-applied" }) : null,
     });
-  } catch { process.exitCode = 79; }
+  } catch (error) {
+    if (process.env.WORKER_ERROR_LOG) {
+      fs.appendFileSync(
+        process.env.WORKER_ERROR_LOG,
+        `${String(error?.code ?? error?.message ?? "unknown-error")}\n`,
+      );
+    }
+    process.exitCode = 79;
+  }
   process.exit(process.exitCode ?? 0);
 }
 
@@ -645,6 +725,93 @@ assert.equal(validateJournalConformance(happy.journal, {
   schema: happyArtifacts.journalSchema, constitution: happyArtifacts.constitution,
   coverage: happyArtifacts.coverage, ownerAttestations: happyArtifacts.ownerAttestations,
 }), true);
+const happyPrepareAt = Date.parse(happy.journal.entries[0].recorded_at);
+const happyWatchAt = Date.parse(
+  happy.journal.entries.find(entry => entry.phase === "watch").recorded_at,
+);
+const happyCommitAt = Date.parse(happy.journal.entries.at(-1).recorded_at);
+assert.equal(happyWatchAt - happyPrepareAt, 300_000,
+  "the v2 happy path reaches the durable watch receipt at the exact 300-second budget");
+assert.equal(happyCommitAt - happyWatchAt, 3_600_000,
+  "the v2 happy path commits at the exact 3600-second post-receipt watch floor");
+assert.equal(Object.hasOwn(happy.journal.binding.canary, "watch_deadline"), false,
+  "v2 derives watch completion from the durable receipt");
+assert.throws(() => loadPinnedJournalSchema(
+  `${root}/docs/autonomous-mutation-journal-v1.schema.json`,
+), /journal_schema_pin_mismatch/,
+"the retained v1 journal is provenance only and cannot authorize new admission");
+const mixedEpochArtifacts = bundle();
+mixedEpochArtifacts.constitution = legacyFixture("constitution.json");
+mixedEpochArtifacts.coverage = legacyFixture("coverage-armed-canary.json");
+mixedEpochArtifacts.ownerAttestations =
+  legacyFixture("owner-attestations.json");
+assert.throws(() => run({
+  dir: `${tmp}/mixed-v1-v2`,
+  artifacts: mixedEpochArtifacts,
+  bind: binding("mixed-v1-v2", mixedEpochArtifacts.coverage),
+}), /w01_schema_invalid/,
+"mixed v1 authority and v2 journal admission fails closed");
+for (const [name, mutate, expected] of [
+  ["late durable watch receipt", journal => {
+    journal.entries.find(entry => entry.phase === "watch").recorded_at =
+      "2026-07-26T00:05:00.001Z";
+  }, /journal_apply_verify_budget_exceeded/],
+  ["short post-receipt watch", journal => {
+    journal.entries.at(-1).recorded_at = "2026-07-26T01:04:59.999Z";
+  }, /journal_watch_incomplete/],
+  ["excess commit grace", journal => {
+    journal.entries.find(entry => entry.phase === "verify").recorded_at =
+      "2026-07-26T00:04:59.999Z";
+    journal.entries.find(entry => entry.phase === "watch").recorded_at =
+      "2026-07-26T00:04:59.999Z";
+    journal.entries.at(-1).recorded_at = "2026-07-26T01:10:00Z";
+  }, /journal_commit_grace_exceeded/],
+  ["total deadline overflow", journal => {
+    journal.binding.deadline = "2026-07-26T01:10:00.001Z";
+  }, /journal_deadline_bound_invalid/],
+]) {
+  const candidate = clone(happy.journal);
+  mutate(candidate);
+  resignJournal(candidate);
+  assert.throws(() => validateJournalConformance(candidate, {
+    schema: happyArtifacts.journalSchema,
+    constitution: happyArtifacts.constitution,
+    coverage: happyArtifacts.coverage,
+    ownerAttestations: happyArtifacts.ownerAttestations,
+  }), expected, name);
+}
+const preboundWatchDeadline = clone(happy.journal);
+preboundWatchDeadline.binding.canary.watch_deadline =
+  "2026-07-26T01:05:00Z";
+resignJournal(preboundWatchDeadline);
+assert.throws(() => validateJournalConformance(preboundWatchDeadline, {
+  schema: happyArtifacts.journalSchema,
+  constitution: happyArtifacts.constitution,
+  coverage: happyArtifacts.coverage,
+  ownerAttestations: happyArtifacts.ownerAttestations,
+}), /journal_schema_invalid/, "v2 rejects caller-prebound watch deadlines");
+const wrongJournalIdentity = clone(happy.journal);
+wrongJournalIdentity.journal_id = "different-mutation";
+assert.throws(() => validateJournalConformance(wrongJournalIdentity, {
+  schema: happyArtifacts.journalSchema, constitution: happyArtifacts.constitution,
+  coverage: happyArtifacts.coverage, ownerAttestations: happyArtifacts.ownerAttestations,
+}), /journal_mutation_identity_mismatch/);
+const aliasedEnvelopeIdentities = clone(happy.journal);
+aliasedEnvelopeIdentities.binding.attempt_id =
+  aliasedEnvelopeIdentities.binding.mutation_id;
+resignJournal(aliasedEnvelopeIdentities);
+assert.throws(() => validateJournalConformance(aliasedEnvelopeIdentities, {
+  schema: happyArtifacts.journalSchema, constitution: happyArtifacts.constitution,
+  coverage: happyArtifacts.coverage, ownerAttestations: happyArtifacts.ownerAttestations,
+}), /journal_envelope_identity_aliased/);
+const rForwardRevert = clone(happy.journal);
+rForwardRevert.entries[1].phase = "revert";
+rForwardRevert.entries[1].outcome = "reverted";
+resignJournal(rForwardRevert);
+assert.throws(() => validateJournalConformance(rForwardRevert, {
+  schema: happyArtifacts.journalSchema, constitution: happyArtifacts.constitution,
+  coverage: happyArtifacts.coverage, ownerAttestations: happyArtifacts.ownerAttestations,
+}), /journal_r_forward_revert_forbidden/);
 const aliasedTerminalIdentity = resignJournal(clone(happy.journal));
 aliasedTerminalIdentity.binding.recovery_disarm_id =
   aliasedTerminalIdentity.binding.attempt_id;
@@ -653,7 +820,7 @@ assert.throws(() => validateJournalConformance(aliasedTerminalIdentity, {
   schema: happyArtifacts.journalSchema, constitution: happyArtifacts.constitution,
   coverage: happyArtifacts.coverage,
   ownerAttestations: happyArtifacts.ownerAttestations,
-}), /journal_attempt_recovery_identity_aliased/);
+}), /journal_envelope_identity_aliased/);
 const duplicateEntryIdentity = clone(happy.journal);
 duplicateEntryIdentity.entries[1].entry_id =
   duplicateEntryIdentity.entries[0].entry_id;
@@ -702,7 +869,9 @@ const wrapperAdapters = overrides => {
       const receipt = {
         ok: true, elapsed_ms: 1,
         execution_request_digest: invocation.execution_request_digest,
-        lease_fence_digest: invocation.lease_fence_digest, reboot_required: false,
+        lease_fence_digest: invocation.lease_fence_digest,
+        fence_checked_at: "2026-07-26T00:00:01Z",
+        reboot_required: false,
       };
       return { ...receipt, receipt_digest: autonomyDigest(receipt) };
     },
@@ -812,7 +981,8 @@ const unboundReceipt = completeDebian({
   nodeId: "node-a", adapters: wrapperAdapters({
     applyFenced: invocation => ({
       ok: true, elapsed_ms: 1, execution_request_digest: "sha256:" + "0".repeat(64),
-      lease_fence_digest: invocation.lease_fence_digest, reboot_required: false,
+      lease_fence_digest: invocation.lease_fence_digest,
+      fence_checked_at: "2026-07-26T00:00:01Z", reboot_required: false,
       receipt_digest: "sha256:" + "0".repeat(64),
     }),
   }),
@@ -837,7 +1007,7 @@ openCoverage.coverage.unreviewed_field = true;
 resignArtifacts(openCoverage);
 assert.throws(() => run({
   dir: `${tmp}/open-coverage`, artifacts: openCoverage,
-}), /w01_schema_invalid:coverage/, "W0.1 artifacts remain closed");
+}), /w01_schema_invalid:coverage/, "W0.2 constitution/coverage remain closed");
 const duplicateRow = bundle();
 duplicateRow.coverage.domains.push(clone(duplicateRow.coverage.domains.find(row => (
   row.domain === "no-reboot-security-bugfix-maintenance"
@@ -891,6 +1061,69 @@ const killed = run({
 });
 assert.equal(killed.reason, "recovered-disarmed");
 assert.deepEqual(killed.journal.entries.map(entry => entry.phase), ["prepare", "apply", "unknown", "recover", "quarantine", "disarm"]);
+let expiredEffectCalls = 0;
+const expiredEffectArtifacts = bundle();
+const expiredEffectPhase = phases({
+  applyFenced: () => {
+    expiredEffectCalls += 1;
+    return { applied: true };
+  },
+});
+const expiredEffect = run({
+  dir: `${tmp}/expired-effect`, artifacts: expiredEffectArtifacts,
+  phase: expiredEffectPhase,
+  adapters: exactAdapters(expiredEffectPhase, {
+    resourceNow: () => "2026-07-26T00:16:00Z",
+  }),
+});
+assert.equal(expiredEffect.reason, "recovered-disarmed");
+assert.equal(expiredEffectCalls, 0,
+  "the effect resource rejects an expired fence before host actuation even without a successor");
+let prematureEffectCalls = 0;
+const prematureEffectArtifacts = bundle();
+const prematureEffectPhase = phases({
+  applyFenced: () => {
+    prematureEffectCalls += 1;
+    return { applied: true };
+  },
+});
+const prematureEffect = run({
+  dir: `${tmp}/premature-effect`, artifacts: prematureEffectArtifacts,
+  phase: prematureEffectPhase,
+  adapters: exactAdapters(prematureEffectPhase, {
+    resourceNow: () => "2026-07-25T23:59:59Z",
+  }),
+});
+assert.equal(prematureEffect.reason, "recovered-disarmed");
+assert.equal(prematureEffectCalls, 0,
+  "the effect resource rejects a fence before activation even without a successor");
+const expiredRecoveryArtifacts = bundle();
+let recoveryResourceNow = "2026-07-26T00:16:00Z";
+const expiredRecoveryCapability = recovery(expiredRecoveryArtifacts, {
+  resourceNow: () => recoveryResourceNow,
+});
+assert.throws(() => run({
+  dir: `${tmp}/expired-recovery`, artifacts: expiredRecoveryArtifacts,
+  phase: phases({ applyFenced: () => { throw Error("force-recovery"); } }),
+  recover: expiredRecoveryCapability, autoResume: false,
+}), /recovery-fence-expired/,
+"the recovery resource rejects an expired fence before recovery actuation without a successor");
+recoveryResourceNow = "2026-07-26T00:20:01Z";
+const recoveredAfterExpiry = run({
+  dir: `${tmp}/expired-recovery`, artifacts: expiredRecoveryArtifacts,
+  admit: recoveryTakeoverAdmission(), recover: expiredRecoveryCapability,
+  autoResume: false,
+});
+assert.equal(recoveredAfterExpiry.reason, "recovered-disarmed");
+const expiredRecoveryOutbox = bounded(
+  `${tmp}/expired-recovery/${binding().idempotency_key}.json.recovery-outbox.json`,
+);
+assert.equal(expiredRecoveryOutbox.authorized_recovery_fence_digests.length, 2);
+assert.equal(
+  expiredRecoveryOutbox.recovery_result.effect_lease_fence_digest,
+  expiredRecoveryOutbox.recovery_result.revalidated_lease_fence_digest,
+  "when no old effect occurred, the successor owns both effect and revalidation",
+);
 const shortWatchArtifacts = bundle();
 const shortWatch = run({
   dir: `${tmp}/short-watch`, artifacts: shortWatchArtifacts,
@@ -901,12 +1134,7 @@ assert.equal(shortWatch.reason, "watching",
 assert.equal(shortWatch.journal.entries.at(-1).phase, "watch");
 const longWatchArtifacts = bundle();
 const longWatchBinding = binding(
-  "long-watch", longWatchArtifacts.coverage, {
-    canary: {
-      scope_digest: execution.target_scope_digest, target_count: 1,
-      watch_deadline: "2026-07-26T00:20:00Z",
-    },
-  },
+  "long-watch", longWatchArtifacts.coverage,
 );
 const longWatchAdapters = exactAdapters();
 const longWatchRecovery = recovery(longWatchArtifacts);
@@ -961,12 +1189,12 @@ assert.equal(
   "the persisted watch releases its short execution lease",
 );
 const dueAdmission = admission([
-  "2026-07-26T00:20:01Z", "2026-07-26T00:20:02Z",
-  "2026-07-26T00:20:03Z", "2026-07-26T00:20:04Z",
-  "2026-07-26T00:20:05Z",
+  "2026-07-26T01:00:04Z", "2026-07-26T01:00:05Z",
+  "2026-07-26T01:00:06Z", "2026-07-26T01:00:07Z",
+  "2026-07-26T01:00:08Z",
 ]);
 dueAdmission.liveness = () => ({
-  healthy: true, observed_at: "2026-07-26T00:20:00Z",
+  healthy: true, observed_at: "2026-07-26T01:00:03Z",
 });
 const longWatchCommit = run({
   dir: `${tmp}/long-watch`, artifacts: longWatchArtifacts,
@@ -975,6 +1203,62 @@ const longWatchCommit = run({
   autoResume: false,
 });
 assert.equal(longWatchCommit.reason, "committed");
+const fullWatchArtifacts = bundle();
+const fullWatchBinding = binding(
+  "full-watch", fullWatchArtifacts.coverage, {
+    deadline: "2026-07-26T01:10:00Z",
+    canary: {
+      scope_digest: execution.target_scope_digest, target_count: 1,
+    },
+  },
+);
+const fullWatchAdapters = exactAdapters();
+const fullWatchRecovery = recovery(fullWatchArtifacts);
+const watchAdmissionAt = (now, end = "2026-07-26T01:10:01Z") => {
+  const result = admission([now]);
+  result.liveness = () => ({ healthy: true, observed_at: now });
+  result.maintenance = () => ({
+    window: { start: "2026-07-26T00:00:00Z", end },
+    target: { platform: "debian", non_pillar: true },
+    plan: {
+      classes: ["security", "bugfix"], reboot_policy: "never",
+      source: "distro_repository", workload_hooks: "not_applicable",
+    },
+  });
+  return result;
+};
+let fullWatchResult = run({
+  dir: `${tmp}/full-watch`, artifacts: fullWatchArtifacts,
+  bind: fullWatchBinding, admit: watchAdmissionAt("2026-07-26T00:00:00Z"),
+  recover: fullWatchRecovery, adapters: fullWatchAdapters, autoResume: false,
+});
+assert.equal(fullWatchResult.reason, "watching");
+for (const now of [
+  "2026-07-26T00:16:00Z", "2026-07-26T00:32:00Z",
+  "2026-07-26T00:48:00Z",
+]) {
+  fullWatchResult = run({
+    dir: `${tmp}/full-watch`, artifacts: fullWatchArtifacts,
+    bind: fullWatchBinding, admit: watchAdmissionAt(now),
+    recover: fullWatchRecovery, adapters: fullWatchAdapters, autoResume: false,
+  });
+  assert.equal(fullWatchResult.reason, "watching", now);
+}
+fullWatchResult = run({
+  dir: `${tmp}/full-watch`, artifacts: fullWatchArtifacts,
+  bind: fullWatchBinding, admit: watchAdmissionAt("2026-07-26T01:00:00Z"),
+  recover: fullWatchRecovery, adapters: fullWatchAdapters, autoResume: false,
+});
+assert.equal(fullWatchResult.reason, "committed",
+  "the exact 3600-second post-receipt watch survives repeated lease release/reacquisition");
+const fullWatchState = bounded(
+  `${tmp}/full-watch/.autonomy-state/domain-state.json`,
+);
+assert.equal(
+  fullWatchState.targets[fullWatchBinding.target_scope_digest.slice(7)]
+    .lease_epoch,
+  5, "the full watch advances one monotonic epoch per restart",
+);
 const killedWatchArtifacts = bundle();
 const killedWatchRecovery = recovery(killedWatchArtifacts);
 const killedWatchAdapters = exactAdapters();
@@ -1002,10 +1286,10 @@ const unsafeReadback = run({
 });
 assert.equal(unsafeReadback.reason, "recovered-disarmed", "maintenance-safe-state readback gates commit");
 
-const deadlineAdmission = admission(["2026-07-26T01:00:00Z"]);
-deadlineAdmission.liveness = () => ({ healthy: true, observed_at: "2026-07-26T00:59:59Z" });
+const deadlineAdmission = admission(["2026-07-26T01:10:00Z"]);
+deadlineAdmission.liveness = () => ({ healthy: true, observed_at: "2026-07-26T01:09:59Z" });
 deadlineAdmission.maintenance = () => ({
-  window: { start: "2026-07-26T00:00:00Z", end: "2026-07-26T01:00:01Z" },
+  window: { start: "2026-07-26T00:00:00Z", end: "2026-07-26T01:10:01Z" },
   target: { platform: "debian", non_pillar: true },
   plan: { classes: ["security"], reboot_policy: "never", source: "distro_repository", workload_hooks: "not_applicable" },
 });
@@ -1071,9 +1355,11 @@ assert.equal(conflictResult.journal.entries.at(-1).phase, "disarm",
 const staleWriterDir = `${tmp}/stale-writer`, staleWriterLog = `${tmp}/stale-writer-apply.log`;
 const staleWriterHostEffects = `${tmp}/stale-writer-host-effects.log`;
 const staleWriterRelease = `${tmp}/stale-writer-release`;
+const staleWriterErrors = `${tmp}/stale-writer-errors.log`;
 const staleWriter = runWorker({
   WORKER_MODE: "race", WORKER_DIR: staleWriterDir, APPLY_LOG: staleWriterLog,
   HOST_EFFECT_LOG: staleWriterHostEffects, HOLD_BEFORE_EFFECT: staleWriterRelease,
+  WORKER_ERROR_LOG: staleWriterErrors,
 });
 while (!fs.existsSync(staleWriterLog)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
 await runWorker({
@@ -1087,6 +1373,9 @@ assert.equal(staleWriterJournal.entries.some(entry => entry.phase === "apply"), 
   "an expired holder is fenced before it can journal over recovery");
 assert.equal(fs.existsSync(staleWriterHostEffects), false,
   "the effect owner rejects the old token inside its mutation transaction");
+assert.match(fs.readFileSync(staleWriterErrors, "utf8").trim(),
+  /^(effect|execution)_lease_fenced$/,
+  "the stale writer fails at or before the resource fence");
 
 const crashApplyLog = `${tmp}/crash-apply.log`;
 assert.equal(await runWorker({ WORKER_MODE: "crash", WORKER_DIR: crashDir, APPLY_LOG: crashApplyLog }), 77);
@@ -1109,11 +1398,13 @@ const staleRecoveryDir = `${tmp}/stale-recovery`;
 const staleRecoveryCalls = `${tmp}/stale-recovery-calls.log`;
 const staleRecoveryEffects = `${tmp}/stale-recovery-effects.log`;
 const staleRecoveryRelease = `${tmp}/stale-recovery-release`;
+const staleRecoveryErrors = `${tmp}/stale-recovery-errors.log`;
 const staleRecovery = runWorker({
   WORKER_MODE: "fault", WORKER_DIR: staleRecoveryDir,
   FORCE_RECOVERY: "1", RECOVERY_CALL_LOG: staleRecoveryCalls,
   RECOVERY_LOG: staleRecoveryEffects,
   HOLD_BEFORE_RECOVERY_EFFECT: staleRecoveryRelease,
+  WORKER_ERROR_LOG: staleRecoveryErrors,
 });
 while (!fs.existsSync(staleRecoveryCalls)) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
@@ -1125,6 +1416,9 @@ assert.equal(await runWorker({
 fs.writeFileSync(staleRecoveryRelease, "");
 assert.equal(await staleRecovery, 79,
   "the old recovery writer is rejected after the resource fence advances");
+assert.equal(fs.readFileSync(staleRecoveryErrors, "utf8").trim(),
+  "recovery_lease_fenced",
+  "the stale recovery writer fails for the expected resource fence");
 assert.equal(await runWorker({
   WORKER_MODE: "recover", WORKER_DIR: staleRecoveryDir,
   VERY_LATE_LEASE_TRANSFER: "1", RECOVERY_CALL_LOG: staleRecoveryCalls,
@@ -1155,7 +1449,9 @@ const failed = run({
   phase: phases({ applyFenced: () => { throw Object.assign(new Error("apply-failed"), { code: "apply-failed" }); } }),
   recover: recovery(failureArtifacts, { recover: request => ({
     idempotency_key: request.idempotency_key,
-    lease_fence_digest: request.lease_fence_digest, recovered: false,
+    effect_lease_fence_digest: request.revalidation_fence_digest,
+    revalidated_lease_fence_digest: request.revalidation_fence_digest,
+    revalidated_at: "2026-07-26T00:00:01Z", recovered: false,
     safe_state_verified: false, quarantine_active: true, reason_code: "forward-repair-failed",
   }) }),
 });
@@ -1315,6 +1611,29 @@ for (const faultPoint of [
       fs.readFileSync(faultRecoveryLog, "utf8").trim().split("\n").filter(Boolean).length : 0,
     1, `${faultPoint}: idempotent recovery effect occurs exactly once`,
   );
+  if (faultPoint === "after-recover-return") {
+    const replayedOutbox = bounded(
+      `${faultDir}/${binding().idempotency_key}.json.recovery-outbox.json`,
+    );
+    assert.equal(replayedOutbox.authorized_recovery_fence_digests.length, 2);
+    const originalRecoveryFenceDigest =
+      replayedOutbox.authorized_recovery_fence_digests[0];
+    assert.equal(
+      replayedOutbox.recovery_request.lease_fence_digest,
+      originalRecoveryFenceDigest,
+      "the original recovery request remains immutable after successor takeover",
+    );
+    assert.equal(
+      replayedOutbox.recovery_result.effect_lease_fence_digest,
+      originalRecoveryFenceDigest,
+      "the recovery receipt remains bound to the immutable original request",
+    );
+    assert.notEqual(
+      replayedOutbox.recovery_result.effect_lease_fence_digest,
+      replayedOutbox.recovery_result.revalidated_lease_fence_digest,
+      "a successor revalidates the immutable original effect receipt under its current fence",
+    );
+  }
 }
 
 for (const faultPoint of ["after-commit-journal", "after-commit-release"]) {
@@ -1463,7 +1782,7 @@ assert.throws(() => run({
   admit: rateAdmission,
 }), /attempt_interval_exceeded|attempt_window_exceeded/);
 
-console.log("maintenance attempt journal: W0.1 authorization, admission, phases, recovery, demotion and rate gates OK");
+console.log("maintenance attempt journal: W0.2 authorization, admission, v2 timing, recovery, demotion and rate gates OK");
 NODE
 
 env ROOT="$ROOT" TMP="$TMP" node "$TMP/test.mjs"

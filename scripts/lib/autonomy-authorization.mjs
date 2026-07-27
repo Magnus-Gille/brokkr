@@ -1,6 +1,7 @@
-// W0.1 Ed25519 owner authorization and signed runtime-narrowing verification.
+// W0.2 Ed25519 owner authorization and signed runtime-narrowing verification.
 // This is a library form of Grimnir's merged verifier contract at
-// 298526972b46d4f8f0c40fbe92e830adb91087a8.
+// 16edee0a5a0111f0142569f5b0cf2f90e807060c. The owner authorization,
+// recovery, attestation, and narrowing envelopes remain v1.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -32,8 +33,11 @@ export const autonomyDigest = (value, omit = null) => {
 };
 export const strictUtc = value => (
   typeof value === "string" &&
-  /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(value) &&
-  new Date(value).toISOString().replace(".000Z", "Z") === value
+  /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/.test(value) &&
+  (
+    new Date(value).toISOString() === value ||
+    new Date(value).toISOString().replace(".000Z", "Z") === value
+  )
 );
 const keyFingerprint = key => `sha256:${crypto.createHash("sha256").update(key.export({ type: "spki", format: "der" })).digest("hex")}`;
 const boundedStructure = value => {
@@ -46,8 +50,8 @@ const boundedStructure = value => {
   if (Buffer.byteLength(JSON.stringify(value)) > 1_000_000) fail("authorization_input_size_exceeded");
 };
 const schemaFiles = Object.freeze({
-  constitution: ["autonomy-constitution-v1.schema.json", "647aacbc963dd5ce620ca6240ce6bd11fd2275e0eb01c861468b10e156d1e707"],
-  coverage: ["autonomy-coverage-registry-v1.schema.json", "9c9a7936350b18300e2b488ac525276b8c91fbf3a2d795fb4d842c5ebbd024b7"],
+  constitution: ["autonomy-constitution-v2.schema.json", "0c0d2bbbe9129b9a692220afc6e7ce53f7415e2eb96cfb06aedcda1f77de170b"],
+  coverage: ["autonomy-coverage-registry-v2.schema.json", "fd2eec3b99fcaccceefe7ea4f432b0ce07d36bf1b66763c719cb1c9752fffdc9"],
   ownerAttestations: ["autonomy-owner-attestation-registry-v1.schema.json", "80099e3d2f871ff89d98facff49ce9f4e8ca7c791ba7e40357ca812d556ecb59"],
   authorization: ["autonomy-owner-authorization-v1.schema.json", "94d685bf863ab6c1f6782374a4f292896aa861ff631545ab765fc9018b1f5225"],
   recoveryRegistry: ["autonomy-recovery-worker-registry-v1.schema.json", "24c51aefbf5511be5ae4d478dc8801f2387b3e8d83274d90c4a3be7b5ee52e48"],

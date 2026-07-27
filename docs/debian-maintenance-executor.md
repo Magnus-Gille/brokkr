@@ -13,7 +13,7 @@ live adapter, no private key, and no armed target.
 
 ## Authorization and scope
 
-Every attempt independently verifies the W0.1 owner-authorization bundle before
+Every attempt independently verifies the W0.2 owner-authorization bundle before
 writing `prepare` or invoking an adapter:
 
 - the owner Ed25519 public key must equal the separately pinned key, and the
@@ -26,8 +26,10 @@ writing `prepare` or invoking an adapter:
   recovery key, and a previously signed demotion to `shadow` makes the target
   ineligible.
 
-The six W0.1 authority artifacts are checked against byte-pinned copies of
-Grimnir's closed schemas before their signatures or digests are trusted.
+The W0.2 constitution and coverage artifacts, plus the unchanged v1 owner
+authorization, attestation, recovery-worker, and runtime-narrowing envelopes,
+are checked against byte-pinned copies of Grimnir's closed schemas before
+their signatures or digests are trusted.
 Domain rows, target bindings and attestations must be unique; all five actor
 identities must be distinct; and the supplied recovery capability must present
 the exact key fingerprint from the owner-signed registry.
@@ -39,6 +41,13 @@ non-pillar Debian target. The plan may contain only unique `security` and/or
 `bugfix` classes from the distribution repository, with `reboot_policy:
 never` and no workload hooks. Constitutional deadline and rate/window limits
 are derived from the verified artifacts rather than caller-selected values.
+Every candidate is a closed object containing exactly `id`, `name`, `class`,
+`source`, `current_version`, `candidate_version`, `eligible`, and `reasons`;
+IDs are unique and canonically sorted, package names are unique, eligibility
+must be true, and all strings and reason lists are bounded. Inventory and
+postconditions are likewise closed to exactly `kernel`, `packages`,
+`reboot_required`, and `dpkg_status`; packages are bounded, unique and sorted,
+reboot must remain false, and dpkg state must remain clean.
 
 `runDebianMaintenance()` also derives the outer immutable binding from the
 inputs it will actually execute. The plan digest becomes the candidate digest;
@@ -64,7 +73,7 @@ fallback. Durable `prepare` remains the first adapter-facing attempt record.
 Immediately after it (or after loading an existing prepared journal) and before
 any initial, resumed, or recovery work, the effect owner must
 implement `activateFence()` for the full target/binding/attempt/mutation/epoch/
-token/expiry capability. Mutation is available only through `applyFenced()`,
+token/activation/expiry capability. Mutation is available only through `applyFenced()`,
 whose effect-owning transaction must atomically compare that entire active
 capability immediately before and together with host actuation. Lower epochs
 and same-epoch/different-token activations are invalid. Its receipt
@@ -83,14 +92,19 @@ exported autonomous execution path.
 
 ## Authoritative attempt journal
 
-The journal uses the exact
-`autonomous-mutation-journal` v1 schema copied from Grimnir commit
-`298526972b46d4f8f0c40fbe92e830adb91087a8`; its bytes, schema ID, and supported
-JSON-Schema keywords are pinned. Brokkr adds semantic validation for authority
-bindings, actors, deadlines, phase transitions, receipts, quarantine, and
-target-bound narrowing. Entries contain only bounded IDs, digests, and opaque
-`ref:` handles—never commands, package logs, private locators, credentials, or
-recovery material.
+The journal uses the exact `autonomous-mutation-journal` v2 schema copied from
+merged Grimnir commit `16edee0a5a0111f0142569f5b0cf2f90e807060c`;
+the journal, v2 constitution, and v2 coverage schema bytes and IDs are pinned.
+Brokkr adds semantic validation for authority bindings, actors, timing, phase
+transitions, receipts, quarantine, and target-bound narrowing. Entries contain
+only bounded IDs, digests, and opaque `ref:` handles—never commands, package
+logs, private locators, credentials, or recovery material.
+
+The earlier v1 journal, constitution, coverage schemas and fixtures remain
+vendored as provenance for the rejected draft epoch. PR #71 was never merged,
+armed, deployed, or given a live adapter, so no legitimate v1 maintenance
+attempt exists and no v1 runtime recovery path is accepted. The fixed v2 pins
+reject new v1 journals and mixed v1/v2 authority bundles.
 
 The local verifier also enforces the canonical cross-field semantics that JSON
 Schema cannot express: attempt and recovery-disarm identities differ, entry
@@ -101,16 +115,23 @@ Success follows exactly:
 
 `prepare → apply → verify → watch → commit`
 
-Each transition obtains a new trusted timestamp. `watch` is a persisted,
-nonblocking continuation: after writing the watch receipt the controller
-atomically releases its execution/resource lease in target state `watching`.
-A later invocation before the deadline remains `watching` and releases again;
-it does not recover healthy work merely because the prior 900-second lease
-expired. At or after the watch deadline, the same attempt reacquires a new
-epoch without consuming another proposal/rate slot, installs that epoch in the
-effect and recovery resources, and performs the final safe-state/authority
-checks before commit. No process or lease is held synchronously for the
-constitution's possible one-hour watch.
+Each transition obtains a new trusted timestamp. Prepare through apply,
+readback, verify, and the durable authenticated `watch` receipt is limited to
+300 seconds. That receipt—not a caller-prebound deadline—starts the minimum
+3600-second watch. Commit has at most 300 seconds of grace after the earliest
+valid commit instant, while every success phase and the immutable attempt
+deadline remain within 4200 seconds of prepare. A start that cannot fit the
+minimum watch before its bound deadline recovers instead of creating an
+unfinishable success path.
+
+`watch` is a persisted, nonblocking continuation: after writing the receipt
+the controller atomically releases its execution/resource lease in target
+state `watching`. Earlier invocations remain `watching` and release again. At
+or after the receipt-derived earliest commit instant, the same attempt
+reacquires a new epoch without consuming another proposal/rate slot, installs
+that epoch in the effect and recovery resources, and performs the final
+safe-state/authority checks. A continuation beyond commit grace recovers. No
+process or lease is held synchronously during the one-hour watch.
 
 The kill switch is checked at admission and between mutation phases, and commit
 additionally requires a maintenance-safe-state readback from a fresh host
@@ -133,8 +154,9 @@ left by a crash. Distinct proposal IDs for the same target, a second active
 target, an exhausted proposal, or a rate-window breach fail before actuation.
 Unknown, disarmed and terminally blocked targets remain unavailable pending
 owner action. That same record owns the single execution lease: a monotonic
-epoch, holder token and trusted-time expiry. There are no separate initial and
-resume claims and no caller assertion that a claim was abandoned. An expired
+epoch, holder token, trusted activation instant and trusted-time expiry. There
+are no separate initial and resume claims and no caller assertion that a claim
+was abandoned. An expired
 lease may transfer mechanically; every journal append and target transition is
 fenced by the exact epoch/token. Lease acquisition also installs the full
 capability in the effect owner. A later epoch/token supersedes it, so an old
@@ -179,10 +201,14 @@ posture.
 
 Recovery has the same resource-bound fencing requirement as apply. Every lease
 activation is installed monotonically in the recovery resource. The durable
-outbox request carries the full target/binding/attempt/mutation/epoch/token/
-expiry fence and digest; `recover()` must atomically compare it with the
-resource's current fence inside the idempotent recovery transaction. A
-transferred attempt rebinds a still-pending request to the new epoch, so an old
+outbox request immutably carries the original full
+target/binding/attempt/mutation/epoch/token/activation/expiry fence and digest.
+It is never rewritten during takeover. A separate successor revalidation fence
+advances monotonically; `recover()` must atomically compare that current fence
+inside the idempotent resource transaction. If the original effect already
+has a receipt, replay preserves its original effect-fence digest while adding
+the successor revalidation digest and timestamp. If no effect occurred, the
+successor effect receipt is bound to the successor fence. In both cases an old
 blocked recovery writer cannot actuate after transfer.
 
 Recovery then fsyncs its idempotent request and `unknown`

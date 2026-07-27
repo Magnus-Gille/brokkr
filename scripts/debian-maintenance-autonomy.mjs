@@ -1,6 +1,6 @@
 // Authoritative Brokkr journal for Grimnir ADR-008's bounded no-reboot
 // security/bugfix maintenance class. No production authority is bundled here:
-// every attempt must independently verify W0.1 owner authorization, coverage,
+// every attempt must independently verify W0.2 owner authorization, coverage,
 // owner attestation, recovery keys, and the protected narrowing tail.
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -16,11 +16,11 @@ import {
 import { windowStatus } from "./maintenance-controller.mjs";
 
 const DOMAIN = "no-reboot-security-bugfix-maintenance";
-const SCHEMA_ID = "https://grimnir.gille.ai/contracts/autonomous-mutation-journal/v1/schema.json";
-const SCHEMA_SHA256 = "237eb4336a84645b88319b4cbd5112b6dd0c3a3a97e7343e0fdc73869b1cac3b";
+const SCHEMA_ID = "https://grimnir.gille.ai/contracts/autonomous-mutation-journal/v2/schema.json";
+const SCHEMA_SHA256 = "fc0d87d815c6fda3b14116e0e8840e8ecbe8e3df77bbeaf74b2064184ad036f4";
 const LOCAL_SCHEMA_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
-  "../docs/autonomous-mutation-journal-v1.schema.json",
+  "../docs/autonomous-mutation-journal-v2.schema.json",
 );
 const PINNED_SCHEMAS = new WeakSet();
 const MAX_BYTES = 256 * 1024;
@@ -45,11 +45,14 @@ const NEXT = Object.freeze({
   disarm: new Set(),
   "terminally-blocked": new Set(),
 });
-const fail = code => {
-  const error = new Error(code);
+const fail = (code, cause = undefined) => {
+  const error = new Error(code, cause === undefined ? undefined : { cause });
   error.code = code;
   throw error;
 };
+const diagnosticCode = error => String(
+  error?.code ?? error?.message ?? "unknown-error",
+).slice(0, 96);
 const assert = (condition, code) => { if (!condition) fail(code); };
 const plain = value => value !== null && typeof value === "object" && !Array.isArray(value);
 const exactKeys = (value, keys) => (
@@ -59,7 +62,8 @@ const sha256 = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const boundedJson = file => {
   const raw = fs.readFileSync(file, "utf8");
   assert(Buffer.byteLength(raw) <= MAX_BYTES, "journal_too_large");
-  try { return JSON.parse(raw); } catch { fail("journal_invalid_json"); }
+  try { return JSON.parse(raw); }
+  catch (error) { fail("journal_invalid_json", error); }
 };
 const fsyncDirectory = directory => {
   const fd = fs.openSync(directory, "r");
@@ -133,7 +137,7 @@ function claimTarget({
 }) {
   return withExclusiveDirectory(domainLockDir(journalDir), "domain_claim_contended", () => {
     const leaseExpiry = new Date(Math.min(
-      Date.parse(binding.deadline) - 1000,
+      Date.parse(binding.deadline),
       Date.parse(now) + policy.bounds.max_silence_seconds * 1000,
     )).toISOString().replace(".000Z", "Z");
     const domainFile = domainStateFile(journalDir);
@@ -184,13 +188,14 @@ function claimTarget({
     if (current.execution_lease !== null) {
       assert(exactKeys(current.execution_lease, [
         "attempt_id", "mutation_id", "binding_digest", "epoch", "holder_pid",
-        "holder_token", "expires_at",
+        "holder_token", "activated_at", "expires_at",
       ]) && current.execution_lease.attempt_id === binding.attempt_id &&
         current.execution_lease.mutation_id === binding.mutation_id &&
         current.execution_lease.binding_digest === bindingDigest &&
         current.execution_lease.epoch === current.lease_epoch &&
         Number.isSafeInteger(current.execution_lease.holder_pid) &&
         typeof current.execution_lease.holder_token === "string" &&
+        strictUtc(current.execution_lease.activated_at) &&
         strictUtc(current.execution_lease.expires_at),
       "execution_lease_invalid");
       if (Date.parse(now) <= Date.parse(current.execution_lease.expires_at)) {
@@ -201,7 +206,7 @@ function claimTarget({
         attempt_id: binding.attempt_id, mutation_id: binding.mutation_id,
         binding_digest: bindingDigest, epoch: current.lease_epoch,
         holder_pid: process.pid, holder_token: crypto.randomUUID(),
-        expires_at: leaseExpiry,
+        activated_at: now, expires_at: leaseExpiry,
       };
       domain.revision += 1;
       writeAtomic(domainFile, domain);
@@ -222,7 +227,7 @@ function claimTarget({
       attempt_id: binding.attempt_id, mutation_id: binding.mutation_id,
       binding_digest: bindingDigest, epoch: current.lease_epoch,
       holder_pid: process.pid, holder_token: crypto.randomUUID(),
-      expires_at: leaseExpiry,
+      activated_at: now, expires_at: leaseExpiry,
     };
     if (!resumeWatch) {
       current.last_started_at = now;
@@ -257,13 +262,21 @@ function executionLeaseFence(binding, bindingDigest, lease) {
     target_scope_digest: binding.target_scope_digest,
     attempt_id: binding.attempt_id, mutation_id: binding.mutation_id,
     binding_digest: bindingDigest, epoch: lease.epoch,
-    holder_token: lease.holder_token, expires_at: lease.expires_at,
+    holder_token: lease.holder_token, activated_at: lease.activated_at,
+    expires_at: lease.expires_at,
   };
   assert(DIGEST.test(fence.target_scope_digest) && DIGEST.test(fence.binding_digest) &&
     Number.isSafeInteger(fence.epoch) && fence.epoch >= 1 &&
     typeof fence.holder_token === "string" && fence.holder_token.length >= 16 &&
-    strictUtc(fence.expires_at), "execution_lease_fence_invalid");
+    strictUtc(fence.activated_at) && strictUtc(fence.expires_at) &&
+    Date.parse(fence.activated_at) <= Date.parse(fence.expires_at),
+  "execution_lease_fence_invalid");
   return Object.freeze(fence);
+}
+function assertFenceFreshAt(fence, checkedAt, code) {
+  assert(strictUtc(checkedAt) &&
+    Date.parse(checkedAt) >= Date.parse(fence.activated_at) &&
+    Date.parse(checkedAt) <= Date.parse(fence.expires_at), code);
 }
 function activateResourceFence(resource, binding, bindingDigest, lease) {
   const fence = executionLeaseFence(binding, bindingDigest, lease);
@@ -411,6 +424,10 @@ function classPolicy(constitution) {
   const policy = policies[0];
   assert(policies.length === 1 && policy.recovery_class === "R-forward" && policy.owner === "brokkr" &&
     policy.bounds?.max_concurrent_targets === 1 && policy.bounds?.max_attempts === 1 &&
+    policy.bounds?.apply_verify_budget_seconds === 300 &&
+    policy.bounds?.minimum_watch_seconds === 3600 &&
+    policy.bounds?.commit_grace_seconds === 300 &&
+    policy.bounds?.deadline_seconds === 4200 &&
     policy.bounds?.trusted_watchdog_time_required === true, "maintenance_constitution_invalid");
   return policy;
 }
@@ -519,18 +536,27 @@ function validateJournalSemantics(journal, { schema, constitution, coverage, own
   const binding = journal.binding;
   ownerBindingFor({ coverage, ownerAttestations, binding });
   assert(journal.binding_digest === autonomyDigest(binding), "journal_binding_digest_invalid");
-  assert(binding.attempt_id !== binding.recovery_disarm_id,
-    "journal_attempt_recovery_identity_aliased");
+  assert(journal.journal_id === binding.mutation_id,
+    "journal_mutation_identity_mismatch");
+  assert(new Set([
+    binding.mutation_id, binding.attempt_id, binding.recovery_disarm_id,
+    binding.idempotency_key,
+  ]).size === 4, "journal_envelope_identity_aliased");
   assert(binding.risk_scope === DOMAIN && binding.recovery.class === "R-forward" &&
     binding.recovery.worker_identity === binding.recovery_worker_identity &&
     binding.recovery.disarms_after_action === true, "journal_recovery_binding_invalid");
-  assert(binding.canary.scope_digest === binding.target_scope_digest && binding.canary.target_count === 1 &&
-    Date.parse(binding.canary.watch_deadline) <= Date.parse(binding.deadline), "journal_canary_invalid");
-  assert(Date.parse(binding.deadline) - Date.parse(journal.entries[0].recorded_at) <= policy.bounds.deadline_seconds * 1000, "journal_deadline_bound_invalid");
+  assert(binding.canary.scope_digest === binding.target_scope_digest &&
+    binding.canary.target_count === 1, "journal_canary_invalid");
+  const preparedAt = Date.parse(journal.entries[0].recorded_at);
+  const deadlineAt = Date.parse(binding.deadline);
+  assert(deadlineAt >= preparedAt &&
+    deadlineAt - preparedAt <= policy.bounds.deadline_seconds * 1000,
+  "journal_deadline_bound_invalid");
   let previous = null;
   const entryIds = new Set();
   for (let index = 0; index < journal.entries.length; index += 1) {
     const entry = journal.entries[index];
+    assert(entry.phase !== "revert", "journal_r_forward_revert_forbidden");
     assert(!entryIds.has(entry.entry_id), "journal_entry_identity_replayed");
     entryIds.add(entry.entry_id);
     assert(entry.sequence === index + 1 && entry.previous_receipt_digest === previous &&
@@ -540,12 +566,29 @@ function validateJournalSemantics(journal, { schema, constitution, coverage, own
       assert(Date.parse(entry.recorded_at) >= Date.parse(journal.entries[index - 1].recorded_at), "journal_clock_backdated");
       assert(NEXT[journal.entries[index - 1].phase].has(entry.phase), "journal_transition_invalid");
     }
-    if (["prepare", "apply", "verify", "watch", "commit"].includes(entry.phase)) assert(Date.parse(entry.recorded_at) <= Date.parse(binding.deadline), "journal_deadline_exceeded");
-    if (entry.phase === "watch") {
-      assert(Date.parse(entry.recorded_at) <= Date.parse(binding.canary.watch_deadline), "journal_watch_started_late");
-      assert(Date.parse(binding.canary.watch_deadline) - Date.parse(entry.recorded_at) <= policy.bounds.watch_seconds * 1000, "journal_watch_bound_invalid");
+    if (["prepare", "apply", "verify", "watch", "commit"].includes(entry.phase)) {
+      assert(Date.parse(entry.recorded_at) <= deadlineAt &&
+        Date.parse(entry.recorded_at) - preparedAt <=
+          policy.bounds.deadline_seconds * 1000,
+      "journal_deadline_exceeded");
     }
-    if (entry.phase === "commit") assert(Date.parse(entry.recorded_at) >= Date.parse(binding.canary.watch_deadline), "journal_watch_incomplete");
+    if (entry.phase === "watch") {
+      assert(Date.parse(entry.recorded_at) - preparedAt <=
+        policy.bounds.apply_verify_budget_seconds * 1000,
+      "journal_apply_verify_budget_exceeded");
+    }
+    if (entry.phase === "commit") {
+      const watch = journal.entries.slice(0, index).find(
+        candidate => candidate.phase === "watch",
+      );
+      assert(watch && Date.parse(entry.recorded_at) - Date.parse(watch.recorded_at) >=
+        policy.bounds.minimum_watch_seconds * 1000,
+      "journal_watch_incomplete");
+      assert(Date.parse(entry.recorded_at) - Date.parse(watch.recorded_at) <=
+        (policy.bounds.minimum_watch_seconds +
+          policy.bounds.commit_grace_seconds) * 1000,
+      "journal_commit_grace_exceeded");
+    }
     const recoveryPhase = ["recover", "quarantine", "disarm", "terminally-blocked"].includes(entry.phase);
     if (entry.phase === "unknown") assert([binding.controller_identity, binding.watchdog_identity].includes(entry.executor_identity), "journal_actor_invalid");
     else assert(entry.executor_identity === (recoveryPhase ? binding.recovery_worker_identity : binding.controller_identity), "journal_actor_invalid");
@@ -632,7 +675,10 @@ function verifyAuthority({ binding, snapshot, recovery }) {
     recovery.publicKeyFingerprint === recoveryBindings[0].public_key_fingerprint, "recovery_capability_unbound");
   return { bundle, narrowing, recoveryBinding: recoveryBindings[0] };
 }
-function verifyAdmission({ binding, snapshot, admission, recovery, journalDir, conformance }) {
+function verifyAdmission({
+  binding, snapshot, admission, recovery, journalDir, conformance,
+  allowDeadlineEquality = false,
+}) {
   const authority = verifyAuthority({ binding, snapshot, recovery });
   const { bundle, narrowing } = authority;
   assert(effectiveTargetState({ coverage: bundle.coverage, narrowingEntries: narrowing.entries, targetScopeDigest: binding.target_scope_digest }) === binding.admission_binding_state, "runtime_demotion_consumed");
@@ -656,7 +702,9 @@ function verifyAdmission({ binding, snapshot, admission, recovery, journalDir, c
     maintenance.plan.classes.every(item => ["security", "bugfix"].includes(item)) &&
     maintenance.plan.reboot_policy === "never" && maintenance.plan.source === "distro_repository" &&
     maintenance.plan.workload_hooks === "not_applicable", "maintenance_plan_out_of_scope");
-  assert(Date.parse(now) < Date.parse(binding.deadline), "attempt_deadline_closed");
+  assert(allowDeadlineEquality ?
+    Date.parse(now) <= Date.parse(binding.deadline) :
+    Date.parse(now) < Date.parse(binding.deadline), "attempt_deadline_closed");
   return {
     ...authority, policy, now, maintenance,
     immutableAdmissionDigest: autonomyDigest({
@@ -669,11 +717,14 @@ function verifyAdmission({ binding, snapshot, admission, recovery, journalDir, c
     }),
   };
 }
-function verifyRecoveryPosture({ binding, snapshot, admission }) {
+function verifyRecoveryPosture({
+  binding, snapshot, admission, snapshotError = null,
+}) {
   let authorityDigest = null;
   let coverageDigest = null;
   let narrowingTailDigest = null;
   let postureAvailable = false;
+  let authorityError = snapshotError;
   try {
     const bundle = verifyOwnerAuthorizationBundle(snapshot);
     const narrowing = verifyRuntimeNarrowingLedger({
@@ -686,22 +737,26 @@ function verifyRecoveryPosture({ binding, snapshot, admission }) {
     coverageDigest = bundle.coverage.registry_digest;
     narrowingTailDigest = narrowing.tailDigest;
     postureAvailable = true;
-  } catch {
+  } catch (error) {
     // Current corruption cannot authorize mutation, but it also cannot strand
     // containment of an authenticated historical attempt.
+    authorityError = diagnosticCode(error);
   }
   let killSafe = false;
+  let killError = null;
   try {
     const proof = admission.killSwitch();
     killSafe = exactKeys(proof, ["safe", "identity"]) &&
       proof.safe === true && proof.identity === binding.kill_switch_identity;
-  } catch {
+  } catch (error) {
     killSafe = false;
+    killError = diagnosticCode(error);
   }
   return {
     now: trustedNow(admission.trustedClock),
     mustRecover: !postureAvailable || !killSafe,
     authorityDigest, coverageDigest, narrowingTailDigest, postureAvailable,
+    authorityError, killError,
   };
 }
 function reasonDigest(code) {
@@ -754,6 +809,8 @@ function finishRecoveryOutbox({ file, journal, context, admission, recovery, out
     assert(exactKeys(outbox, [
       "kind", "schema_version", "binding_digest", "stage", "owner_authorization_digest",
       "previous_narrowing_digest", "narrowing_sequence", "narrowing_tail_digest",
+      "authorized_recovery_fence_digests",
+      "revalidation_fence", "revalidation_fence_digest",
       "recovery_request", "recovery_result", "recovery_error", "unknown_entry",
       "recover_entry", "quarantine_entry", "terminal_entry",
     ]) && outbox.kind === "brokkr-autonomy-recovery-outbox" &&
@@ -774,23 +831,45 @@ function finishRecoveryOutbox({ file, journal, context, admission, recovery, out
         journal.binding.target_scope_digest &&
       outbox.recovery_request.binding_digest === journal.binding_digest,
     "recovery_request_invalid");
+    assert(Array.isArray(outbox.authorized_recovery_fence_digests) &&
+      outbox.authorized_recovery_fence_digests.length >= 1 &&
+      outbox.authorized_recovery_fence_digests.length <= 16 &&
+      new Set(outbox.authorized_recovery_fence_digests).size ===
+        outbox.authorized_recovery_fence_digests.length &&
+      outbox.authorized_recovery_fence_digests.every(digest => DIGEST.test(digest)) &&
+      outbox.authorized_recovery_fence_digests[0] ===
+        outbox.recovery_request.lease_fence_digest,
+    "recovery_fence_history_invalid");
     assert(DIGEST.test(outbox.recovery_request.lease_fence_digest) &&
       outbox.recovery_request.lease_fence?.kind ===
         "brokkr-effect-lease-fence" &&
       autonomyDigest(outbox.recovery_request.lease_fence) ===
         outbox.recovery_request.lease_fence_digest,
     "recovery_request_fence_invalid");
+    assert(DIGEST.test(outbox.revalidation_fence_digest) &&
+      outbox.revalidation_fence?.kind === "brokkr-effect-lease-fence" &&
+      autonomyDigest(outbox.revalidation_fence) ===
+        outbox.revalidation_fence_digest &&
+      outbox.authorized_recovery_fence_digests.includes(
+        outbox.revalidation_fence_digest,
+      ),
+    "recovery_revalidation_fence_invalid");
     const recoveryEffectPending = [
       "intent", "unknown-journaled", "target-unknown", "recovering",
     ].includes(outbox.stage);
     if (recoveryEffectPending) {
-      if (outbox.recovery_request.lease_fence_digest !== currentFenceDigest) {
-        outbox.recovery_request.lease_fence = structuredClone(currentFence);
-        outbox.recovery_request.lease_fence_digest = currentFenceDigest;
+      if (outbox.revalidation_fence_digest !== currentFenceDigest) {
+        if (!outbox.authorized_recovery_fence_digests.includes(currentFenceDigest)) {
+          assert(outbox.authorized_recovery_fence_digests.length < 16,
+            "recovery_fence_history_exhausted");
+          outbox.authorized_recovery_fence_digests.push(currentFenceDigest);
+        }
+        outbox.revalidation_fence = structuredClone(currentFence);
+        outbox.revalidation_fence_digest = currentFenceDigest;
         writeAtomic(outboxFile, outbox);
       }
-      assert(outbox.recovery_request.lease_fence_digest === currentFenceDigest &&
-        canonicalJson(outbox.recovery_request.lease_fence) ===
+      assert(outbox.revalidation_fence_digest === currentFenceDigest &&
+        canonicalJson(outbox.revalidation_fence) ===
           canonicalJson(currentFence), "recovery_request_stale_fence");
     }
     const leaseContext = { journalDir: context.journalDir, lease };
@@ -820,17 +899,28 @@ function finishRecoveryOutbox({ file, journal, context, admission, recovery, out
         journalDir: context.journalDir, binding: journal.binding,
         bindingDigest: journal.binding_digest, lease,
       });
-      const result = recovery.recover(structuredClone(outbox.recovery_request));
+      const result = recovery.recover({
+        ...structuredClone(outbox.recovery_request),
+        revalidation_fence: structuredClone(outbox.revalidation_fence),
+        revalidation_fence_digest: outbox.revalidation_fence_digest,
+      });
       recovery.fault?.("after-recover-return");
       assert(exactKeys(result, [
-        "idempotency_key", "lease_fence_digest", "recovered",
+        "idempotency_key", "effect_lease_fence_digest",
+        "revalidated_lease_fence_digest", "revalidated_at", "recovered",
         "safe_state_verified", "quarantine_active", "reason_code",
       ]) && result.idempotency_key === outbox.recovery_request.idempotency_key &&
-        result.lease_fence_digest === currentFenceDigest &&
+        outbox.authorized_recovery_fence_digests.includes(
+          result.effect_lease_fence_digest,
+        ) &&
+        result.revalidated_lease_fence_digest === currentFenceDigest &&
         typeof result.recovered === "boolean" && typeof result.safe_state_verified === "boolean" &&
         typeof result.quarantine_active === "boolean" &&
         (result.reason_code === null || typeof result.reason_code === "string"),
       "recovery_receipt_invalid");
+      assertFenceFreshAt(
+        currentFence, result.revalidated_at, "recovery_fence_expired",
+      );
       outbox.recovery_result = structuredClone(result);
       outbox.recovery_error = result.reason_code;
       let at = trustedNow(admission.trustedClock, outbox.unknown_entry.recorded_at);
@@ -975,6 +1065,17 @@ function enterRecovery({ file, journal, context, admission, recovery, code, last
       previous_narrowing_digest: context.narrowing.tailDigest,
       narrowing_sequence: context.narrowing.entries.length + 1,
       narrowing_tail_digest: null,
+      authorized_recovery_fence_digests: [
+        autonomyDigest(executionLeaseFence(
+          journal.binding, journal.binding_digest, lease,
+        )),
+      ],
+      revalidation_fence: structuredClone(executionLeaseFence(
+        journal.binding, journal.binding_digest, lease,
+      )),
+      revalidation_fence_digest: autonomyDigest(executionLeaseFence(
+        journal.binding, journal.binding_digest, lease,
+      )),
       recovery_request: {
         idempotency_key: journal.binding.recovery_disarm_id,
         descriptor_digest: journal.binding.recovery.descriptor_digest,
@@ -1053,10 +1154,12 @@ function runMaintenanceAttempt({
   let pendingOutbox = null;
   let authoritySnapshot = readOptional(authorityFile);
   let initialSnapshot = null;
+  let initialSnapshotError = null;
   if (!authoritySnapshot) {
     initialSnapshot = readArtifacts(artifacts);
   } else {
-    try { initialSnapshot = readArtifacts(artifacts); } catch {}
+    try { initialSnapshot = readArtifacts(artifacts); }
+    catch (error) { initialSnapshotError = diagnosticCode(error); }
   }
   const schema = initialSnapshot?.journalSchema ??
     loadPinnedJournalSchema(LOCAL_SCHEMA_PATH);
@@ -1095,6 +1198,7 @@ function runMaintenanceAttempt({
     if (pendingOutbox) {
       recoveryPosture = verifyRecoveryPosture({
         binding: existing.binding, snapshot: initialSnapshot, admission,
+        snapshotError: initialSnapshotError,
       });
     }
     if (pendingOutbox?.stage === "complete") {
@@ -1160,6 +1264,7 @@ function runMaintenanceAttempt({
   }
 
   let recoveryOnly = false;
+  let recoveryOnlyCode = "current-posture-requires-recovery";
   if (!admitted && pendingOutbox) {
     admitted = {
       now: recoveryPosture.now,
@@ -1169,6 +1274,7 @@ function runMaintenanceAttempt({
   } else if (!admitted) {
     recoveryPosture = verifyRecoveryPosture({
       binding: existing?.binding ?? binding, snapshot: initialSnapshot, admission,
+      snapshotError: initialSnapshotError,
     });
     admitted = {
       now: recoveryPosture.now,
@@ -1198,7 +1304,7 @@ function runMaintenanceAttempt({
   let journal = existing;
   if (!journal) {
     journal = {
-      kind: "autonomous-mutation-journal", schema_version: "v1", journal_id: binding.mutation_id,
+      kind: "autonomous-mutation-journal", schema_version: "v2", journal_id: binding.mutation_id,
       domain: DOMAIN, constitution_digest: authoritySnapshot.constitution.constitution_digest,
       binding: structuredClone(binding), binding_digest: bindingDigest, entries: [], extensions: [],
     };
@@ -1230,18 +1336,20 @@ function runMaintenanceAttempt({
       try {
         const resumedAdmission = verifyAdmission({
           binding: journal.binding, snapshot: initialSnapshot, admission, recovery,
-          journalDir, conformance,
+          journalDir, conformance, allowDeadlineEquality: watchContinuation,
         });
         recoveryOnly = resumedAdmission.immutableAdmissionDigest !==
           authoritySnapshot.immutableAdmissionDigest;
-      } catch {
+      } catch (error) {
         recoveryOnly = true;
+        recoveryOnlyCode =
+          `current-posture-${diagnosticCode(error)}`.slice(0, 96);
       }
     }
     if (recoveryOnly) {
       return enterRecovery({
         file, journal, context, admission, recovery, lease,
-        code: "current-posture-requires-recovery",
+        code: recoveryOnlyCode,
         lastAt: journal.entries.at(-1).recorded_at,
       });
     }
@@ -1279,13 +1387,21 @@ function runMaintenanceAttempt({
 
   let at = trustedNow(admission.trustedClock, journal.entries.at(-1).recorded_at);
   try {
-    if (watchContinuation &&
-        Date.parse(admitted.now) < Date.parse(binding.canary.watch_deadline)) {
-      transitionTarget({
-        journalDir, binding, bindingDigest, lease,
-        state: "watching", release: true,
-      });
-      return { journal, ran: false, reason: "watching" };
+    if (watchContinuation) {
+      const watchAt = Date.parse(journal.entries.at(-1).recorded_at);
+      const commitEarliest = watchAt +
+        context.policy.bounds.minimum_watch_seconds * 1000;
+      const commitLatest = commitEarliest +
+        context.policy.bounds.commit_grace_seconds * 1000;
+      if (Date.parse(admitted.now) < commitEarliest) {
+        transitionTarget({
+          journalDir, binding, bindingDigest, lease,
+          state: "watching", release: true,
+        });
+        return { journal, ran: false, reason: "watching" };
+      }
+      assert(Date.parse(admitted.now) <= commitLatest,
+        "maintenance_commit_grace_exceeded");
     }
     if (!watchContinuation) {
       const beforeApplySnapshot = readArtifacts(artifacts);
@@ -1317,8 +1433,12 @@ function runMaintenanceAttempt({
         phase: "verify", at, actor: binding.controller_identity, contentRef,
       }, { journalDir, lease });
       checkKillSwitch(admission.killSwitch, binding);
-      assert(Date.parse(at) <= Date.parse(binding.canary.watch_deadline),
-        "maintenance_watch_started_late");
+      assert(Date.parse(at) - Date.parse(journal.entries[0].recorded_at) <=
+        context.policy.bounds.apply_verify_budget_seconds * 1000,
+      "maintenance_apply_verify_budget_exceeded");
+      assert(Date.parse(binding.deadline) - Date.parse(at) >=
+        context.policy.bounds.minimum_watch_seconds * 1000,
+      "maintenance_watch_deadline_unreachable");
       journal = appendFenced(file, journal, {
         phase: "watch", at, actor: binding.controller_identity, contentRef,
       }, { journalDir, lease });
@@ -1328,14 +1448,21 @@ function runMaintenanceAttempt({
       });
       return { journal, ran: true, reason: "watching" };
     }
-    assert(Date.parse(at) >= Date.parse(binding.canary.watch_deadline),
-      "maintenance_watch_incomplete");
+    const watchAt = Date.parse(journal.entries.at(-1).recorded_at);
+    assert(Date.parse(at) - watchAt >=
+      context.policy.bounds.minimum_watch_seconds * 1000,
+    "maintenance_watch_incomplete");
+    assert(Date.parse(at) - watchAt <=
+      (context.policy.bounds.minimum_watch_seconds +
+        context.policy.bounds.commit_grace_seconds) * 1000,
+    "maintenance_commit_grace_exceeded");
     checkKillSwitch(admission.killSwitch, binding);
     const readback = phases.safeStateReadback();
     assert(readback?.safe === true && readback.postconditions_digest === binding.postconditions_digest, "maintenance_safe_state_unverified");
     const beforeCommitSnapshot = readArtifacts(artifacts);
     const beforeCommit = verifyAdmission({
-      binding, snapshot: beforeCommitSnapshot, admission, recovery, journalDir, conformance,
+      binding, snapshot: beforeCommitSnapshot, admission, recovery, journalDir,
+      conformance, allowDeadlineEquality: true,
     });
     assert(beforeCommit.immutableAdmissionDigest === authoritySnapshot.immutableAdmissionDigest,
       "immutable_admission_drifted");
@@ -1366,6 +1493,9 @@ const DEBIAN_API = (() => {
   const MAX_PLAN_AGE_MS = 5 * 60 * 1000;
   const MAX_EVENTS = 24;
   const MAX_INVENTORY_BYTES = 16_384;
+  const MAX_CANDIDATES = 256;
+  const PACKAGE_NAME = /^[a-z0-9][a-z0-9+.-]{0,127}$/i;
+  const PACKAGE_VERSION = /^[A-Za-z0-9:+.~-]{1,128}$/;
   const hash = value => `sha256:${crypto.createHash("sha256")
     .update(canonicalJson(value)).digest("hex")}`;
   const parseUtc = value => strictUtc(value) ? Date.parse(value) :
@@ -1399,24 +1529,65 @@ const DEBIAN_API = (() => {
   };
   const inventory = value => {
     if (!plain(value)) fail("inventory_invalid");
-    const allowed = new Set([
+    if (!exactKeys(value, [
       "kernel", "packages", "reboot_required", "dpkg_status",
-    ]);
-    const output = {};
-    for (const [key, item] of Object.entries(value)) {
-      if (!allowed.has(key)) fail("inventory_field_not_allowed");
-      if (typeof item === "string" && item.length <= 256) output[key] = item;
-      else if (typeof item === "boolean") output[key] = item;
-      else if (Array.isArray(item) && item.length <= 256 &&
-          item.every(element => (
-            typeof element === "string" && element.length <= 256
-          ))) output[key] = [...item].sort();
-      else fail("inventory_invalid");
+    ])) fail("inventory_shape_invalid");
+    if (typeof value.kernel !== "string" || value.kernel.length < 1 ||
+        value.kernel.length > 256 || !PACKAGE_VERSION.test(value.kernel)) {
+      fail("inventory_kernel_invalid");
     }
+    if (!Array.isArray(value.packages) || value.packages.length < 1 ||
+        value.packages.length > 256 ||
+        !value.packages.every(element => (
+          typeof element === "string" && element.length <= 256 &&
+          /^[A-Za-z0-9][A-Za-z0-9:+.~=_-]{0,255}$/.test(element)
+        )) || new Set(value.packages).size !== value.packages.length) {
+      fail("inventory_packages_invalid");
+    }
+    if (value.reboot_required !== false) fail("inventory_reboot_unsafe");
+    if (value.dpkg_status !== "clean") fail("inventory_dpkg_unsafe");
+    const output = {
+      kernel: value.kernel,
+      packages: [...value.packages].sort(),
+      reboot_required: false,
+      dpkg_status: "clean",
+    };
     if (Buffer.byteLength(canonicalJson(output)) > MAX_INVENTORY_BYTES) {
       fail("inventory_too_large");
     }
     return output;
+  };
+  const debianCandidates = candidates => {
+    if (!Array.isArray(candidates) || candidates.length < 1 ||
+        candidates.length > MAX_CANDIDATES) fail("debian_candidates_invalid");
+    const result = candidates.map(candidate => {
+      if (!exactKeys(candidate, [
+        "id", "name", "class", "source", "current_version",
+        "candidate_version", "eligible", "reasons",
+      ]) || !PACKAGE_NAME.test(candidate.name) ||
+          !PACKAGE_VERSION.test(candidate.candidate_version) ||
+          (candidate.current_version !== null &&
+            !PACKAGE_VERSION.test(candidate.current_version)) ||
+          candidate.id !== `${candidate.name}@${candidate.candidate_version}` ||
+          !["security", "bugfix"].includes(candidate.class) ||
+          candidate.source !== "distro_repository" ||
+          candidate.eligible !== true || !Array.isArray(candidate.reasons) ||
+          candidate.reasons.length !== 0) {
+        fail("debian_candidate_invalid");
+      }
+      return structuredClone(candidate);
+    });
+    const identities = result.map(candidate => candidate.id);
+    const packages = result.map(candidate => candidate.name);
+    if (new Set(identities).size !== identities.length ||
+        new Set(packages).size !== packages.length) {
+      fail("debian_candidate_duplicate");
+    }
+    const sorted = [...identities].sort();
+    if (canonicalJson(identities) !== canonicalJson(sorted)) {
+      fail("debian_candidates_not_canonical");
+    }
+    return result;
   };
   const deepFreeze = value => {
     if (value && typeof value === "object" && !Object.isFrozen(value)) {
@@ -1448,6 +1619,9 @@ const DEBIAN_API = (() => {
         !Array.isArray(plan.unmet_policy_classes) ||
         typeof plan.inventory_evidence_id !== "string" ||
         typeof plan.running_kernel !== "string" ||
+        typeof plan.plan_id !== "string" || plan.plan_id.length > 128 ||
+        typeof plan.node_id !== "string" || plan.node_id.length > 128 ||
+        plan.hook_gaps.length > 64 || plan.unmet_policy_classes.length > 64 ||
         plan.node_id !== nodeId || !policy.selector.node_ids.includes(nodeId) ||
         plan.policy_digest !== policy.policy_digest ||
         plan.policy_id !== policy.policy_id) fail("plan_not_authorized");
@@ -1459,12 +1633,9 @@ const DEBIAN_API = (() => {
         !["mains", "not_applicable"].includes(gates.power) ||
         gates.clock !== "synchronized" ||
         gates.workload_hooks !== "not_applicable" ||
-        plan.hook_gaps.length !== 0 ||
-        !Array.isArray(plan.candidates) || plan.candidates.length < 1 ||
-        !plan.candidates.every(candidate => (
-          candidate?.eligible === true &&
-          ["security", "bugfix"].includes(candidate.class) &&
-          candidate.source === "distro_repository" &&
+        plan.hook_gaps.length !== 0) fail("plan_gates_not_safe");
+    const candidates = debianCandidates(plan.candidates);
+    if (!candidates.every(candidate => (
           policy.updates.allowed_classes.includes(candidate.class) &&
           policy.updates.allowed_sources.includes(candidate.source)
         ))) fail("plan_gates_not_safe");
@@ -1512,12 +1683,7 @@ const DEBIAN_API = (() => {
     if (!DIGEST.test(suppliedPlanDigest) ||
         suppliedPlanDigest !== hash(planCopy) ||
         plan.gates?.workload_hooks !== "not_applicable" ||
-        !Array.isArray(plan.candidates) || plan.candidates.length < 1 ||
-        !plan.candidates.every(item => (
-          item?.eligible === true &&
-          ["security", "bugfix"].includes(item.class) &&
-          item.source === "distro_repository"
-        )) || policy.reboot?.policy !== "never" ||
+        policy.reboot?.policy !== "never" ||
         !Array.isArray(policy.updates?.allowed_classes) ||
         !policy.updates.allowed_classes.every(item => (
           ["security", "bugfix"].includes(item)
@@ -1525,6 +1691,11 @@ const DEBIAN_API = (() => {
         !policy.updates.allowed_sources.every(item => (
           item === "distro_repository"
         ))) fail("autonomy_execution_out_of_scope");
+    const normalizedCandidates = debianCandidates(plan.candidates);
+    if (!normalizedCandidates.every(item => (
+      policy.updates.allowed_classes.includes(item.class) &&
+      policy.updates.allowed_sources.includes(item.source)
+    ))) fail("autonomy_execution_out_of_scope");
     const normalizedPreState = inventory(preState);
     const normalizedPostconditions = inventory(postconditions);
     const targetScopeDigest = hash({
@@ -1547,7 +1718,7 @@ const DEBIAN_API = (() => {
     const executionRequest = {
       kind: "brokkr-bounded-debian-maintenance-request",
       schema_version: "v1", target: structuredClone(target),
-      candidates: structuredClone(plan.candidates),
+      candidates: normalizedCandidates,
       config: {
         adapter_revision_digest: adapterRevisionDigest,
         plan_digest: suppliedPlanDigest,
@@ -1591,7 +1762,9 @@ const DEBIAN_API = (() => {
         !DIGEST.test(leaseFence.target_scope_digest) ||
         !DIGEST.test(leaseFence.binding_digest) ||
         typeof leaseFence.holder_token !== "string" ||
+        !strictUtc(leaseFence.activated_at) ||
         !strictUtc(leaseFence.expires_at) ||
+        Date.parse(leaseFence.activated_at) > Date.parse(leaseFence.expires_at) ||
         boundExecutionRequest?.kind !==
           "brokkr-bounded-debian-maintenance-request" ||
         boundExecutionRequest.schema_version !== "v1" ||
@@ -1645,7 +1818,7 @@ const DEBIAN_API = (() => {
       delete receipt?.receipt_digest;
       if (!exactKeys(receipt, [
         "ok", "elapsed_ms", "execution_request_digest",
-        "lease_fence_digest", "reboot_required",
+        "lease_fence_digest", "fence_checked_at", "reboot_required",
       ]) || receipt.ok !== true ||
           receipt.execution_request_digest !== hash(boundExecutionRequest) ||
           receipt.lease_fence_digest !== hash(leaseFence) ||
@@ -1656,6 +1829,9 @@ const DEBIAN_API = (() => {
           suppliedReceiptDigest !== hash(receipt)) {
         fail("adapter_receipt_unbound");
       }
+      assertFenceFreshAt(
+        leaseFence, receipt.fence_checked_at, "effect_lease_expired",
+      );
       journal.adapter_receipt_digest = suppliedReceiptDigest;
       event("apply", "succeeded", applied);
       const substrate = adapters.substrateHealth();
