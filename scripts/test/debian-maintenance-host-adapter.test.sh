@@ -213,8 +213,9 @@ assert.equal(deadline.outcome, "terminally-blocked");
 assert.equal(deadline.reason, "host_recovery_budget_exhausted");
 const published = [];
 const bridge = executor.createBoundedRecoveryDispatcher({
-  recovery: {}, attemptId: request.attempt_id, bindingDigest: request.binding_digest,
+  recovery: {}, attemptId: request.attempt_id,
   descriptorDigest: request.recovery_descriptor_digest,
+  authorizeBinding: () => true,
   publishActivation: activation => { published.push(activation); return { activation_digest: digest(activation), idempotent: published.length > 1 }; },
   dispatch: input => ({ idempotency_key: input.idempotency_key ?? "recovery-67", effect_lease_fence_digest: request.lease_fence_digest, revalidated_lease_fence_digest: recoveryActivation.fence_digest, revalidated_at: "2026-07-27T12:00:00Z", recovered: true, safe_state_verified: true, quarantine_active: true, reason_code: null }),
 });

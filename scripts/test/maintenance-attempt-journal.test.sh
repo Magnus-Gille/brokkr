@@ -316,7 +316,7 @@ function recovery(artifacts, overrides = {}) {
   } = overrides;
   const receipts = new Map();
   let activeFence = null;
-  return {
+  const api = {
     workerIdentity: "maintenance-recovery-worker",
     publicKeyFingerprint: fingerprint(recoveryPublicPem),
     activateFence: fence => {
@@ -388,8 +388,14 @@ function recovery(artifacts, overrides = {}) {
         minimum_entries: input.minimum_entries,
       };
     },
+    publishActivation: activation => ({
+      activation_digest: autonomyDigest(activation), idempotent: false,
+    }),
+    authorizeBinding: () => true,
+    dispatch: input => api.recover(input.recovery_request),
     ...capabilityOverrides,
   };
+  return api;
 }
 function exactAdapters(phase = phases(), overrides = {}) {
   const {

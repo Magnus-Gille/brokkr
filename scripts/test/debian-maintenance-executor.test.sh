@@ -31,7 +31,7 @@ assert.deepEqual(
   "direct imports cannot reach a generic arbitrary-callback mutation runner",
 );
 assert.equal(journalModule.runMaintenanceAttempt, undefined);
-assert.throws(() => runDebianMaintenance({}), /attempt_journal_contract_invalid/);
+assert.throws(() => runDebianMaintenance({}), /bounded_recovery_dispatch_required/);
 
 const policy = JSON.parse(fs.readFileSync(
   `${process.env.ROOT}/tests/fixtures/maintenance-policy/normal-window.json`, "utf8",
