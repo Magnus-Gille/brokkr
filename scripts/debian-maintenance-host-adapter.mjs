@@ -8,8 +8,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import * as fixedHost from "./lib/fixed-debian-maintenance-host-dependencies.mjs";
 
 const STATE_ROOT = "/var/lib/brokkr/debian-maintenance";
+const FIXED_HOST_DEPENDENCY_DIGEST = "sha256:c8c20879423662c85bad0439f7c86917a39e50452c822103b3698dca401a7472";
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,62}$/;
 const PACKAGE = /^[a-z0-9][a-z0-9+.-]{0,127}$/;
@@ -20,7 +22,7 @@ const MAX_PACKAGES = 64;
 const MIN_AVAILABLE_KIB = 1024 * 1024;
 const RECOVERY_UNIT_ALLOWLIST = new Set(["brokkr-maintenance-safe.service"]);
 
-export const canonicalJson = value => {
+const canonicalJson = value => {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.keys(value).sort().map(key => (
@@ -237,7 +239,7 @@ function terminal(state, env, reason, bindingDigest) {
   return { outcome: "terminally-blocked", reason, journal: state };
 }
 
-export function runHostAdapter({ action, request, registration, env }) {
+function runHostAdapterCore({ action, request, registration, env }) {
   const safeEnv = {
     uid: env?.uid, now: env?.now, run: env?.run, rebootRequired: env?.rebootRequired,
     readJournal: env?.readJournal, writeJournal: env?.writeJournal, writeTerminal: env?.writeTerminal,
@@ -245,7 +247,7 @@ export function runHostAdapter({ action, request, registration, env }) {
   if (safeEnv.uid !== 0) fail("host_root_required");
   if (typeof safeEnv.now !== "function" || typeof safeEnv.run !== "function" || typeof safeEnv.rebootRequired !== "function" ||
     typeof safeEnv.readJournal !== "function" || typeof safeEnv.writeJournal !== "function" || typeof safeEnv.writeTerminal !== "function" ||
-    typeof env?.adapterReleaseDigest !== "function" || typeof env?.activateFence !== "function" || typeof env?.applyFenced !== "function" || typeof env?.readRecoveryActivation !== "function") fail("host_environment_invalid");
+    typeof env?.adapterReleaseDigest !== "function" || typeof env?.activateFence !== "function" || typeof env?.assertFenceCurrent !== "function" || typeof env?.readRecoveryActivation !== "function") fail("host_environment_invalid");
   const { execution, candidates, descriptor, assertFence, aptEvidence } = validateRequest(request, registration, action);
   if (env.adapterReleaseDigest() !== request.release_digest) fail("host_release_unbound");
   let state = safeEnv.readJournal();
@@ -265,12 +267,11 @@ export function runHostAdapter({ action, request, registration, env }) {
       append(state, "inventory_before", safeEnv, before, request.binding_digest);
       preflight(safeEnv); verifyAptEvidence(safeEnv, candidates, aptEvidence); exactSimulation(safeEnv, candidates);
       append(state, "apply", safeEnv, { execution_request_digest: request.execution_request_digest }, request.binding_digest);
-      env.applyFenced({ fence: clone(request.lease_fence), lease_fence_digest: request.lease_fence_digest, apply: () => {
-        const checkedAt = safeEnv.now();
-        if (!iso(checkedAt) || Date.parse(checkedAt) < Date.parse(request.lease_fence.activated_at) || Date.parse(checkedAt) > Date.parse(request.lease_fence.expires_at)) fail("host_fence_expired");
-        verifyAptEvidence(safeEnv, candidates, aptEvidence);
-        return ok(safeEnv, ["/usr/bin/apt-get", "--assume-yes", "--no-install-recommends", "--no-remove", "--only-upgrade", "install", ...candidates.map(item => `${item.name}=${item.candidate_version}`)], "host_apply_failed");
-      } });
+      env.assertFenceCurrent(clone(request.lease_fence), request.lease_fence_digest);
+      const checkedAt = safeEnv.now();
+      if (!iso(checkedAt) || Date.parse(checkedAt) < Date.parse(request.lease_fence.activated_at) || Date.parse(checkedAt) > Date.parse(request.lease_fence.expires_at)) fail("host_fence_expired");
+      verifyAptEvidence(safeEnv, candidates, aptEvidence);
+      ok(safeEnv, ["/usr/bin/apt-get", "--assume-yes", "--no-install-recommends", "--no-remove", "--only-upgrade", "install", ...candidates.map(item => `${item.name}=${item.candidate_version}`)], "host_apply_failed");
       const after = hostInventory(safeEnv, candidates);
       append(state, "inventory_after", safeEnv, after, request.binding_digest);
       if (canonicalJson(after) !== canonicalJson(execution.expected_postconditions)) fail("host_postconditions_unverifiable");
@@ -301,12 +302,12 @@ export function runHostAdapter({ action, request, registration, env }) {
     if (!plain(recoveryFenceReceipt) || recoveryFenceReceipt.activated !== true || recoveryFenceReceipt.lease_fence_digest !== activation.fence_digest) fail("host_revalidation_activation_failed");
     append(state, "recover", safeEnv, { recovery_descriptor_digest: request.recovery_descriptor_digest }, request.binding_digest);
     const deadline = Math.min(started + descriptor.budget_seconds * 1000, Date.parse(activation.fence.expires_at));
-    env.applyFenced({ fence: clone(activation.fence), lease_fence_digest: activation.fence_digest, apply: () => {
-      const checkedAt = safeEnv.now(); if (!iso(checkedAt) || Date.parse(checkedAt) < Date.parse(activation.fence.activated_at) || Date.parse(checkedAt) > Date.parse(activation.fence.expires_at)) fail("host_revalidation_fence_expired");
-      recoveryOk(safeEnv, deadline, ["/usr/bin/dpkg", "--configure", "-a"], "host_recovery_repair_failed");
-      for (const unit of descriptor.restart_units) recoveryOk(safeEnv, deadline, ["/usr/bin/systemctl", "try-restart", unit], "host_recovery_restart_failed");
-      for (const packageName of descriptor.packages) recoveryOk(safeEnv, deadline, ["/usr/bin/apt-mark", "hold", packageName], "host_recovery_hold_failed");
-    }});
+    env.assertFenceCurrent(clone(activation.fence), activation.fence_digest);
+    const checkedAt = safeEnv.now();
+    if (!iso(checkedAt) || Date.parse(checkedAt) < Date.parse(activation.fence.activated_at) || Date.parse(checkedAt) > Date.parse(activation.fence.expires_at)) fail("host_revalidation_fence_expired");
+    recoveryOk(safeEnv, deadline, ["/usr/bin/dpkg", "--configure", "-a"], "host_recovery_repair_failed");
+    for (const unit of descriptor.restart_units) recoveryOk(safeEnv, deadline, ["/usr/bin/systemctl", "try-restart", unit], "host_recovery_restart_failed");
+    for (const packageName of descriptor.packages) recoveryOk(safeEnv, deadline, ["/usr/bin/apt-mark", "hold", packageName], "host_recovery_hold_failed");
     withinRecoveryBudget(safeEnv, deadline);
     const after = hostInventory(safeEnv, candidates);
     if (canonicalJson(after) !== canonicalJson(execution.expected_postconditions)) fail("host_postconditions_unverifiable");
@@ -318,70 +319,72 @@ export function runHostAdapter({ action, request, registration, env }) {
   } catch (error) { return terminal(state, safeEnv, String(error?.code ?? error?.message ?? "host_recovery_failed"), request.binding_digest); }
 }
 
-function regularRootOwned(file) {
-  const stat = fs.lstatSync(file);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== 0 || (stat.mode & 0o077) !== 0) fail("host_input_file_unsafe");
-}
-function protectedDirectory(directory, create = false) {
-  if (create && !fs.existsSync(directory)) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const stat = fs.lstatSync(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== 0 || (stat.mode & 0o077) !== 0) fail("host_state_root_unsafe");
-}
-function readJson(file) { regularRootOwned(file); try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { fail("host_input_json_invalid"); } }
-function atomicWrite(file, value) {
-  protectedDirectory(STATE_ROOT);
-  protectedDirectory(path.dirname(file), true);
-  const temporary = `${file}.${process.pid}.${crypto.randomUUID()}`;
-  const fd = fs.openSync(temporary, "wx", 0o600); try { fs.writeFileSync(fd, `${canonicalJson(value)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  fs.renameSync(temporary, file); const directory = fs.openSync(path.dirname(file), "r"); try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+export function runHostAdapter({ action, request, registration }) {
+  const attempt = request?.attempt_id;
+  fixedHost.assertFixedDependencyDigest(FIXED_HOST_DEPENDENCY_DIGEST);
+  fixedHost.fixedAssertEffectLock(attempt);
+  return runHostAdapterCore({
+    action, request, registration,
+    env: {
+      uid: fixedHost.fixedUid(),
+      now: fixedHost.fixedNow,
+      run: fixedHost.fixedRun,
+      rebootRequired: fixedHost.fixedRebootRequired,
+      adapterReleaseDigest: fixedHost.fixedAdapterReleaseDigest,
+      activateFence: fence => fixedHost.fixedActivateFence(attempt, fence),
+      assertFenceCurrent: (fence, leaseFenceDigest) =>
+        fixedHost.fixedAssertFenceCurrent(attempt, fence, leaseFenceDigest),
+      readRecoveryActivation: () => fixedHost.fixedReadRecoveryActivation(attempt),
+      readJournal: () => fixedHost.fixedReadJournal(attempt),
+      writeJournal: value => fixedHost.fixedWriteJournal(attempt, value),
+      writeTerminal: value => fixedHost.fixedWriteTerminal(attempt, value),
+    },
+  });
 }
 function cli() {
-  const internal = process.argv[2] === "--effect-locked";
-  const offset = internal ? 3 : 2;
-  const [flag, action, attemptFlag, attempt] = process.argv.slice(offset);
-  if (flag !== "--action" || !["apply", "recover"].includes(action) || attemptFlag !== "--attempt" || !ID.test(attempt) || process.argv.length !== offset + 4) fail("host_cli_arguments_invalid");
+  const [flag, action, attemptFlag, attempt] = process.argv.slice(2);
+  if (flag !== "--action" || !["apply", "recover"].includes(action) ||
+    attemptFlag !== "--attempt" || !ID.test(attempt) || process.argv.length !== 6) {
+    fail("host_cli_arguments_invalid");
+  }
   if (process.getuid() !== 0) fail("host_root_required");
-  protectedDirectory(STATE_ROOT);
-  protectedDirectory(path.join(STATE_ROOT, "fences"), true);
-  if (!internal) {
-    const child = spawnSync("/usr/bin/flock", ["--nonblock", path.join(STATE_ROOT, "fences", `${attempt}.effect-lock`), process.execPath, fileURLToPath(import.meta.url), "--effect-locked", "--action", action, "--attempt", attempt], { encoding: "utf8" });
+  const stateRootStat = fs.lstatSync(STATE_ROOT);
+  if (!stateRootStat.isDirectory() || stateRootStat.isSymbolicLink() ||
+    stateRootStat.uid !== 0 || (stateRootStat.mode & 0o077) !== 0) {
+    fail("host_state_root_unsafe");
+  }
+  const fenceDirectory = path.join(STATE_ROOT, "fences");
+  if (!fs.existsSync(fenceDirectory)) fs.mkdirSync(fenceDirectory, { recursive: true, mode: 0o700 });
+  const fenceDirectoryStat = fs.lstatSync(fenceDirectory);
+  if (!fenceDirectoryStat.isDirectory() || fenceDirectoryStat.isSymbolicLink() ||
+    fenceDirectoryStat.uid !== 0 || (fenceDirectoryStat.mode & 0o077) !== 0) {
+    fail("host_state_root_unsafe");
+  }
+  const lockFile = path.join(fenceDirectory, `${attempt}.effect-lock`);
+  if (process.env.BROKKR_EFFECT_LOCKED !== "1") {
+    const lockFd = fs.openSync(
+      lockFile,
+      fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    const lockStat = fs.fstatSync(lockFd);
+    if (!lockStat.isFile() || lockStat.uid !== 0 || (lockStat.mode & 0o077) !== 0) {
+      fs.closeSync(lockFd); fail("host_effect_lock_unverified");
+    }
+    fs.closeSync(lockFd);
+    const child = spawnSync("/usr/bin/flock", [
+      "--nonblock", "--no-fork", lockFile,
+      process.execPath, fileURLToPath(import.meta.url),
+      "--action", action, "--attempt", attempt,
+    ], {
+      encoding: "utf8",
+      env: { ...process.env, BROKKR_EFFECT_LOCKED: "1" },
+    });
     process.stdout.write(child.stdout ?? ""); process.stderr.write(child.stderr ?? "");
     process.exitCode = child.status ?? 1; return;
   }
-  protectedDirectory(path.join(STATE_ROOT, "requests"));
-  protectedDirectory(path.join(STATE_ROOT, "registrations"));
-  protectedDirectory(path.join(STATE_ROOT, "recovery-activations"));
-  const request = readJson(path.join(STATE_ROOT, "requests", `${attempt}.json`));
-  const registration = readJson(path.join(STATE_ROOT, "registrations", `${attempt}.json`));
-  const journalFile = path.join(STATE_ROOT, "journals", `${attempt}.json`);
-  const terminalFile = path.join(STATE_ROOT, "terminals", `${attempt}.json`);
-  const fenceFile = path.join(STATE_ROOT, "fences", `${attempt}.json`);
-  const rawDigest = `sha256:${crypto.createHash("sha256").update(fs.readFileSync(fileURLToPath(import.meta.url))).digest("hex")}`;
-  const activateFence = fence => {
-    protectedDirectory(path.dirname(fenceFile), true);
-    const existing = fs.existsSync(fenceFile) ? readJson(fenceFile) : null;
-    if (existing !== null) {
-      if (!exactKeys(existing, ["fence", "lease_fence_digest"]) || existing.lease_fence_digest !== digest(existing.fence)) fail("host_fence_store_corrupt");
-      if (existing.fence.epoch > fence.epoch || (existing.fence.epoch === fence.epoch && existing.lease_fence_digest !== digest(fence))) fail("host_fence_superseded");
-    }
-    atomicWrite(fenceFile, { fence: clone(fence), lease_fence_digest: digest(fence) });
-    return { activated: true, lease_fence_digest: digest(fence) };
-  };
-  const applyFenced = ({ fence, lease_fence_digest, apply }) => {
-    if (lease_fence_digest !== digest(fence)) fail("host_fence_digest_invalid");
-    const current = readJson(fenceFile);
-    if (canonicalJson(current) !== canonicalJson({ fence, lease_fence_digest })) fail("host_fence_superseded");
-    return apply();
-  };
-  const result = runHostAdapter({ action, request, registration, env: {
-    uid: process.getuid(), now: () => new Date().toISOString().replace(".000Z", "Z"),
-    run: (argv, options = {}) => { const result = spawnSync(argv[0], argv.slice(1), { encoding: "utf8", timeout: options.timeoutMs ?? 120_000 }); return { status: result.status ?? 1, stdout: result.stdout ?? "" }; },
-    rebootRequired: () => fs.existsSync("/var/run/reboot-required"),
-    adapterReleaseDigest: () => rawDigest, activateFence, applyFenced,
-    readRecoveryActivation: () => readJson(path.join(STATE_ROOT, "recovery-activations", `${attempt}.json`)),
-    readJournal: () => fs.existsSync(journalFile) ? readJson(journalFile) : null,
-    writeJournal: value => atomicWrite(journalFile, value), writeTerminal: value => atomicWrite(terminalFile, value),
-  }});
+  const { request, registration } = fixedHost.readFixedHostInputs(attempt);
+  const result = runHostAdapter({ action, request, registration });
   process.stdout.write(`${canonicalJson({ outcome: result.outcome, reason: result.reason ?? null })}\n`);
   process.exitCode = result.outcome === "applied" || result.outcome === "disarmed" ? 0 : 1;
 }

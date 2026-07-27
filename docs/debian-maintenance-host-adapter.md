@@ -19,13 +19,18 @@ request's exact attempt, binding, plan, constitution, release, execution-request
 and recovery-descriptor digests. The adapter does not accept a path, command,
 repository, source, unit, package action, shell fragment, hook, or reboot policy
 from its CLI. `release_digest` must also equal the raw SHA-256 digest of the
-installed adapter module; it is not merely a request/registration self-claim.
+installed adapter module; that module pins and verifies the exact concrete
+dependency module before any effect, so splitting the implementation does not
+leave an unbound production seam.
 The full W2a target/binding/attempt/mutation/epoch/token/activation/expiry
 effect fence is request-and-registration-bound. The adapter takes an
-OS-released `flock` for the entire activation/check/effect process, installs
-that fence before preflight, re-reads the identical fence, and invokes apt
-synchronously inside that critical section. A superseded, missing, corrupt,
-or wedged fence fails closed. Recovery instead reads a separate root-owned,
+OS-enforced `flock` for the entire activation/check/effect process. The
+effecting process verifies that it inherited a descriptor for the exact
+root-owned lock inode and that an independent contender cannot acquire it;
+there is no caller-selectable locked mode. It then installs the fence before
+preflight, re-reads the identical fence, and invokes apt synchronously inside
+that critical section. A superseded, missing, corrupt, or wedged fence fails
+closed. Recovery instead reads a separate root-owned,
 fixed-path protected activation record bound to the immutable descriptor and
 attempt; its epoch must strictly advance the original effect fence, so a
 crashed recovery worker can be superseded without rewriting the original

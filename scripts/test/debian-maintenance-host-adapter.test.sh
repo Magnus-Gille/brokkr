@@ -7,7 +7,20 @@ cat >"$TMP/test.mjs" <<'NODE'
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 
-const adapter = await import(`${process.env.ROOT}/scripts/debian-maintenance-host-adapter.mjs`);
+const productionAdapter = await import(`${process.env.ROOT}/scripts/debian-maintenance-host-adapter.mjs`);
+const canonicalJson = value => value === null || typeof value !== "object" ? JSON.stringify(value) :
+  Array.isArray(value) ? `[${value.map(canonicalJson).join(",")}]` :
+    `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+const adapter = {
+  ...productionAdapter,
+  canonicalJson,
+  runHostAdapter: ({ env, ...input }) => {
+    globalThis.__BROKKR_TEST_HOST_ADAPTER_ENV__ = env;
+    return productionAdapter.runHostAdapter(input);
+  },
+};
+assert.deepEqual(Object.keys(productionAdapter), ["runHostAdapter"],
+  "the production adapter exports only the fixed-dependency runner");
 const { createBoundedRecoveryDispatcher } = await import(
   `${process.env.ROOT}/scripts/lib/bounded-recovery-dispatch.mjs`
 );
@@ -104,6 +117,17 @@ assert.equal(result.outcome, "applied");
 assert.deepEqual(state.entries.map(entry => entry.phase), ["preflight", "inventory_before", "apply", "inventory_after", "verify"]);
 assert(calls.some(argv => argv[0] === "/usr/bin/apt-get" && argv.includes("--only-upgrade") && argv.includes("openssl=3.0.17-1~deb12u2")));
 assert(calls.every(argv => argv[0].startsWith("/")), "adapter invokes only absolute fixed binaries");
+let injectedCallbackCalled = false;
+const injectedResult = productionAdapter.runHostAdapter({
+  action: "apply", request, registration,
+  env: {
+    run: () => { injectedCallbackCalled = true; throw Error("public callback reached"); },
+    activateFence: () => { injectedCallbackCalled = true; throw Error("public callback reached"); },
+    applyFenced: () => { injectedCallbackCalled = true; throw Error("public callback reached"); },
+  },
+});
+assert.equal(injectedCallbackCalled, false, "public imports cannot inject host effects");
+assert.equal(injectedResult.reason, "host_apply_replay_forbidden");
 
 for (const [name, mutate, code] of [
   ["arbitrary action", value => { value.action = "shell"; }, /host_action_invalid/],
@@ -295,6 +319,13 @@ for (const [name, mutate] of [
 console.log("debian host adapter: root-only exact allowlist, preflight, forward recovery and disarm OK");
 NODE
 env ROOT="$ROOT" node --experimental-loader "$ROOT/scripts/test/fixtures/fixed-recovery-host/loader.mjs" "$TMP/test.mjs"
+if env BROKKR_EFFECT_LOCKED=1 node "$ROOT/scripts/debian-maintenance-host-adapter.mjs" \
+  --effect-locked --action recover --attempt attempt-67 >"$TMP/direct-bypass.out" 2>&1; then
+  echo "direct --effect-locked invocation unexpectedly succeeded" >&2
+  exit 1
+fi
+rg -q 'host_cli_arguments_invalid' "$TMP/direct-bypass.out"
+! rg -q -- '--effect-locked' "$ROOT/scripts/debian-maintenance-host-adapter.mjs"
 UNIT="$ROOT/systemd/brokkr-debian-maintenance-recovery@.service"
 rg -q '^ExecStart=/usr/local/lib/brokkr/debian-maintenance-host-adapter --action recover --attempt %i$' "$UNIT"
 if command -v systemd-analyze >/dev/null 2>&1; then
