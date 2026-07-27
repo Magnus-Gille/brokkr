@@ -5,3 +5,4 @@ export {
   deriveDebianAutonomyExecution,
   runDebianMaintenance,
 } from "./debian-maintenance-autonomy.mjs";
+export { createBoundedRecoveryDispatcher } from "./lib/bounded-recovery-dispatch.mjs";

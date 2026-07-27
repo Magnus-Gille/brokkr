@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 
 const adapter = await import(`${process.env.ROOT}/scripts/debian-maintenance-host-adapter.mjs`);
+const executor = await import(`${process.env.ROOT}/scripts/debian-maintenance-executor.mjs`);
 const digest = value => `sha256:${crypto.createHash("sha256").update(adapter.canonicalJson(value)).digest("hex")}`;
 const candidate = {
   id: "openssl@3.0.17-1~deb12u2", name: "openssl", class: "security",
@@ -210,6 +211,17 @@ const deadline = adapter.runHostAdapter({ action: "recover", request, registrati
 }});
 assert.equal(deadline.outcome, "terminally-blocked");
 assert.equal(deadline.reason, "host_recovery_budget_exhausted");
+const published = [];
+const bridge = executor.createBoundedRecoveryDispatcher({
+  recovery: {}, attemptId: request.attempt_id, bindingDigest: request.binding_digest,
+  descriptorDigest: request.recovery_descriptor_digest,
+  publishActivation: activation => { published.push(activation); return { activation_digest: digest(activation), idempotent: published.length > 1 }; },
+  dispatch: input => ({ idempotency_key: input.idempotency_key ?? "recovery-67", effect_lease_fence_digest: request.lease_fence_digest, revalidated_lease_fence_digest: recoveryActivation.fence_digest, revalidated_at: "2026-07-27T12:00:00Z", recovered: true, safe_state_verified: true, quarantine_active: true, reason_code: null }),
+});
+const bridgeRequest = { idempotency_key: "recovery-67", descriptor_digest: request.recovery_descriptor_digest, target_scope_digest: request.lease_fence.target_scope_digest, binding_digest: request.binding_digest, lease_fence: request.lease_fence, lease_fence_digest: request.lease_fence_digest, revalidation_fence: recoveryActivation.fence, revalidation_fence_digest: recoveryActivation.fence_digest };
+const bridgeResult = bridge.recover(bridgeRequest);
+assert.equal(bridgeResult.recovered, true);
+assert.equal(published.length, 1, "real public executor seam publishes one protected activation before fixed dispatch");
 console.log("debian host adapter: root-only exact allowlist, preflight, forward recovery and disarm OK");
 NODE
 env ROOT="$ROOT" node "$TMP/test.mjs"

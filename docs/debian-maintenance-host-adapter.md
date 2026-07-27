@@ -63,12 +63,14 @@ postconditions inside the descriptor's at-most-300-second budget, then journals
 quarantine and disarm. Any repair, restart, hold, journal, or verification
 failure terminalizes and writes a disarm record.
 
-An `unknown` result is recovery-eligible evidence, not an automatic recovery
-dispatch: the W2a watchdog/recovery owner must issue the strictly newer
-protected activation and invoke the separate recovery unit. This adapter never
-manufactures that authority. Consequently this PR supplies the safe host seam
-but does not by itself close the system-level automatic-dispatch acceptance
-criterion of brokkr#67.
+`createBoundedRecoveryDispatcher()` is the public typed composition seam used
+by W2a callers. W2a's durable outbox supplies its authenticated, monotonic
+successor fence; the bridge persists the matching host activation idempotently
+and dispatches only `{action: "recover", attempt_id}` to the fixed unit. A
+restart reads the same W2a outbox and repeats the same idempotency key; it
+cannot synthesize a plan, re-arm, or widen scope. The production installer is
+still intentionally absent, so this remains a hermetic/disarmed contract until
+the separate owner ceremony installs the fixed state root and unit.
 
 `systemd/brokkr-debian-maintenance-recovery@.service` is a separate hardened
 root capability because dpkg repair itself requires root. Its sole executable

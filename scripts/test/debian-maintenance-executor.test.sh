@@ -19,7 +19,7 @@ const digest = value => `sha256:${crypto.createHash("sha256").update(canonicalJs
 
 assert.deepEqual(
   Object.keys(module).sort(),
-  ["deriveDebianAutonomyExecution", "runDebianMaintenance"],
+  ["createBoundedRecoveryDispatcher", "deriveDebianAutonomyExecution", "runDebianMaintenance"],
   "the raw drain/reboot executor is not an exported journal-bypass capability",
 );
 assert.deepEqual(
