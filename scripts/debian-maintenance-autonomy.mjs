@@ -1002,11 +1002,13 @@ function finishRecoveryOutbox({ file, journal, context, admission, recovery, out
         "idempotency_key", "effect_lease_fence_digest",
         "revalidated_lease_fence_digest", "revalidated_at", "recovered",
         "safe_state_verified", "quarantine_active", "reason_code",
+        "activation_digest", "terminal_receipt_digest",
       ]) && result.idempotency_key === outbox.recovery_request.idempotency_key &&
         outbox.authorized_recovery_fence_digests.includes(
           result.effect_lease_fence_digest,
         ) &&
         result.revalidated_lease_fence_digest === currentFenceDigest &&
+        DIGEST.test(result.activation_digest) && DIGEST.test(result.terminal_receipt_digest) &&
         typeof result.recovered === "boolean" && typeof result.safe_state_verified === "boolean" &&
         typeof result.quarantine_active === "boolean" &&
         (result.reason_code === null || typeof result.reason_code === "string"),
@@ -2150,8 +2152,7 @@ export function runDebianMaintenance(options = {}) {
     !ID.test(binding.mutation_id) || !ID.test(binding.recovery_disarm_id) ||
     !DIGEST.test(binding.target_scope_digest) ||
     !DIGEST.test(binding.recovery?.descriptor_digest) ||
-    typeof recovery.publishActivation !== "function" ||
-    typeof recovery.dispatch !== "function") {
+    !plain(recovery.host)) {
     fail("bounded_recovery_dispatch_required");
   }
   const boundedRecoveryFactory = ({ binding: recoveredBinding, bindingDigest }) => {
@@ -2174,8 +2175,7 @@ export function runDebianMaintenance(options = {}) {
         mutationId: recoveredBinding.mutation_id,
         targetScopeDigest: recoveredBinding.target_scope_digest,
       },
-      publishActivation: recovery.publishActivation,
-      dispatch: recovery.dispatch,
+      host: recovery.host,
     });
   };
   return DEBIAN_API.runBoundDebianMaintenance({

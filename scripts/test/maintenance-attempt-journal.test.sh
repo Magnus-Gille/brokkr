@@ -23,6 +23,9 @@ const {
 const {
   policyDigest,
 } = await import(`${root}/scripts/lib/maintenance-policy-contract.mjs`);
+const { createBoundedRecoveryHost } = await import(
+  `${root}/scripts/lib/bounded-recovery-dispatch.mjs`
+);
 
 const fixture = name => JSON.parse(fs.readFileSync(`${root}/tests/fixtures/autonomy-contract-v2/${name}`, "utf8"));
 const legacyFixture = name => JSON.parse(fs.readFileSync(
@@ -388,12 +391,21 @@ function recovery(artifacts, overrides = {}) {
         minimum_entries: input.minimum_entries,
       };
     },
-    publishActivation: activation => ({
-      activation_digest: autonomyDigest(activation), idempotent: false,
-    }),
-    dispatch: input => api.recover(input.recovery_request),
     ...capabilityOverrides,
   };
+  const activations = new Map();
+  api.host = createBoundedRecoveryHost({
+    persistActivation: activation => {
+      const activationDigest = autonomyDigest(activation);
+      const existing = activations.get(activation.attempt_id);
+      if (existing && autonomyDigest(existing) !== activationDigest) {
+        throw Object.assign(new Error("activation-conflict"), { code: "activation_conflict" });
+      }
+      activations.set(activation.attempt_id, clone(activation));
+      return { activation_digest: activationDigest, idempotent: existing !== undefined };
+    },
+    runFixedAdapter: input => api.recover(input.recovery_request),
+  });
   return api;
 }
 function exactAdapters(phase = phases(), overrides = {}) {

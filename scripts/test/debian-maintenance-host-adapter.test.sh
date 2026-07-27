@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 
 const adapter = await import(`${process.env.ROOT}/scripts/debian-maintenance-host-adapter.mjs`);
-const { createBoundedRecoveryDispatcher } = await import(
+const { createBoundedRecoveryDispatcher, createBoundedRecoveryHost } = await import(
   `${process.env.ROOT}/scripts/lib/bounded-recovery-dispatch.mjs`
 );
 const digest = value => `sha256:${crypto.createHash("sha256").update(adapter.canonicalJson(value)).digest("hex")}`;
@@ -213,7 +213,22 @@ const deadline = adapter.runHostAdapter({ action: "recover", request, registrati
 }});
 assert.equal(deadline.outcome, "terminally-blocked");
 assert.equal(deadline.reason, "host_recovery_budget_exhausted");
+assert.throws(() => createBoundedRecoveryDispatcher({
+  recovery: {}, expected: {
+    attemptId: request.attempt_id, bindingDigest: request.binding_digest,
+    descriptorDigest: request.recovery_descriptor_digest,
+    idempotencyKey: "recovery-67", mutationId: request.lease_fence.mutation_id,
+    targetScopeDigest: request.lease_fence.target_scope_digest,
+  },
+  host: {
+    persistActivation: () => ({ activation_digest: "sha256:" + "0".repeat(64), idempotent: false }),
+    runFixedAdapter: () => ({ recovered: true }),
+  },
+}), /bounded_recovery_dispatch_contract_invalid/, "look-alike caller callbacks are not a recovery host capability");
 const published = [];
+let bridgeActivation = null;
+let fixedHostAdapterExecutions = 0;
+const bridgeHostState = structuredClone(recoveryTemplate);
 const bridge = createBoundedRecoveryDispatcher({
   recovery: {}, expected: {
     attemptId: request.attempt_id, bindingDigest: request.binding_digest,
@@ -221,13 +236,38 @@ const bridge = createBoundedRecoveryDispatcher({
     idempotencyKey: "recovery-67", mutationId: request.lease_fence.mutation_id,
     targetScopeDigest: request.lease_fence.target_scope_digest,
   },
-  publishActivation: activation => { published.push(activation); return { activation_digest: digest(activation), idempotent: published.length > 1 }; },
-  dispatch: input => ({ idempotency_key: input.idempotency_key ?? "recovery-67", effect_lease_fence_digest: request.lease_fence_digest, revalidated_lease_fence_digest: recoveryActivation.fence_digest, revalidated_at: "2026-07-27T12:00:00Z", recovered: true, safe_state_verified: true, quarantine_active: true, reason_code: null }),
+  host: createBoundedRecoveryHost({
+    persistActivation: activation => {
+      published.push(activation); bridgeActivation = structuredClone(activation);
+      return { activation_digest: digest(activation), idempotent: published.length > 1 };
+    },
+    runFixedAdapter: input => {
+      fixedHostAdapterExecutions += 1;
+      assert.equal(input.action, "recover");
+      assert.equal(input.attempt_id, request.attempt_id);
+      assert.equal(input.activation_digest, digest(bridgeActivation));
+      const result = adapter.runHostAdapter({ action: "recover", request, registration, env: {
+        ...env, readRecoveryActivation: () => structuredClone(bridgeActivation),
+        readJournal: () => structuredClone(bridgeHostState),
+        writeJournal: value => Object.assign(bridgeHostState, structuredClone(value)),
+        run: argv => {
+          if (argv[0] === "/usr/bin/dpkg" && argv[1] === "--configure") return { status: 0, stdout: "" };
+          if (argv[0] === "/usr/bin/apt-mark" || argv[0] === "/usr/bin/systemctl") return { status: 0, stdout: "" };
+          if (argv[0] === "/usr/bin/dpkg-query") return { status: 0, stdout: "openssl=3.0.17-1~deb12u2\n" };
+          return run(argv);
+        },
+      }});
+      assert.equal(result.outcome, "disarmed", "the fixed host adapter must durably complete recovery");
+      return { idempotency_key: input.recovery_request.idempotency_key, effect_lease_fence_digest: request.lease_fence_digest, revalidated_lease_fence_digest: bridgeActivation.fence_digest, revalidated_at: "2026-07-27T12:00:00Z", recovered: true, safe_state_verified: true, quarantine_active: true, reason_code: null };
+    },
+  }),
 });
 const bridgeRequest = { idempotency_key: "recovery-67", descriptor_digest: request.recovery_descriptor_digest, target_scope_digest: request.lease_fence.target_scope_digest, binding_digest: request.binding_digest, lease_fence: request.lease_fence, lease_fence_digest: request.lease_fence_digest, revalidation_fence: recoveryActivation.fence, revalidation_fence_digest: recoveryActivation.fence_digest };
 const bridgeResult = bridge.recover(bridgeRequest);
 assert.equal(bridgeResult.recovered, true);
-assert.equal(published.length, 1, "real public executor seam publishes one protected activation before fixed dispatch");
+assert.equal(published.length, 1, "the bridge persists one successor activation before dispatch");
+assert.equal(fixedHostAdapterExecutions, 1, "recovery success requires fixed host-adapter execution, not a shape-only callback");
+assert(bridgeHostState.entries.some(entry => entry.phase === "disarm"), "the host adapter durably disarmed the recovered attempt");
 for (const [name, mutate] of [
   ["binding", value => { value.binding_digest = "sha256:" + "f".repeat(64); }],
   ["target", value => { value.revalidation_fence.target_scope_digest = "sha256:" + "f".repeat(64); }],
