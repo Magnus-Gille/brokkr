@@ -11,6 +11,7 @@ import { runMaintenanceAttempt } from "./maintenance-attempt-journal.mjs";
 const MAX_PLAN_AGE_MS = 5 * 60 * 1000;
 const MAX_EVENTS = 32;
 const MAX_INVENTORY_BYTES = 16_384;
+const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const hash = value => `sha256:${crypto.createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
 const fail = (code, cause) => { const error = new Error(code); error.code = code; error.cause = cause; throw error; };
 const parseUtc = value => strictUtc(value) ? Date.parse(value) : fail("invalid_timestamp");
@@ -36,6 +37,65 @@ function inventory(value) {
   }
   if (Buffer.byteLength(canonicalJson(output)) > MAX_INVENTORY_BYTES) fail("inventory_too_large");
   return output;
+}
+export function deriveDebianAutonomyExecution({
+  plan, policy, target, inventory: preState, adapterRevisionDigest, postconditions,
+}) {
+  assertPolicy(policy);
+  if (!target || Object.keys(target).sort().join(",") !== "node_id,non_pillar,platform" ||
+      target.platform !== "debian" || target.non_pillar !== true || target.node_id !== plan?.node_id ||
+      !DIGEST.test(adapterRevisionDigest) || !postconditions || typeof postconditions !== "object" ||
+      Array.isArray(postconditions)) fail("autonomy_execution_out_of_scope");
+  const planCopy = structuredClone(plan);
+  const suppliedPlanDigest = planCopy?.plan_digest;
+  delete planCopy?.plan_digest;
+  if (!DIGEST.test(suppliedPlanDigest) || suppliedPlanDigest !== hash(planCopy) ||
+      plan.gates?.workload_hooks !== "not_applicable" || !Array.isArray(plan.candidates) ||
+      plan.candidates.length < 1 ||
+      !plan.candidates.every(item => (
+        item?.eligible === true && ["security", "bugfix"].includes(item.class) &&
+        item.source === "distro_repository"
+      )) ||
+      policy.reboot?.policy !== "never" ||
+      !Array.isArray(policy.updates?.allowed_classes) ||
+      !policy.updates.allowed_classes.every(item => ["security", "bugfix"].includes(item)) ||
+      !Array.isArray(policy.updates?.allowed_sources) ||
+      !policy.updates.allowed_sources.every(item => item === "distro_repository")) {
+    fail("autonomy_execution_out_of_scope");
+  }
+  const normalizedPreState = inventory(preState);
+  const normalizedPostconditions = inventory(postconditions);
+  const targetScopeDigest = hash({ node_id: target.node_id, platform: target.platform });
+  const configDigest = hash({
+    adapter_revision_digest: adapterRevisionDigest,
+    node_id: target.node_id,
+    target_scope_digest: targetScopeDigest,
+  });
+  const baselineDigest = hash({
+    inventory: normalizedPreState,
+    node_id: target.node_id,
+    target_scope_digest: targetScopeDigest,
+  });
+  const postconditionsDigest = hash(normalizedPostconditions);
+  const evidenceDigest = hash({
+    baseline_digest: baselineDigest,
+    candidate_digest: suppliedPlanDigest,
+    config_digest: configDigest,
+    policy_digest: policy.policy_digest,
+  });
+  return {
+    node_id: target.node_id,
+    target_scope_digest: targetScopeDigest,
+    candidate_digest: suppliedPlanDigest,
+    config_digest: configDigest,
+    evidence_digest: evidenceDigest,
+    policy_digest: policy.policy_digest,
+    baseline_digest: baselineDigest,
+    postconditions_digest: postconditionsDigest,
+    pre_state: normalizedPreState,
+    postconditions: normalizedPostconditions,
+    adapter_revision_digest: adapterRevisionDigest,
+  };
 }
 function assertPolicy(policy) {
   if (!policy || policy.kind !== "maintenance-policy" || policy.schema_version !== "v1" || typeof policy.policy_id !== "string" || policy.policy_digest !== policyDigest(policy)) fail("policy_invalid");
@@ -69,7 +129,9 @@ function currentAdmission({ plan, policy, nodeId, adapters }) {
 // All effects are injected, synchronous and individually bounded by the host
 // adapter. This layer never retries: #34's finite controller retry budget owns
 // retries. `currentPolicy` and `clock` are read once per admission boundary.
-export function executeDebianMaintenance({ plan, policy, nodeId = plan?.node_id, journalFile, adapters }) {
+export function executeDebianMaintenance({
+  plan, policy, nodeId = plan?.node_id, journalFile, adapters, boundInitialInventory = null,
+}) {
   for (const name of ["inventory", "apply", "afterInventory", "currentPolicy", "clock", "hold"]) if (typeof adapters?.[name] !== "function") fail("adapter_contract_invalid");
   assertPolicy(policy); if (read(journalFile) !== null) fail("journal_already_exists");
   if (policy.reboot?.policy === "always_after_window") fail("always_after_window_unsupported");
@@ -104,7 +166,9 @@ export function executeDebianMaintenance({ plan, policy, nodeId = plan?.node_id,
     write(journalFile, journal); return { outcome: journal.outcome, reason: code, journal };
   };
   try {
-    journal.before_inventory = inventory(adapters.inventory()); event("inventory_before", "succeeded", journal.before_inventory);
+    journal.before_inventory = boundInitialInventory === null ?
+      inventory(adapters.inventory()) : inventory(boundInitialInventory);
+    event("inventory_before", "succeeded", journal.before_inventory);
     if (workload === "ready") { event("drain_started", "started", {}); drainBoundary = true; const drained = adapters.drain(); event("drain", drained?.ok ? "succeeded" : "failed", drained); if (!drained?.ok) fail("drain_failed"); const verified = adapters.verifyDrain(); event("drain_verify", verified?.ok ? "succeeded" : "failed", verified); if (!verified?.ok) fail("drain_verify_failed"); }
     // The exact second boundary closes any race while drain was running.
     eventAt = currentAdmission({ plan, policy, nodeId, adapters }).now; event("admission_revalidated", "succeeded", {});
@@ -124,23 +188,61 @@ export function executeDebianMaintenance({ plan, policy, nodeId = plan?.node_id,
 export function runDebianMaintenance(options) {
   const {
     binding, attemptJournalDir, artifacts, admission, recovery, reconcile = null,
-    watch, safeStateReadback, ...executor
+    watch, target, expectedPostconditions, plan, policy, nodeId = plan?.node_id, adapters,
   } = options ?? {};
   if (!binding || typeof attemptJournalDir !== "string" || !artifacts || !admission || !recovery ||
-      typeof watch !== "function" || typeof safeStateReadback !== "function") fail("attempt_journal_contract_invalid");
+      typeof watch !== "function" || !target || !expectedPostconditions || !plan || !policy || !adapters ||
+      typeof adapters.revisionDigest !== "function" || typeof adapters.targetMetadata !== "function") {
+    fail("attempt_journal_contract_invalid");
+  }
   const journalFile = path.join(attemptJournalDir, "mutation", `${binding.attempt_id}.json`);
   let executionResult = null;
+  let captured = null;
+  const capture = () => {
+    const actualTarget = adapters.targetMetadata();
+    if (canonicalJson(actualTarget) !== canonicalJson(target) || actualTarget.node_id !== nodeId ||
+        canonicalJson(adapters.currentPolicy()) !== canonicalJson(policy)) {
+      fail("execution_binding_substituted");
+    }
+    const actual = deriveDebianAutonomyExecution({
+      plan, policy, target: actualTarget,
+      inventory: executionResult?.journal?.before_inventory ?? adapters.inventory(),
+      adapterRevisionDigest: adapters.revisionDigest(), postconditions: expectedPostconditions,
+    });
+    for (const field of [
+      "target_scope_digest", "candidate_digest", "config_digest", "evidence_digest",
+      "policy_digest", "baseline_digest", "postconditions_digest",
+    ]) if (binding[field] !== actual[field]) fail("execution_binding_substituted");
+    captured = actual;
+    return {
+      execution_digest: hash({
+        baseline_digest: actual.baseline_digest, candidate_digest: actual.candidate_digest,
+        config_digest: actual.config_digest, evidence_digest: actual.evidence_digest,
+        policy_digest: actual.policy_digest, postconditions_digest: actual.postconditions_digest,
+        target_scope_digest: actual.target_scope_digest,
+      }),
+    };
+  };
+  capture();
   return runMaintenanceAttempt({
     journalDir: attemptJournalDir, binding, artifacts, admission, recovery, reconcile,
     phases: {
+      preflight: capture,
       apply: () => {
-        executionResult = executeDebianMaintenance({ ...executor, journalFile });
+        executionResult = executeDebianMaintenance({
+          plan, policy, nodeId, journalFile, adapters,
+          boundInitialInventory: captured.pre_state,
+        });
         if (executionResult.outcome !== "succeeded") fail("executor_postconditions_unmet");
         return { applied: true };
       },
       verify: () => ({ verified: executionResult?.outcome === "succeeded" }),
       watch,
-      safeStateReadback,
+      safeStateReadback: () => ({
+        safe: executionResult?.outcome === "succeeded",
+        postconditions_digest: executionResult?.journal?.after_inventory ?
+          hash(executionResult.journal.after_inventory) : null,
+      }),
     },
   });
 }

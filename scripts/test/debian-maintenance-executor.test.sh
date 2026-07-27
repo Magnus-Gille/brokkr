@@ -6,7 +6,7 @@ trap 'rm -rf "$TMP"' EXIT
 cat >"$TMP/test.mjs" <<'NODE'
 import fs from "node:fs"; import assert from "node:assert/strict"; import crypto from "node:crypto";
 const { policyDigest, canonicalJson } = await import(process.env.ROOT + "/scripts/lib/maintenance-policy-contract.mjs");
-const { executeDebianMaintenance, runDebianMaintenance } = await import(process.env.ROOT + "/scripts/debian-maintenance-executor.mjs");
+const { deriveDebianAutonomyExecution, executeDebianMaintenance, runDebianMaintenance } = await import(process.env.ROOT + "/scripts/debian-maintenance-executor.mjs");
 const now="2026-07-26T01:00:00Z", base=JSON.parse(fs.readFileSync(process.env.ROOT+"/tests/fixtures/maintenance-policy/normal-window.json","utf8")).records.find(x=>x.kind==="maintenance-policy");
 base.timezone="UTC";base.window.days_of_week=["sun"];base.window.start_local_time="00:00";base.window.duration="PT2H";base.selector.node_ids=["node-a"];delete base.policy_digest;base.policy_digest=policyDigest(base);
 const digest=x=>`sha256:${crypto.createHash("sha256").update(canonicalJson(x)).digest("hex")}`;
@@ -28,6 +28,14 @@ let heldDrain=0;assert.throws(()=>run("hold",plan(),adapters({hold:()=>({active:
 const noWork=plan();noWork.gates.workload_hooks="not_applicable";noWork.plan_digest=digest(Object.fromEntries(Object.entries(noWork).filter(([k])=>k!=="plan_digest")));let noDrain=0;assert.equal(run("no-work",noWork,adapters({drain:()=>{noDrain++;return {ok:true};}})).outcome,"succeeded");assert.equal(noDrain,0);
 const always=structuredClone(base);always.reboot.policy="always_after_window";delete always.policy_digest;always.policy_digest=policyDigest(always);let effects=0;
 assert.throws(()=>executeDebianMaintenance({plan:plan(),policy:always,nodeId:"node-a",journalFile:`${process.env.TMP}/always`,adapters:adapters({currentPolicy:()=>always,apply:()=>{effects++;return {ok:true,elapsed_ms:1};}})}),/always_after_window_unsupported/);assert.equal(effects,0);
+const autonomousPlan=plan();autonomousPlan.gates.workload_hooks="not_applicable";autonomousPlan.unmet_policy_classes=[];autonomousPlan.plan_digest=digest(Object.fromEntries(Object.entries(autonomousPlan).filter(([k])=>k!=="plan_digest")));
+const autonomousPolicy=structuredClone(base);autonomousPolicy.reboot.policy="never";delete autonomousPolicy.policy_digest;autonomousPolicy.policy_digest=policyDigest(autonomousPolicy);autonomousPlan.policy_digest=autonomousPolicy.policy_digest;delete autonomousPlan.plan_digest;autonomousPlan.plan_digest=digest(autonomousPlan);
+const target={node_id:"node-a",platform:"debian",non_pillar:true};
+const preState={kernel:"old",packages:["a"]};
+const postState={kernel:"new",packages:["b"],reboot_required:false,dpkg_status:"clean"};
+const actual=deriveDebianAutonomyExecution({plan:autonomousPlan,policy:autonomousPolicy,target,inventory:preState,adapterRevisionDigest:"sha256:"+"9".repeat(64),postconditions:postState});
+assert.equal(actual.candidate_digest,autonomousPlan.plan_digest);assert.equal(actual.policy_digest,autonomousPolicy.policy_digest);assert.equal(actual.node_id,"node-a");
+for (const [name,mutate] of [["pillar",x=>{x.target.non_pillar=false;}],["workload",x=>{x.plan.gates.workload_hooks="ready";}],["kernel",x=>{x.plan.candidates[0].class="kernel";}],["firmware",x=>{x.plan.candidates[0].class="firmware";}],["source",x=>{x.plan.candidates[0].source="third_party";}],["reboot",x=>{x.policy.reboot.policy="if_required";}]]) { const x={plan:structuredClone(autonomousPlan),policy:structuredClone(autonomousPolicy),target:structuredClone(target),inventory:preState,adapterRevisionDigest:"sha256:"+"9".repeat(64),postconditions:postState};mutate(x);if(name==="workload"||name==="kernel"||name==="firmware"||name==="source"){delete x.plan.plan_digest;x.plan.plan_digest=digest(x.plan);}if(name==="reboot"){delete x.policy.policy_digest;x.policy.policy_digest=policyDigest(x.policy);}assert.throws(()=>deriveDebianAutonomyExecution(x),/autonomy_execution_out_of_scope/,name);}
 assert.throws(()=>runDebianMaintenance({}),/attempt_journal_contract_invalid/);
 console.log("debian executor: admission, immutable journals, boundaries, phase evidence and bounded recovery OK");
 NODE

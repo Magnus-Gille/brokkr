@@ -2,6 +2,9 @@
 // This is a library form of Grimnir's merged verifier contract at
 // 298526972b46d4f8f0c40fbe92e830adb91087a8.
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,62}$/;
@@ -42,12 +45,98 @@ const boundedStructure = value => {
   visit(value);
   if (Buffer.byteLength(JSON.stringify(value)) > 1_000_000) fail("authorization_input_size_exceeded");
 };
+const schemaFiles = Object.freeze({
+  constitution: ["autonomy-constitution-v1.schema.json", "647aacbc963dd5ce620ca6240ce6bd11fd2275e0eb01c861468b10e156d1e707"],
+  coverage: ["autonomy-coverage-registry-v1.schema.json", "9c9a7936350b18300e2b488ac525276b8c91fbf3a2d795fb4d842c5ebbd024b7"],
+  ownerAttestations: ["autonomy-owner-attestation-registry-v1.schema.json", "80099e3d2f871ff89d98facff49ce9f4e8ca7c791ba7e40357ca812d556ecb59"],
+  authorization: ["autonomy-owner-authorization-v1.schema.json", "94d685bf863ab6c1f6782374a4f292896aa861ff631545ab765fc9018b1f5225"],
+  recoveryRegistry: ["autonomy-recovery-worker-registry-v1.schema.json", "24c51aefbf5511be5ae4d478dc8801f2387b3e8d83274d90c4a3be7b5ee52e48"],
+  runtimeNarrowing: ["autonomy-runtime-narrowing-v1.schema.json", "d4ec31f156b31efd70584ebc2cb9c22033602fa1275c168cc31686c7631b80e9"],
+});
+const schemaRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..", "docs");
+const schemaCache = new Map();
+function closedSchema(name) {
+  if (schemaCache.has(name)) return schemaCache.get(name);
+  const [file, expected] = schemaFiles[name];
+  const raw = fs.readFileSync(path.join(schemaRoot, file));
+  if (crypto.createHash("sha256").update(raw).digest("hex") !== expected) fail("w01_schema_pin_mismatch");
+  const root = JSON.parse(raw);
+  const supported = new Set([
+    "$schema", "$id", "title", "description", "$defs", "$ref", "oneOf", "allOf",
+    "const", "enum", "type", "pattern", "format", "minimum", "maximum", "minItems",
+    "maxItems", "uniqueItems", "items", "required", "properties", "additionalProperties",
+  ]);
+  const resolve = ref => {
+    if (!ref.startsWith("#/")) fail("w01_external_schema_ref");
+    return ref.slice(2).split("/").reduce((value, key) => (
+      value?.[key.replaceAll("~1", "/").replaceAll("~0", "~")]
+    ), root);
+  };
+  const inspect = node => {
+    if (!plain(node)) fail("w01_schema_node_invalid");
+    for (const key of Object.keys(node)) if (!supported.has(key)) fail("w01_schema_keyword_unsupported");
+    if (node.$ref && !resolve(node.$ref)) fail("w01_schema_ref_invalid");
+    for (const child of Object.values(node.$defs ?? {})) inspect(child);
+    for (const child of Object.values(node.properties ?? {})) inspect(child);
+    if (node.items) inspect(node.items);
+    for (const child of node.oneOf ?? []) inspect(child);
+    for (const child of node.allOf ?? []) inspect(child);
+  };
+  const typeMatches = (type, value) => ({
+    object: plain(value), array: Array.isArray(value), string: typeof value === "string",
+    integer: Number.isInteger(value), boolean: typeof value === "boolean", null: value === null,
+  })[type];
+  const errors = (node, value, at = "$") => {
+    if (node.$ref) return errors(resolve(node.$ref), value, at);
+    if (node.oneOf) return node.oneOf.filter(child => errors(child, value, at).length === 0).length === 1 ?
+      [] : [`${at}:oneOf`];
+    if (node.allOf) return node.allOf.flatMap(child => errors(child, value, at));
+    const result = [];
+    if (Object.hasOwn(node, "const") && canonicalJson(value) !== canonicalJson(node.const)) result.push(`${at}:const`);
+    if (node.enum && !node.enum.some(candidate => canonicalJson(value) === canonicalJson(candidate))) result.push(`${at}:enum`);
+    if (node.type && !typeMatches(node.type, value)) return [...result, `${at}:type`];
+    if (typeof value === "string") {
+      if (node.pattern && !new RegExp(node.pattern).test(value)) result.push(`${at}:pattern`);
+      if (node.format === "date-time" && !strictUtc(value)) result.push(`${at}:date-time`);
+    }
+    if (Number.isInteger(value)) {
+      if (node.minimum !== undefined && value < node.minimum) result.push(`${at}:minimum`);
+      if (node.maximum !== undefined && value > node.maximum) result.push(`${at}:maximum`);
+    }
+    if (Array.isArray(value)) {
+      if (node.minItems !== undefined && value.length < node.minItems) result.push(`${at}:minItems`);
+      if (node.maxItems !== undefined && value.length > node.maxItems) result.push(`${at}:maxItems`);
+      if (node.uniqueItems && new Set(value.map(canonicalJson)).size !== value.length) result.push(`${at}:uniqueItems`);
+      value.forEach((item, index) => { if (node.items) result.push(...errors(node.items, item, `${at}[${index}]`)); });
+    }
+    if (plain(value)) {
+      for (const field of node.required ?? []) if (!Object.hasOwn(value, field)) result.push(`${at}.${field}:required`);
+      if (node.additionalProperties === false) {
+        for (const field of Object.keys(value)) if (!Object.hasOwn(node.properties ?? {}, field)) result.push(`${at}.${field}:additional`);
+      }
+      for (const [field, child] of Object.entries(node.properties ?? {})) {
+        if (Object.hasOwn(value, field)) result.push(...errors(child, value[field], `${at}.${field}`));
+      }
+    }
+    return result;
+  };
+  inspect(root);
+  const check = value => {
+    const found = errors(root, value);
+    if (found.length) fail(`w01_schema_invalid:${name}:${found[0]}`);
+  };
+  schemaCache.set(name, check);
+  return check;
+}
 
 export function verifyOwnerAuthorizationBundle({
   authorization, constitution, coverage, ownerAttestations, recoveryRegistry,
   pinnedOwnerPublicKeyPem, authorizationCheckpoint,
 }) {
   for (const value of [authorization, constitution, coverage, ownerAttestations, recoveryRegistry, authorizationCheckpoint]) boundedStructure(value);
+  for (const [name, value] of Object.entries({
+    authorization, constitution, coverage, ownerAttestations, recoveryRegistry,
+  })) closedSchema(name)(value);
   if (!exactKeys(authorization, ["kind", "schema_version", "authorization_id", "authorization_sequence", "previous_authorization_digest", "issued_at", "authority", "bindings", "signature"]) ||
       !exactKeys(authorization.authority, ["key_id", "algorithm", "public_key_pem", "public_key_fingerprint"]) ||
       !exactKeys(authorization.bindings, ["constitution_digest", "coverage_intent_digest", "owner_attestation_registry_digest", "recovery_worker_registry_digest"]) ||
@@ -112,6 +201,8 @@ export function verifyOwnerAuthorizationBundle({
 
 export function verifyRuntimeNarrowingLedger({ ledger, recoveryRegistry, authorizationDigest, tailCheckpoint }) {
   for (const value of [ledger, recoveryRegistry, tailCheckpoint]) boundedStructure(value);
+  closedSchema("runtimeNarrowing")(ledger);
+  closedSchema("recoveryRegistry")(recoveryRegistry);
   if (!exactKeys(ledger, ["kind", "schema_version", "ledger_id", "owner_authorization_digest", "entries", "extensions"]) ||
       ledger.kind !== "autonomy-runtime-narrowing" || ledger.schema_version !== "v1" || !ID.test(ledger.ledger_id) ||
       !DIGEST.test(ledger.owner_authorization_digest) || !Array.isArray(ledger.entries) || ledger.entries.length > 4096 ||
@@ -155,9 +246,11 @@ export function verifyRuntimeNarrowingLedger({ ledger, recoveryRegistry, authori
 }
 
 export function effectiveTargetState({ coverage, narrowingEntries, targetScopeDigest }) {
-  const row = coverage.domains?.find(entry => entry.domain === DOMAIN);
-  const binding = row?.bindings?.find(entry => entry.target_scope_digest === targetScopeDigest);
-  if (!binding || coverage.global_state !== "armed" || row.coverage !== binding.state ||
+  const rows = coverage.domains?.filter(entry => entry.domain === DOMAIN) ?? [];
+  const bindings = rows[0]?.bindings?.filter(entry => entry.target_scope_digest === targetScopeDigest) ?? [];
+  const row = rows[0], binding = bindings[0];
+  if (rows.length !== 1 || bindings.length !== 1 || coverage.global_state !== "armed" ||
+      row.coverage !== row.target_state || row.coverage !== binding.state ||
       !["armed-canary", "armed-fleet"].includes(row.coverage)) return "shadow";
   return narrowingEntries.some(entry => entry.domain === DOMAIN && entry.target_scope_digest === targetScopeDigest) ? "shadow" : binding.state;
 }

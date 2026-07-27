@@ -84,6 +84,140 @@ function claimExclusive(file, digest) {
   fsyncDirectory(path.dirname(file));
   return true;
 }
+const stateRoot = journalDir => path.join(journalDir, ".autonomy-state");
+const targetKey = binding => binding.target_scope_digest.slice("sha256:".length);
+const domainStateFile = journalDir => path.join(stateRoot(journalDir), "domain-state.json");
+const domainLockDir = journalDir => path.join(stateRoot(journalDir), "domain-state.lock");
+const executionClaimFile = (journalDir, binding, kind) => (
+  path.join(stateRoot(journalDir), `execution-${binding.attempt_id}-${kind}.json`)
+);
+function withExclusiveDirectory(lockDir, code, operation) {
+  const tickets = `${lockDir}.tickets`;
+  fs.mkdirSync(tickets, { recursive: true, mode: 0o700 });
+  const token = crypto.randomUUID();
+  const entries = fs.readdirSync(tickets).filter(name => /^\d{8}\.json$/.test(name)).sort();
+  assert(entries.length < 10_000, "lock_ticket_limit");
+  let sequence = 1;
+  if (entries.length) {
+    const latestName = entries.at(-1);
+    sequence = Number.parseInt(latestName.slice(0, 8), 10) + 1;
+    const existing = boundedJson(path.join(tickets, latestName));
+    assert(exactKeys(existing, ["kind", "schema_version", "pid", "token", "sequence"]) &&
+      existing.kind === "brokkr-lock-ticket" && existing.schema_version === "v1" &&
+      Number.isSafeInteger(existing.pid) && typeof existing.token === "string" &&
+      existing.sequence === sequence - 1, "lock_owner_invalid");
+    const completed = fs.existsSync(path.join(tickets, `${latestName.slice(0, 8)}.done`));
+    if (!completed) {
+    let alive = true;
+    try { process.kill(existing.pid, 0); }
+    catch (error) { if (error.code === "ESRCH") alive = false; else throw error; }
+    if (alive) fail(code);
+    }
+  }
+  const prefix = String(sequence).padStart(8, "0");
+  const ticket = {
+    kind: "brokkr-lock-ticket", schema_version: "v1", pid: process.pid, token, sequence,
+  };
+  assert(createExclusive(path.join(tickets, `${prefix}.json`), ticket), code);
+  try { return operation(); }
+  finally {
+    assert(createExclusive(path.join(tickets, `${prefix}.done`), {
+      kind: "brokkr-lock-ticket-completion", schema_version: "v1", token, sequence,
+    }), "lock_completion_conflict");
+  }
+}
+function readOptional(file) {
+  try { return boundedJson(file); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+}
+function claimTarget({ journalDir, binding, now, policy }) {
+  return withExclusiveDirectory(domainLockDir(journalDir), "domain_claim_contended", () => {
+    const domainFile = domainStateFile(journalDir);
+    const domain = readOptional(domainFile) ?? {
+      kind: "brokkr-autonomy-domain-state", schema_version: "v1",
+      active_target_scope_digest: null, active_attempt_id: null, recent_starts: [],
+      targets: {}, revision: 0,
+    };
+    assert(exactKeys(domain, [
+      "kind", "schema_version", "active_target_scope_digest", "active_attempt_id",
+      "recent_starts", "targets", "revision",
+    ]) && domain.kind === "brokkr-autonomy-domain-state" && domain.schema_version === "v1" &&
+      Array.isArray(domain.recent_starts) && plain(domain.targets) &&
+      Number.isSafeInteger(domain.revision), "domain_state_invalid");
+    if (domain.active_attempt_id !== binding.attempt_id) {
+      assert(domain.active_attempt_id === null && domain.active_target_scope_digest === null,
+        "domain_concurrency_exceeded");
+      const nowMs = Date.parse(now);
+      domain.recent_starts = domain.recent_starts.filter(start => (
+        strictUtc(start) && nowMs - Date.parse(start) < policy.bounds.attempt_window_seconds * 1000
+      ));
+      assert(!domain.recent_starts.some(start => (
+        nowMs - Date.parse(start) < policy.bounds.min_seconds_between_attempts * 1000
+      )), "attempt_interval_exceeded");
+      assert(domain.recent_starts.length < policy.bounds.max_attempts_per_window,
+        "attempt_window_exceeded");
+      domain.active_target_scope_digest = binding.target_scope_digest;
+      domain.active_attempt_id = binding.attempt_id;
+      domain.recent_starts.push(now);
+      domain.revision += 1;
+      writeAtomic(domainFile, domain);
+    } else {
+      assert(domain.active_target_scope_digest === binding.target_scope_digest,
+        "domain_target_mismatch");
+    }
+    const key = targetKey(binding);
+    const current = domain.targets[key] ?? {
+      state: binding.admission_binding_state, active_attempt_id: null,
+      active_mutation_id: null, last_started_at: null, proposal_attempts: {},
+    };
+    assert(exactKeys(current, [
+      "state", "active_attempt_id", "active_mutation_id", "last_started_at", "proposal_attempts",
+    ]) && plain(current.proposal_attempts), "target_state_invalid");
+    if (current.active_attempt_id === binding.attempt_id) return current;
+    assert(current.state === binding.admission_binding_state, "target_state_not_armed");
+    assert(current.active_attempt_id === null && current.active_mutation_id === null, "target_concurrency_exceeded");
+    const attempts = current.proposal_attempts[binding.mutation_id] ?? 0;
+    assert(attempts < policy.bounds.max_attempts, "proposal_attempts_exceeded");
+    current.active_attempt_id = binding.attempt_id;
+    current.active_mutation_id = binding.mutation_id;
+    current.last_started_at = now;
+    current.proposal_attempts[binding.mutation_id] = attempts + 1;
+    domain.targets[key] = current;
+    domain.revision += 1;
+    writeAtomic(domainFile, domain);
+    return current;
+  });
+}
+function transitionTarget({ journalDir, binding, state, release = false }) {
+  return withExclusiveDirectory(domainLockDir(journalDir), "domain_state_contended", () => {
+    const domainFile = domainStateFile(journalDir);
+    const domain = readOptional(domainFile);
+    const current = domain?.targets?.[targetKey(binding)];
+    assert(current?.active_attempt_id === binding.attempt_id &&
+      domain.active_attempt_id === binding.attempt_id &&
+      domain.active_target_scope_digest === binding.target_scope_digest, "target_state_owner_mismatch");
+    current.state = state;
+    if (release) {
+      current.active_attempt_id = null;
+      current.active_mutation_id = null;
+    }
+    if (release) {
+      domain.active_attempt_id = null;
+      domain.active_target_scope_digest = null;
+    }
+    domain.revision += 1;
+    writeAtomic(domainFile, domain);
+    return current;
+  });
+}
+function claimExecution({ journalDir, binding, kind, bindingDigest }) {
+  const file = executionClaimFile(journalDir, binding, kind);
+  return createExclusive(file, {
+    kind: "brokkr-autonomy-execution-claim", schema_version: "v1",
+    attempt_id: binding.attempt_id, target_scope_digest: binding.target_scope_digest,
+    binding_digest: bindingDigest, claim_kind: kind,
+  });
+}
 
 // Dependency-free Draft-2020-12 subset used by the exact Grimnir journal
 // schema. This refuses unknown schema keywords so a future contract cannot be
@@ -145,8 +279,9 @@ function schemaChecker(rootSchema) {
 }
 
 function ownerBindingFor({ coverage, ownerAttestations, binding }) {
-  const row = coverage.domains?.find(entry => entry.domain === DOMAIN);
-  const ownerBinding = row?.bindings?.find(entry => (
+  const rows = coverage.domains?.filter(entry => entry.domain === DOMAIN) ?? [];
+  const row = rows[0];
+  const ownerBindings = row?.bindings?.filter(entry => (
     entry.target_scope_digest === binding.target_scope_digest &&
     entry.writer_owner === binding.writer_owner &&
     entry.owner_authority_ref === binding.owner_authority_ref &&
@@ -154,27 +289,34 @@ function ownerBindingFor({ coverage, ownerAttestations, binding }) {
     entry.configuration_owner === binding.configuration_owner &&
     entry.configuration_owner_authority_ref === binding.configuration_owner_authority_ref &&
     entry.configuration_owner_authority_digest === binding.configuration_owner_authority_digest
-  ));
-  const attestation = ownerAttestations.attestations?.find(entry => (
+  )) ?? [];
+  const ownerBinding = ownerBindings[0];
+  const attestations = ownerAttestations.attestations?.filter(entry => (
     `ref:${entry.attestation_id}` === binding.configuration_owner_authority_ref &&
     entry.attestation_digest === binding.configuration_owner_authority_digest &&
     entry.domain === DOMAIN && entry.target_scope_digest === binding.target_scope_digest &&
     entry.configuration_owner === binding.configuration_owner &&
     entry.attestation_digest === autonomyDigest(entry, "attestation_digest")
-  ));
-  assert(row && ownerBinding && attestation, "target_owner_attestation_invalid");
-  assert(coverage.global_state === "armed" && ["armed-canary", "armed-fleet"].includes(row.coverage), "coverage_not_armed");
+  )) ?? [];
+  assert(rows.length === 1 && ownerBindings.length === 1 && attestations.length === 1, "target_owner_attestation_invalid");
+  assert(coverage.global_state === "armed" && row.coverage === row.target_state &&
+    row.coverage === ownerBinding.state && ["armed-canary", "armed-fleet"].includes(row.coverage), "coverage_not_armed");
   assert(binding.admission_coverage_digest === coverage.registry_digest && binding.admission_binding_state === ownerBinding.state, "coverage_binding_mismatch");
   assert(binding.writer_owner === "brokkr" && binding.configuration_owner === "brokkr", "maintenance_owner_invalid");
   const identities = ownerBinding.identities;
+  assert(exactKeys(identities, ["owner", "controller", "watchdog", "kill_switch", "recovery_worker"]) &&
+    new Set(Object.values(identities)).size === 5, "coverage_identity_ambiguity");
   assert(binding.owner_identity === identities.owner && binding.controller_identity === identities.controller &&
     binding.watchdog_identity === identities.watchdog && binding.kill_switch_identity === identities.kill_switch &&
     binding.recovery_worker_identity === identities.recovery_worker, "coverage_identity_mismatch");
   return ownerBinding;
 }
 function classPolicy(constitution) {
-  const policy = constitution.autonomous_classes?.find(entry => entry.class === DOMAIN);
-  assert(policy && policy.recovery_class === "R-forward" && policy.owner === "brokkr", "maintenance_constitution_invalid");
+  const policies = constitution.autonomous_classes?.filter(entry => entry.class === DOMAIN) ?? [];
+  const policy = policies[0];
+  assert(policies.length === 1 && policy.recovery_class === "R-forward" && policy.owner === "brokkr" &&
+    policy.bounds?.max_concurrent_targets === 1 && policy.bounds?.max_attempts === 1 &&
+    policy.bounds?.trusted_watchdog_time_required === true, "maintenance_constitution_invalid");
   return policy;
 }
 function trustedNow(clock, previous = null) {
@@ -209,8 +351,34 @@ function makeEntry(journal, { phase, at, actor, contentRef, reason = null, quara
   return entry;
 }
 function append(file, journal, options) {
-  journal.entries.push(makeEntry(journal, options));
-  writeAtomic(file, journal);
+  const lock = `${file}.append-lock`;
+  return withExclusiveDirectory(lock, "journal_append_contended", () => {
+    const current = boundedJson(file);
+    assert(current.binding_digest === journal.binding_digest, "journal_binding_changed");
+    const expectedTail = journal.entries.at(-1)?.receipt_digest ?? null;
+    const actualTail = current.entries.at(-1)?.receipt_digest ?? null;
+    assert(actualTail === expectedTail, "journal_tail_conflict");
+    current.entries.push(makeEntry(current, options));
+    writeAtomic(file, current);
+    return current;
+  });
+}
+function appendExact(file, journal, entry) {
+  const lock = `${file}.append-lock`;
+  return withExclusiveDirectory(lock, "journal_append_contended", () => {
+    const current = boundedJson(file);
+    const expectedTail = journal.entries.at(-1)?.receipt_digest ?? null;
+    const actualTail = current.entries.at(-1)?.receipt_digest ?? null;
+    assert(current.binding_digest === journal.binding_digest && actualTail === expectedTail,
+      "journal_tail_conflict");
+    assert(entry.previous_receipt_digest === actualTail &&
+      entry.sequence === current.entries.length + 1 &&
+      entry.binding_digest === current.binding_digest &&
+      entry.receipt_digest === autonomyDigest(entry, "receipt_digest"), "journal_prepared_entry_invalid");
+    current.entries.push(structuredClone(entry));
+    writeAtomic(file, current);
+    return current;
+  });
 }
 function coverageTransition(binding) {
   return {
@@ -282,30 +450,31 @@ export function attemptIdentity(binding) {
   assert(ID.test(binding?.idempotency_key), "attempt_identity_invalid");
   return binding.idempotency_key;
 }
-function scanAttemptRate(journalDir, currentId, now, policy, conformance) {
-  let entries = [];
-  try { entries = fs.readdirSync(journalDir, { withFileTypes: true }); }
-  catch (error) { if (error.code === "ENOENT") return; throw error; }
-  const starts = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".json") || entry.name === `${currentId}.json`) continue;
-    const journal = boundedJson(path.join(journalDir, entry.name));
-    validateJournalSemantics(journal, conformance, { allowActive: true });
-    starts.push(Date.parse(journal.entries[0].recorded_at));
-  }
-  const nowMs = Date.parse(now);
-  assert(!starts.some(start => nowMs - start < policy.bounds.min_seconds_between_attempts * 1000), "attempt_interval_exceeded");
-  assert(starts.filter(start => nowMs - start < policy.bounds.attempt_window_seconds * 1000).length < policy.bounds.max_attempts_per_window, "attempt_window_exceeded");
+function readArtifacts(artifacts) {
+  const snapshot = typeof artifacts?.read === "function" ? artifacts.read() : artifacts;
+  assert(plain(snapshot), "authorization_artifacts_unavailable");
+  return snapshot;
 }
-function verifyAdmission({ binding, artifacts, admission, journalDir, conformance }) {
-  const bundle = verifyOwnerAuthorizationBundle(artifacts);
+function verifyAuthority({ binding, snapshot, recovery }) {
+  const bundle = verifyOwnerAuthorizationBundle(snapshot);
   const narrowing = verifyRuntimeNarrowingLedger({
-    ledger: artifacts.runtimeNarrowing,
+    ledger: snapshot.runtimeNarrowing,
     recoveryRegistry: bundle.recoveryRegistry,
     authorizationDigest: bundle.authorizationDigest,
-    tailCheckpoint: artifacts.runtimeNarrowingCheckpoint,
+    tailCheckpoint: snapshot.runtimeNarrowingCheckpoint,
   });
   ownerBindingFor({ coverage: bundle.coverage, ownerAttestations: bundle.ownerAttestations, binding });
+  const recoveryBindings = bundle.recoveryRegistry.entries.filter(entry => (
+    entry.domain === DOMAIN && entry.target_scope_digest === binding.target_scope_digest &&
+    entry.recovery_worker_identity === binding.recovery_worker_identity
+  ));
+  assert(recoveryBindings.length === 1 && recovery?.workerIdentity === binding.recovery_worker_identity &&
+    recovery.publicKeyFingerprint === recoveryBindings[0].public_key_fingerprint, "recovery_capability_unbound");
+  return { bundle, narrowing, recoveryBinding: recoveryBindings[0] };
+}
+function verifyAdmission({ binding, snapshot, admission, recovery, journalDir, conformance }) {
+  const authority = verifyAuthority({ binding, snapshot, recovery });
+  const { bundle, narrowing } = authority;
   assert(effectiveTargetState({ coverage: bundle.coverage, narrowingEntries: narrowing.entries, targetScopeDigest: binding.target_scope_digest }) === binding.admission_binding_state, "runtime_demotion_consumed");
   const policy = classPolicy(bundle.constitution);
   const now = trustedNow(admission.trustedClock);
@@ -328,11 +497,105 @@ function verifyAdmission({ binding, artifacts, admission, journalDir, conformanc
     maintenance.plan.reboot_policy === "never" && maintenance.plan.source === "distro_repository" &&
     maintenance.plan.workload_hooks === "not_applicable", "maintenance_plan_out_of_scope");
   assert(Date.parse(now) < Date.parse(binding.deadline), "attempt_deadline_closed");
-  scanAttemptRate(journalDir, binding.idempotency_key, now, policy, conformance);
-  return { bundle, narrowing, policy, now, maintenance };
+  return {
+    ...authority, policy, now, maintenance,
+    immutableAdmissionDigest: autonomyDigest({
+      authorization_digest: bundle.authorizationDigest,
+      coverage_digest: bundle.coverage.registry_digest,
+      evidence_digest: evidence.digest,
+      maintenance,
+      recovery_registry_digest: bundle.recoveryRegistry.registry_digest,
+      target_state: binding.admission_binding_state,
+    }),
+  };
 }
 function reasonDigest(code) {
   return autonomyDigest({ code: String(code || "unknown").slice(0, 96) });
+}
+function verifyTerminalNarrowing({ narrowed, authorizationDigest, recoveryRegistry, terminal }) {
+  const verified = verifyRuntimeNarrowingLedger({
+    ledger: narrowed.ledger, recoveryRegistry,
+    authorizationDigest, tailCheckpoint: narrowed.tailCheckpoint,
+  });
+  const tail = verified.entries.at(-1);
+  assert(tail?.journal_receipt_digest === terminal.receipt_digest &&
+    tail.target_scope_digest === terminal.coverage_transition.target_scope_digest &&
+    tail.recovery_worker_identity === terminal.coverage_transition.actor_identity &&
+    tail.to_state === "shadow", "runtime_narrowing_not_consumed");
+  return verified;
+}
+function finishRecoveryOutbox({ file, journal, context, artifacts, recovery, outboxFile }) {
+  return withExclusiveDirectory(`${outboxFile}.lock`, "recovery_outbox_contended", () => {
+    let outbox = boundedJson(outboxFile);
+    assert(exactKeys(outbox, [
+      "kind", "schema_version", "binding_digest", "stage", "terminal_entry",
+      "recovery_error", "narrowing_tail_digest", "owner_authorization_digest",
+      "previous_narrowing_digest", "narrowing_sequence",
+    ]) && outbox.kind === "brokkr-autonomy-recovery-outbox" &&
+      outbox.schema_version === "v1" && outbox.binding_digest === journal.binding_digest,
+    "recovery_outbox_invalid");
+    if (outbox.stage === "prepared") {
+      const narrowed = recovery.appendSignedNarrowing({
+        journal_receipt_digest: outbox.terminal_entry.receipt_digest,
+        recorded_at: outbox.terminal_entry.recorded_at,
+        binding: journal.binding,
+        authorization_digest: outbox.owner_authorization_digest,
+        previous_entry_digest: outbox.previous_narrowing_digest,
+        sequence: outbox.narrowing_sequence,
+      });
+      const historical = recovery.readAuthorityHistory({
+        authorization_digest: outbox.owner_authorization_digest,
+      });
+      const historicalBundle = verifyOwnerAuthorizationBundle(historical);
+      assert(historicalBundle.authorizationDigest === outbox.owner_authorization_digest,
+        "recovery_authority_history_mismatch");
+      const verified = verifyTerminalNarrowing({
+        narrowed, authorizationDigest: outbox.owner_authorization_digest,
+        recoveryRegistry: historicalBundle.recoveryRegistry, terminal: outbox.terminal_entry,
+      });
+      outbox.stage = "narrowing-verified";
+      outbox.narrowing_tail_digest = verified.tailDigest;
+      writeAtomic(outboxFile, outbox);
+      recovery.fault?.("after-narrowing-checkpoint");
+    }
+    const historical = recovery.readAuthorityHistory({
+      authorization_digest: outbox.owner_authorization_digest,
+    });
+    const historicalBundle = verifyOwnerAuthorizationBundle(historical);
+    assert(historicalBundle.authorizationDigest === outbox.owner_authorization_digest,
+      "recovery_authority_history_mismatch");
+    const narrowedHistory = recovery.readNarrowingHistory({
+      authorization_digest: outbox.owner_authorization_digest,
+    });
+    const verifiedCurrent = verifyRuntimeNarrowingLedger({
+      ledger: narrowedHistory.ledger, recoveryRegistry: historicalBundle.recoveryRegistry,
+      authorizationDigest: outbox.owner_authorization_digest,
+      tailCheckpoint: narrowedHistory.tailCheckpoint,
+    });
+    const tail = verifiedCurrent.entries.at(-1);
+    assert(tail?.entry_digest === outbox.narrowing_tail_digest &&
+      tail.journal_receipt_digest === outbox.terminal_entry.receipt_digest,
+    "recovery_outbox_narrowing_missing");
+    let current = boundedJson(file);
+    if (current.entries.at(-1).receipt_digest !== outbox.terminal_entry.receipt_digest) {
+      current = appendExact(file, current, outbox.terminal_entry);
+      recovery.fault?.("after-terminal-journal");
+    }
+    const terminalState = outbox.terminal_entry.phase === "disarm" ? "shadow" : "terminally-blocked";
+    transitionTarget({ journalDir: context.journalDir, binding: journal.binding, state: terminalState });
+    outbox.stage = "complete";
+    writeAtomic(outboxFile, outbox);
+    recovery.fault?.("after-outbox-complete");
+    validateJournalSemantics(current, {
+      schema: context.conformance.schema, constitution: historical.constitution,
+      coverage: historical.coverage, ownerAttestations: historical.ownerAttestations,
+    });
+    return {
+      journal: current, ran: false,
+      reason: outbox.terminal_entry.phase === "disarm" ? "recovered-disarmed" : "terminally-blocked",
+      recovery_error: outbox.recovery_error,
+    };
+  });
 }
 function enterRecovery({ file, journal, context, artifacts, admission, recovery, code, lastAt }) {
   let at = trustedNow(admission.trustedClock, lastAt);
@@ -341,98 +604,178 @@ function enterRecovery({ file, journal, context, artifacts, admission, recovery,
   if (!claimExclusive(claim, journal.binding_digest)) {
     const current = boundedJson(file);
     validateJournalSemantics(current, context.conformance, { allowActive: true });
+    const existingOutbox = readOptional(`${file}.recovery-outbox.json`);
+    if (existingOutbox) return finishRecoveryOutbox({
+      file, journal: current, context, artifacts, recovery,
+      outboxFile: `${file}.recovery-outbox.json`,
+    });
     return { journal: current, ran: false, reason: "recovery-already-claimed", recovery_error: "recovery-already-claimed" };
   }
   if (journal.entries.at(-1).phase !== "unknown") {
-    append(file, journal, { phase: "unknown", at, actor: journal.binding.watchdog_identity, contentRef: context.contentRef, reason, quarantine: true });
+    journal = append(file, journal, { phase: "unknown", at, actor: journal.binding.watchdog_identity, contentRef: context.contentRef, reason, quarantine: true });
   }
+  transitionTarget({ journalDir: context.journalDir, binding: journal.binding, state: "unknown" });
   let result;
   let recoveryError = null;
   try { result = recovery.recover({ descriptor_digest: journal.binding.recovery.descriptor_digest }); }
   catch (error) { recoveryError = String(error?.code ?? error?.message ?? "recovery-error").slice(0, 96); }
   at = trustedNow(admission.trustedClock, at);
+  let terminal;
   if (result?.recovered === true && result.safe_state_verified === true && result.quarantine_active === true) {
-    append(file, journal, { phase: "recover", at, actor: journal.binding.recovery_worker_identity, contentRef: context.contentRef, quarantine: true });
+    journal = append(file, journal, { phase: "recover", at, actor: journal.binding.recovery_worker_identity, contentRef: context.contentRef, quarantine: true });
     at = trustedNow(admission.trustedClock, at);
-    append(file, journal, { phase: "quarantine", at, actor: journal.binding.recovery_worker_identity, contentRef: context.contentRef, quarantine: true });
+    journal = append(file, journal, { phase: "quarantine", at, actor: journal.binding.recovery_worker_identity, contentRef: context.contentRef, quarantine: true });
     at = trustedNow(admission.trustedClock, at);
-    const disarm = makeEntry(journal, {
+    terminal = makeEntry(journal, {
       phase: "disarm", at, actor: journal.binding.recovery_worker_identity, contentRef: context.contentRef,
       reason, quarantine: true, coverageTransition: coverageTransition(journal.binding),
     });
-    const narrowed = recovery.appendSignedNarrowing({
-      journal_receipt_digest: disarm.receipt_digest,
-      recorded_at: at,
-      binding: journal.binding,
-      authorization_digest: context.bundle.authorizationDigest,
-      previous_entry_digest: context.narrowing.tailDigest,
-      sequence: context.narrowing.entries.length + 1,
+  } else {
+    const terminalReason = reasonDigest(recoveryError ?? result?.reason_code ?? "recovery-postconditions-failed");
+    terminal = makeEntry(journal, {
+      phase: "terminally-blocked", at, actor: journal.binding.recovery_worker_identity, contentRef: context.contentRef,
+      reason: terminalReason, quarantine: true, coverageTransition: coverageTransition(journal.binding),
     });
-    const verified = verifyRuntimeNarrowingLedger({
-      ledger: narrowed.ledger, recoveryRegistry: context.bundle.recoveryRegistry,
-      authorizationDigest: context.bundle.authorizationDigest, tailCheckpoint: narrowed.tailCheckpoint,
-    });
-    const tail = verified.entries.at(-1);
-    assert(tail?.journal_receipt_digest === disarm.receipt_digest && tail.target_scope_digest === journal.binding.target_scope_digest &&
-      tail.recovery_worker_identity === journal.binding.recovery_worker_identity && tail.to_state === "shadow", "runtime_narrowing_not_consumed");
-    journal.entries.push(disarm);
-    writeAtomic(file, journal);
-    validateJournalSemantics(journal, context.conformance);
-    return { journal, ran: false, reason: "recovered-disarmed", recovery_error: null, narrowing: narrowed };
   }
-  const terminalReason = reasonDigest(recoveryError ?? result?.reason_code ?? "recovery-postconditions-failed");
-  const terminal = makeEntry(journal, {
-    phase: "terminally-blocked", at, actor: journal.binding.recovery_worker_identity, contentRef: context.contentRef,
-    reason: terminalReason, quarantine: true, coverageTransition: coverageTransition(journal.binding),
-  });
-  const narrowed = recovery.appendSignedNarrowing({
-    journal_receipt_digest: terminal.receipt_digest, recorded_at: at, binding: journal.binding,
-    authorization_digest: context.bundle.authorizationDigest, previous_entry_digest: context.narrowing.tailDigest,
-    sequence: context.narrowing.entries.length + 1,
-  });
-  const verified = verifyRuntimeNarrowingLedger({
-    ledger: narrowed.ledger, recoveryRegistry: context.bundle.recoveryRegistry,
-    authorizationDigest: context.bundle.authorizationDigest, tailCheckpoint: narrowed.tailCheckpoint,
-  });
-  assert(verified.entries.at(-1)?.journal_receipt_digest === terminal.receipt_digest, "runtime_narrowing_not_consumed");
-  journal.entries.push(terminal);
-  writeAtomic(file, journal);
-  validateJournalSemantics(journal, context.conformance);
-  return { journal, ran: false, reason: "terminally-blocked", recovery_error: recoveryError ?? result?.reason_code ?? "recovery-postconditions-failed", narrowing: narrowed };
+  const outboxFile = `${file}.recovery-outbox.json`;
+  const outbox = {
+    kind: "brokkr-autonomy-recovery-outbox", schema_version: "v1",
+    binding_digest: journal.binding_digest, stage: "prepared",
+    terminal_entry: terminal,
+    recovery_error: recoveryError ?? result?.reason_code ?? null,
+    narrowing_tail_digest: null,
+    owner_authorization_digest: context.bundle.authorizationDigest,
+    previous_narrowing_digest: context.narrowing.tailDigest,
+    narrowing_sequence: context.narrowing.entries.length + 1,
+  };
+  assert(createExclusive(outboxFile, outbox), "recovery_outbox_conflict");
+  recovery.fault?.("after-recovery-outbox");
+  return finishRecoveryOutbox({ file, journal, context, artifacts, recovery, outboxFile });
 }
 
+function executionBindingDigest(binding) {
+  return autonomyDigest({
+    baseline_digest: binding.baseline_digest,
+    candidate_digest: binding.candidate_digest,
+    config_digest: binding.config_digest,
+    evidence_digest: binding.evidence_digest,
+    policy_digest: binding.policy_digest,
+    postconditions_digest: binding.postconditions_digest,
+    target_scope_digest: binding.target_scope_digest,
+  });
+}
+function verifyExecutionPreflight(phases, binding) {
+  const result = phases.preflight();
+  assert(exactKeys(result, ["execution_digest"]) &&
+    result.execution_digest === executionBindingDigest(binding), "execution_binding_substituted");
+}
 export function runMaintenanceAttempt({
   journalDir, binding, artifacts, admission, phases, recovery, contentRef = "ref:maintenance-candidate",
   reconcile = null,
 }) {
   assert(typeof journalDir === "string" && path.isAbsolute(journalDir) && REF.test(contentRef), "attempt_arguments_invalid");
-  assert(plain(binding) && plain(artifacts) && plain(admission) && plain(phases) && plain(recovery), "attempt_arguments_invalid");
+  assert(plain(binding) && plain(artifacts) && typeof artifacts.read === "function" &&
+    plain(admission) && plain(phases) && plain(recovery), "attempt_arguments_invalid");
   for (const fn of ["trustedClock", "killSwitch", "evidence", "liveness", "maintenance"]) assert(typeof admission[fn] === "function", "admission_verifier_missing");
-  for (const fn of ["apply", "verify", "watch", "safeStateReadback"]) assert(typeof phases[fn] === "function", "maintenance_phase_missing");
-  for (const fn of ["recover", "appendSignedNarrowing"]) assert(typeof recovery[fn] === "function", "maintenance_recovery_missing");
-  const schema = artifacts.journalSchema;
-  const conformance = { schema, constitution: artifacts.constitution, coverage: artifacts.coverage, ownerAttestations: artifacts.ownerAttestations };
-  const admitted = verifyAdmission({ binding, artifacts, admission, journalDir, conformance });
+  for (const fn of ["preflight", "apply", "verify", "watch", "safeStateReadback"]) assert(typeof phases[fn] === "function", "maintenance_phase_missing");
+  for (const fn of ["recover", "appendSignedNarrowing", "readAuthorityHistory", "readNarrowingHistory"]) {
+    assert(typeof recovery[fn] === "function", "maintenance_recovery_missing");
+  }
+  const initialSnapshot = readArtifacts(artifacts);
+  const schema = initialSnapshot.journalSchema;
+  const conformance = {
+    schema, constitution: initialSnapshot.constitution, coverage: initialSnapshot.coverage,
+    ownerAttestations: initialSnapshot.ownerAttestations,
+  };
   const file = path.join(journalDir, `${attemptIdentity(binding)}.json`);
+  let existing = readOptional(file);
+  if (existing) {
+    const pendingOutbox = readOptional(`${file}.recovery-outbox.json`);
+    if (pendingOutbox) {
+      const historical = recovery.readAuthorityHistory({
+        authorization_digest: pendingOutbox.owner_authorization_digest,
+      });
+      const authority = verifyAuthority({ binding: existing.binding, snapshot: historical, recovery });
+      const historicalConformance = {
+        schema: initialSnapshot.journalSchema, constitution: historical.constitution,
+        coverage: historical.coverage, ownerAttestations: historical.ownerAttestations,
+      };
+      validateJournalSemantics(existing, historicalConformance, { allowActive: true });
+      const historicalContext = {
+          ...authority, policy: classPolicy(authority.bundle.constitution),
+          contentRef, conformance: historicalConformance, journalDir,
+      };
+      if (pendingOutbox.stage !== "complete") {
+        return finishRecoveryOutbox({
+          file, journal: existing, context: historicalContext, artifacts, recovery,
+          outboxFile: `${file}.recovery-outbox.json`,
+        });
+      }
+      const conflict = canonicalJson(existing.binding) !== canonicalJson(binding);
+      assert(!conflict, "attempt_conflicting_replay");
+      assert(TERMINAL.has(existing.entries.at(-1).phase), "recovery_outbox_terminal_missing");
+      return { journal: existing, ran: false, reason: `terminal-${existing.entries.at(-1).phase}` };
+    }
+    validateJournalSemantics(existing, conformance, { allowActive: true });
+    const authority = verifyAuthority({ binding: existing.binding, snapshot: initialSnapshot, recovery });
+    const existingContext = {
+      ...authority, policy: classPolicy(authority.bundle.constitution),
+      contentRef, conformance, journalDir,
+    };
+    const conflicting = canonicalJson(existing.binding) !== canonicalJson(binding);
+    if (TERMINAL.has(existing.entries.at(-1).phase)) {
+      assert(!conflicting, "attempt_conflicting_replay");
+      return { journal: existing, ran: false, reason: `terminal-${existing.entries.at(-1).phase}` };
+    }
+    if (conflicting) {
+      claimTarget({
+        journalDir, binding: existing.binding,
+        now: trustedNow(admission.trustedClock, existing.entries.at(-1).recorded_at),
+        policy: existingContext.policy,
+      });
+      return enterRecovery({
+        file, journal: existing, context: existingContext, artifacts, admission, recovery,
+        code: "attempt-conflicting-replay", lastAt: existing.entries.at(-1).recorded_at,
+      });
+    }
+  }
+  const admitted = verifyAdmission({
+    binding, snapshot: initialSnapshot, admission, recovery, journalDir, conformance,
+  });
+  verifyExecutionPreflight(phases, binding);
+  claimTarget({ journalDir, binding, now: admitted.now, policy: admitted.policy });
   let journal = {
     kind: "autonomous-mutation-journal", schema_version: "v1", journal_id: binding.mutation_id,
-    domain: DOMAIN, constitution_digest: artifacts.constitution.constitution_digest,
+    domain: DOMAIN, constitution_digest: initialSnapshot.constitution.constitution_digest,
     binding: structuredClone(binding), binding_digest: autonomyDigest(binding), entries: [], extensions: [],
   };
   journal.entries.push(makeEntry(journal, { phase: "prepare", at: admitted.now, actor: binding.controller_identity, contentRef }));
   validateJournalSemantics(journal, conformance, { allowActive: true });
   const created = createExclusive(file, journal);
-  const context = { ...admitted, contentRef, conformance };
-  if (!created) {
+  const context = { ...admitted, contentRef, conformance, journalDir };
+  if (created) {
+    assert(claimExecution({
+      journalDir, binding, kind: "initial", bindingDigest: journal.binding_digest,
+    }), "execution_claim_contended");
+  } else {
     journal = boundedJson(file);
     validateJournalSemantics(journal, conformance, { allowActive: true });
-    assert(canonicalJson(journal.binding) === canonicalJson(binding), "attempt_conflicting_replay");
+    if (canonicalJson(journal.binding) !== canonicalJson(binding)) {
+      return enterRecovery({
+        file, journal, context, artifacts, admission, recovery,
+        code: "attempt-conflicting-replay", lastAt: journal.entries.at(-1).recorded_at,
+      });
+    }
     if (TERMINAL.has(journal.entries.at(-1).phase)) return { journal, ran: false, reason: `terminal-${journal.entries.at(-1).phase}` };
+    if (typeof reconcile !== "function") {
+      return { journal, ran: false, reason: "execution-claim-active" };
+    }
     let reconciliation;
     try {
-      assert(typeof reconcile === "function", "attempt_reconciliation_required");
       reconciliation = reconcile({ phase: journal.entries.at(-1).phase });
-      assert(["not-applied", "applied", "indeterminate"].includes(reconciliation?.state), "attempt_reconciliation_invalid");
+      assert(exactKeys(reconciliation, ["state", "claim_abandoned"]) &&
+        ["not-applied", "applied", "indeterminate"].includes(reconciliation.state) &&
+        reconciliation.claim_abandoned === true, "attempt_reconciliation_invalid");
     } catch (error) {
       return enterRecovery({
         file, journal, context, artifacts, admission, recovery,
@@ -447,33 +790,53 @@ export function runMaintenanceAttempt({
         lastAt: journal.entries.at(-1).recorded_at,
       });
     }
+    if (!claimExecution({
+      journalDir, binding, kind: "resume", bindingDigest: journal.binding_digest,
+    })) return { journal: boundedJson(file), ran: false, reason: "execution-resume-claimed" };
   }
 
   let at = trustedNow(admission.trustedClock, journal.entries.at(-1).recorded_at);
   try {
+    const beforeApplySnapshot = readArtifacts(artifacts);
+    const beforeApply = verifyAdmission({
+      binding, snapshot: beforeApplySnapshot, admission, recovery, journalDir, conformance,
+    });
+    assert(beforeApply.immutableAdmissionDigest === admitted.immutableAdmissionDigest,
+      "immutable_admission_drifted");
+    verifyExecutionPreflight(phases, binding);
     checkKillSwitch(admission.killSwitch, binding);
     const applied = phases.apply();
     assert(applied?.applied === true, "maintenance_apply_failed");
     at = trustedNow(admission.trustedClock, at);
-    append(file, journal, { phase: "apply", at, actor: binding.controller_identity, contentRef });
+    journal = append(file, journal, { phase: "apply", at, actor: binding.controller_identity, contentRef });
     checkKillSwitch(admission.killSwitch, binding);
     const verified = phases.verify();
     assert(verified?.verified === true, "maintenance_verify_failed");
     at = trustedNow(admission.trustedClock, at);
-    append(file, journal, { phase: "verify", at, actor: binding.controller_identity, contentRef });
+    journal = append(file, journal, { phase: "verify", at, actor: binding.controller_identity, contentRef });
     checkKillSwitch(admission.killSwitch, binding);
     assert(Date.parse(at) <= Date.parse(binding.canary.watch_deadline), "maintenance_watch_started_late");
-    append(file, journal, { phase: "watch", at, actor: binding.controller_identity, contentRef });
+    journal = append(file, journal, { phase: "watch", at, actor: binding.controller_identity, contentRef });
     phases.watch({ until: binding.canary.watch_deadline });
     at = trustedNow(admission.trustedClock, at);
     assert(Date.parse(at) >= Date.parse(binding.canary.watch_deadline), "maintenance_watch_incomplete");
     checkKillSwitch(admission.killSwitch, binding);
     const readback = phases.safeStateReadback();
     assert(readback?.safe === true && readback.postconditions_digest === binding.postconditions_digest, "maintenance_safe_state_unverified");
+    const beforeCommitSnapshot = readArtifacts(artifacts);
+    const beforeCommit = verifyAdmission({
+      binding, snapshot: beforeCommitSnapshot, admission, recovery, journalDir, conformance,
+    });
+    assert(beforeCommit.immutableAdmissionDigest === admitted.immutableAdmissionDigest,
+      "immutable_admission_drifted");
+    verifyExecutionPreflight(phases, binding);
     at = trustedNow(admission.trustedClock, at);
     assert(Date.parse(at) <= Date.parse(binding.deadline), "attempt_deadline_closed");
-    append(file, journal, { phase: "commit", at, actor: binding.controller_identity, contentRef });
+    journal = append(file, journal, { phase: "commit", at, actor: binding.controller_identity, contentRef });
     validateJournalSemantics(journal, conformance);
+    transitionTarget({
+      journalDir, binding, state: binding.admission_binding_state, release: true,
+    });
     return { journal, ran: true, reason: "committed" };
   } catch (error) {
     return enterRecovery({
