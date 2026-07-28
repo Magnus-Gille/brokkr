@@ -182,6 +182,9 @@ for (const packageName of [
   "linux-image-amd64", "linux-headers-amd64", "linux-perf",
   "linux-support", "firmware-linux-free",
   "grub-efi-amd64", "shim-signed", "u-boot-tools", "initramfs-tools",
+  "syslinux", "syslinux-common", "extlinux", "efibootmgr",
+  "lilo", "elilo", "refind", "limine", "systemd-ukify", "ukify",
+  "kexec-tools", "mokutil",
 ]) {
   const unsafe = structuredClone(request);
   unsafe.execution_request.candidates[0].name = packageName;

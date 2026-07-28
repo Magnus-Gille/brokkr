@@ -22,6 +22,8 @@ const PROTECTED_PACKAGE_FAMILIES = Object.freeze([
   /^(?:raspi|rpi)(?:[-.]|$)/,
   /^(?:grub|shim|u-boot|uboot|initramfs|dracut|dkms|kmod|fwupd|flashrom)(?:[-.]|$)/,
   /^(?:systemd-boot)(?:[-.]|$)/,
+  /^(?:syslinux|extlinux|efibootmgr|lilo|elilo|refind|limine)(?:[-.]|$)/,
+  /^(?:systemd-ukify|ukify|kexec-tools|mokutil)(?:[-.]|$)/,
 ]);
 const APPROVED_DEBIAN_ORIGINS = new Map([
   ["deb.debian.org", new Set(["/debian", "/debian-security"])],
