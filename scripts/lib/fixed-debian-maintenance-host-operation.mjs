@@ -17,7 +17,7 @@ const PACKAGE = /^[a-z0-9][a-z0-9+.-]{0,127}$/;
 const VERSION = /^[A-Za-z0-9:+.~-]{1,128}$/;
 const UNIT = /^[a-zA-Z0-9@_.-]{1,128}\.service$/;
 const PROTECTED_PACKAGE_FAMILIES = Object.freeze([
-  /^(?:linux-(?:base|headers|image|kbuild|libc-dev|modules|source|tools)|kernel)(?:[-.]|$)/,
+  /^(?:linux|kernel)(?:[-.]|$)/,
   /(?:^|[-.])(?:kernel|firmware|microcode|eeprom)(?:[-.]|$)/,
   /^(?:raspi|rpi)(?:[-.]|$)/,
   /^(?:grub|shim|u-boot|uboot|initramfs|dracut|dkms|kmod|fwupd|flashrom)(?:[-.]|$)/,

@@ -179,7 +179,8 @@ for (const [name, mutate, code] of [
 }
 for (const packageName of [
   "intel-microcode", "amd64-microcode", "rpi-eeprom", "raspi-firmware",
-  "linux-image-amd64", "linux-headers-amd64", "firmware-linux-free",
+  "linux-image-amd64", "linux-headers-amd64", "linux-perf",
+  "linux-support", "firmware-linux-free",
   "grub-efi-amd64", "shim-signed", "u-boot-tools", "initramfs-tools",
 ]) {
   const unsafe = structuredClone(request);
