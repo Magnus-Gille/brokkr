@@ -862,7 +862,7 @@ function dispatchFixedRecovery(request, activation) {
       // durable receipt without widening or replaying the original effect.
     }
   }
-  const unit = `brokkr-debian-maintenance-recovery@${attempt}.service`;
+  const unit = `brokkr-debian-maintenance-recovery-${attempt}.service`;
   const result = fixedSpawnSync(
     "/usr/bin/systemctl", ["start", unit],
     { encoding: "utf8", timeout: 300_000 },

@@ -135,6 +135,22 @@ const env = { uid: 0, now: () => "2026-07-27T12:00:00Z", run, rebootRequired: ()
   writeJournal: value => { Object.assign(state, structuredClone(value)); },
   writeTerminal: value => { state.terminal = structuredClone(value); },
 };
+const isolatedEnvironment = overrides => {
+  const local = { entries: [], terminal: null };
+  return {
+    state: local,
+    env: {
+      ...env,
+      readJournal: () =>
+        local.entries.length || local.terminal ? structuredClone(local) : null,
+      readTerminal: () =>
+        local.terminal ? structuredClone(local.terminal) : null,
+      writeJournal: value => { Object.assign(local, structuredClone(value)); },
+      writeTerminal: value => { local.terminal = structuredClone(value); },
+      ...overrides,
+    },
+  };
+};
 const result = adapter.runHostAdapter({ action: "apply", request, registration, env });
 assert.equal(result.outcome, "applied");
 assert.deepEqual(state.entries.map(entry => entry.phase), ["preflight", "inventory_before", "apply", "inventory_after", "verify"]);
@@ -209,12 +225,92 @@ for (const packageName of [
 }
 assert.throws(() => adapter.runHostAdapter({ action: "apply", request, registration, env: { ...env, uid: 1000, readJournal: () => null } }), /host_root_required/);
 
-const blocked = adapter.runHostAdapter({ action: "apply", request, registration, env: {
-  ...env, readJournal: () => null,
+const lockScenario = isolatedEnvironment({
   run: argv => argv[0] === "/usr/bin/flock" ? { status: 1, stdout: "" } : run(argv),
-}});
+});
+const blocked = adapter.runHostAdapter({
+  action: "apply", request, registration, env: lockScenario.env,
+});
 assert.equal(blocked.outcome, "terminally-blocked");
 assert.equal(blocked.reason, "host_package_lock_busy");
+assert.equal(
+  lockScenario.state.entries.some(entry => entry.phase === "apply"),
+  false,
+);
+
+const diskScenario = isolatedEnvironment({
+  run: argv => argv[0] === "/bin/df" ?
+    {
+      status: 0,
+      stdout: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/test 9999999 9999998 1 100% /var\n",
+    } : run(argv),
+});
+const diskFailure = adapter.runHostAdapter({
+  action: "apply", request, registration, env: diskScenario.env,
+});
+assert.equal(diskFailure.outcome, "terminally-blocked");
+assert.equal(diskFailure.reason, "host_disk_exhausted");
+assert.equal(diskScenario.state.terminal.state, "terminally-blocked");
+assert.equal(
+  diskScenario.state.entries.some(entry => entry.phase === "apply"),
+  false,
+);
+
+const networkScenario = isolatedEnvironment({
+  run: argv => argv[0] === "/usr/bin/getent" ?
+    { status: 2, stdout: "" } : run(argv),
+});
+const networkFailure = adapter.runHostAdapter({
+  action: "apply", request, registration, env: networkScenario.env,
+});
+assert.equal(networkFailure.outcome, "terminally-blocked");
+assert.equal(networkFailure.reason, "host_network_unreachable");
+assert.equal(networkScenario.state.terminal.state, "terminally-blocked");
+assert.equal(
+  networkScenario.state.entries.some(entry => entry.phase === "apply"),
+  false,
+);
+
+applied = false;
+let interruptedAptEffects = 0;
+const interruptedScenario = isolatedEnvironment({
+  run: argv => {
+    if (argv[0] === "/usr/bin/apt-get" && !argv.includes("--simulate")) {
+      interruptedAptEffects += 1;
+      applied = true;
+      return { status: 1, stdout: "" };
+    }
+    return run(argv);
+  },
+});
+const interruptedApply = adapter.runHostAdapter({
+  action: "apply", request, registration, env: interruptedScenario.env,
+});
+assert.equal(interruptedApply.outcome, "unknown");
+assert.equal(interruptedApply.reason, "host_apply_failed");
+const interruptedRecovery = adapter.runHostAdapter({
+  action: "recover",
+  request,
+  registration,
+  env: {
+    ...interruptedScenario.env,
+    run: argv => {
+      if (argv[0] === "/usr/bin/dpkg" && argv[1] === "--configure") {
+        return { status: 0, stdout: "" };
+      }
+      if (argv[0] === "/usr/bin/apt-mark" ||
+          (argv[0] === "/usr/bin/systemctl" &&
+            argv[1] === "try-restart")) {
+        return { status: 0, stdout: "" };
+      }
+      return run(argv);
+    },
+  },
+});
+assert.equal(interruptedRecovery.outcome, "disarmed");
+assert.equal(interruptedScenario.state.terminal.state, "disarmed");
+assert.equal(interruptedAptEffects, 1,
+  "recovery repairs and disarms without applying a new apt plan");
 
 for (const [name, simulation] of [
   ["removal", "Inst openssl [3.0.17-1~deb12u1] (3.0.17-1~deb12u2 Debian:stable-security [amd64])\nRemv unrelated [1]\n"],
@@ -467,16 +563,55 @@ for (const [field, value] of [["target_scope_digest", "sha256:" + "f".repeat(64)
   assert.equal(result.reason, "host_revalidation_fence_invalid");
 }
 const deadlineState = structuredClone(recoveryTemplate);
+let deadlineNewPlanMutations = 0;
+const deadlineInvocationAt = "2026-07-27T12:05:00Z";
 const deadline = adapter.runHostAdapter({ action: "recover", request, registration, env: {
-  ...env, now: () => "2026-07-27T12:05:00Z", readJournal: () => structuredClone(deadlineState), writeJournal: value => Object.assign(deadlineState, structuredClone(value)),
+  ...env, now: () => deadlineInvocationAt,
+  readJournal: () => structuredClone(deadlineState),
+  writeJournal: value => Object.assign(deadlineState, structuredClone(value)),
+  run: argv => {
+    if (argv[0] === "/usr/bin/apt-get" && !argv.includes("--simulate")) {
+      deadlineNewPlanMutations += 1;
+    }
+    return run(argv);
+  },
 }});
 assert.equal(deadline.outcome, "terminally-blocked");
 assert.equal(deadline.reason, "host_recovery_budget_exhausted");
+assert.equal(deadlineNewPlanMutations, 0);
 assert.equal(deadlineState.terminal.activation_digest, digest(recoveryActivation));
 assert.equal(
   deadlineState.terminal.revalidation_fence_digest,
   recoveryActivation.fence_digest,
 );
+let postconditionAptEffects = 0;
+const postconditionScenario = isolatedEnvironment({
+  readJournal: () => structuredClone(recoveryTemplate),
+  run: argv => {
+    if (argv[0] === "/usr/bin/dpkg" && argv[1] === "--configure") {
+      return { status: 0, stdout: "" };
+    }
+    if (argv[0] === "/usr/bin/apt-mark" ||
+        (argv[0] === "/usr/bin/systemctl" &&
+          argv[1] === "try-restart")) {
+      return { status: 0, stdout: "" };
+    }
+    if (argv[0] === "/usr/bin/dpkg-query") {
+      return { status: 0, stdout: "openssl=3.0.17-1~deb12u1\n" };
+    }
+    if (argv[0] === "/usr/bin/apt-get" && !argv.includes("--simulate")) {
+      postconditionAptEffects += 1;
+    }
+    return run(argv);
+  },
+});
+const postconditionFailure = adapter.runHostAdapter({
+  action: "recover", request, registration, env: postconditionScenario.env,
+});
+assert.equal(postconditionFailure.outcome, "terminally-blocked");
+assert.equal(postconditionFailure.reason, "host_postconditions_unverifiable");
+assert.equal(postconditionAptEffects, 0,
+  "forward recovery never adopts or applies a replacement apt plan");
 for (const [name, expectedReason, recoveryRun] of [
   [
     "repair", "host_recovery_repair_failed",
@@ -751,7 +886,7 @@ globalThis.__BROKKR_TEST_SPAWN_SYNC__ = (binary, argv) => {
   assert.equal(binary, "/usr/bin/systemctl");
   assert.deepEqual(argv, [
     "start",
-    `brokkr-debian-maintenance-recovery@${activeProductionAttempt}.service`,
+    `brokkr-debian-maintenance-recovery-${activeProductionAttempt}.service`,
   ]);
   productionStarts += 1;
   const activation = JSON.parse(fs.readFileSync(path.join(
@@ -909,6 +1044,110 @@ assert.throws(
   "an authorized but stale activation cannot replace a newer activation",
 );
 assert.equal(productionStarts, beforeDowngrade);
+if (process.env.BROKKR_FI_HOST_RECEIPT) {
+  const root = process.env.ROOT;
+  const elapsed = (terminalRecord, startedAt, budgetSeconds) => {
+    assert(terminalRecord && typeof terminalRecord.at === "string");
+    const observed = Math.max(
+      0,
+      (Date.parse(terminalRecord.at) - Date.parse(startedAt)) / 1000,
+    );
+    assert.equal(Number.isSafeInteger(observed), true);
+    assert.equal(
+      observed <= budgetSeconds,
+      true,
+      `${terminalRecord.at} exceeds ${startedAt} + ${budgetSeconds}s`,
+    );
+    return observed;
+  };
+  const noApply = scenario =>
+    Number(scenario.entries.some(entry => entry.phase === "apply"));
+  const fileDigest = relative =>
+    `sha256:${crypto.createHash("sha256")
+      .update(fs.readFileSync(`${root}/${relative}`)).digest("hex")}`;
+  const scenarios = [
+    {
+      id: "interrupted-package-state", outcome: interruptedRecovery.outcome,
+      terminal: interruptedScenario.state.terminal,
+      startedAt: recoveryActivation.fence.activated_at,
+      budgetSeconds: request.recovery_descriptor.budget_seconds,
+      newPlanMutations: interruptedAptEffects - 1,
+    },
+    {
+      id: "lock-contention", outcome: blocked.outcome,
+      terminal: lockScenario.state.terminal,
+      startedAt: request.lease_fence.activated_at,
+      budgetSeconds: request.recovery_descriptor.budget_seconds,
+      newPlanMutations: noApply(lockScenario.state),
+    },
+    {
+      id: "network-loss", outcome: networkFailure.outcome,
+      terminal: networkScenario.state.terminal,
+      startedAt: request.lease_fence.activated_at,
+      budgetSeconds: request.recovery_descriptor.budget_seconds,
+      newPlanMutations: noApply(networkScenario.state),
+    },
+    {
+      id: "disk-headroom-failure", outcome: diskFailure.outcome,
+      terminal: diskScenario.state.terminal,
+      startedAt: request.lease_fence.activated_at,
+      budgetSeconds: request.recovery_descriptor.budget_seconds,
+      newPlanMutations: noApply(diskScenario.state),
+    },
+    {
+      id: "postcondition-failure", outcome: postconditionFailure.outcome,
+      terminal: postconditionScenario.state.terminal,
+      startedAt: recoveryActivation.fence.activated_at,
+      budgetSeconds: request.recovery_descriptor.budget_seconds,
+      newPlanMutations: postconditionAptEffects,
+    },
+    {
+      id: "terminal-exhaustion", outcome: deadline.outcome,
+      terminal: deadlineState.terminal,
+      startedAt: deadlineInvocationAt,
+      budgetSeconds: request.recovery_descriptor.budget_seconds,
+      newPlanMutations: deadlineNewPlanMutations,
+    },
+  ].map(value => {
+    assert.equal(value.newPlanMutations, 0, value.id);
+    assert.equal(
+      ["disarmed", "terminally-blocked"].includes(value.outcome),
+      true,
+      value.id,
+    );
+    return {
+      id: value.id,
+      outcome: value.outcome,
+      path_id: "w2a-w2b-production-v1",
+      passed: true,
+      quarantine_active: true,
+      new_plan_mutations: value.newPlanMutations,
+      budget_seconds: value.budgetSeconds,
+      observed_elapsed_seconds: elapsed(
+        value.terminal, value.startedAt, value.budgetSeconds,
+      ),
+      terminal_at: value.terminal.at,
+    };
+  });
+  fs.writeFileSync(
+    process.env.BROKKR_FI_HOST_RECEIPT,
+    `${JSON.stringify({
+      kind: "brokkr-supervised-debian-fi-fragment",
+      schema_version: "v1",
+      path_id: "w2a-w2b-production-v1",
+      production_path: {
+        host_operation: fileDigest(
+          "scripts/lib/fixed-debian-maintenance-host-operation.mjs",
+        ),
+        recovery_unit: fileDigest(
+          "systemd/brokkr-debian-maintenance-recovery.service.in",
+        ),
+      },
+      scenarios,
+    })}\n`,
+    { mode: 0o600 },
+  );
+}
 console.log("debian host adapter: root-only exact allowlist, preflight, forward recovery and disarm OK");
 NODE
 env ROOT="$ROOT" BROKKR_TEST_STATE_ROOT="$TMP/production-state" \
@@ -1053,21 +1292,29 @@ grep -Eq '"--nonblock", "--no-fork"' "$ROOT/scripts/debian-maintenance-host-adap
 ! grep -Eq 'fixedRun|fixedWriteJournal|fixedWriteTerminal|fixedActivateFence' \
   "$ROOT/scripts/debian-maintenance-host-adapter.mjs" \
   "$ROOT/scripts/lib/bounded-recovery-dispatch.mjs"
-UNIT="$ROOT/systemd/brokkr-debian-maintenance-recovery@.service"
-grep -Eq '^ExecStart=/usr/local/lib/brokkr/debian-maintenance-host-adapter --action recover --attempt %i$' "$UNIT"
+UNIT="$ROOT/systemd/brokkr-debian-maintenance-recovery.service.in"
+grep -Eq '^ExecStart=/usr/local/lib/brokkr/releases/@RELEASE_SHA@/scripts/debian-maintenance-host-adapter.mjs --action recover --attempt @CANARY_ID@$' "$UNIT"
 if command -v systemd-analyze >/dev/null 2>&1; then
   UNIT_ROOT="$TMP/systemd-root"
-  mkdir -p "$UNIT_ROOT/etc/systemd/system" "$UNIT_ROOT/usr/local/lib/brokkr"
-  cp "$UNIT" "$UNIT_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery@.service"
+  RELEASE_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  RENDERED_UNIT="brokkr-debian-maintenance-recovery-attempt-67.service"
+  mkdir -p "$UNIT_ROOT/etc/systemd/system" \
+    "$UNIT_ROOT/usr/local/lib/brokkr/releases/$RELEASE_SHA/scripts"
+  sed \
+    -e "s/@RELEASE_SHA@/$RELEASE_SHA/g" \
+    -e 's/@CANARY_ID@/attempt-67/g' \
+    "$UNIT" >"$UNIT_ROOT/etc/systemd/system/$RENDERED_UNIT"
   for target in \
     basic.target local-fs.target network-online.target shutdown.target \
     sysinit.target; do
     printf '[Unit]\nDescription=Hermetic test %s\nDefaultDependencies=no\n' \
       "$target" >"$UNIT_ROOT/etc/systemd/system/$target"
   done
-  printf '#!/bin/sh\nexit 0\n' >"$UNIT_ROOT/usr/local/lib/brokkr/debian-maintenance-host-adapter"
-  chmod 0755 "$UNIT_ROOT/usr/local/lib/brokkr/debian-maintenance-host-adapter"
-  systemd-analyze verify --root="$UNIT_ROOT" brokkr-debian-maintenance-recovery@.service
+  printf '#!/bin/sh\nexit 0\n' \
+    >"$UNIT_ROOT/usr/local/lib/brokkr/releases/$RELEASE_SHA/scripts/debian-maintenance-host-adapter.mjs"
+  chmod 0755 \
+    "$UNIT_ROOT/usr/local/lib/brokkr/releases/$RELEASE_SHA/scripts/debian-maintenance-host-adapter.mjs"
+  systemd-analyze verify --root="$UNIT_ROOT" "$RENDERED_UNIT"
 else
   grep -Eq '^User=root$' "$UNIT"
   grep -Eq '^NoNewPrivileges=yes$' "$UNIT"
