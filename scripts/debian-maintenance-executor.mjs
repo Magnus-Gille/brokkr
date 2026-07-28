@@ -1,6 +1,6 @@
-// Exact public execution surface. The generic journal state machine and raw
-// effect seam are private in the composed module so callers cannot substitute
-// arbitrary phase callbacks behind a valid lease.
+// Compatibility entry point for the closed production surface. The mandatory
+// recovery bridge lives beside the private W2a runner, so importing either
+// module reaches the same guarded function.
 export {
   deriveDebianAutonomyExecution,
   runDebianMaintenance,

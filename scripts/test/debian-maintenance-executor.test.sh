@@ -8,6 +8,9 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 const module = await import(`${process.env.ROOT}/scripts/debian-maintenance-executor.mjs`);
+const autonomyModule = await import(
+  `${process.env.ROOT}/scripts/debian-maintenance-autonomy.mjs`
+);
 const journalModule = await import(
   `${process.env.ROOT}/scripts/maintenance-attempt-journal.mjs`
 );
@@ -20,8 +23,13 @@ const digest = value => `sha256:${crypto.createHash("sha256").update(canonicalJs
 assert.deepEqual(
   Object.keys(module).sort(),
   ["deriveDebianAutonomyExecution", "runDebianMaintenance"],
-  "the raw drain/reboot executor is not an exported journal-bypass capability",
+  "the production entry exposes only immutable derivation and the guarded runner",
 );
+assert.equal(
+  autonomyModule.runDebianMaintenance, runDebianMaintenance,
+  "direct imports of the former raw module reach the same mandatory wrapper",
+);
+assert.equal(autonomyModule.runBoundDebianMaintenance, undefined);
 assert.deepEqual(
   Object.keys(journalModule).sort(),
   [
@@ -31,7 +39,12 @@ assert.deepEqual(
   "direct imports cannot reach a generic arbitrary-callback mutation runner",
 );
 assert.equal(journalModule.runMaintenanceAttempt, undefined);
-assert.throws(() => runDebianMaintenance({}), /attempt_journal_contract_invalid/);
+assert.throws(() => runDebianMaintenance({}), /bounded_recovery_dispatch_required/);
+assert.throws(
+  () => autonomyModule.runDebianMaintenance({}),
+  /bounded_recovery_dispatch_required/,
+  "no exported production runner can skip bounded activation and fixed dispatch",
+);
 
 const policy = JSON.parse(fs.readFileSync(
   `${process.env.ROOT}/tests/fixtures/maintenance-policy/normal-window.json`, "utf8",

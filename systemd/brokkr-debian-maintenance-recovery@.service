@@ -1,0 +1,29 @@
+[Unit]
+Description=Brokkr bounded Debian forward recovery for attempt %i
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/debian-maintenance-host-adapter.md
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# This is a deliberately separate recovery capability. It runs as root because
+# dpkg's recovery transaction is inherently root-owned; its authority is least
+# privilege by construction: this exact fixed-argv wrapper is the only action.
+# No sudo transition is used, so NoNewPrivileges remains meaningful.
+User=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+# dpkg postinst scripts may legitimately update /etc; making it read-only would
+# turn a declared repair into a deterministic partial failure. The capability is
+# constrained by the fixed adapter/descriptor rather than a false filesystem
+# sandbox claim.
+ProtectSystem=false
+ReadWritePaths=/var/lib/brokkr/debian-maintenance /var/lib/dpkg /var/cache/apt /var/log/apt
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+PrivateDevices=yes
+RestrictSUIDSGID=yes
+ExecStart=/usr/local/lib/brokkr/debian-maintenance-host-adapter --action recover --attempt %i
+TimeoutStartSec=300

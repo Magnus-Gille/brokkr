@@ -316,7 +316,7 @@ function recovery(artifacts, overrides = {}) {
   } = overrides;
   const receipts = new Map();
   let activeFence = null;
-  return {
+  const api = {
     workerIdentity: "maintenance-recovery-worker",
     publicKeyFingerprint: fingerprint(recoveryPublicPem),
     activateFence: fence => {
@@ -357,7 +357,7 @@ function recovery(artifacts, overrides = {}) {
       if (!receipts.has(request.idempotency_key)) {
         receipts.set(request.idempotency_key, {
           idempotency_key: request.idempotency_key,
-          effect_lease_fence_digest: request.revalidation_fence_digest,
+          effect_lease_fence_digest: request.lease_fence_digest,
           recovered: true,
           safe_state_verified: true, quarantine_active: true, reason_code: null,
         });
@@ -390,6 +390,20 @@ function recovery(artifacts, overrides = {}) {
     },
     ...capabilityOverrides,
   };
+  const activations = new Map();
+  globalThis.__BROKKR_TEST_FIXED_RECOVERY_HOST__ = {
+    persistActivation: activation => {
+      const activationDigest = autonomyDigest(activation);
+      const existing = activations.get(activation.attempt_id);
+      if (existing && autonomyDigest(existing) !== activationDigest) {
+        throw Object.assign(new Error("activation-conflict"), { code: "activation_conflict" });
+      }
+      activations.set(activation.attempt_id, clone(activation));
+      return { activation_digest: activationDigest, idempotent: existing !== undefined };
+    },
+    runFixedAdapter: input => api.recover(input.recovery_request),
+  };
+  return api;
 }
 function exactAdapters(phase = phases(), overrides = {}) {
   const {
@@ -461,11 +475,12 @@ function exactAdapters(phase = phases(), overrides = {}) {
 const run = ({
   dir, artifacts = bundle(), bind = binding(), admit = admission(),
   phase = phases(), recover = null, reconcile = null, adapters = null,
-  autoResume = true,
+  autoResume = true, publicOptions = {},
 }) => {
   const selectedRecovery = recover ?? recovery(artifacts);
   const selectedAdapters = adapters ?? exactAdapters(phase);
   const input = {
+    ...publicOptions,
     binding: bind, attemptJournalDir: dir, artifacts, admission: admit,
     recovery: selectedRecovery, reconcile, target: executionTarget,
     expectedPostconditions: executionAfter, plan: executionPlan,
@@ -507,10 +522,10 @@ if (process.env.WORKER_MODE) {
   };
   const recoveryTransactionLock = `${workerRecoveryState}.transaction`;
   const workerResourceNow = () => process.env.VERY_LATE_LEASE_TRANSFER ?
-    "2026-07-26T00:56:01Z" : process.env.LATE_LEASE_TRANSFER ?
-    "2026-07-26T00:40:01Z" : process.env.WORKER_MODE === "recover" ?
-    "2026-07-26T00:20:01Z" : ["resume", "race"].includes(process.env.WORKER_MODE) ?
-    "2026-07-26T00:16:01Z" : "2026-07-26T00:00:01Z";
+    "2026-07-26T00:56:10Z" : process.env.LATE_LEASE_TRANSFER ?
+    "2026-07-26T00:40:10Z" : process.env.WORKER_MODE === "recover" ?
+    "2026-07-26T00:20:10Z" : ["resume", "race"].includes(process.env.WORKER_MODE) ?
+    "2026-07-26T00:16:10Z" : "2026-07-26T00:00:10Z";
   const readWorkerRecoveryState = () => fs.existsSync(workerRecoveryState) ?
     JSON.parse(fs.readFileSync(workerRecoveryState, "utf8")) : {
       ledger: clone(workerArtifacts.runtimeNarrowing),
@@ -558,7 +573,10 @@ if (process.env.WORKER_MODE) {
             code: "recovery_lease_fenced",
           });
         }
-        const revalidatedAt = workerResourceNow();
+        // Recovery revalidates at the installed successor fence's trusted
+        // activation instant. Effect-side stale-writer cases below retain their
+        // independent host-clock probes.
+        const revalidatedAt = state.active_fence.activated_at;
         if (Date.parse(revalidatedAt) <
               Date.parse(state.active_fence.activated_at) ||
             Date.parse(revalidatedAt) >
@@ -573,7 +591,7 @@ if (process.env.WORKER_MODE) {
           }
           state.receipts[request.idempotency_key] = {
             idempotency_key: request.idempotency_key,
-            effect_lease_fence_digest: request.revalidation_fence_digest,
+            effect_lease_fence_digest: request.lease_fence_digest,
             recovered: true,
             safe_state_verified: true, quarantine_active: true,
             reason_code: null,
@@ -1163,32 +1181,43 @@ assert.equal(prematureEffect.reason, "recovered-disarmed");
 assert.equal(prematureEffectCalls, 0,
   "the effect resource rejects a fence before activation even without a successor");
 const expiredRecoveryArtifacts = bundle();
-let recoveryResourceNow = "2026-07-26T00:16:00Z";
+let recoveryResourceNow = null;
 const expiredRecoveryCapability = recovery(expiredRecoveryArtifacts, {
   resourceNow: () => recoveryResourceNow,
 });
-assert.throws(() => run({
+const recoveredWithSuccessor = run({
   dir: `${tmp}/expired-recovery`, artifacts: expiredRecoveryArtifacts,
   phase: phases({ applyFenced: () => { throw Error("force-recovery"); } }),
   recover: expiredRecoveryCapability, autoResume: false,
-}), /recovery-fence-expired/,
-"the recovery resource rejects an expired fence before recovery actuation without a successor");
-recoveryResourceNow = "2026-07-26T00:20:01Z";
-const recoveredAfterExpiry = run({
-  dir: `${tmp}/expired-recovery`, artifacts: expiredRecoveryArtifacts,
-  admit: recoveryTakeoverAdmission(), recover: expiredRecoveryCapability,
-  autoResume: false,
 });
-assert.equal(recoveredAfterExpiry.reason, "recovered-disarmed");
+assert.equal(recoveredWithSuccessor.reason, "recovered-disarmed",
+  "forward recovery transfers to a fresh successor fence before host actuation");
 const expiredRecoveryOutbox = bounded(
   `${tmp}/expired-recovery/${binding().idempotency_key}.json.recovery-outbox.json`,
 );
 assert.equal(expiredRecoveryOutbox.authorized_recovery_fence_digests.length, 2);
 assert.equal(
   expiredRecoveryOutbox.recovery_result.effect_lease_fence_digest,
-  expiredRecoveryOutbox.recovery_result.revalidated_lease_fence_digest,
-  "when no old effect occurred, the successor owns both effect and revalidation",
+  expiredRecoveryOutbox.recovery_request.lease_fence_digest,
+  "the terminal receipt preserves the original effect-lease identity",
 );
+assert.notEqual(
+  expiredRecoveryOutbox.recovery_result.effect_lease_fence_digest,
+  expiredRecoveryOutbox.recovery_result.revalidated_lease_fence_digest,
+  "the successor revalidation fence remains a distinct durable authority",
+);
+const callerMintedHost = {
+  persistActivation: () => { throw Error("caller host must never run"); },
+  runFixedAdapter: () => { throw Error("caller adapter must never run"); },
+};
+const publicBoundary = run({
+  dir: `${tmp}/public-boundary`, artifacts: bundle(),
+  phase: phases({ applyFenced: () => { throw Error("force-recovery"); } }),
+  autoResume: false,
+  publicOptions: { host: callerMintedHost, recoveryHostFactory: () => callerMintedHost },
+});
+assert.equal(publicBoundary.reason, "recovered-disarmed",
+  "public look-alikes and factories cannot replace the fixed recovery host");
 const shortWatchArtifacts = bundle();
 const shortWatch = run({
   dir: `${tmp}/short-watch`, artifacts: shortWatchArtifacts,
@@ -1442,11 +1471,11 @@ assert.throws(() => run({
 
 const crashDir = `${tmp}/crash`;
 const runWorker = env => new Promise(resolve => {
-  const child = spawn(process.execPath, [process.argv[1]], { env: { ...process.env, ...env } });
+  const child = spawn(process.execPath, [...process.execArgv, process.argv[1]], { env: { ...process.env, ...env } });
   child.on("exit", code => resolve(code));
 });
 const staleLockDir = `${tmp}/stale-lock`, staleLockReady = `${tmp}/stale-lock-ready`;
-const staleLockChild = spawn(process.execPath, [process.argv[1]], {
+const staleLockChild = spawn(process.execPath, [...process.execArgv, process.argv[1]], {
   env: {
     ...process.env, WORKER_MODE: "hold-lock", WORKER_DIR: staleLockDir,
     READY: staleLockReady,
@@ -1591,9 +1620,9 @@ const failed = run({
   phase: phases({ applyFenced: () => { throw Object.assign(new Error("apply-failed"), { code: "apply-failed" }); } }),
   recover: recovery(failureArtifacts, { recover: request => ({
     idempotency_key: request.idempotency_key,
-    effect_lease_fence_digest: request.revalidation_fence_digest,
+    effect_lease_fence_digest: request.lease_fence_digest,
     revalidated_lease_fence_digest: request.revalidation_fence_digest,
-    revalidated_at: "2026-07-26T00:00:01Z", recovered: false,
+    revalidated_at: request.revalidation_fence.activated_at, recovered: false,
     safe_state_verified: false, quarantine_active: true, reason_code: "forward-repair-failed",
   }) }),
 });
@@ -1757,7 +1786,8 @@ for (const faultPoint of [
     const replayedOutbox = bounded(
       `${faultDir}/${binding().idempotency_key}.json.recovery-outbox.json`,
     );
-    assert.equal(replayedOutbox.authorized_recovery_fence_digests.length, 2);
+    assert.equal(replayedOutbox.authorized_recovery_fence_digests.length, 3,
+      "the crash replay records the original fence and both monotonic successors");
     const originalRecoveryFenceDigest =
       replayedOutbox.authorized_recovery_fence_digests[0];
     assert.equal(
@@ -1765,10 +1795,16 @@ for (const faultPoint of [
       originalRecoveryFenceDigest,
       "the original recovery request remains immutable after successor takeover",
     );
+    assert.ok(
+      replayedOutbox.authorized_recovery_fence_digests.includes(
+        replayedOutbox.recovery_result.effect_lease_fence_digest,
+      ),
+      "the recovery receipt remains bound to a recorded, authorized effect fence",
+    );
     assert.equal(
       replayedOutbox.recovery_result.effect_lease_fence_digest,
       originalRecoveryFenceDigest,
-      "the recovery receipt remains bound to the immutable original request",
+      "the recovery terminal receipt preserves the immutable original effect lease",
     );
     assert.notEqual(
       replayedOutbox.recovery_result.effect_lease_fence_digest,
@@ -2032,4 +2068,4 @@ assert.throws(() => run({
 console.log("maintenance attempt journal: W0.2 authorization, admission, v2 timing, recovery, demotion and rate gates OK");
 NODE
 
-env ROOT="$ROOT" TMP="$TMP" node "$TMP/test.mjs"
+env ROOT="$ROOT" TMP="$TMP" node --experimental-loader "$ROOT/scripts/test/fixtures/fixed-recovery-host/loader.mjs" "$TMP/test.mjs"

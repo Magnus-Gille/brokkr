@@ -39,8 +39,8 @@ maintenance-plan: ## Produce a deterministic, read-only maintenance observation/
 maintenance-controller: ## Inspect fail-closed maintenance-controller admission (ARGS="...")
 	@node scripts/maintenance-controller.mjs $(ARGS)
 
-maintenance-executor: ## Library-only Debian executor seam; no live host adapter is shipped
-	@echo "No live executor is shipped; use the reviewed library integration only."
+maintenance-executor: ## Inspect the disarmed Debian host-adapter contract; no live host adapter is installed
+	@echo "Host adapter is disarmed; owner ceremony and exact root-owned registration are required."
 
 maintenance-os: ## Run the OS maintenance report on the service host (ARGS="--dry-run --verbose")
 	@ssh $(BROKKR_SSH_TARGET) 'cd $(BROKKR_REMOTE_DIR) && bash scripts/maintenance-report.sh os $(ARGS)'
