@@ -49,20 +49,26 @@ request or recovery descriptor.
 Apply rechecks NTP synchronization, mains power, the dpkg lock, free `/var`
 space, and Debian DNS immediately before simulating and again before applying.
 It permits only canonical, already-bound `security`/`bugfix` candidates from the
-distribution repository. Kernel and firmware names are rejected. Apt receives a
-fixed absolute executable and `--only-upgrade --no-remove --no-install-recommends`;
-the simulation must show exactly the bound package/version set and no removals.
-So a new package, dependency expansion, removal, unbound version, reboot, drain,
-or unreachable/unknown precondition is a terminal, disarmed outcome before or
+distribution repository. The host boundary positively permits only Debian
+`main` policy entries from the exact `deb.debian.org` or
+`security.debian.org` archive paths, and separately rejects protected kernel,
+firmware, microcode, EEPROM, bootloader, initramfs, and kernel-module package
+families. Apt receives a fixed absolute executable and
+`--only-upgrade --no-remove --no-install-recommends`; the simulation must show
+exactly the bound package/version set and no removals. So a new package,
+dependency expansion, removal, unbound version, reboot, drain, or
+unreachable/unknown precondition is a terminal, disarmed outcome before or
 after no further automatic reapply.
 
 The request also carries a closed, canonical apt-policy evidence object: for
 each already-bound candidate it records the SHA-256 of the exact `apt-cache
 policy <package>` output. The adapter re-reads that output immediately before
 simulation and again immediately before apt effect, requiring the requested
-version and a Debian archive URL. This is a verifiable local apt trust-property
-and exact byte binding, not an invented signature scheme; changed source,
-candidate, plan/policy digest, or evidence fails closed.
+version and a structurally parsed, credential-free, default-port HTTP(S) URL
+whose hostname, archive path, and `main` component are exactly allowlisted.
+This is a verifiable local apt trust-property and exact byte binding, not an
+invented signature scheme; changed source, candidate, plan/policy digest, or
+evidence fails closed.
 
 The adapter atomically persists a compact phase journal (`preflight`, inventory
 before/after, apply, verify) using fsync-and-rename. It records only digests and
@@ -76,7 +82,7 @@ never runs apt, adopts a plan, re-arms a target, widens the package set, or
 creates a replacement request. It must verify the original declared
 postconditions inside the descriptor's at-most-300-second budget, then journals
 quarantine and disarm. Any repair, restart, hold, journal, or verification
-failure terminalizes and writes a disarm record.
+failure terminalizes and writes an activation-bound quarantine record.
 
 The mandatory recovery bridge reaches only the same high-level host operation.
 W2a's durable outbox supplies its authenticated, monotonic successor fence;
@@ -89,8 +95,15 @@ terminal receipt makes the operation idempotent without another unit start. A
 strictly advancing, exactly authorized successor activation may replace a
 crashed worker's activation. Recovery resumes from each durable recovery phase,
 revalidates safe state before disarm, and repairs a terminal sidecar lost after
-its journal commit. A restart reads the same W2a outbox and repeats the same
-idempotency key; it cannot synthesize a plan, re-arm, or widen scope.
+its journal commit. Recovery failures write a negative terminal receipt bound
+to the exact activation and successor fence. The dispatcher returns that
+authenticated `recovered: false` receipt even when `systemctl start` reports a
+timeout after the terminal commit, allowing W2a to durably terminal-narrow
+instead of retrying an unknown operation forever. Missing, malformed, stale, or
+unbound terminal evidence still fails closed. A restart reads the same W2a
+outbox and repeats the same idempotency key; it cannot synthesize a plan,
+re-arm, or widen scope. All fence, journal, activation, terminal, and bridge
+timestamps are exact, real, second-resolution canonical UTC instants.
 The production installer is still intentionally absent, so this remains a
 hermetic/disarmed contract until the separate owner ceremony installs the fixed
 state root and unit.

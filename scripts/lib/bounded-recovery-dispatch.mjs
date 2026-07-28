@@ -11,7 +11,13 @@ const exactKeys = (value, keys) => plain(value) && Object.keys(value).sort().joi
 const canonicalJson = value => value === null || typeof value !== "object" ? JSON.stringify(value) : Array.isArray(value) ? `[${value.map(canonicalJson).join(",")}]` : `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
 const digest = value => `sha256:${crypto.createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
 const fail = code => { const error = new Error(code); error.code = code; throw error; };
-const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
+const strictUtc = value => {
+  if (typeof value !== "string" ||
+      !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(value)) return false;
+  const instant = new Date(value);
+  return !Number.isNaN(instant.getTime()) &&
+    instant.toISOString().replace(".000Z", "Z") === value;
+};
 function validFence(fence, expected) {
   return exactKeys(fence, [
     "kind", "schema_version", "domain", "target_scope_digest", "attempt_id",
@@ -26,9 +32,7 @@ function validFence(fence, expected) {
     fence.binding_digest === expected.bindingDigest &&
     Number.isSafeInteger(fence.epoch) && fence.epoch >= 1 &&
     typeof fence.holder_token === "string" && fence.holder_token.length >= 16 &&
-    ISO.test(fence.activated_at) && ISO.test(fence.expires_at) &&
-    Number.isFinite(Date.parse(fence.activated_at)) &&
-    Number.isFinite(Date.parse(fence.expires_at)) &&
+    strictUtc(fence.activated_at) && strictUtc(fence.expires_at) &&
     Date.parse(fence.activated_at) <= Date.parse(fence.expires_at);
 }
 
@@ -72,7 +76,19 @@ export function createBoundedRecoveryDispatcher({ expected }) {
       });
       if (!plain(dispatched) || dispatched.activation_digest !== digest(activation)) fail("bounded_recovery_activation_unverified");
       const { activation_digest: activationDigest, ...receipt } = dispatched;
-      if (!exactKeys(receipt, ["idempotency_key", "effect_lease_fence_digest", "revalidated_lease_fence_digest", "revalidated_at", "recovered", "safe_state_verified", "quarantine_active", "reason_code"]) || receipt.idempotency_key !== request.idempotency_key || receipt.effect_lease_fence_digest !== request.lease_fence_digest || receipt.revalidated_lease_fence_digest !== request.revalidation_fence_digest || !ISO.test(receipt.revalidated_at) || !Number.isFinite(Date.parse(receipt.revalidated_at)) || typeof receipt.recovered !== "boolean" || typeof receipt.safe_state_verified !== "boolean" || typeof receipt.quarantine_active !== "boolean" || (receipt.reason_code !== null && typeof receipt.reason_code !== "string")) fail("bounded_recovery_dispatch_receipt_invalid");
+      if (!exactKeys(receipt, ["idempotency_key", "effect_lease_fence_digest", "revalidated_lease_fence_digest", "revalidated_at", "recovered", "safe_state_verified", "quarantine_active", "reason_code"]) || receipt.idempotency_key !== request.idempotency_key || receipt.effect_lease_fence_digest !== request.lease_fence_digest || receipt.revalidated_lease_fence_digest !== request.revalidation_fence_digest || !strictUtc(receipt.revalidated_at) || typeof receipt.recovered !== "boolean" || typeof receipt.safe_state_verified !== "boolean" || typeof receipt.quarantine_active !== "boolean" || (receipt.reason_code !== null && typeof receipt.reason_code !== "string")) fail("bounded_recovery_dispatch_receipt_invalid");
+      const successful = receipt.recovered === true &&
+        receipt.safe_state_verified === true &&
+        receipt.quarantine_active === true &&
+        receipt.reason_code === null;
+      const terminalFailure = receipt.recovered === false &&
+        receipt.safe_state_verified === false &&
+        receipt.quarantine_active === true &&
+        typeof receipt.reason_code === "string" &&
+        receipt.reason_code.length > 0;
+      if (!successful && !terminalFailure) {
+        fail("bounded_recovery_dispatch_receipt_invalid");
+      }
       // The outbox receipt carries the durable activation identity as well as
       // a digest of the fixed-adapter terminal receipt.  Both are explicitly
       // bound to the successor fence; a successful-looking adapter response

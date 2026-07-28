@@ -177,6 +177,32 @@ for (const [name, mutate, code] of [
   }
   assert.throws(() => adapter.runHostAdapter({ action: "apply", request: unsafe, registration: unsafeRegistration, env: { ...env, readJournal: () => null } }), code, name);
 }
+for (const packageName of [
+  "intel-microcode", "amd64-microcode", "rpi-eeprom", "raspi-firmware",
+  "linux-image-amd64", "linux-headers-amd64", "firmware-linux-free",
+  "grub-efi-amd64", "shim-signed", "u-boot-tools", "initramfs-tools",
+]) {
+  const unsafe = structuredClone(request);
+  unsafe.execution_request.candidates[0].name = packageName;
+  unsafe.execution_request.candidates[0].id =
+    `${packageName}@${candidate.candidate_version}`;
+  unsafe.recovery_descriptor.packages = [packageName];
+  unsafe.execution_request_digest = digest(unsafe.execution_request);
+  unsafe.recovery_descriptor_digest = digest(unsafe.recovery_descriptor);
+  const unsafeRegistration = {
+    ...structuredClone(registration),
+    execution_request_digest: unsafe.execution_request_digest,
+    recovery_descriptor_digest: unsafe.recovery_descriptor_digest,
+  };
+  assert.throws(
+    () => adapter.runHostAdapter({
+      action: "apply", request: unsafe, registration: unsafeRegistration,
+      env: { ...env, readJournal: () => null },
+    }),
+    /host_candidate_forbidden/,
+    `${packageName} is a protected kernel, firmware, or boot-chain package`,
+  );
+}
 assert.throws(() => adapter.runHostAdapter({ action: "apply", request, registration, env: { ...env, uid: 1000, readJournal: () => null } }), /host_root_required/);
 
 const blocked = adapter.runHostAdapter({ action: "apply", request, registration, env: {
@@ -204,6 +230,69 @@ const changedSource = adapter.runHostAdapter({ action: "apply", request, registr
 }});
 assert.equal(changedSource.outcome, "terminally-blocked");
 assert.equal(changedSource.reason, "host_apt_source_changed");
+for (const origin of [
+  "https://attacker-debian.org/debian-security",
+  "https://debian.org.evil.example/path/debian.org/debian",
+  "https://deb.debian.org.evil.example/debian-security",
+  "https://user@deb.debian.org/debian-security",
+  "https://deb.debian.org:8443/debian-security",
+  "https://deb.debian.org/debian-security/extra",
+]) {
+  applied = false;
+  const policy = aptPolicy.replace(
+    "http://deb.debian.org/debian-security", origin,
+  );
+  const unsafe = structuredClone(request);
+  unsafe.apt_source_evidence.candidates[0].policy_output_digest =
+    digest(policy);
+  unsafe.apt_source_evidence_digest = digest(unsafe.apt_source_evidence);
+  const unsafeRegistration = {
+    ...structuredClone(registration),
+    apt_source_evidence_digest: unsafe.apt_source_evidence_digest,
+  };
+  const result = adapter.runHostAdapter({
+    action: "apply", request: unsafe, registration: unsafeRegistration,
+    env: {
+      ...env, readJournal: () => null,
+      run: argv => argv[0] === "/usr/bin/apt-cache" ?
+        { status: 0, stdout: policy } : run(argv),
+    },
+  });
+  assert.equal(
+    result.outcome, "terminally-blocked",
+    `${origin} must not satisfy the exact Debian repository boundary`,
+  );
+  assert.equal(result.reason, "host_apt_source_changed");
+  assert.equal(applied, false, "a rejected repository cannot reach apt effect");
+}
+{
+  applied = false;
+  const policy = aptPolicy.replace(
+    "bookworm-security/main", "bookworm-security/non-free-firmware",
+  );
+  const unsafe = structuredClone(request);
+  unsafe.apt_source_evidence.candidates[0].policy_output_digest =
+    digest(policy);
+  unsafe.apt_source_evidence_digest = digest(unsafe.apt_source_evidence);
+  const unsafeRegistration = {
+    ...structuredClone(registration),
+    apt_source_evidence_digest: unsafe.apt_source_evidence_digest,
+  };
+  const result = adapter.runHostAdapter({
+    action: "apply", request: unsafe, registration: unsafeRegistration,
+    env: {
+      ...env, readJournal: () => null,
+      run: argv => argv[0] === "/usr/bin/apt-cache" ?
+        { status: 0, stdout: policy } : run(argv),
+    },
+  });
+  assert.equal(result.outcome, "terminally-blocked");
+  assert.equal(result.reason, "host_apt_source_changed");
+  assert.equal(
+    applied, false,
+    "only Debian main is positively allowed; firmware components cannot act",
+  );
+}
 applied = false;
 const changedTrust = adapter.runHostAdapter({ action: "apply", request, registration, env: { ...env, readJournal: () => null,
   run: argv => argv[0] === "/usr/bin/apt-config" ? { status: 0, stdout: "APT::Get::AllowInsecureRepositories true\n" } : run(argv),
@@ -379,6 +468,122 @@ const deadline = adapter.runHostAdapter({ action: "recover", request, registrati
 }});
 assert.equal(deadline.outcome, "terminally-blocked");
 assert.equal(deadline.reason, "host_recovery_budget_exhausted");
+assert.equal(deadlineState.terminal.activation_digest, digest(recoveryActivation));
+assert.equal(
+  deadlineState.terminal.revalidation_fence_digest,
+  recoveryActivation.fence_digest,
+);
+for (const [name, expectedReason, recoveryRun] of [
+  [
+    "repair", "host_recovery_repair_failed",
+    argv => argv[0] === "/usr/bin/dpkg" && argv[1] === "--configure" ?
+      { status: 1, stdout: "" } : run(argv),
+  ],
+  [
+    "postcondition", "host_postconditions_unverifiable",
+    argv => {
+      if (argv[0] === "/usr/bin/dpkg" && argv[1] === "--configure") {
+        return { status: 0, stdout: "" };
+      }
+      if (argv[0] === "/usr/bin/apt-mark" ||
+          (argv[0] === "/usr/bin/systemctl" &&
+            argv[1] === "try-restart")) {
+        return { status: 0, stdout: "" };
+      }
+      if (argv[0] === "/usr/bin/dpkg-query") {
+        return {
+          status: 0, stdout: "openssl=3.0.17-1~deb12u1\n",
+        };
+      }
+      return run(argv);
+    },
+  ],
+]) {
+  const failureState = structuredClone(recoveryTemplate);
+  const failure = adapter.runHostAdapter({
+    action: "recover", request, registration, env: {
+      ...env,
+      readJournal: () => structuredClone(failureState),
+      writeJournal: value => Object.assign(
+        failureState, structuredClone(value),
+      ),
+      writeTerminal: value => {
+        failureState.terminal = structuredClone(value);
+      },
+      run: recoveryRun,
+    },
+  });
+  assert.equal(failure.outcome, "terminally-blocked");
+  assert.equal(failure.reason, expectedReason);
+  assert.equal(
+    failureState.terminal.activation_digest, digest(recoveryActivation),
+    `${name} terminal binds the exact recovery activation`,
+  );
+  assert.equal(
+    failureState.terminal.revalidation_fence_digest,
+    recoveryActivation.fence_digest,
+    `${name} terminal binds the exact successor fence`,
+  );
+}
+const successorFailureState = structuredClone(deadlineState);
+let successorFailureFenceActivated = false;
+const successorFailure = adapter.runHostAdapter({
+  action: "recover", request, registration, env: {
+    ...env,
+    readJournal: () => structuredClone(successorFailureState),
+    readTerminal: () => structuredClone(successorFailureState.terminal),
+    writeJournal: value => Object.assign(
+      successorFailureState, structuredClone(value),
+    ),
+    writeTerminal: value => {
+      successorFailureState.terminal = structuredClone(value);
+    },
+    readRecoveryActivation: () => structuredClone(advancedActivation),
+    activateFence: fence => {
+      successorFailureFenceActivated = true;
+      return {
+        activated: true, lease_fence_digest: digest(fence),
+      };
+    },
+  },
+});
+assert.equal(successorFailure.outcome, "terminally-blocked");
+assert.equal(
+  successorFailure.reason, "host_recovery_budget_exhausted",
+);
+assert.equal(
+  successorFailureFenceActivated, true,
+  "a successor activates its fence before rebinding a failed terminal",
+);
+assert.equal(
+  successorFailureState.terminal.activation_digest,
+  digest(advancedActivation),
+);
+assert.equal(
+  successorFailureState.terminal.revalidation_fence_digest,
+  advancedActivation.fence_digest,
+);
+
+for (const instant of [
+  "2026-02-30T12:00:00Z",
+  "2026-07-27T24:00:00Z",
+]) {
+  const unsafe = structuredClone(request);
+  unsafe.lease_fence.activated_at = instant;
+  unsafe.lease_fence_digest = digest(unsafe.lease_fence);
+  const unsafeRegistration = {
+    ...structuredClone(registration),
+    lease_fence_digest: unsafe.lease_fence_digest,
+  };
+  assert.throws(
+    () => adapter.runHostAdapter({
+      action: "apply", request: unsafe, registration: unsafeRegistration,
+      env: { ...env, readJournal: () => null },
+    }),
+    /host_fence_invalid/,
+    `${instant} is not a canonical real UTC instant`,
+  );
+}
 const callerMintedLookalike = {
   persistActivation: () => { throw Error("caller callback must stay unreachable"); },
   runFixedAdapter: () => { throw Error("caller callback must stay unreachable"); },
@@ -444,6 +649,48 @@ assert.equal(bridgeHostState.terminal.activation_digest, bridgeResult.activation
   "the durable terminal record binds the dispatcher activation");
 assert.equal(bridgeHostState.terminal.revalidation_fence_digest, bridgeRequest.revalidation_fence_digest,
   "the durable terminal record binds the successor fence");
+const successfulBridgeRunner =
+  globalThis.__BROKKR_TEST_FIXED_RECOVERY_HOST__.runFixedAdapter;
+globalThis.__BROKKR_TEST_FIXED_RECOVERY_HOST__.runFixedAdapter = input => ({
+  idempotency_key: input.recovery_request.idempotency_key,
+  effect_lease_fence_digest:
+    input.recovery_request.lease_fence_digest,
+  revalidated_lease_fence_digest:
+    input.recovery_request.revalidation_fence_digest,
+  revalidated_at: "2026-07-27T12:00:00Z",
+  recovered: false,
+  safe_state_verified: false,
+  quarantine_active: true,
+  reason_code: "host_recovery_repair_failed",
+});
+const negativeBridgeResult = bridge.recover(bridgeRequest);
+assert.equal(negativeBridgeResult.recovered, false);
+assert.equal(
+  negativeBridgeResult.reason_code, "host_recovery_repair_failed",
+);
+assert.match(
+  negativeBridgeResult.terminal_receipt_digest, /^sha256:[a-f0-9]{64}$/,
+  "the bridge authenticates a durable negative host receipt",
+);
+globalThis.__BROKKR_TEST_FIXED_RECOVERY_HOST__.runFixedAdapter = input => ({
+  idempotency_key: input.recovery_request.idempotency_key,
+  effect_lease_fence_digest:
+    input.recovery_request.lease_fence_digest,
+  revalidated_lease_fence_digest:
+    input.recovery_request.revalidation_fence_digest,
+  revalidated_at: "2026-02-30T12:00:00Z",
+  recovered: false,
+  safe_state_verified: false,
+  quarantine_active: true,
+  reason_code: "host_recovery_repair_failed",
+});
+assert.throws(
+  () => bridge.recover(bridgeRequest),
+  /bounded_recovery_dispatch_receipt_invalid/,
+  "an impossible terminal receipt instant cannot cross the bridge",
+);
+globalThis.__BROKKR_TEST_FIXED_RECOVERY_HOST__.runFixedAdapter =
+  successfulBridgeRunner;
 for (const [name, mutate] of [
   ["binding", value => { value.binding_digest = "sha256:" + "f".repeat(64); }],
   ["target", value => { value.revalidation_fence.target_scope_digest = "sha256:" + "f".repeat(64); }],
@@ -455,6 +702,19 @@ for (const [name, mutate] of [
   unsafe.lease_fence_digest = digest(unsafe.lease_fence);
   unsafe.revalidation_fence_digest = digest(unsafe.revalidation_fence);
   assert.throws(() => bridge.recover(unsafe), /bounded_recovery_dispatch_(binding|fence)_invalid/, name);
+}
+for (const instant of [
+  "2026-02-30T12:00:00Z",
+  "2026-07-27T24:00:00Z",
+]) {
+  const unsafe = structuredClone(bridgeRequest);
+  unsafe.revalidation_fence.activated_at = instant;
+  unsafe.revalidation_fence_digest = digest(unsafe.revalidation_fence);
+  assert.throws(
+    () => bridge.recover(unsafe),
+    /bounded_recovery_dispatch_fence_invalid/,
+    `${instant} cannot cross the production recovery bridge`,
+  );
 }
 
 const productionStateRoot = process.env.BROKKR_TEST_STATE_ROOT;
@@ -478,30 +738,40 @@ const dispatchProduction = (recoveryRequest, activation) =>
     registration: activation,
   });
 let productionStarts = 0;
+let activeProductionAttempt = request.attempt_id;
+let productionTerminalState = "disarmed";
+let productionTerminalReason = "forward_recovery_verified";
+let productionTerminalAt = "2026-07-27T12:00:00Z";
+let productionStartStatus = 0;
 globalThis.__BROKKR_TEST_SPAWN_SYNC__ = (binary, argv) => {
   assert.equal(binary, "/usr/bin/systemctl");
   assert.deepEqual(argv, [
     "start",
-    `brokkr-debian-maintenance-recovery@${request.attempt_id}.service`,
+    `brokkr-debian-maintenance-recovery@${activeProductionAttempt}.service`,
   ]);
   productionStarts += 1;
   const activation = JSON.parse(fs.readFileSync(path.join(
     productionStateRoot, "recovery-activations",
-    `${request.attempt_id}.json`,
+    `${activeProductionAttempt}.json`,
   )));
-  writeProtectedJson("terminals", request.attempt_id, {
+  writeProtectedJson("terminals", activeProductionAttempt, {
     kind: "brokkr-debian-host-adapter-terminal", schema_version: "v1",
-    state: "disarmed", reason: "forward_recovery_verified",
-    at: "2026-07-27T12:00:00Z", binding_digest: request.binding_digest,
+    state: productionTerminalState, reason: productionTerminalReason,
+    at: productionTerminalAt, binding_digest: request.binding_digest,
     activation_digest: digest(activation),
     revalidation_fence_digest: activation.fence_digest,
   });
-  return { status: 0, stdout: "", stderr: "" };
+  return {
+    status: productionStartStatus, stdout: "", stderr: "",
+    error: productionStartStatus === null ?
+      Object.assign(new Error("test timeout"), { code: "ETIMEDOUT" }) :
+      undefined,
+  };
 };
 const authorizeDispatch = (recoveryRequest, activation) =>
-  writeProtectedJson("recovery-authorizations", request.attempt_id, {
+  writeProtectedJson("recovery-authorizations", activation.attempt_id, {
     kind: "brokkr-debian-recovery-authorization", schema_version: "v1",
-    attempt_id: request.attempt_id, activation,
+    attempt_id: activation.attempt_id, activation,
     recovery_request: recoveryRequest,
   });
 authorizeDispatch(bridgeRequest, recoveryActivation);
@@ -532,15 +802,109 @@ assert.equal(advancedProductionDispatch.recovered, true);
 assert.equal(productionStarts, 2,
   "a strictly advancing authorized activation resumes through the fixed unit");
 
+const failedDispatch = ({ suffix, reason, status = 1, at =
+  "2026-07-27T12:00:00Z" }) => {
+  const attemptId = `attempt-${suffix}`;
+  const recoveryRequest = structuredClone(bridgeRequest);
+  recoveryRequest.idempotency_key = `recovery-${suffix}`;
+  recoveryRequest.lease_fence.attempt_id = attemptId;
+  recoveryRequest.lease_fence.mutation_id = `mutation-${suffix}`;
+  recoveryRequest.lease_fence.holder_token =
+    `effect-${suffix}-token-0123456789`;
+  recoveryRequest.lease_fence_digest =
+    digest(recoveryRequest.lease_fence);
+  recoveryRequest.revalidation_fence = {
+    ...structuredClone(recoveryRequest.lease_fence),
+    epoch: recoveryRequest.lease_fence.epoch + 1,
+    holder_token: `recovery-${suffix}-token-0123456789`,
+  };
+  recoveryRequest.revalidation_fence_digest =
+    digest(recoveryRequest.revalidation_fence);
+  const activation = {
+    ...structuredClone(recoveryActivation),
+    attempt_id: attemptId,
+    fence: structuredClone(recoveryRequest.revalidation_fence),
+    fence_digest: recoveryRequest.revalidation_fence_digest,
+  };
+  activeProductionAttempt = attemptId;
+  productionTerminalState = "terminally-blocked";
+  productionTerminalReason = reason;
+  productionTerminalAt = at;
+  productionStartStatus = status;
+  authorizeDispatch(recoveryRequest, activation);
+  return {
+    activation, recoveryRequest,
+    dispatch: () => dispatchProduction(recoveryRequest, activation),
+  };
+};
+for (const failure of [
+  {
+    suffix: "repair-failure",
+    reason: "host_recovery_repair_failed",
+  },
+  {
+    suffix: "budget-failure",
+    reason: "host_recovery_budget_exhausted",
+  },
+  {
+    suffix: "postcondition-failure",
+    reason: "host_postconditions_unverifiable",
+  },
+  {
+    suffix: "timeout-terminal",
+    reason: "host_recovery_hold_failed",
+    status: null,
+  },
+]) {
+  const before = productionStarts;
+  const failed = failedDispatch(failure);
+  const receipt = failed.dispatch();
+  assert.equal(receipt.recovered, false, `${failure.suffix} is durable`);
+  assert.equal(receipt.safe_state_verified, false);
+  assert.equal(receipt.quarantine_active, true);
+  assert.equal(receipt.reason_code, failure.reason);
+  assert.equal(receipt.activation_digest, digest(failed.activation));
+  assert.equal(
+    receipt.revalidated_lease_fence_digest,
+    failed.recoveryRequest.revalidation_fence_digest,
+  );
+  assert.equal(productionStarts, before + 1);
+  assert.deepEqual(
+    failed.dispatch(), receipt,
+    `${failure.suffix} replays its authenticated negative receipt`,
+  );
+  assert.equal(
+    productionStarts, before + 1,
+    `${failure.suffix} does not restart after durable terminalization`,
+  );
+}
+
+const invalidTerminal = failedDispatch({
+  suffix: "invalid-terminal-time",
+  reason: "host_recovery_repair_failed",
+  at: "2026-02-30T12:00:00Z",
+});
+assert.throws(
+  invalidTerminal.dispatch,
+  /bounded_recovery_fixed_adapter_failed/,
+  "a terminal receipt with an impossible instant is unauthenticated",
+);
+
+activeProductionAttempt = request.attempt_id;
+productionTerminalState = "disarmed";
+productionTerminalReason = "forward_recovery_verified";
+productionTerminalAt = "2026-07-27T12:00:00Z";
+productionStartStatus = 0;
 const downgradeActivation = structuredClone(recoveryActivation);
 const downgradeRequest = structuredClone(bridgeRequest);
 authorizeDispatch(downgradeRequest, downgradeActivation);
+const beforeDowngrade = productionStarts;
 assert.throws(
   () => dispatchProduction(downgradeRequest, downgradeActivation),
   /bounded_recovery_activation_conflict/,
   "an authorized but stale activation cannot replace a newer activation",
 );
-assert.equal(productionStarts, 2);
+assert.equal(productionStarts, beforeDowngrade);
 console.log("debian host adapter: root-only exact allowlist, preflight, forward recovery and disarm OK");
 NODE
 env ROOT="$ROOT" BROKKR_TEST_STATE_ROOT="$TMP/production-state" \
@@ -608,8 +972,8 @@ if env BROKKR_EFFECT_LOCKED=1 node "$ROOT/scripts/debian-maintenance-host-adapte
   echo "direct --effect-locked invocation unexpectedly succeeded" >&2
   exit 1
 fi
-rg -q 'host_cli_arguments_invalid' "$TMP/direct-bypass.out"
-! rg -q -- '--effect-locked' "$ROOT/scripts/debian-maintenance-host-adapter.mjs"
+grep -Eq 'host_cli_arguments_invalid' "$TMP/direct-bypass.out"
+! grep -Eq -- '--effect-locked' "$ROOT/scripts/debian-maintenance-host-adapter.mjs"
 env ROOT="$ROOT" node --input-type=module <<'NODE'
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -679,22 +1043,28 @@ assert.throws(() => fixedHost.runFixedDebianMaintenanceHostOperation({
 }), /bounded_recovery_dispatch_fence_invalid/,
 "a fully shaped dispatch rejects a non-canonical attempt before fixed paths or systemd");
 NODE
-rg -q '/proc/self/fdinfo/' "$ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
-rg -Fq 'fields[5] === String(process.pid)' "$ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
-rg -q '"--nonblock", "--no-fork"' "$ROOT/scripts/debian-maintenance-host-adapter.mjs"
-! rg -q 'fixedRun|fixedWriteJournal|fixedWriteTerminal|fixedActivateFence' \
+grep -Eq '/proc/self/fdinfo/' "$ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
+grep -Fq 'fields[5] === String(process.pid)' "$ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
+grep -Eq '"--nonblock", "--no-fork"' "$ROOT/scripts/debian-maintenance-host-adapter.mjs"
+! grep -Eq 'fixedRun|fixedWriteJournal|fixedWriteTerminal|fixedActivateFence' \
   "$ROOT/scripts/debian-maintenance-host-adapter.mjs" \
   "$ROOT/scripts/lib/bounded-recovery-dispatch.mjs"
 UNIT="$ROOT/systemd/brokkr-debian-maintenance-recovery@.service"
-rg -q '^ExecStart=/usr/local/lib/brokkr/debian-maintenance-host-adapter --action recover --attempt %i$' "$UNIT"
+grep -Eq '^ExecStart=/usr/local/lib/brokkr/debian-maintenance-host-adapter --action recover --attempt %i$' "$UNIT"
 if command -v systemd-analyze >/dev/null 2>&1; then
   UNIT_ROOT="$TMP/systemd-root"
   mkdir -p "$UNIT_ROOT/etc/systemd/system" "$UNIT_ROOT/usr/local/lib/brokkr"
   cp "$UNIT" "$UNIT_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery@.service"
+  for target in \
+    basic.target local-fs.target network-online.target shutdown.target \
+    sysinit.target; do
+    printf '[Unit]\nDescription=Hermetic test %s\nDefaultDependencies=no\n' \
+      "$target" >"$UNIT_ROOT/etc/systemd/system/$target"
+  done
   printf '#!/bin/sh\nexit 0\n' >"$UNIT_ROOT/usr/local/lib/brokkr/debian-maintenance-host-adapter"
   chmod 0755 "$UNIT_ROOT/usr/local/lib/brokkr/debian-maintenance-host-adapter"
   systemd-analyze verify --root="$UNIT_ROOT" brokkr-debian-maintenance-recovery@.service
 else
-  rg -q '^User=root$' "$UNIT"
-  rg -q '^NoNewPrivileges=yes$' "$UNIT"
+  grep -Eq '^User=root$' "$UNIT"
+  grep -Eq '^NoNewPrivileges=yes$' "$UNIT"
 fi

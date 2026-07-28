@@ -16,7 +16,17 @@ const ID = /^[a-z][a-z0-9-]{2,62}$/;
 const PACKAGE = /^[a-z0-9][a-z0-9+.-]{0,127}$/;
 const VERSION = /^[A-Za-z0-9:+.~-]{1,128}$/;
 const UNIT = /^[a-zA-Z0-9@_.-]{1,128}\.service$/;
-const KERNEL_OR_FIRMWARE = /(^|[-.])(linux|kernel|firmware|raspi-firmware)([-.]|$)/i;
+const PROTECTED_PACKAGE_FAMILIES = Object.freeze([
+  /^(?:linux-(?:base|headers|image|kbuild|libc-dev|modules|source|tools)|kernel)(?:[-.]|$)/,
+  /(?:^|[-.])(?:kernel|firmware|microcode|eeprom)(?:[-.]|$)/,
+  /^(?:raspi|rpi)(?:[-.]|$)/,
+  /^(?:grub|shim|u-boot|uboot|initramfs|dracut|dkms|kmod|fwupd|flashrom)(?:[-.]|$)/,
+  /^(?:systemd-boot)(?:[-.]|$)/,
+]);
+const APPROVED_DEBIAN_ORIGINS = new Map([
+  ["deb.debian.org", new Set(["/debian", "/debian-security"])],
+  ["security.debian.org", new Set(["/debian-security"])],
+]);
 const MAX_PACKAGES = 64;
 const MIN_AVAILABLE_KIB = 1024 * 1024;
 const RECOVERY_UNIT_ALLOWLIST = new Set(["brokkr-maintenance-safe.service"]);
@@ -33,7 +43,17 @@ const digest = value => `sha256:${crypto.createHash("sha256").update(canonicalJs
 const fail = code => { const error = new Error(code); error.code = code; throw error; };
 const plain = value => value !== null && typeof value === "object" && !Array.isArray(value);
 const exactKeys = (value, keys) => plain(value) && Object.keys(value).sort().join(",") === [...keys].sort().join(",");
-const iso = value => typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(value) && Number.isFinite(Date.parse(value));
+const iso = value => {
+  if (typeof value !== "string" ||
+      !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(value)) return false;
+  const instant = new Date(value);
+  return !Number.isNaN(instant.getTime()) &&
+    instant.toISOString().replace(".000Z", "Z") === value;
+};
+const protectedPackage = value => (
+  typeof value === "string" &&
+  PROTECTED_PACKAGE_FAMILIES.some(pattern => pattern.test(value))
+);
 const command = (env, argv) => {
   if (!Array.isArray(argv) || argv.length < 1 || typeof argv[0] !== "string" || !argv[0].startsWith("/") || argv.some(arg => typeof arg !== "string" || arg.includes("\0"))) fail("host_command_invalid");
   const result = env.run(argv);
@@ -222,12 +242,12 @@ function candidateSet(request) {
   const ids = [];
   for (const candidate of candidates) {
     if (!exactKeys(candidate, ["id", "name", "class", "source", "current_version", "candidate_version", "eligible", "reasons"]) ||
-      !PACKAGE.test(candidate.name) || KERNEL_OR_FIRMWARE.test(candidate.name) ||
+      !PACKAGE.test(candidate.name) || protectedPackage(candidate.name) ||
       !VERSION.test(candidate.candidate_version) || (candidate.current_version !== null && !VERSION.test(candidate.current_version)) ||
       candidate.id !== `${candidate.name}@${candidate.candidate_version}` ||
       !["security", "bugfix"].includes(candidate.class) || candidate.source !== "distro_repository" ||
       candidate.eligible !== true || !Array.isArray(candidate.reasons) || candidate.reasons.length !== 0) {
-      fail(KERNEL_OR_FIRMWARE.test(String(candidate.name)) ? "host_candidate_forbidden" : "host_candidate_invalid");
+      fail(protectedPackage(candidate.name) ? "host_candidate_forbidden" : "host_candidate_invalid");
     }
     if (names.has(candidate.name)) fail("host_candidate_duplicate");
     names.add(candidate.name); ids.push(candidate.id);
@@ -313,8 +333,10 @@ function preflight(env) {
   ok(env, ["/usr/bin/getent", "ahostsv4", "deb.debian.org"], "host_network_unreachable");
 }
 function withinRecoveryBudget(env, deadline) {
-  const now = Date.parse(env.now());
-  if (!Number.isFinite(now) || now >= deadline) fail("host_recovery_budget_exhausted");
+  const at = env.now();
+  if (!iso(at)) fail("host_clock_unverified");
+  const now = Date.parse(at);
+  if (now >= deadline) fail("host_recovery_budget_exhausted");
   return Math.max(1, deadline - now);
 }
 function recoveryOk(env, deadline, argv, code) {
@@ -349,13 +371,45 @@ function exactSimulation(env, candidates) {
   }
   if (output.split("\n").some(line => /^(Remv|Del) /.test(line))) fail("host_exact_upgrade_widened");
 }
+function approvedDebianOrigin(value, archiveComponent) {
+  let origin;
+  try { origin = new URL(value); } catch { return false; }
+  return ["http:", "https:"].includes(origin.protocol) &&
+    origin.username === "" && origin.password === "" && origin.port === "" &&
+    origin.search === "" && origin.hash === "" &&
+    APPROVED_DEBIAN_ORIGINS.get(origin.hostname)?.has(origin.pathname) === true &&
+    /^[a-z0-9][a-z0-9+.-]*\/main$/.test(archiveComponent);
+}
+function policyBindsApprovedCandidate(output, version) {
+  const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const exactVersion = new RegExp(
+    `^\\s*(?:\\*\\*\\*\\s+)?${escaped}\\s+\\d+\\s*$`,
+  );
+  const anyVersion = /^\s*(?:\*\*\*\s+)?\S+\s+\d+\s*$/;
+  const lines = output.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!exactVersion.test(lines[index])) continue;
+    for (let originIndex = index + 1;
+      originIndex < lines.length &&
+      !anyVersion.test(lines[originIndex]);
+      originIndex += 1) {
+      const match = /^\s+\d+\s+(\S+)\s+(\S+)\s+\S+\s+Packages\s*$/
+        .exec(lines[originIndex]);
+      if (match && approvedDebianOrigin(match[1], match[2])) return true;
+    }
+  }
+  return false;
+}
 function verifyAptEvidence(env, candidates, evidence) {
   const trust = ok(env, ["/usr/bin/apt-config", "dump"], "host_apt_trust_unverifiable");
   if (digest(trust) !== evidence.trust_config_digest || /(?:AllowInsecureRepositories|AllowDowngradeToInsecureRepositories|Trusted)\s+"?true"?/i.test(trust)) fail("host_apt_trust_changed");
   for (const candidate of candidates) {
     const expected = evidence.candidates.find(item => item.name === candidate.name);
     const output = ok(env, ["/usr/bin/apt-cache", "policy", candidate.name], "host_apt_source_unverifiable");
-    if (digest(output) !== expected.policy_output_digest || !new RegExp(`\\n\\s*${candidate.candidate_version.replace(/[.+~-]/g, "\\$&")} \\d+\\n\\s+\\d+ https?://[^\\s]*debian\\.org/debian(?:-security)?\\b`).test(output)) fail("host_apt_source_changed");
+    if (digest(output) !== expected.policy_output_digest ||
+        !policyBindsApprovedCandidate(output, candidate.candidate_version)) {
+      fail("host_apt_source_changed");
+    }
   }
 }
 
@@ -378,11 +432,13 @@ function validJournal(state, bindingDigest) {
   if (state.terminal !== null) {
     const terminal = state.terminal;
     const legacy = exactKeys(terminal, ["kind", "schema_version", "state", "reason", "at", "binding_digest"]);
-    const disarmed = exactKeys(terminal, ["kind", "schema_version", "state", "reason", "at", "binding_digest", "activation_digest", "revalidation_fence_digest"]);
-    if ((!legacy && !disarmed) || terminal.kind !== "brokkr-debian-host-adapter-terminal" ||
+    const bound = exactKeys(terminal, ["kind", "schema_version", "state", "reason", "at", "binding_digest", "activation_digest", "revalidation_fence_digest"]);
+    if ((!legacy && !bound) || terminal.kind !== "brokkr-debian-host-adapter-terminal" ||
       terminal.schema_version !== "v1" || !["terminally-blocked", "disarmed"].includes(terminal.state) ||
       typeof terminal.reason !== "string" || !iso(terminal.at) || terminal.binding_digest !== bindingDigest ||
-      (terminal.state === "disarmed" && (!disarmed || !DIGEST.test(terminal.activation_digest) || !DIGEST.test(terminal.revalidation_fence_digest)))) return false;
+      (terminal.state === "disarmed" && !bound) ||
+      (bound && (!DIGEST.test(terminal.activation_digest) ||
+        !DIGEST.test(terminal.revalidation_fence_digest)))) return false;
   }
   let previous = null;
   for (let index = 0; index < state.entries.length; index += 1) {
@@ -405,15 +461,23 @@ function append(state, phase, env, detail, bindingDigest) {
   if (!iso(entry.at)) fail("host_clock_unverified");
   state.entries.push(entry); env.writeJournal(clone(state)); return entry;
 }
-function terminal(state, env, reason, bindingDigest) {
-  const record = { kind: "brokkr-debian-host-adapter-terminal", schema_version: "v1", state: "terminally-blocked", reason, at: env.now(), binding_digest: bindingDigest };
+function terminal(state, env, reason, bindingDigest, activation = null) {
+  const at = env.now();
+  if (!iso(at)) fail("host_clock_unverified");
+  const record = { kind: "brokkr-debian-host-adapter-terminal", schema_version: "v1", state: "terminally-blocked", reason, at, binding_digest: bindingDigest };
+  if (activation !== null) {
+    record.activation_digest = digest(activation);
+    record.revalidation_fence_digest = activation.fence_digest;
+  }
   state.terminal = record; env.writeJournal(clone(state)); env.writeTerminal(clone(record));
   return { outcome: "terminally-blocked", reason, journal: state };
 }
 function disarmedTerminal(env, state, request, activation) {
+  const at = env.now();
+  if (!iso(at)) fail("host_clock_unverified");
   const record = {
     kind: "brokkr-debian-host-adapter-terminal", schema_version: "v1",
-    state: "disarmed", reason: "forward_recovery_verified", at: env.now(),
+    state: "disarmed", reason: "forward_recovery_verified", at,
     binding_digest: request.binding_digest,
     activation_digest: digest(activation),
     revalidation_fence_digest: activation.fence_digest,
@@ -430,6 +494,49 @@ function reconcileTerminal(state, env) {
     env.writeTerminal(clone(state.terminal));
   } else if (canonicalJson(sidecar) !== canonicalJson(state.terminal)) {
     fail("host_terminal_conflict");
+  }
+}
+function validateHostRecoveryActivation(request, activation, assertFence) {
+  if (!exactKeys(activation, [
+    "kind", "schema_version", "attempt_id", "binding_digest",
+    "recovery_descriptor_digest", "fence", "fence_digest",
+  ]) || activation.kind !== "brokkr-debian-recovery-activation" ||
+      activation.schema_version !== "v1" ||
+      activation.attempt_id !== request.attempt_id ||
+      activation.binding_digest !== request.binding_digest ||
+      activation.recovery_descriptor_digest !==
+        request.recovery_descriptor_digest ||
+      activation.fence_digest !== digest(activation.fence)) {
+    fail("host_revalidation_fence_invalid");
+  }
+  assertFence(activation.fence, "host_revalidation_fence_invalid");
+  if (activation.fence.epoch <= request.lease_fence.epoch ||
+      activation.fence.domain !== request.lease_fence.domain ||
+      activation.fence.target_scope_digest !==
+        request.lease_fence.target_scope_digest ||
+      activation.fence.attempt_id !== request.lease_fence.attempt_id ||
+      activation.fence.mutation_id !== request.lease_fence.mutation_id ||
+      activation.fence.binding_digest !== request.lease_fence.binding_digest ||
+      activation.fence.holder_token === request.lease_fence.holder_token ||
+      Date.parse(activation.fence.activated_at) <
+        Date.parse(request.lease_fence.activated_at) ||
+      Date.parse(activation.fence.expires_at) <=
+        Date.parse(activation.fence.activated_at)) {
+    fail("host_revalidation_fence_invalid");
+  }
+}
+function activateHostRecoveryFence(env, activation) {
+  const receipt = env.activateFence(clone(activation.fence));
+  if (!plain(receipt) || receipt.activated !== true ||
+      receipt.lease_fence_digest !== activation.fence_digest) {
+    fail("host_revalidation_activation_failed");
+  }
+  env.assertFenceCurrent(clone(activation.fence), activation.fence_digest);
+  const checkedAt = env.now();
+  if (!iso(checkedAt) ||
+      Date.parse(checkedAt) < Date.parse(activation.fence.activated_at) ||
+      Date.parse(checkedAt) > Date.parse(activation.fence.expires_at)) {
+    fail("host_revalidation_fence_expired");
   }
 }
 
@@ -449,8 +556,28 @@ function runHostAdapterCore({ action, request, registration, env }) {
   const { execution, candidates, descriptor, assertFence, aptEvidence } = validateRequest(request, registration, action);
   if (env.adapterReleaseDigest() !== request.release_digest) fail("host_release_unbound");
   let state = safeEnv.readJournal();
+  let activation = null;
+  if (action === "recover") {
+    try {
+      activation = env.readRecoveryActivation();
+      validateHostRecoveryActivation(request, activation, assertFence);
+    } catch (error) {
+      const terminalState = state !== null &&
+        validJournal(state, request.binding_digest) ?
+        state : { entries: [], terminal: null };
+      return terminal(
+        terminalState, safeEnv,
+        String(error?.code ?? error?.message ??
+          "host_revalidation_fence_invalid"),
+        request.binding_digest,
+      );
+    }
+  }
   if (state !== null && !validJournal(state, request.binding_digest)) {
-    return terminal({ entries: [], terminal: null }, safeEnv, "host_journal_corrupt", request.binding_digest);
+    return terminal(
+      { entries: [], terminal: null }, safeEnv, "host_journal_corrupt",
+      request.binding_digest, activation,
+    );
   }
   state ??= { entries: [], terminal: null };
   if (action === "apply") {
@@ -495,11 +622,18 @@ function runHostAdapterCore({ action, request, registration, env }) {
     }
   }
   if (state.terminal?.state === "terminally-blocked") {
+    if (state.terminal.activation_digest !== digest(activation) ||
+        state.terminal.revalidation_fence_digest !==
+          activation.fence_digest) {
+      activateHostRecoveryFence(env, activation);
+      return terminal(
+        state, safeEnv, state.terminal.reason, request.binding_digest,
+        activation,
+      );
+    }
     reconcileTerminal(state, safeEnv);
-    return {
-      outcome: state.terminal.state, reason: state.terminal.reason,
-      journal: state,
-    };
+    return { outcome: state.terminal.state, reason: state.terminal.reason,
+      journal: state };
   }
   const recoveryPhase = state.entries.at(-1)?.phase;
   if (state.entries.length === 0 ||
@@ -509,27 +643,24 @@ function runHostAdapterCore({ action, request, registration, env }) {
       state, safeEnv, "host_recovery_not_eligible", request.binding_digest,
     );
   }
-  const started = Date.parse(safeEnv.now());
+  const startedAt = safeEnv.now();
+  if (!iso(startedAt)) {
+    return terminal(
+      state, safeEnv, "host_clock_unverified", request.binding_digest,
+      activation,
+    );
+  }
+  const started = Date.parse(startedAt);
+  let recoveryFenceActivated = false;
   try {
-    const activation = env.readRecoveryActivation();
-    if (!exactKeys(activation, ["kind", "schema_version", "attempt_id", "binding_digest", "recovery_descriptor_digest", "fence", "fence_digest"]) || activation.kind !== "brokkr-debian-recovery-activation" || activation.schema_version !== "v1" || activation.attempt_id !== request.attempt_id || activation.binding_digest !== request.binding_digest || activation.recovery_descriptor_digest !== request.recovery_descriptor_digest || activation.fence_digest !== digest(activation.fence)) fail("host_revalidation_fence_invalid");
-    assertFence(activation.fence, "host_revalidation_fence_invalid");
-    if (activation.fence.epoch <= request.lease_fence.epoch || activation.fence.domain !== request.lease_fence.domain ||
-      activation.fence.target_scope_digest !== request.lease_fence.target_scope_digest ||
-      activation.fence.attempt_id !== request.lease_fence.attempt_id || activation.fence.mutation_id !== request.lease_fence.mutation_id ||
-      activation.fence.binding_digest !== request.lease_fence.binding_digest || activation.fence.holder_token === request.lease_fence.holder_token ||
-      Date.parse(activation.fence.activated_at) < Date.parse(request.lease_fence.activated_at) || Date.parse(activation.fence.expires_at) <= Date.parse(activation.fence.activated_at)) fail("host_revalidation_fence_invalid");
-    const recoveryFenceReceipt = env.activateFence(clone(activation.fence));
-    if (!plain(recoveryFenceReceipt) || recoveryFenceReceipt.activated !== true || recoveryFenceReceipt.lease_fence_digest !== activation.fence_digest) fail("host_revalidation_activation_failed");
+    activateHostRecoveryFence(env, activation);
+    recoveryFenceActivated = true;
     if (!["recover", "quarantine", "disarm"].includes(recoveryPhase)) {
       append(state, "recover", safeEnv, {
         recovery_descriptor_digest: request.recovery_descriptor_digest,
       }, request.binding_digest);
     }
     const deadline = Math.min(started + descriptor.budget_seconds * 1000, Date.parse(activation.fence.expires_at));
-    env.assertFenceCurrent(clone(activation.fence), activation.fence_digest);
-    const checkedAt = safeEnv.now();
-    if (!iso(checkedAt) || Date.parse(checkedAt) < Date.parse(activation.fence.activated_at) || Date.parse(checkedAt) > Date.parse(activation.fence.expires_at)) fail("host_revalidation_fence_expired");
     if (!["quarantine", "disarm"].includes(recoveryPhase)) {
       recoveryOk(safeEnv, deadline, ["/usr/bin/dpkg", "--configure", "-a"], "host_recovery_repair_failed");
       for (const unit of descriptor.restart_units) recoveryOk(safeEnv, deadline, ["/usr/bin/systemctl", "try-restart", unit], "host_recovery_restart_failed");
@@ -555,7 +686,13 @@ function runHostAdapterCore({ action, request, registration, env }) {
       return { outcome: "disarmed", journal: state };
     }
     return disarmedTerminal(safeEnv, state, request, activation);
-  } catch (error) { return terminal(state, safeEnv, String(error?.code ?? error?.message ?? "host_recovery_failed"), request.binding_digest); }
+  } catch (error) {
+    return terminal(
+      state, safeEnv,
+      String(error?.code ?? error?.message ?? "host_recovery_failed"),
+      request.binding_digest, recoveryFenceActivated ? activation : null,
+    );
+  }
 }
 
 function validRecoveryFence(fence, expected) {
@@ -632,25 +769,29 @@ function recoveryReceipt(attempt, activation, request) {
     "kind", "schema_version", "state", "reason", "at", "binding_digest",
     "activation_digest", "revalidation_fence_digest",
   ]) || terminal.kind !== "brokkr-debian-host-adapter-terminal" ||
-      terminal.schema_version !== "v1" || terminal.state !== "disarmed" ||
-      terminal.reason !== "forward_recovery_verified" ||
+      terminal.schema_version !== "v1" ||
+      !["disarmed", "terminally-blocked"].includes(terminal.state) ||
+      typeof terminal.reason !== "string" || terminal.reason.length === 0 ||
       terminal.binding_digest !== request.binding_digest ||
       terminal.activation_digest !== activationDigest ||
       terminal.revalidation_fence_digest !==
         request.revalidation_fence_digest ||
+      (terminal.state === "disarmed" &&
+        terminal.reason !== "forward_recovery_verified") ||
       !iso(terminal.at)) {
     fail("bounded_recovery_terminal_unverified");
   }
+  const recovered = terminal.state === "disarmed";
   return {
     activation_digest: activationDigest,
     idempotency_key: request.idempotency_key,
     effect_lease_fence_digest: request.lease_fence_digest,
     revalidated_lease_fence_digest: request.revalidation_fence_digest,
     revalidated_at: terminal.at,
-    recovered: true,
-    safe_state_verified: true,
+    recovered,
+    safe_state_verified: recovered,
     quarantine_active: true,
-    reason_code: null,
+    reason_code: recovered ? null : terminal.reason,
   };
 }
 function validStoredActivation(activation, request, attempt) {
@@ -671,13 +812,16 @@ function validStoredActivation(activation, request, attempt) {
     activation.fence_digest === digest(activation.fence) &&
     validRecoveryFence(activation.fence, expected);
 }
-function validPriorDisarmedTerminal(terminal, request) {
+function validPriorBoundTerminal(terminal, request) {
   return exactKeys(terminal, [
     "kind", "schema_version", "state", "reason", "at", "binding_digest",
     "activation_digest", "revalidation_fence_digest",
   ]) && terminal.kind === "brokkr-debian-host-adapter-terminal" &&
-    terminal.schema_version === "v1" && terminal.state === "disarmed" &&
-    terminal.reason === "forward_recovery_verified" &&
+    terminal.schema_version === "v1" &&
+    ["disarmed", "terminally-blocked"].includes(terminal.state) &&
+    typeof terminal.reason === "string" && terminal.reason.length > 0 &&
+    (terminal.state !== "disarmed" ||
+      terminal.reason === "forward_recovery_verified") &&
     terminal.binding_digest === request.binding_digest &&
     DIGEST.test(terminal.activation_digest) &&
     DIGEST.test(terminal.revalidation_fence_digest) && iso(terminal.at);
@@ -709,10 +853,11 @@ function dispatchFixedRecovery(request, activation) {
     try {
       return recoveryReceipt(attempt, activation, request);
     } catch (error) {
-      if (!validPriorDisarmedTerminal(existingTerminal, request)) throw error;
+      if (!validPriorBoundTerminal(existingTerminal, request)) throw error;
       // A newly authorized successor may resume after the prior worker
-      // disarmed but crashed before W2a durably accepted its receipt. Start
-      // the fixed unit so it revalidates safe state and rebinds the receipt.
+      // terminalized but crashed before W2a durably accepted its receipt.
+      // Start the fixed unit so it validates the successor and rebinds the
+      // durable receipt without widening or replaying the original effect.
     }
   }
   const unit = `brokkr-debian-maintenance-recovery@${attempt}.service`;
@@ -720,8 +865,12 @@ function dispatchFixedRecovery(request, activation) {
     "/usr/bin/systemctl", ["start", unit],
     { encoding: "utf8", timeout: 300_000 },
   );
-  if (result.status !== 0) fail("bounded_recovery_fixed_adapter_failed");
-  return recoveryReceipt(attempt, activation, request);
+  try {
+    return recoveryReceipt(attempt, activation, request);
+  } catch (error) {
+    if (result.status !== 0) fail("bounded_recovery_fixed_adapter_failed");
+    throw error;
+  }
 }
 
 export function runFixedDebianMaintenanceHostOperation(input) {
