@@ -1,9 +1,14 @@
 # Debian maintenance host adapter (brokkr#67)
 
-`scripts/debian-maintenance-host-adapter.mjs` is the root-only, fixed-command
-actuator for the disarmed Debian security/bugfix lane. It is a capability seam,
-not an installer, timer, deployer, or arming mechanism. No unit, sudoers rule,
-request, registration, target, or private locator is shipped by this repository.
+`scripts/debian-maintenance-host-adapter.mjs` is the root-only fixed CLI for the
+disarmed Debian security/bugfix lane. The entire actuator, recovery publisher,
+fixed dependencies, and state machinery live behind the single exported
+`runFixedDebianMaintenanceHostOperation()` in
+`scripts/lib/fixed-debian-maintenance-host-operation.mjs`. That operation accepts
+only a closed action/request/registration tuple. Commands, paths, units, raw
+writes, and callbacks are lexical-private. This is a capability seam, not an
+installer, timer, deployer, or arming mechanism. No unit, sudoers rule, request,
+registration, target, or private locator is installed by this repository.
 
 The only CLI shapes are:
 
@@ -18,21 +23,26 @@ files with mode 0600 or stricter. The root-owned registration must equal the
 request's exact attempt, binding, plan, constitution, release, execution-request
 and recovery-descriptor digests. The adapter does not accept a path, command,
 repository, source, unit, package action, shell fragment, hook, or reboot policy
-from its CLI. `release_digest` must also equal the raw SHA-256 digest of the
-installed adapter module; that module pins and verifies the exact concrete
-dependency module before any effect, so splitting the implementation does not
-leave an unbound production seam.
+from its CLI. The high-level operation independently re-reads both fixed files
+and requires exact canonical equality with its untrusted arguments.
+`release_digest` must also equal the raw SHA-256 digest of that installed
+operation module. There is no separately importable command runner, state
+writer, fence writer, or adapter core to bind.
 The full W2a target/binding/attempt/mutation/epoch/token/activation/expiry
 effect fence is request-and-registration-bound. The adapter takes an
 OS-enforced `flock` for the entire activation/check/effect process. The
-effecting process verifies that it inherited a descriptor for the exact
-root-owned lock inode and that an independent contender cannot acquire it;
-there is no caller-selectable locked mode. It then installs the fence before
-preflight, re-reads the identical fence, and invokes apt synchronously inside
-that critical section. A superseded, missing, corrupt, or wedged fence fails
-closed. Recovery instead reads a separate root-owned,
-fixed-path protected activation record bound to the immutable descriptor and
-attempt; its epoch must strictly advance the original effect fence, so a
+effecting process verifies through `/proc/self/fdinfo` that its current PID owns
+an advisory write FLOCK on a descriptor with the exact root-owned lock
+device/inode, and that an independent contender cannot acquire it. Merely
+opening the same inode while a different process owns the lock is insufficient.
+The CLI's fixed `flock --no-fork` invocation preserves that lock-holder PID and
+descriptor; there is no caller-selectable locked mode. It then installs the
+fence before preflight, re-reads the identical fence, and invokes apt
+synchronously inside that critical section. A superseded, missing, corrupt, or
+wedged fence fails closed. Recovery instead reads a separate root-owned,
+fixed-path protected activation and `recovery-authorizations/<attempt>.json`
+record bound to the immutable request, descriptor, successor fence, and
+attempt. Its epoch must strictly advance the original effect fence, so a
 crashed recovery worker can be superseded without rewriting the original
 request or recovery descriptor.
 
@@ -68,13 +78,19 @@ postconditions inside the descriptor's at-most-300-second budget, then journals
 quarantine and disarm. Any repair, restart, hold, journal, or verification
 failure terminalizes and writes a disarm record.
 
-The mandatory, private recovery bridge is co-located with the only exported
-W2a runner. W2a's durable outbox supplies its authenticated, monotonic
-successor fence; before publishing an activation the bridge structurally binds
-the exact attempt, binding, target scope, mutation, descriptor, idempotency
-key, and successor epoch/token. It then dispatches only `{action: "recover",
-attempt_id}` to the fixed unit. A restart reads the same W2a outbox and repeats
-the same idempotency key; it cannot synthesize a plan, re-arm, or widen scope.
+The mandatory recovery bridge reaches only the same high-level host operation.
+W2a's durable outbox supplies its authenticated, monotonic successor fence;
+before publishing an activation the bridge structurally binds the exact
+attempt, binding, target scope, mutation, descriptor, idempotency key, and
+successor epoch/token. The operation then revalidates the exact root-owned
+recovery authorization, atomically publishes that fixed activation, and starts
+only `brokkr-debian-maintenance-recovery@<canonical-attempt>.service`. A matching
+terminal receipt makes the operation idempotent without another unit start. A
+strictly advancing, exactly authorized successor activation may replace a
+crashed worker's activation. Recovery resumes from each durable recovery phase,
+revalidates safe state before disarm, and repairs a terminal sidecar lost after
+its journal commit. A restart reads the same W2a outbox and repeats the same
+idempotency key; it cannot synthesize a plan, re-arm, or widen scope.
 The production installer is still intentionally absent, so this remains a
 hermetic/disarmed contract until the separate owner ceremony installs the fixed
 state root and unit.
@@ -84,4 +100,5 @@ root capability because dpkg repair itself requires root. Its sole executable
 is the exact fixed recovery wrapper, with no sudo transition and
 `NoNewPrivileges=yes`; it cannot accept a plan or arbitrary command. It is
 intentionally not installed here: the future owner ceremony must first create
-the fixed root-owned state tree, the registration, and signed outer authority.
+the fixed root-owned state tree, request, registration, exact recovery
+authorization, and signed outer authority.

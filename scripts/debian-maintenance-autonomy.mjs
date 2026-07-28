@@ -1149,7 +1149,7 @@ function recoveryForBinding(recovery, binding, bindingDigest) {
   const bounded = factory({ binding: structuredClone(binding), bindingDigest });
   assert(plain(bounded) && typeof bounded.recover === "function",
     "bounded_recovery_dispatch_required");
-  return bounded;
+  return { ...recovery, recover: bounded.recover };
 }
 function enterRecovery({ file, journal, context, admission, phases, recovery, code, lastAt, lease }) {
   const outboxFile = `${file}.recovery-outbox.json`;
@@ -2165,7 +2165,6 @@ export function runDebianMaintenance(options = {}) {
       fail("bounded_recovery_dispatch_required");
     }
     return createBoundedRecoveryDispatcher({
-      recovery,
       expected: {
         attemptId: recoveredBinding.attempt_id,
         bindingDigest,

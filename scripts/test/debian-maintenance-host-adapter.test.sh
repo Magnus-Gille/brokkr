@@ -2,12 +2,24 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+HOLDER_PID=""
+cleanup() {
+  if [[ -n "$HOLDER_PID" ]]; then
+    kill "$HOLDER_PID" 2>/dev/null || true
+    wait "$HOLDER_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 cat >"$TMP/test.mjs" <<'NODE'
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 
-const productionAdapter = await import(`${process.env.ROOT}/scripts/debian-maintenance-host-adapter.mjs`);
+const productionAdapter = await import(
+  `${process.env.ROOT}/scripts/lib/fixed-debian-maintenance-host-operation.mjs`
+);
 const canonicalJson = value => value === null || typeof value !== "object" ? JSON.stringify(value) :
   Array.isArray(value) ? `[${value.map(canonicalJson).join(",")}]` :
     `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
@@ -16,11 +28,21 @@ const adapter = {
   canonicalJson,
   runHostAdapter: ({ env, ...input }) => {
     globalThis.__BROKKR_TEST_HOST_ADAPTER_ENV__ = env;
-    return productionAdapter.runHostAdapter(input);
+    return productionAdapter.runFixedDebianMaintenanceHostOperation(input);
   },
 };
-assert.deepEqual(Object.keys(productionAdapter), ["runHostAdapter"],
-  "the production adapter exports only the fixed-dependency runner");
+assert.deepEqual(
+  Object.keys(productionAdapter),
+  ["runFixedDebianMaintenanceHostOperation"],
+  "the production host boundary exports only one closed high-level operation",
+);
+assert.match(
+  productionAdapter.runFixedDebianMaintenanceHostOperation({
+    action: "test-fixed-now", request: {}, registration: {},
+  }),
+  /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/,
+  "the production clock used by strict journal and fence timestamps is canonical UTC",
+);
 const { createBoundedRecoveryDispatcher } = await import(
   `${process.env.ROOT}/scripts/lib/bounded-recovery-dispatch.mjs`
 );
@@ -109,6 +131,7 @@ const env = { uid: 0, now: () => "2026-07-27T12:00:00Z", run, rebootRequired: ()
     assert.equal(lease_fence_digest, digest(fence)); return apply();
   },
   readJournal: () => state.entries.length ? structuredClone(state) : null,
+  readTerminal: () => state.terminal ? structuredClone(state.terminal) : null,
   writeJournal: value => { Object.assign(state, structuredClone(value)); },
   writeTerminal: value => { state.terminal = structuredClone(value); },
 };
@@ -118,7 +141,7 @@ assert.deepEqual(state.entries.map(entry => entry.phase), ["preflight", "invento
 assert(calls.some(argv => argv[0] === "/usr/bin/apt-get" && argv.includes("--only-upgrade") && argv.includes("openssl=3.0.17-1~deb12u2")));
 assert(calls.every(argv => argv[0].startsWith("/")), "adapter invokes only absolute fixed binaries");
 let injectedCallbackCalled = false;
-const injectedResult = productionAdapter.runHostAdapter({
+const injectedResult = productionAdapter.runFixedDebianMaintenanceHostOperation({
   action: "apply", request, registration,
   env: {
     run: () => { injectedCallbackCalled = true; throw Error("public callback reached"); },
@@ -127,7 +150,10 @@ const injectedResult = productionAdapter.runHostAdapter({
   },
 });
 assert.equal(injectedCallbackCalled, false, "public imports cannot inject host effects");
-assert.equal(injectedResult.reason, "host_apply_replay_forbidden");
+assert.equal(injectedResult.outcome, "applied",
+  "a completed apply is an idempotent readback without another effect");
+assert.equal(state.terminal, null,
+  "an idempotent applied readback does not terminalize the successful attempt");
 
 for (const [name, mutate, code] of [
   ["arbitrary action", value => { value.action = "shell"; }, /host_action_invalid/],
@@ -216,6 +242,120 @@ assert(recoveryState.entries.some(entry => entry.phase === "quarantine"));
 assert.equal(recoveryState.terminal.activation_digest, digest(recoveryActivation));
 assert.equal(recoveryState.terminal.revalidation_fence_digest, recoveryActivation.fence_digest);
 assert(calls.every(argv => argv[0] !== "/bin/sh"));
+
+for (const crashPhase of ["recover", "quarantine", "disarm"]) {
+  const crashState = structuredClone(recoveryState);
+  const phaseIndex = crashState.entries.findIndex(
+    entry => entry.phase === crashPhase,
+  );
+  crashState.entries = crashState.entries.slice(0, phaseIndex + 1);
+  crashState.terminal = null;
+  let recoveryEffects = 0;
+  const resumed = adapter.runHostAdapter({
+    action: "recover", request, registration, env: {
+      ...env,
+      readJournal: () => structuredClone(crashState),
+      readTerminal: () => null,
+      writeJournal: value => Object.assign(
+        crashState, structuredClone(value),
+      ),
+      writeTerminal: value => {
+        crashState.terminal = structuredClone(value);
+      },
+      run: argv => {
+        if (argv[0] === "/usr/bin/dpkg" && argv[1] === "--configure") {
+          recoveryEffects += 1;
+          return { status: 0, stdout: "" };
+        }
+        if (argv[0] === "/usr/bin/apt-mark" ||
+            (argv[0] === "/usr/bin/systemctl" &&
+              argv[1] === "try-restart")) {
+          recoveryEffects += 1;
+          return { status: 0, stdout: "" };
+        }
+        if (argv[0] === "/usr/bin/dpkg-query") {
+          return {
+            status: 0, stdout: "openssl=3.0.17-1~deb12u2\n",
+          };
+        }
+        return run(argv);
+      },
+    },
+  });
+  assert.equal(resumed.outcome, "disarmed",
+    `${crashPhase} journal crash resumes to disarm`);
+  assert.equal(
+    crashState.entries.filter(entry => entry.phase === "recover").length,
+    1,
+    `${crashPhase} replay never duplicates the recover phase`,
+  );
+  assert.equal(
+    crashState.entries.filter(entry => entry.phase === "quarantine").length,
+    1,
+    `${crashPhase} replay never duplicates quarantine`,
+  );
+  assert.equal(
+    crashState.entries.filter(entry => entry.phase === "disarm").length,
+    1,
+    `${crashPhase} replay never duplicates disarm`,
+  );
+  assert.equal(
+    recoveryEffects > 0, crashPhase === "recover",
+    "only an interrupted recovery effect is safely replayed",
+  );
+}
+
+const missingTerminalState = structuredClone(recoveryState);
+let repairedTerminal = null;
+const repaired = adapter.runHostAdapter({
+  action: "recover", request, registration, env: {
+    ...env,
+    readJournal: () => structuredClone(missingTerminalState),
+    readTerminal: () => null,
+    writeJournal: value => Object.assign(
+      missingTerminalState, structuredClone(value),
+    ),
+    writeTerminal: value => { repairedTerminal = structuredClone(value); },
+    readRecoveryActivation: () => structuredClone(recoveryActivation),
+    run: argv => argv[0] === "/usr/bin/dpkg-query" ?
+      { status: 0, stdout: "openssl=3.0.17-1~deb12u2\n" } : run(argv),
+  },
+});
+assert.equal(repaired.outcome, "disarmed");
+assert.deepEqual(
+  repairedTerminal, missingTerminalState.terminal,
+  "replay repairs a terminal sidecar lost after the journal commit",
+);
+
+const advancedActivation = structuredClone(recoveryActivation);
+advancedActivation.fence.epoch += 1;
+advancedActivation.fence.holder_token = "advanced-fence-token-012345";
+advancedActivation.fence_digest = digest(advancedActivation.fence);
+const advancedState = structuredClone(recoveryState);
+const rebound = adapter.runHostAdapter({
+  action: "recover", request, registration, env: {
+    ...env,
+    readJournal: () => structuredClone(advancedState),
+    readTerminal: () => structuredClone(advancedState.terminal),
+    writeJournal: value => Object.assign(
+      advancedState, structuredClone(value),
+    ),
+    writeTerminal: value => {
+      advancedState.terminal = structuredClone(value);
+    },
+    readRecoveryActivation: () => structuredClone(advancedActivation),
+    activateFence: fence => ({
+      activated: true, lease_fence_digest: digest(fence),
+    }),
+    run: argv => argv[0] === "/usr/bin/dpkg-query" ?
+      { status: 0, stdout: "openssl=3.0.17-1~deb12u2\n" } : run(argv),
+  },
+});
+assert.equal(rebound.outcome, "disarmed");
+assert.equal(
+  advancedState.terminal.activation_digest, digest(advancedActivation),
+  "a strictly advancing authorized successor rebinds the durable receipt",
+);
 
 const staleRecoveryState = structuredClone(recoveryTemplate);
 const stale = adapter.runHostAdapter({ action: "recover", request, registration, env: {
@@ -316,9 +456,153 @@ for (const [name, mutate] of [
   unsafe.revalidation_fence_digest = digest(unsafe.revalidation_fence);
   assert.throws(() => bridge.recover(unsafe), /bounded_recovery_dispatch_(binding|fence)_invalid/, name);
 }
+
+const productionStateRoot = process.env.BROKKR_TEST_STATE_ROOT;
+for (const directory of [
+  productionStateRoot,
+  ...["recovery-authorizations", "recovery-activations", "terminals"]
+    .map(name => path.join(productionStateRoot, name)),
+]) {
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(directory, 0o700);
+}
+const writeProtectedJson = (directory, attempt, value) => {
+  const file = path.join(productionStateRoot, directory, `${attempt}.json`);
+  fs.writeFileSync(file, `${adapter.canonicalJson(value)}\n`, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+};
+const dispatchProduction = (recoveryRequest, activation) =>
+  productionAdapter.runFixedDebianMaintenanceHostOperation({
+    action: "test-production-dispatch",
+    request: recoveryRequest,
+    registration: activation,
+  });
+let productionStarts = 0;
+globalThis.__BROKKR_TEST_SPAWN_SYNC__ = (binary, argv) => {
+  assert.equal(binary, "/usr/bin/systemctl");
+  assert.deepEqual(argv, [
+    "start",
+    `brokkr-debian-maintenance-recovery@${request.attempt_id}.service`,
+  ]);
+  productionStarts += 1;
+  const activation = JSON.parse(fs.readFileSync(path.join(
+    productionStateRoot, "recovery-activations",
+    `${request.attempt_id}.json`,
+  )));
+  writeProtectedJson("terminals", request.attempt_id, {
+    kind: "brokkr-debian-host-adapter-terminal", schema_version: "v1",
+    state: "disarmed", reason: "forward_recovery_verified",
+    at: "2026-07-27T12:00:00Z", binding_digest: request.binding_digest,
+    activation_digest: digest(activation),
+    revalidation_fence_digest: activation.fence_digest,
+  });
+  return { status: 0, stdout: "", stderr: "" };
+};
+const authorizeDispatch = (recoveryRequest, activation) =>
+  writeProtectedJson("recovery-authorizations", request.attempt_id, {
+    kind: "brokkr-debian-recovery-authorization", schema_version: "v1",
+    attempt_id: request.attempt_id, activation,
+    recovery_request: recoveryRequest,
+  });
+authorizeDispatch(bridgeRequest, recoveryActivation);
+const firstProductionDispatch = dispatchProduction(
+  bridgeRequest, recoveryActivation,
+);
+assert.equal(firstProductionDispatch.recovered, true);
+assert.equal(productionStarts, 1);
+assert.equal(
+  dispatchProduction(bridgeRequest, recoveryActivation).activation_digest,
+  firstProductionDispatch.activation_digest,
+  "an exact duplicate production dispatch returns its durable receipt",
+);
+assert.equal(productionStarts, 1,
+  "an exact duplicate production dispatch does not restart the unit");
+
+const advancedDispatchRequest = structuredClone(bridgeRequest);
+advancedDispatchRequest.revalidation_fence = structuredClone(
+  advancedActivation.fence,
+);
+advancedDispatchRequest.revalidation_fence_digest =
+  advancedActivation.fence_digest;
+authorizeDispatch(advancedDispatchRequest, advancedActivation);
+const advancedProductionDispatch = dispatchProduction(
+  advancedDispatchRequest, advancedActivation,
+);
+assert.equal(advancedProductionDispatch.recovered, true);
+assert.equal(productionStarts, 2,
+  "a strictly advancing authorized activation resumes through the fixed unit");
+
+const downgradeActivation = structuredClone(recoveryActivation);
+const downgradeRequest = structuredClone(bridgeRequest);
+authorizeDispatch(downgradeRequest, downgradeActivation);
+assert.throws(
+  () => dispatchProduction(downgradeRequest, downgradeActivation),
+  /bounded_recovery_activation_conflict/,
+  "an authorized but stale activation cannot replace a newer activation",
+);
+assert.equal(productionStarts, 2);
 console.log("debian host adapter: root-only exact allowlist, preflight, forward recovery and disarm OK");
 NODE
-env ROOT="$ROOT" node --experimental-loader "$ROOT/scripts/test/fixtures/fixed-recovery-host/loader.mjs" "$TMP/test.mjs"
+env ROOT="$ROOT" BROKKR_TEST_STATE_ROOT="$TMP/production-state" \
+  node --experimental-loader \
+  "$ROOT/scripts/test/fixtures/fixed-recovery-host/loader.mjs" "$TMP/test.mjs"
+if [[ -d /proc/self/fd && -x /usr/bin/flock ]]; then
+  LOCK_ROOT="$TMP/lock-state"
+  mkdir -p "$LOCK_ROOT/fences"
+  chmod 0700 "$LOCK_ROOT" "$LOCK_ROOT/fences"
+  LOCK_FILE="$LOCK_ROOT/fences/attempt-67.effect-lock"
+  : >"$LOCK_FILE"
+  chmod 0600 "$LOCK_FILE"
+  cat >"$TMP/lock-holder.mjs" <<'NODE'
+import fs from "node:fs";
+fs.writeFileSync(process.env.READY, "ready\n");
+setTimeout(() => {}, 30_000);
+NODE
+  cat >"$TMP/lock-proof.mjs" <<'NODE'
+import assert from "node:assert/strict";
+import fs from "node:fs";
+const operation = await import(
+  `${process.env.ROOT}/scripts/lib/fixed-debian-maintenance-host-operation.mjs`
+);
+const invoke = () => operation.runFixedDebianMaintenanceHostOperation({
+  action: "test-lock-proof",
+  request: { attempt_id: "attempt-67" },
+  registration: {},
+});
+if (process.env.EXPECT_UNLOCKED_REJECTION === "1") {
+  const fd = fs.openSync(process.env.LOCK_FILE, "r");
+  try {
+    assert.throws(invoke, /host_effect_lock_unverified/,
+      "an unlocked same-inode fd cannot borrow another process's flock");
+  } finally {
+    fs.closeSync(fd);
+  }
+} else {
+  assert.doesNotThrow(invoke,
+    "flock --no-fork preserves the current lock-holder PID and descriptor");
+}
+NODE
+  READY="$TMP/lock-ready"
+  /usr/bin/flock --no-fork "$LOCK_FILE" \
+    /usr/bin/env READY="$READY" node "$TMP/lock-holder.mjs" &
+  HOLDER_PID=$!
+  for _ in {1..100}; do
+    [[ -f "$READY" ]] && break
+    sleep 0.01
+  done
+  [[ -f "$READY" ]]
+  env ROOT="$ROOT" LOCK_FILE="$LOCK_FILE" \
+    BROKKR_TEST_STATE_ROOT="$LOCK_ROOT" EXPECT_UNLOCKED_REJECTION=1 \
+    node --experimental-loader "$ROOT/scripts/test/fixtures/fixed-recovery-host/loader.mjs" \
+    "$TMP/lock-proof.mjs"
+  kill "$HOLDER_PID"
+  wait "$HOLDER_PID" 2>/dev/null || true
+  HOLDER_PID=""
+  /usr/bin/flock --no-fork "$LOCK_FILE" /usr/bin/env \
+    ROOT="$ROOT" LOCK_FILE="$LOCK_FILE" BROKKR_TEST_STATE_ROOT="$LOCK_ROOT" \
+    node --experimental-loader "$ROOT/scripts/test/fixtures/fixed-recovery-host/loader.mjs" \
+    "$TMP/lock-proof.mjs"
+fi
 if env BROKKR_EFFECT_LOCKED=1 node "$ROOT/scripts/debian-maintenance-host-adapter.mjs" \
   --effect-locked --action recover --attempt attempt-67 >"$TMP/direct-bypass.out" 2>&1; then
   echo "direct --effect-locked invocation unexpectedly succeeded" >&2
@@ -326,6 +610,81 @@ if env BROKKR_EFFECT_LOCKED=1 node "$ROOT/scripts/debian-maintenance-host-adapte
 fi
 rg -q 'host_cli_arguments_invalid' "$TMP/direct-bypass.out"
 ! rg -q -- '--effect-locked' "$ROOT/scripts/debian-maintenance-host-adapter.mjs"
+env ROOT="$ROOT" node --input-type=module <<'NODE'
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+const fixedHost = await import(
+  `${process.env.ROOT}/scripts/lib/fixed-debian-maintenance-host-operation.mjs`
+);
+assert.deepEqual(
+  Object.keys(fixedHost),
+  ["runFixedDebianMaintenanceHostOperation"],
+);
+assert.deepEqual(
+  Object.keys(await import(
+    `${process.env.ROOT}/scripts/debian-maintenance-host-adapter.mjs`
+  )),
+  [],
+  "the CLI exports no production helper",
+);
+assert.throws(() => fixedHost.runFixedDebianMaintenanceHostOperation({
+  action: "recover",
+  request: { attempt_id: "../../tmp/traversal" },
+  registration: {},
+}), /host_action_invalid/,
+"a direct production import rejects traversal before touching fixed state");
+let callbackReached = false;
+assert.throws(() => fixedHost.runFixedDebianMaintenanceHostOperation({
+  action: "apply", request: {}, registration: {},
+  run: () => { callbackReached = true; },
+}), /host_operation_contract_invalid/);
+assert.equal(callbackReached, false, "the closed operation rejects callbacks");
+const canonical = value => value === null || typeof value !== "object" ?
+  JSON.stringify(value) : Array.isArray(value) ?
+    `[${value.map(canonical).join(",")}]` :
+    `{${Object.keys(value).sort().map(key =>
+      `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+const digest = value => `sha256:${crypto.createHash("sha256")
+  .update(canonical(value)).digest("hex")}`;
+const fence = {
+  kind: "brokkr-effect-lease-fence", schema_version: "v1",
+  domain: "no-reboot-security-bugfix-maintenance",
+  target_scope_digest: "sha256:" + "1".repeat(64),
+  attempt_id: "../../tmp/traversal", mutation_id: "mutation-67",
+  binding_digest: "sha256:" + "2".repeat(64), epoch: 1,
+  holder_token: "original-token-0123456789",
+  activated_at: "2026-07-27T12:00:00Z",
+  expires_at: "2026-07-27T12:05:00Z",
+};
+const successor = {
+  ...fence, epoch: 2, holder_token: "successor-token-0123456789",
+};
+const dispatch = {
+  idempotency_key: "recovery-67",
+  descriptor_digest: "sha256:" + "3".repeat(64),
+  target_scope_digest: fence.target_scope_digest,
+  binding_digest: fence.binding_digest,
+  lease_fence: fence, lease_fence_digest: digest(fence),
+  revalidation_fence: successor,
+  revalidation_fence_digest: digest(successor),
+};
+const activation = {
+  kind: "brokkr-debian-recovery-activation", schema_version: "v1",
+  attempt_id: fence.attempt_id, binding_digest: fence.binding_digest,
+  recovery_descriptor_digest: dispatch.descriptor_digest,
+  fence: successor, fence_digest: dispatch.revalidation_fence_digest,
+};
+assert.throws(() => fixedHost.runFixedDebianMaintenanceHostOperation({
+  action: "dispatch-recovery", request: dispatch, registration: activation,
+}), /bounded_recovery_dispatch_fence_invalid/,
+"a fully shaped dispatch rejects a non-canonical attempt before fixed paths or systemd");
+NODE
+rg -q '/proc/self/fdinfo/' "$ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
+rg -Fq 'fields[5] === String(process.pid)' "$ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
+rg -q '"--nonblock", "--no-fork"' "$ROOT/scripts/debian-maintenance-host-adapter.mjs"
+! rg -q 'fixedRun|fixedWriteJournal|fixedWriteTerminal|fixedActivateFence' \
+  "$ROOT/scripts/debian-maintenance-host-adapter.mjs" \
+  "$ROOT/scripts/lib/bounded-recovery-dispatch.mjs"
 UNIT="$ROOT/systemd/brokkr-debian-maintenance-recovery@.service"
 rg -q '^ExecStart=/usr/local/lib/brokkr/debian-maintenance-host-adapter --action recover --attempt %i$' "$UNIT"
 if command -v systemd-analyze >/dev/null 2>&1; then

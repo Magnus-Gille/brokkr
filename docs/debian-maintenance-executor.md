@@ -66,13 +66,15 @@ to the executor. Inventory drift therefore stops before the adapter is called.
 Commit uses a separate binding check plus a fresh postcondition readback, so
 post-mutation inventory cannot be reinterpreted as the admitted baseline.
 
-The recovery host is an opaque, module-branded composition capability, not a
-pair of caller-supplied `publishActivation`/`dispatch` callbacks. The bounded
-dispatcher first persists the exact successor activation, then invokes only
-the fixed host-adapter recovery action. Its returned outbox receipt includes
-the activation digest and a terminal-receipt digest, each bound to the exact
-successor revalidation fence. The original effect-lease digest remains a
+The recovery host is one fixed high-level operation, not a pair of
+caller-supplied `publishActivation`/`dispatch` callbacks. It revalidates the
+exact root-owned authorization, persists the exact successor activation, and
+invokes only the fixed host-adapter recovery unit. Its returned outbox receipt
+includes the activation digest and a terminal-receipt digest, each bound to the
+exact successor revalidation fence. The original effect-lease digest remains a
 separate historical value; it is never substituted for the successor fence.
+Durable recovery phases are restartable, and only a strictly advancing,
+root-authorized successor fence may replace a crashed worker's activation.
 
 A caller cannot substitute a different plan, policy, node, target, inventory,
 adapter, or postcondition behind a valid-looking outer claim. The adapter

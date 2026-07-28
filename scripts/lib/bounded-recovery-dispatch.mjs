@@ -2,7 +2,7 @@
 // lease and signed narrowing; this bridge owns only publishing the already
 // authorized successor activation and dispatching the one fixed recovery action.
 import crypto from "node:crypto";
-import { runFixedBoundedRecoveryHost } from "./fixed-bounded-recovery-host.mjs";
+import { runFixedDebianMaintenanceHostOperation } from "./fixed-debian-maintenance-host-operation.mjs";
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,62}$/;
@@ -32,8 +32,8 @@ function validFence(fence, expected) {
     Date.parse(fence.activated_at) <= Date.parse(fence.expires_at);
 }
 
-export function createBoundedRecoveryDispatcher({ recovery, expected }) {
-  if (!plain(recovery) || !exactKeys(expected, [
+export function createBoundedRecoveryDispatcher({ expected }) {
+  if (!exactKeys(expected, [
     "attemptId", "bindingDigest", "descriptorDigest", "idempotencyKey",
     "mutationId", "targetScopeDigest",
   ]) || !ID.test(expected.attemptId) || !ID.test(expected.mutationId) ||
@@ -42,7 +42,6 @@ export function createBoundedRecoveryDispatcher({ recovery, expected }) {
     fail("bounded_recovery_dispatch_contract_invalid");
   }
   return {
-    ...recovery,
     recover: request => {
       if (!exactKeys(request, ["idempotency_key", "descriptor_digest", "target_scope_digest", "binding_digest", "lease_fence", "lease_fence_digest", "revalidation_fence", "revalidation_fence_digest"])) fail("bounded_recovery_dispatch_shape_invalid");
       if (request.idempotency_key !== expected.idempotencyKey ||
@@ -66,9 +65,10 @@ export function createBoundedRecoveryDispatcher({ recovery, expected }) {
         binding_digest: expected.bindingDigest, recovery_descriptor_digest: expected.descriptorDigest,
         fence: structuredClone(request.revalidation_fence), fence_digest: request.revalidation_fence_digest,
       };
-      const dispatched = runFixedBoundedRecoveryHost({
-        action: "recover", attempt_id: expected.attemptId,
-        activation: structuredClone(activation), recovery_request: structuredClone(request),
+      const dispatched = runFixedDebianMaintenanceHostOperation({
+        action: "dispatch-recovery",
+        request: structuredClone(request),
+        registration: structuredClone(activation),
       });
       if (!plain(dispatched) || dispatched.activation_digest !== digest(activation)) fail("bounded_recovery_activation_unverified");
       const { activation_digest: activationDigest, ...receipt } = dispatched;
