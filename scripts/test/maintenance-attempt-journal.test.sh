@@ -698,25 +698,39 @@ if (process.env.WORKER_MODE) {
               !fs.existsSync(process.env.HOLD_BEFORE_EFFECT)) {
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
           }
-          effectTransaction(() => {
-            const activeFence = JSON.parse(fs.readFileSync(effectFenceFile, "utf8"));
-            if (autonomyDigest(activeFence) !== invocation.lease_fence_digest) {
-              throw Object.assign(new Error("effect-lease-fenced"), {
-                code: "effect_lease_fenced",
-              });
+          try {
+            effectTransaction(() => {
+              const activeFence = JSON.parse(fs.readFileSync(effectFenceFile, "utf8"));
+              if (autonomyDigest(activeFence) !== invocation.lease_fence_digest) {
+                throw Object.assign(new Error("effect-lease-fenced"), {
+                  code: "effect_lease_fenced",
+                });
+              }
+              const checkedAt = workerResourceNow();
+              if (Date.parse(checkedAt) <
+                    Date.parse(activeFence.activated_at) ||
+                  Date.parse(checkedAt) > Date.parse(activeFence.expires_at)) {
+                throw Object.assign(new Error("effect-lease-expired"), {
+                  code: "effect_lease_expired",
+                });
+              }
+              if (process.env.HOST_EFFECT_LOG) {
+                fs.appendFileSync(process.env.HOST_EFFECT_LOG, "host-effect\n");
+              }
+            });
+          } catch (error) {
+            if (process.env.WORKER_ERROR_LOG &&
+                process.env.HOLD_AFTER_APPLY_READY) {
+              fs.appendFileSync(
+                process.env.WORKER_ERROR_LOG,
+                `${String(error?.code ?? error?.message ?? "unknown-error")}\n`,
+              );
             }
-            const checkedAt = workerResourceNow();
-            if (Date.parse(checkedAt) <
-                  Date.parse(activeFence.activated_at) ||
-                Date.parse(checkedAt) > Date.parse(activeFence.expires_at)) {
-              throw Object.assign(new Error("effect-lease-expired"), {
-                code: "effect_lease_expired",
-              });
-            }
-            if (process.env.HOST_EFFECT_LOG) {
-              fs.appendFileSync(process.env.HOST_EFFECT_LOG, "host-effect\n");
-            }
-          });
+            throw error;
+          }
+          if (process.env.HOLD_AFTER_APPLY_READY) {
+            fs.writeFileSync(process.env.HOLD_AFTER_APPLY_READY, "ready\n");
+          }
           while (process.env.HOLD_AFTER_APPLY && !fs.existsSync(process.env.HOLD_AFTER_APPLY)) {
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
           }
@@ -1491,6 +1505,75 @@ assert.throws(() => run({
   dir: staleLockDir, bind: { ...binding(), candidate_digest: "sha256:" + "7".repeat(64) },
 }), /attempt_conflicting_replay/, "terminal retry is idempotent only for the exact binding");
 
+const sigkillDir = `${tmp}/controller-sigkill`;
+const sigkillApplyLog = `${tmp}/controller-sigkill-apply.log`;
+const sigkillErrorLog = `${tmp}/controller-sigkill-error.log`;
+const sigkillRelease = `${tmp}/controller-sigkill-release`;
+const sigkillReady = `${tmp}/controller-sigkill-ready`;
+const sigkillStartedAtMs = Date.now();
+const sigkillChild = spawn(
+  process.execPath,
+  [...process.execArgv, process.argv[1]],
+  {
+    env: {
+      ...process.env,
+      WORKER_MODE: "sigkill",
+      WORKER_DIR: sigkillDir,
+      APPLY_LOG: sigkillApplyLog,
+      WORKER_ERROR_LOG: sigkillErrorLog,
+      HOLD_AFTER_APPLY: sigkillRelease,
+      HOLD_AFTER_APPLY_READY: sigkillReady,
+    },
+  },
+);
+const sigkillExit = new Promise(resolve =>
+  sigkillChild.on("exit", (code, signal) => resolve({ code, signal })));
+await new Promise((resolve, reject) => {
+  const deadline = Date.now() + 10_000;
+  const poll = setInterval(() => {
+    if (fs.existsSync(sigkillReady)) {
+      clearInterval(poll);
+      sigkillChild.off("exit", onEarlyExit);
+      resolve();
+    } else if (Date.now() >= deadline) {
+      clearInterval(poll);
+      sigkillChild.off("exit", onEarlyExit);
+      reject(new Error("SIGKILL worker readiness timed out after 10 seconds"));
+    }
+  }, 5);
+  const onEarlyExit = (code, signal) => {
+    clearInterval(poll);
+    const detail = fs.existsSync(sigkillErrorLog) ?
+      fs.readFileSync(sigkillErrorLog, "utf8").trim() : "no worker error receipt";
+    reject(new Error(
+      `SIGKILL worker exited before readiness: code=${code} signal=${signal} (${detail})`,
+    ));
+  };
+  sigkillChild.once("exit", onEarlyExit);
+});
+sigkillChild.kill("SIGKILL");
+assert.deepEqual(await sigkillExit, { code: null, signal: "SIGKILL" },
+  "the supervised controller is actually killed with SIGKILL");
+assert.equal(await runWorker({
+  WORKER_MODE: "recover", WORKER_DIR: sigkillDir,
+  RECOVERY_LOG: `${tmp}/controller-sigkill-recovery.log`,
+}), 0);
+assert.equal(
+  bounded(`${sigkillDir}/${binding().idempotency_key}.json`)
+    .entries.at(-1).phase,
+  "disarm",
+  "the exact durable recovery path disarms after controller SIGKILL",
+);
+const sigkillElapsedSeconds = Math.ceil(
+  (Date.now() - sigkillStartedAtMs) / 1000,
+);
+assert.equal(sigkillElapsedSeconds <= 300, true,
+  "SIGKILL recovery completes inside the declared recovery budget");
+const sigkillApplyCount = fs.readFileSync(sigkillApplyLog, "utf8")
+  .trim().split("\n").filter(Boolean).length;
+assert.equal(sigkillApplyCount, 1,
+  "recovery after SIGKILL cannot apply a new plan");
+
 const resumeDir = `${tmp}/resume-race`, resumeApplyLog = `${tmp}/resume-apply.log`;
 assert.equal(await runWorker({
   WORKER_MODE: "crash", WORKER_DIR: resumeDir, APPLY_LOG: `${tmp}/resume-crash-apply.log`,
@@ -1547,6 +1630,22 @@ assert.equal(fs.existsSync(staleWriterHostEffects), false,
 assert.match(fs.readFileSync(staleWriterErrors, "utf8").trim(),
   /^(effect|execution)_lease_fenced$/,
   "the stale writer fails at or before the resource fence");
+const staleWriterRecoveryStart = staleWriterJournal.entries.find(
+  entry => entry.phase === "recover",
+)?.recorded_at;
+const staleWriterTerminalAt =
+  staleWriterJournal.entries.at(-1).recorded_at;
+assert.equal(typeof staleWriterRecoveryStart, "string");
+const progressWedgeElapsedSeconds =
+  (Date.parse(staleWriterTerminalAt) -
+    Date.parse(staleWriterRecoveryStart)) / 1000;
+assert.equal(Number.isSafeInteger(progressWedgeElapsedSeconds), true);
+assert.equal(progressWedgeElapsedSeconds <= 300, true,
+  "progress-loop wedge recovery completes inside its bound");
+const staleWriterNewPlanMutations = fs.existsSync(staleWriterHostEffects) ?
+  fs.readFileSync(staleWriterHostEffects, "utf8")
+    .trim().split("\n").filter(Boolean).length : 0;
+assert.equal(staleWriterNewPlanMutations, 0);
 
 const crashApplyLog = `${tmp}/crash-apply.log`;
 assert.equal(await runWorker({ WORKER_MODE: "crash", WORKER_DIR: crashDir, APPLY_LOG: crashApplyLog }), 77);
@@ -1604,6 +1703,26 @@ assert.equal(
     .entries.at(-1).phase,
   "disarm",
 );
+const recoveryCrashJournal = bounded(
+  `${staleRecoveryDir}/${binding().idempotency_key}.json`,
+);
+const recoveryCrashStartedAt = recoveryCrashJournal.entries.find(
+  entry => entry.phase === "recover",
+)?.recorded_at;
+const recoveryCrashTerminalAt =
+  recoveryCrashJournal.entries.at(-1).recorded_at;
+assert.equal(typeof recoveryCrashStartedAt, "string");
+const recoveryCrashElapsedSeconds =
+  (Date.parse(recoveryCrashTerminalAt) -
+    Date.parse(recoveryCrashStartedAt)) / 1000;
+assert.equal(Number.isSafeInteger(recoveryCrashElapsedSeconds), true);
+assert.equal(recoveryCrashElapsedSeconds <= 300, true,
+  "recovery crash-loop exhaustion completes inside its bound");
+const recoveryCrashNewPlanMutations = recoveryCrashJournal.entries.filter(
+  entry => entry.phase === "apply",
+).length;
+assert.equal(recoveryCrashNewPlanMutations, 0,
+  "recovery crash-loop handling cannot create a new apply phase");
 
 const raceDir = `${tmp}/prepare-race`, applyLog = `${tmp}/race-apply.log`, prepareBarrier = `${tmp}/prepare-barrier`;
 const prepareWorkers = [
@@ -1645,6 +1764,69 @@ const failedReplay = run({
 });
 assert.equal(failedReplay.reason, "terminal-terminally-blocked",
   "exact terminal replay remains idempotent after signed demotion");
+
+const unknownReachabilityArtifacts = bundle();
+let unknownReachabilityCalls = 0;
+const unknownReachabilityRecovery = recovery(
+  unknownReachabilityArtifacts,
+  {
+    recover: request => {
+      unknownReachabilityCalls += 1;
+      return {
+        idempotency_key: request.idempotency_key,
+        effect_lease_fence_digest: request.lease_fence_digest,
+        revalidated_lease_fence_digest:
+          request.revalidation_fence_digest,
+        revalidated_at: request.revalidation_fence.activated_at,
+        recovered: false,
+        safe_state_verified: false,
+        quarantine_active: true,
+        reason_code: "unknown-reachability",
+      };
+    },
+  },
+);
+const unknownReachability = run({
+  dir: `${tmp}/unknown-reachability`,
+  artifacts: unknownReachabilityArtifacts,
+  phase: phases({
+    applyFenced: () => {
+      throw Object.assign(new Error("effect-reachability-unknown"), {
+        code: "effect_reachability_unknown",
+      });
+    },
+  }),
+  recover: unknownReachabilityRecovery,
+});
+assert.equal(unknownReachability.reason, "terminally-blocked");
+assert.equal(unknownReachability.recovery_error, "unknown-reachability");
+assert.equal(
+  unknownReachability.journal.entries.at(-1).phase,
+  "terminally-blocked",
+);
+assert.equal(unknownReachabilityCalls, 1);
+assert.equal(run({
+  dir: `${tmp}/unknown-reachability`,
+  artifacts: unknownReachabilityArtifacts,
+  recover: unknownReachabilityRecovery,
+}).reason, "terminal-terminally-blocked");
+assert.equal(unknownReachabilityCalls, 1,
+  "unknown reachability terminalizes without an optimistic retry");
+const unknownStartedAt = unknownReachability.journal.entries.find(
+  entry => entry.phase === "unknown",
+)?.recorded_at;
+const unknownTerminalAt =
+  unknownReachability.journal.entries.at(-1).recorded_at;
+assert.equal(typeof unknownStartedAt, "string");
+const unknownReachabilityElapsedSeconds =
+  (Date.parse(unknownTerminalAt) - Date.parse(unknownStartedAt)) / 1000;
+assert.equal(Number.isSafeInteger(unknownReachabilityElapsedSeconds), true);
+assert.equal(unknownReachabilityElapsedSeconds <= 300, true);
+const unknownReachabilityNewPlanMutations =
+  unknownReachability.journal.entries.filter(
+    entry => entry.phase === "apply",
+  ).length;
+assert.equal(unknownReachabilityNewPlanMutations, 0);
 
 const wrongFromArtifacts = bundle();
 const wrongFromBase = recovery(wrongFromArtifacts);
@@ -2064,6 +2246,84 @@ assert.throws(() => run({
   dir: `${tmp}/rate`, artifacts: rateArtifacts, bind: binding("maintenance-rate-two"),
   admit: rateAdmission,
 }), /attempt_interval_exceeded|attempt_window_exceeded/);
+
+if (process.env.BROKKR_FI_CONTROLLER_RECEIPT) {
+  const fileDigest = relative =>
+    `sha256:${crypto.createHash("sha256")
+      .update(fs.readFileSync(`${root}/${relative}`)).digest("hex")}`;
+  const cleanElapsedSeconds = (happyCommitAt - happyPrepareAt) / 1000;
+  assert.equal(cleanElapsedSeconds, 3900);
+  const happyNewPlanMutations =
+    happy.journal.entries.filter(entry => entry.phase === "apply").length - 1;
+  assert.equal(happyNewPlanMutations, 0);
+  const fragment = {
+    kind: "brokkr-supervised-debian-fi-fragment",
+    schema_version: "v1",
+    path_id: "w2a-w2b-production-v1",
+    production_path: {
+      controller: fileDigest("scripts/debian-maintenance-autonomy.mjs"),
+      bounded_recovery_dispatcher: fileDigest(
+        "scripts/lib/bounded-recovery-dispatch.mjs",
+      ),
+    },
+    scenarios: [
+      {
+        id: "clean-run", outcome: "committed",
+        quarantine_active: false,
+        new_plan_mutations: happyNewPlanMutations,
+        budget_seconds: 3900,
+        observed_elapsed_seconds: cleanElapsedSeconds,
+        terminal_at: happy.journal.entries.at(-1).recorded_at,
+      },
+      {
+        id: "controller-kill-9", outcome: "disarmed",
+        quarantine_active: true,
+        new_plan_mutations: sigkillApplyCount - 1,
+        budget_seconds: 300,
+        observed_elapsed_seconds: sigkillElapsedSeconds,
+        terminal_at: bounded(
+          `${sigkillDir}/${binding().idempotency_key}.json`,
+        ).entries.at(-1).recorded_at,
+      },
+      {
+        id: "progress-loop-wedge", outcome: "disarmed",
+        quarantine_active: true,
+        new_plan_mutations: staleWriterNewPlanMutations,
+        budget_seconds: 300,
+        observed_elapsed_seconds: progressWedgeElapsedSeconds,
+        terminal_at: staleWriterTerminalAt,
+      },
+      {
+        id: "recovery-crash-loop", outcome: "disarmed",
+        quarantine_active: true,
+        new_plan_mutations: recoveryCrashNewPlanMutations,
+        budget_seconds: 300,
+        observed_elapsed_seconds: recoveryCrashElapsedSeconds,
+        terminal_at: recoveryCrashTerminalAt,
+      },
+      {
+        id: "unknown-reachability", outcome: "terminally-blocked",
+        quarantine_active: true,
+        new_plan_mutations: unknownReachabilityNewPlanMutations,
+        budget_seconds: 300,
+        observed_elapsed_seconds: unknownReachabilityElapsedSeconds,
+        terminal_at: unknownTerminalAt,
+      },
+    ].map(value => ({
+      ...value,
+      path_id: "w2a-w2b-production-v1",
+      passed:
+        value.new_plan_mutations === 0 &&
+        value.observed_elapsed_seconds <= value.budget_seconds,
+    })),
+  };
+  assert.equal(fragment.scenarios.every(value => value.passed), true);
+  fs.writeFileSync(
+    process.env.BROKKR_FI_CONTROLLER_RECEIPT,
+    `${JSON.stringify(fragment)}\n`,
+    { mode: 0o600 },
+  );
+}
 
 console.log("maintenance attempt journal: W0.2 authorization, admission, v2 timing, recovery, demotion and rate gates OK");
 NODE

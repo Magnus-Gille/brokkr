@@ -90,7 +90,7 @@ before publishing an activation the bridge structurally binds the exact
 attempt, binding, target scope, mutation, descriptor, idempotency key, and
 successor epoch/token. The operation then revalidates the exact root-owned
 recovery authorization, atomically publishes that fixed activation, and starts
-only `brokkr-debian-maintenance-recovery@<canonical-attempt>.service`. A matching
+only `brokkr-debian-maintenance-recovery-<canonical-attempt>.service`. A matching
 terminal receipt makes the operation idempotent without another unit start. A
 strictly advancing, exactly authorized successor activation may replace a
 crashed worker's activation. Recovery resumes from each durable recovery phase,
@@ -104,14 +104,20 @@ unbound terminal evidence still fails closed. A restart reads the same W2a
 outbox and repeats the same idempotency key; it cannot synthesize a plan,
 re-arm, or widen scope. All fence, journal, activation, terminal, and bridge
 timestamps are exact, real, second-resolution canonical UTC instants.
-The production installer is still intentionally absent, so this remains a
-hermetic/disarmed contract until the separate owner ceremony installs the fixed
-state root and unit.
+The revision-bound installer in
+`scripts/install-debian-maintenance-canary.sh` can lay down one disabled canary
+and its immutable release directory. It does not enable, start, arm, dispatch,
+or create any authority input. It stages from verified blobs in the named Git
+commit, refuses to overwrite divergent release/unit bytes, and renders both
+units before publishing either. Its `disable` action fsyncs a disarm marker
+before stopping the exact units and preserves the release, journal, evidence,
+and preallocated headroom even if systemd reports failure. A separate owner
+ceremony is still required for any live installation or activation.
 
-`systemd/brokkr-debian-maintenance-recovery@.service` is a separate hardened
-root capability because dpkg repair itself requires root. Its sole executable
-is the exact fixed recovery wrapper, with no sudo transition and
-`NoNewPrivileges=yes`; it cannot accept a plan or arbitrary command. It is
-intentionally not installed here: the future owner ceremony must first create
-the fixed root-owned state tree, request, registration, exact recovery
-authorization, and signed outer authority.
+`systemd/brokkr-debian-maintenance-recovery.service.in` is the tracked source
+for each concrete, revision-bound recovery unit. The installer copies that
+template into the immutable release and substitutes only the validated canary
+ID and full release SHA. Its root capability exists because dpkg repair itself
+requires root. Its sole executable is the exact fixed recovery wrapper, with
+no sudo transition and `NoNewPrivileges=yes`; it cannot accept a plan or
+arbitrary command.
