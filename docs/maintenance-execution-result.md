@@ -25,9 +25,9 @@ coverage and authority snapshots remain the responsibility of the
 authoritative ADR-008 admission and journal path. The projector verifies the
 closed evidence it receives and cannot elevate it into authority.
 Its SHA-256 digests provide deterministic integrity and correlation, not sender
-authentication. A future delivery adapter must preserve Brokkr's trusted
-producer boundary and authenticate transport; a consumer must not accept an
-arbitrary caller's recomputed self-digests as production evidence.
+authentication. The delivery adapter preserves Brokkr's trusted producer
+boundary with a dedicated Bearer credential and HTTPS; a consumer must not
+accept an arbitrary caller's recomputed self-digests as production evidence.
 
 The result includes the journal tail instant, complete durable-watch anchor,
 explicit `evaluated_at` instant, and a self-binding `result_digest`, so changing
@@ -41,12 +41,67 @@ exactly covers the expected count. Zero or partial probe coverage is
 `stale`, `unreconciled`, `failed`, `recovered-by-worker`, `disarmed`, and
 `terminally-blocked` are never healthy or promotion-eligible.
 
-The optional command-line delivery boundary is intentionally inert:
-`scripts/maintenance-execution-result-delivery.mjs --result FILE` validates a
-result and prints a `delivery_disabled` acknowledgement. It has no transport,
-installation, enablement, service, arming, disarming, recovery, retry, plan,
-package, or host-mutation capability. Enabling delivery requires a future,
-separately reviewed versioned adapter and explicit owner authorization.
+## Authenticated delivery adapter
+
+`scripts/maintenance-execution-result-delivery.mjs` accepts the exact result
+bytes on standard input, re-runs the closed semantic validator, and accepts only
+the `brokkr-maintenance` v1 source. It accepts no arguments. The endpoint,
+dedicated Bearer token, enabled state, and exact adapter revision and SHA-256
+digest come from the protected systemd credential named
+`brokkr-maintenance-result-delivery-v1`. The credential must be a current-user
+owned, non-symlink regular file with mode `0400` or `0600`; its containing
+credential directory must also be current-user owned and not writable by group
+or other. The adapter never prints the endpoint, token, credential directory,
+curl stderr, or Heimdall response body.
+
+The closed configuration is version `v1`. A disabled configuration contains
+only its kind, version, `enabled: false`, and the adapter revision/digest
+binding. An enabled configuration adds the endpoint and token. The endpoint
+must be canonical HTTPS with no userinfo, query, or fragment, and its path must
+be exactly `/api/maintenance-execution-results`. The token has a bounded,
+configuration-safe alphabet and length. Unknown fields, versions, alternate
+paths, HTTP downgrade, missing bindings, and malformed or unsafe credentials
+fail before transport. Live endpoint and credential values, and the private
+backing-source locator, do not belong in git, a unit, argv, a receipt, or public
+evidence.
+
+Delivery uses curl with user configuration disabled, HTTPS-only protocol
+selection, TLS 1.2 or newer, no redirects, a five-second connection timeout,
+ten-second total attempt timeout, and a 64 KiB response limit. The body sent to
+Heimdall is byte-identical to the locally validated input. Its
+`result_digest` is also sent as the idempotency key. Only 2xx is accepted.
+Transport failures and 5xx responses retry the same bytes at most three total
+attempts using fixed 100 ms and 250 ms delays. Redirects, authentication
+failures, malformed requests, epoch conflicts/replay rejection, and every
+other non-2xx response fail immediately. Heimdall's monotonic
+`execution_epoch` plus same-epoch `result_digest` rule makes repeating the
+identical result idempotent; a conflicting or older epoch is never converted
+into success.
+
+The revision-bound installer is deliberately separate:
+
+```sh
+sudo scripts/install-maintenance-execution-result-delivery.sh install \
+  --source /absolute/clean/worktree \
+  --revision FULL_40_CHARACTER_SHA
+```
+
+It archives and blob-verifies only the named commit, installs it under an
+immutable revision directory, and renders
+`brokkr-maintenance-execution-result-delivery.service` with the exact revision
+and adapter digest. The unit has no `[Install]` section, the installer never
+calls systemd, and no credential or enabled gate is installed. The unit's
+standard input is the fixed authoritative result projection at
+`/var/lib/brokkr/debian-maintenance/evidence/maintenance-execution-result.json`;
+no result or credential locator appears in its process arguments.
+
+Installation therefore remains inert. The separately authorized #69 owner
+ceremony must bind and provision the exact protected credential, atomically
+publish the already validated result at that fixed evidence path, and
+explicitly start this exact revision-bound unit. Neither the installer nor the
+adapter can enable a timer, arm/disarm maintenance, select a target, change
+policy, dispatch an operation, mutate packages, recover a host, or grant
+Heimdall lifecycle authority.
 
 ## Redaction and retention
 

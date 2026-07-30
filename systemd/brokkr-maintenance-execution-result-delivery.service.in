@@ -1,0 +1,32 @@
+[Unit]
+Description=Deliver Brokkr maintenance execution evidence to Heimdall
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/maintenance-execution-result.md
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+PrivateDevices=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+UMask=0077
+LoadCredential=brokkr-maintenance-result-delivery-v1
+StandardInput=file:/var/lib/brokkr/debian-maintenance/evidence/maintenance-execution-result.json
+Environment=PATH=/usr/bin:/bin
+Environment=BROKKR_ADAPTER_REVISION=@REVISION@
+Environment=BROKKR_ADAPTER_DIGEST=@DIGEST@
+ExecStart=/usr/bin/node /usr/local/lib/brokkr/maintenance-result-delivery/releases/@REVISION@/scripts/maintenance-execution-result-delivery.mjs
+TimeoutStartSec=40
+
+# There is deliberately no [Install] section. The revision-bound artifact is
+# inert until the owner ceremony provisions an enabled protected credential
+# and explicitly starts this exact unit.
