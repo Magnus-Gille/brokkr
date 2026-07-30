@@ -8,9 +8,14 @@ material, credentials, commands, package details, logs, and recovery material
 in an owner-controlled private record; do not copy them into this packet or
 git.
 
-This document grants no authority. The installer remains disabled by default;
-the current delivery adapter remains `delivery_disabled`; and an incomplete or
-mismatched row is a stop condition.
+This document grants no authority. The installer remains disabled by default
+and the current delivery adapter remains `delivery_disabled`. Live Heimdall
+evidence additionally requires Brokkr #81's separately reviewed authenticated
+delivery adapter and a separately reviewed scheduler/unit-enablement/arming
+mechanism. Before the ceremony, their exact reviewed, revision-bound artifacts
+must be available for inspection but must not be installed. Current Brokkr
+source provides neither live capability. An incomplete or mismatched row is a
+stop condition.
 
 ## Ceremony record
 
@@ -26,15 +31,24 @@ address, account, path, or recovery detail.
 | Source release revision | `REQUIRED: full 40-character Git SHA` |
 | Source checkout result | `REQUIRED: clean and exactly at the release revision` |
 | Controller revision and digest | `REQUIRED: full SHA and content digest` |
+| Executor revision and digest | `REQUIRED: full SHA and content digest` |
+| Journal revision and digest | `REQUIRED: full SHA and content digest` |
 | Host-operation revision and digest | `REQUIRED: full SHA and content digest` |
+| Bounded-recovery-dispatcher revision and digest | `REQUIRED: full SHA and content digest` |
 | Recovery-unit-template digest | `REQUIRED: content digest` |
+| Installer revision and digest | `REQUIRED: full SHA and content digest` |
+| Projector revision and digest | `REQUIRED: full SHA and content digest` |
+| Inert delivery-boundary revision and digest | `REQUIRED: full SHA, content digest, and delivery_disabled readback` |
 | Execution-result schema digest | `REQUIRED: content digest` |
-| Policy, plan, constitution, target-scope, configuration, evidence, baseline, and postconditions digests | `REQUIRED: eight content-blind digests` |
+| Fixture-corpus digest and readback | `REQUIRED: aggregate content digest and producer/consumer conformance result` |
+| Ceremony-pinned coverage digests | `REQUIRED: policy, constitution, coverage, target-scope, and configuration digests` |
 | Owner-authorization, owner-attestation, and recovery-registry digests | `REQUIRED: three content-blind digests` |
 | Private target eligibility record | `REQUIRED: checked privately; record only its target-scope digest here` |
 | Private trust-root binding record | `REQUIRED: checked privately; record only its authorization/registry digests here` |
 | Canary state | `REQUIRED: one eligible canary; target count = 1; no fleet state` |
-| Delivery state | `REQUIRED: delivery_disabled before and after the ceremony` |
+| Authenticated delivery adapter (#81) | `REQUIRED: exact reviewed revision/digest available before approval but not installed; disabled install, then configured/enabled/readback-ready before arming` |
+| Scheduler/unit-enablement/arming mechanism | `REQUIRED: exact reviewed revision/digest available before approval but not installed; disabled install and readback after approval; absent from current source` |
+| Per-window attempt facts | `AUTO-RECORDED: attempt ID, plan, evidence, baseline, postconditions, deadline, journal and receipt digests; never ceremony inputs` |
 
 ## Roles and separation
 
@@ -44,8 +58,8 @@ digest(s).
 
 | Role | Required responsibility | Evidence to retain privately |
 | --- | --- | --- |
-| Owner | Approves, holds, or aborts; authorizes the exact bound attempt | decision and authorization digest |
-| Brokkr control plane | Sole arm/disarm authority and journal producer | binding and journal-tail digests |
+| Owner | Approves, holds, or aborts the exact covered target, authority bundle, release, delivery path, scheduler and arming transition; does not authorize per-window attempts | decision and authorization digest |
+| Brokkr control plane | Sole arm/disarm authority; derives and journals each eligible window's exact attempt facts | coverage binding and per-window journal-tail digests |
 | Fixed host operation | Executes only the fixed no-reboot Debian request or fixed R-forward recovery | request/registration and terminal-receipt digests |
 | Recovery worker | Executes recovery, quarantine, and disarm; never promotes | successor-fence and terminal-receipt digests |
 | Heimdall consumer | Read-only projection and freshness/reconciliation display; no lifecycle authority | received result digest and display check |
@@ -60,9 +74,15 @@ All entries below must be affirmatively verified for the bound release.
 - Only already-bound `security` or `bugfix` upgrades are eligible. Kernel,
   reboot, firmware, boot-chain, hooks, removals, new dependencies, downgrade,
   remote recovery, and fleet action remain out of scope.
-- The attempt binds exact policy, plan, constitution, target scope,
-  configuration, source revision, postconditions, recovery descriptor, and
-  admission evidence. Any mismatch fails closed.
+- The ceremony pins the policy, constitution, authority, target coverage,
+  configuration, release, recovery class, and mechanisms that may operate. It
+  does not authorize an exact attempt or pre-bind a future plan, evidence,
+  baseline, postconditions, or deadline.
+- For each eligible scheduled window, the Brokkr control plane automatically
+  derives and records the exact attempt ID, plan, fresh evidence, baseline,
+  postconditions, deadline, journal, and receipt under that armed coverage.
+  Those per-window facts must not be ceremony inputs and every mismatch fails
+  closed without per-run human approval.
 - The timing budget is at most 300 seconds through durable watch anchoring, at
   least 3,600 seconds of watch, at most 300 seconds commit grace, and at most
   4,200 seconds from prepare to deadline. Forward recovery has at most 300
@@ -74,8 +94,8 @@ All entries below must be affirmatively verified for the bound release.
 ## Offline evidence gate — required before any live owner action
 
 - [ ] Record the exact release SHA and the SHA-256 values of the controller,
-  executor, journal, host adapter, recovery template, installer, projector,
-  delivery boundary, schema, and fixture corpus.
+  executor, journal, host adapter, bounded recovery dispatcher, recovery
+  template, installer, projector, delivery boundary, schema, and fixture corpus.
 - [ ] Run the full hermetic test suite, shellcheck, and diff check on the exact
   clean release; retain the public-safe summary and evidence digests.
 - [ ] Produce and inspect the revision-bound fault-injection dossier. It must
@@ -85,6 +105,19 @@ All entries below must be affirmatively verified for the bound release.
   enable, start, arm, dispatch, or create authority inputs.
 - [ ] Verify the delivery boundary still reports `delivery_disabled` and that
   all positive and adversarial execution-result fixtures validate.
+- [ ] Before live Heimdall evidence, obtain the exact revision and digest of a
+  Brokkr #81 separately reviewed authenticated delivery adapter. Verify its
+  artifact is available but not installed before owner approval, supports a
+  disabled installation, has independently reviewed transport authentication,
+  and restricts its result input to the closed v1 projection. Its absence is a
+  stop condition; this packet does not design or implement it.
+- [ ] Obtain the exact revision and digest of a separately reviewed
+  scheduler/unit-enablement/arming mechanism. Verify that its artifact is
+  available but not installed before owner approval, supports a disabled
+  installation, binds only the recorded release and coverage, exposes
+  mechanical readbacks, and cannot bypass the Brokkr control plane. Its absence
+  is a stop condition; the current installer and source do not provide live
+  scheduling, unit enablement, or arming.
 - [ ] Verify Heimdall #16 is merged and deployed as a read-only consumer, then
   check fresh, unknown, stale, unreconciled, and mismatch rendering against the
   shared fixture corpus. This is a live dependency and cannot be inferred from
@@ -93,21 +126,39 @@ All entries below must be affirmatively verified for the bound release.
 ## #69 owner-ceremony gate
 
 Proceed only after the offline gate and private records prove target eligibility
-and trust-root binding. The owner must separately authorize each state change.
+and trust-root binding. Owner explicit approval must precede any live
+installation. That approval authorizes the exact ceremony transitions through
+disabled installation, authenticated delivery configuration/enablement,
+scheduler/unit enablement, and arming. It binds the one canary, coverage,
+authority, release, and mechanism revisions—not a future attempt or its
+dynamically derived facts.
 
-- [ ] Install only the exact, clean, revision-bound release; leave its units
-  disabled after installation and record the installed release digest.
-- [ ] Independently verify the disabled units, immutable release bytes,
-  root-owned private state protection, reserves, and absence of an enabled
-  timer or delivery transport.
+- [ ] The owner records explicit approve for the exact ceremony record before
+  any live installation, configuration, enablement, authority-input creation,
+  or arming. A hold or abort leaves every reviewed artifact uninstalled.
+- [ ] After approval, install only the exact clean revision-bound release,
+  reviewed scheduler/unit-enablement/arming artifact, and Brokkr #81 delivery
+  artifact. Leave every installed unit and adapter disabled.
+- [ ] Read back the installed revisions, content digests, immutable release
+  bytes, root-owned private state protection, reserves, configuration bindings,
+  disabled states, and unit identities before any enablement.
 - [ ] Bind the private authority inputs to the exact release and all recorded
   public digests. Confirm distinct owner, controller, watchdog, kill-switch,
   and recovery-worker identities without exposing them here.
-- [ ] Arm one canary only after the owner records an explicit approval. Confirm
-  that only the Brokkr control plane can arm or disarm and that Heimdall cannot
-  mutate lifecycle state.
+- [ ] Configure and enable the exact authenticated delivery adapter under the
+  ceremony. Prove authenticated readiness and Heimdall readback capability
+  while Heimdall remains read-only with no lifecycle authority.
+- [ ] Through the reviewed mechanism, configure the exact schedule and enable
+  only the bound units after delivery is configured, enabled, and
+  readback-ready. Keep the canary unarmed and verify unit/schedule readbacks.
+- [ ] Arm one canary last, only under the recorded owner approval and after all
+  earlier readbacks pass. Confirm that only the Brokkr control plane can arm or
+  disarm and that Heimdall cannot mutate lifecycle state.
 - [ ] Before any scheduled window, verify the current target eligibility,
   maintenance-safe state, bounded plan, clock, and protected postconditions.
+- [ ] After the one owner arming ceremony, each eligible bound scheduled window
+  requires no per-run human approval. A mismatch or negative outcome remains a
+  stop-and-disarm condition, never a silent re-authorization.
 - [ ] Stop and disarm on any missing, stale, unknown, unreconciled, failed, or
   recovery-worker outcome. Do not promote, retry across an ambiguous package
   boundary, or substitute a new plan.
