@@ -1,15 +1,19 @@
 # Maintenance owner-ceremony transition
 
 `scripts/maintenance-owner-ceremony-transition.mjs` is the separately
-reviewable Brokkr #82 transition from inert, revision-bound maintenance
-artifacts to one armed canary. It does not select a target, mint authority,
-install an artifact, derive a maintenance attempt, or approve a future window.
+reviewable Brokkr #82 transition state machine for revision-bound maintenance
+artifacts. Production arming is intentionally blocked: the current repository
+has no closed producer for fresh per-window request, registration, recovery
+authority, and evidence bindings. It does not select a target, mint authority,
+derive a maintenance attempt, or approve a future window.
 The ordinary canary and delivery installers remain disabled by default, never
 call systemd, and cannot arm or schedule anything.
 
-The owner approves one exact protected ceremony record before any live
-installation. Installation then lays down only disabled artifacts. The
-transition consumes that record later and performs the fixed sequence:
+The owner may prepare one exact protected ceremony record before any live
+installation. Installation lays down only disabled artifacts. The transition
+can verify and fail-safe the following proposed sequence, but production
+returns `scheduler_prerequisite_unimplemented` before publishing or enabling
+ceremony units:
 
 1. verify the signed owner decision, separately signed closed configuration,
    and exact release,
@@ -24,12 +28,13 @@ transition consumes that record later and performs the fixed sequence:
    disabled state;
 4. copy the already-bound enabled delivery credential from the protected
    ceremony source, publish a closed non-promotable disarm result, and require
-   a fresh `delivered: true` receipt from the exact #81 adapter;
-5. enable and positively read back the watchdog timer, then the scheduler
-   timer, while the canary remains disarmed;
-6. recheck all delivery, watchdog, and scheduler readiness and arm the one
-   exact target last by durably publishing the signed ceremony binding and
-   lifting its disarm marker.
+   the separately installed #81 adapter file to match its bound owner, mode,
+   and digest before requiring a fresh `delivered: true` receipt;
+5. once the missing scheduler contract exists, enable and positively read back
+   the watchdog timer, then the scheduler timer, while the canary remains
+   disarmed;
+6. recheck delivery bytes and receipt, effective unit state, watchdog
+   readiness, and credentials immediately before any future arm.
 
 Each transition is fsynced to a metadata-only append log with its
 revision-bound reversal recipe. A failure after the first mutation writes and
@@ -61,6 +66,11 @@ regular, non-symlink, root-owned `0400` or `0600` file:
 - `watchdog.service`, `watchdog.timer`, and `scheduler.timer` — exact private
   ceremony unit bytes, installed only by this transition.
 
+The watchdog service invokes the release-bound
+`maintenance-canary-watchdog.mjs`, not the apply/recover-only host adapter.
+The ceremony executes its read-only readiness probe before timer enablement
+and its pre-arm probe after the final delivery and unit readbacks.
+
 The signed record contains only canonical IDs, full Git revisions, digests,
 unit names derived from the canary ID, distinct role identities, the literal
 owner decision, and the reversal recipe. It binds the whole immutable installed
@@ -75,26 +85,30 @@ bind the exact release revision. The transition does not generate, repair, or
 reinterpret either unit.
 
 The ceremony deliberately does not bind a future attempt ID, plan, evidence,
-baseline, postconditions, deadline, package set, or terminal receipt. Once
-armed, the reviewed scheduler/control-plane path derives and journals those
-facts for every eligible window without another human approval. A mismatch is
-a stop-and-disarm condition, never implicit re-authorization.
+baseline, postconditions, deadline, package set, or terminal receipt. No
+current production component derives the mutually bound request,
+registration, recovery descriptor/authority, and fresh evidence set for each
+eligible window. Reusing the fixed canary attempt or inventing a template
+would bypass existing host gates, so #82 remains inert until that prerequisite
+contract is implemented and independently reviewed.
 
 ## Invocation and replay
 
-Run only from the immutable release selected by the owner record:
+An attempted production arm from the immutable release selected by the owner
+record remains fail-closed:
 
 ```sh
 sudo /usr/local/lib/brokkr/releases/FULL_SHA/scripts/maintenance-owner-ceremony-transition.mjs arm
 ```
 
-Exact replay first requires the durable armed marker to match the supplied
-record byte-for-byte at the binding level. Only then does it verify the signed
-record, protected and published delivery bytes, release/unit bytes, effective
-loaded systemd properties, fresh authenticated delivery, and live timer
-readbacks. It returns an idempotent result without another enablement.
-Any verified mismatch durably and terminally disarms; an untrusted record
-cannot trigger mutation. Divergent records, revisions, digests, unit state,
+The implementation retains defensive handling for an armed marker left by an
+earlier build. It first requires the durable armed marker to match the supplied
+record at the binding level so untrusted input cannot trigger mutation. A
+trusted legacy active state is then terminally disarmed because the scheduler
+prerequisite is absent. The same replay path verifies protected and published
+delivery bytes, release/unit bytes, effective loaded systemd properties,
+fresh authenticated delivery, and live timer readbacks in the future-state
+test harness. Divergent records, revisions, digests, unit state,
 authorization, identity, target, eligibility, kill-switch, delivery, or
 scheduler/watchdog evidence fail closed.
 
@@ -110,15 +124,18 @@ strictly newer ceremony sequence and a strictly newer owner authorization
 whose previous digest is the terminal marker's authorization digest. Retryable
 transition failures may replay the same ceremony.
 
-Both `arm` and `disable` run under one root-owned, no-follow, exclusive
-`flock` held for the complete lifecycle transition. A concurrent disable waits
-for an in-progress arm and then wins. The older installer `disable` action
-remains an additional revision-bound emergency path.
+Both `arm` and `disable` run under one root-owned, no-follow, absolute-path
+exclusive `flock` held for the complete lifecycle transition. The locked child
+uses a dedicated imported entrypoint rather than a spoofable environment
+marker. A concurrent disable waits for an in-progress transition and then
+wins. The older installer `disable` action remains an additional
+revision-bound emergency path.
 
 ## Authority boundary
 
-Only the signed owner record can widen the one target to `armed-canary`.
-Recovery remains separately bound and may only narrow it. Heimdall receives a
+No input can currently widen the target to `armed-canary`; the missing
+per-window scheduler prerequisite is a mechanical production gate. Recovery
+remains separately bound and may only narrow state. Heimdall receives a
 read-only result and has no arm, disarm, recovery, scheduling, policy, package,
 or promotion capability. Fleet state, live ceremony execution, private target
 selection, package mutation, and evidence-window claims remain outside this

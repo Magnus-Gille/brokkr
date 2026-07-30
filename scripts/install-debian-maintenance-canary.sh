@@ -95,6 +95,7 @@ APPLY_UNIT="brokkr-debian-maintenance-canary-$CANARY.service"
 RECOVERY_UNIT="brokkr-debian-maintenance-recovery-$CANARY.service"
 RELEASE_FILES=(
   scripts/debian-maintenance-host-adapter.mjs
+  scripts/maintenance-canary-watchdog.mjs
   scripts/maintenance-owner-ceremony-transition.mjs
   scripts/lib/fixed-debian-maintenance-host-operation.mjs
   scripts/lib/bounded-recovery-dispatch.mjs
@@ -340,6 +341,7 @@ stage_exact_release() {
     "$staged_release/scripts/lib" \
     "$staged_release/systemd"
   chmod 0755 "$staged_release/scripts/debian-maintenance-host-adapter.mjs"
+  chmod 0755 "$staged_release/scripts/maintenance-canary-watchdog.mjs"
   chmod 0755 \
     "$staged_release/scripts/maintenance-owner-ceremony-transition.mjs"
   chmod 0644 \

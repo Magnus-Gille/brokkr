@@ -661,6 +661,28 @@ const requireEnabledActive = (systemd, unit, code) => {
 };
 const unitFile = (rootPrefix, unit) =>
   rooted(rootPrefix, `${UNIT_PATH}/${unit}`);
+const deliveryAdapterFile = (rootPrefix, record) => rooted(
+  rootPrefix,
+  path.join(
+    "/usr/local/lib/brokkr/maintenance-result-delivery/releases",
+    record.bindings.delivery_adapter_revision,
+    "scripts/maintenance-execution-result-delivery.mjs",
+  ),
+);
+const verifyDeliveryAdapter = ({
+  rootPrefix, expectedUid, record,
+}) => {
+  const file = deliveryAdapterFile(rootPrefix, record);
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() ||
+      stat.uid !== expectedUid || (stat.mode & 0o7777) !== 0o755) {
+    fail("delivery_adapter_file_unsafe");
+  }
+  if (digestBytes(fs.readFileSync(file)) !==
+      record.bindings.delivery_adapter_digest) {
+    fail("delivery_adapter_file_drift");
+  }
+};
 const verifyUnitFile = ({
   rootPrefix, expectedUid, unit, digest,
 }) => {
@@ -692,6 +714,7 @@ function verifyImmutableArtifacts({
   );
   if (digestValue(releaseTreeManifest(release)) !==
       record.bindings.release_tree_digest) fail("release_binding_mismatch");
+  verifyDeliveryAdapter({ rootPrefix, expectedUid, record });
   const roleToDigest = {
     apply_service: "apply_unit_digest",
     recovery_service: "recovery_unit_digest",
@@ -923,6 +946,12 @@ function failSafeDisarm({
   let systemdFailed = forceFailure;
   for (const role of ["scheduler_timer", "watchdog_timer"]) {
     try {
+      const enabled = enabledState(systemd, record.units[role]);
+      const active = activeState(systemd, record.units[role]);
+      if (enabled === "not-found" &&
+          ["inactive", "failed", "not-found"].includes(active)) {
+        continue;
+      }
       systemd.disableNow(record.units[role]);
     } catch {
       systemdFailed = true;
@@ -933,6 +962,9 @@ function failSafeDisarm({
     "watchdog_service",
   ]) {
     try {
+      if (activeState(systemd, record.units[role]) === "not-found") {
+        continue;
+      }
       systemd.stop(record.units[role]);
     } catch {
       systemdFailed = true;
@@ -1040,7 +1072,10 @@ const validateDeliveredReceipt = (receipt, probe) => {
   return digestValue(receipt);
 };
 
-const deliverFreshProbe = ({ systemd, probe, record, rootPrefix }) => {
+const deliverFreshProbe = ({
+  systemd, probe, record, rootPrefix, expectedUid,
+}) => {
+  verifyDeliveryAdapter({ rootPrefix, expectedUid, record });
   if (typeof systemd.deliverProbe !== "function") {
     fail("delivery_adapter_readback_missing");
   }
@@ -1050,6 +1085,24 @@ const deliverFreshProbe = ({ systemd, probe, record, rootPrefix }) => {
     rootPrefix,
   });
   return validateDeliveredReceipt(receipt, probe);
+};
+
+const probeWatchdogReadiness = ({ systemd, record, rootPrefix, mode }) => {
+  if (typeof systemd.probeWatchdog !== "function") {
+    fail("watchdog_readiness_probe_missing");
+  }
+  const receipt = systemd.probeWatchdog({ record, rootPrefix, mode });
+  if (!exact(receipt, [
+    "kind", "schema_version", "canary_id", "mode", "ready",
+  ]) ||
+      receipt.kind !==
+        "brokkr-maintenance-canary-watchdog-readiness" ||
+      receipt.schema_version !== "v1" ||
+      receipt.canary_id !== record.canary_id ||
+      receipt.mode !== mode ||
+      receipt.ready !== true) {
+    fail("watchdog_readiness_failed");
+  }
 };
 
 const terminalDisarm = marker =>
@@ -1143,6 +1196,10 @@ export function armMaintenanceCanary(options) {
       const privateInputs = verifyOwnerInputs({
         record, sourceDirectory, expectedUid, now,
       });
+      if (rootPrefix === "" ||
+          options.schedulerPrerequisiteSatisfiedForTest !== true) {
+        fail("scheduler_prerequisite_unimplemented");
+      }
       readCeremonyUnitSources({
         record, sourceDirectory, expectedUid,
       });
@@ -1163,7 +1220,22 @@ export function armMaintenanceCanary(options) {
         rootPrefix, expectedUid, privateInputs, record,
       });
       const deliveryReceiptDigest = deliverFreshProbe({
-        systemd, probe, record, rootPrefix,
+        systemd, probe, record, rootPrefix, expectedUid,
+      });
+      verifyImmutableArtifacts({
+        record, rootPrefix, expectedUid, systemd,
+        configuration: privateInputs.configuration,
+      });
+      verifyCeremonyUnits({
+        record, rootPrefix, expectedUid, systemd,
+        configuration: privateInputs.configuration,
+        requireArmed: true,
+      });
+      readPublishedDelivery({
+        rootPrefix, expectedUid, privateInputs, record,
+      });
+      probeWatchdogReadiness({
+        systemd, record, rootPrefix, mode: "monitor",
       });
       let armAuditPresent = false;
       try {
@@ -1234,7 +1306,7 @@ export function armMaintenanceCanary(options) {
     !["inactive", "failed", "not-found"].includes(
       activeState(systemd, record.units.watchdog_service),
     );
-  const partialTransition = fs.existsSync(disarmedPath) && (
+  const partialTransition = (
     publishedDeliveryEnabled ||
     publishedCeremonyStateUnsafe ||
     activeState(systemd, record.units.apply_service) !== "inactive" ||
@@ -1247,7 +1319,14 @@ export function armMaintenanceCanary(options) {
     });
     fail("partial_transition_recovered_disarmed");
   }
-  if (!fs.existsSync(disarmedPath) || fs.existsSync(armedPath)) {
+  if (!fs.existsSync(disarmedPath)) {
+    failSafeDisarm({
+      rootPrefix, record, recordDigest, now, systemd, auditFile,
+      reason: "missing-disarm-recovered",
+    });
+    fail("missing_disarm_recovered");
+  }
+  if (fs.existsSync(armedPath)) {
     fail("initial_disarm_missing");
   }
   const existingDisarm = readProtected(disarmedPath, expectedUid);
@@ -1263,6 +1342,10 @@ export function armMaintenanceCanary(options) {
     recordDigest,
     privateInputs,
   });
+  if (rootPrefix === "" ||
+      options.schedulerPrerequisiteSatisfiedForTest !== true) {
+    fail("scheduler_prerequisite_unimplemented");
+  }
   let transitionStarted = false;
   let publishedCeremonyUnits = [];
   try {
@@ -1309,11 +1392,15 @@ export function armMaintenanceCanary(options) {
       probe: privateInputs.deliveryProbe,
       record,
       rootPrefix,
+      expectedUid,
     });
     appendAudit(auditFile, {
       ...durableBinding(record, recordDigest, now, "transitioning"),
       transition: "delivery-readback-ready",
       delivery_receipt_digest: deliveryReceiptDigest,
+    });
+    probeWatchdogReadiness({
+      systemd, record, rootPrefix, mode: "readiness",
     });
     fault("after-delivery-readback");
 
@@ -1350,6 +1437,22 @@ export function armMaintenanceCanary(options) {
       probe: privateInputs.deliveryProbe,
       record,
       rootPrefix,
+      expectedUid,
+    });
+    verifyImmutableArtifacts({
+      record, rootPrefix, expectedUid, systemd,
+      configuration: privateInputs.configuration,
+    });
+    verifyCeremonyUnits({
+      record, rootPrefix, expectedUid, systemd,
+      configuration: privateInputs.configuration,
+      requireArmed: true,
+    });
+    readPublishedDelivery({
+      rootPrefix, expectedUid, privateInputs, record,
+    });
+    probeWatchdogReadiness({
+      systemd, record, rootPrefix, mode: "pre-arm",
     });
     const armed = durableBinding(
       record,
@@ -1433,12 +1536,14 @@ export function disableMaintenanceCanary(options) {
       !fs.existsSync(armedPath) &&
       ["apply_service", "recovery_service", "delivery_service",
         "watchdog_service"].every(role =>
-        ["inactive", "failed"].includes(
+        ["inactive", "failed", "not-found"].includes(
           activeState(systemd, record.units[role]),
         )) &&
       ["scheduler_timer", "watchdog_timer"].every(role =>
-        enabledState(systemd, record.units[role]) === "disabled" &&
-        ["inactive", "failed"].includes(
+        ["disabled", "not-found"].includes(
+          enabledState(systemd, record.units[role]),
+        ) &&
+        ["inactive", "failed", "not-found"].includes(
           activeState(systemd, record.units[role]),
         )) &&
       credentialDisabled;
@@ -1563,16 +1668,38 @@ function productionSystemd() {
         fail("delivery_readback_failed");
       }
     },
+    probeWatchdog: ({ record, mode }) => {
+      const executable = path.join(
+        `/usr/local/lib/brokkr/releases/${record.release_sha}`,
+        "scripts/maintenance-canary-watchdog.mjs",
+      );
+      const result = spawnSync("/usr/bin/node", [
+        executable, "--action", mode, "--canary", record.canary_id,
+      ], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        maxBuffer: MAX_JSON_BYTES,
+        env: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" },
+      });
+      if (result.error || result.status !== 0) {
+        fail("watchdog_readiness_failed");
+      }
+      try {
+        return JSON.parse(result.stdout);
+      } catch {
+        fail("watchdog_readiness_failed");
+      }
+    },
   };
 }
 
-function ensureLifecycleLock() {
+function ensureLifecycleLock(lockPath = LIFECYCLE_LOCK_PATH) {
   ensureProtectedDirectory(
-    path.dirname(LIFECYCLE_LOCK_PATH),
+    path.dirname(lockPath),
     process.geteuid(),
   );
   const fd = fs.openSync(
-    LIFECYCLE_LOCK_PATH,
+    lockPath,
     fs.constants.O_RDWR | fs.constants.O_CREAT |
       fs.constants.O_NOFOLLOW,
     0o600,
@@ -1584,6 +1711,43 @@ function ensureLifecycleLock() {
     fail("lifecycle_lock_unsafe");
   }
   return fd;
+}
+
+export function runUnderLifecycleLock({
+  command,
+  lockPath = LIFECYCLE_LOCK_PATH,
+  flockPath = "/usr/bin/flock",
+}) {
+  if (!Array.isArray(command) || command.length < 1 ||
+      command.some(value =>
+        typeof value !== "string" || value.includes("\0")) ||
+      !path.isAbsolute(lockPath) || !path.isAbsolute(flockPath)) {
+    fail("lifecycle_lock_arguments_invalid");
+  }
+  const lockFd = ensureLifecycleLock(lockPath);
+  fs.closeSync(lockFd);
+  const result = spawnSync(flockPath, [
+    "--exclusive", "--no-fork", lockPath, ...command,
+  ], {
+    stdio: "inherit",
+    env: {
+      PATH: "/usr/sbin:/usr/bin:/sbin:/bin",
+    },
+  });
+  if (result.error || result.status === null) {
+    fail("lifecycle_lock_failed");
+  }
+  return result.status;
+}
+
+export function runLockedCeremonyAction(action) {
+  if (!["arm", "disable"].includes(action)) {
+    fail("ceremony_action_invalid");
+  }
+  const result = action === "arm" ?
+    armMaintenanceCanary({ systemd: productionSystemd() }) :
+    disableMaintenanceCanary({ systemd: productionSystemd() });
+  process.stdout.write(`${canonicalJson(result)}\n`);
 }
 
 function main() {
@@ -1601,32 +1765,17 @@ function main() {
     fail("test_override_forbidden");
   }
   const action = process.argv[2];
-  if (process.env.BROKKR_CEREMONY_LIFECYCLE_LOCKED !== "1") {
-    const lockFd = ensureLifecycleLock();
-    try {
-      const result = spawnSync("/usr/bin/flock", [
-        "--exclusive", "--no-fork", "3",
-        "/usr/bin/node", fileURLToPath(import.meta.url), action,
-      ], {
-        stdio: ["inherit", "inherit", "inherit", lockFd],
-        env: {
-          ...process.env,
-          BROKKR_CEREMONY_LIFECYCLE_LOCKED: "1",
-        },
-      });
-      if (result.error || result.status === null) {
-        fail("lifecycle_lock_failed");
-      }
-      process.exitCode = result.status;
-      return;
-    } finally {
-      fs.closeSync(lockFd);
-    }
-  }
-  const result = action === "arm" ?
-    armMaintenanceCanary({ systemd: productionSystemd() }) :
-    disableMaintenanceCanary({ systemd: productionSystemd() });
-  process.stdout.write(`${canonicalJson(result)}\n`);
+  const moduleUrl = import.meta.url;
+  const lockedEntry = [
+    `import { runLockedCeremonyAction } from ${JSON.stringify(moduleUrl)};`,
+    "runLockedCeremonyAction(process.argv[1]);",
+  ].join("");
+  process.exitCode = runUnderLifecycleLock({
+    command: [
+      "/usr/bin/node", "--input-type=module", "--eval", lockedEntry,
+      action,
+    ],
+  });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

@@ -11,6 +11,7 @@ SYSTEMCTL_LOG="$TMP/systemctl.log"
 NODE_BIN="$(command -v node)"
 mkdir -p "$SOURCE/scripts/lib" "$SOURCE/systemd"
 cp "$ROOT/scripts/debian-maintenance-host-adapter.mjs" "$SOURCE/scripts/"
+cp "$ROOT/scripts/maintenance-canary-watchdog.mjs" "$SOURCE/scripts/"
 cp "$ROOT/scripts/maintenance-owner-ceremony-transition.mjs" \
   "$SOURCE/scripts/"
 cp "$ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs" \
@@ -67,12 +68,14 @@ RECOVERY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-recove
 
 test -x "$RELEASE_ROOT/scripts/debian-maintenance-host-adapter.mjs"
 test -x "$RELEASE_ROOT/scripts/maintenance-owner-ceremony-transition.mjs"
+test -x "$RELEASE_ROOT/scripts/maintenance-canary-watchdog.mjs"
 test -r "$RELEASE_ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
 test -r "$RELEASE_ROOT/scripts/lib/bounded-recovery-dispatch.mjs"
 test -r "$RELEASE_ROOT/systemd/brokkr-debian-maintenance-recovery.service.in"
 for file in \
   scripts/debian-maintenance-host-adapter.mjs \
   scripts/maintenance-owner-ceremony-transition.mjs \
+  scripts/maintenance-canary-watchdog.mjs \
   scripts/lib/fixed-debian-maintenance-host-operation.mjs \
   scripts/lib/bounded-recovery-dispatch.mjs \
   systemd/brokkr-debian-maintenance-recovery.service.in; do
@@ -200,6 +203,11 @@ git -C "$SOURCE" checkout -- scripts/debian-maintenance-host-adapter.mjs
 # or overwriting the conflicting bytes.
 printf '\n// retained-release-conflict\n' \
   >>"$RACE_RELEASE/scripts/debian-maintenance-host-adapter.mjs"
+if [[ "${REVISION: -1}" == "0" ]]; then
+  WRONG_REVISION="${REVISION%?}1"
+else
+  WRONG_REVISION="${REVISION%?}0"
+fi
 if env \
   BROKKR_CANARY_INSTALL_TEST_ROOT="$TOCTOU_ROOT" \
   BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
@@ -513,7 +521,7 @@ if env \
   BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
   "$INSTALLER" install \
     --source "$SOURCE" \
-    --revision "${REVISION%?}0" \
+    --revision "$WRONG_REVISION" \
     --canary canary-fi >"$TMP/wrong.out" 2>&1; then
   echo "wrong revision unexpectedly installed" >&2
   exit 1

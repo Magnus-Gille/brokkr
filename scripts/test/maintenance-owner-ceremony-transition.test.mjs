@@ -3,6 +3,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   armMaintenanceCanary,
   disableMaintenanceCanary,
@@ -10,10 +12,15 @@ import {
   digestBytes,
   digestValue,
 } from "../maintenance-owner-ceremony-transition.mjs";
+import { probeMaintenanceCanaryWatchdog } from
+  "../maintenance-canary-watchdog.mjs";
 
 const sha = character => `sha256:${character.repeat(64)}`;
 const revision = "1".repeat(40);
 const adapterRevision = "2".repeat(40);
+const deliveryAdapterBytes =
+  Buffer.from("#!/usr/bin/env node\n// exact delivery adapter fixture\n");
+const adapterDigest = digestBytes(deliveryAdapterBytes);
 const canary = "canary-one";
 const targetScopeDigest = sha("5");
 const utc = "2026-07-30T15:00:00Z";
@@ -28,7 +35,9 @@ const rooted = absolute => path.join(root, absolute.slice(1));
 const write = (absolute, value, mode = 0o600) => {
   const file = rooted(absolute);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, typeof value === "string" ? value : `${JSON.stringify(value)}\n`, { mode });
+  fs.writeFileSync(file, Buffer.isBuffer(value) ? value :
+    typeof value === "string" ? value : `${JSON.stringify(value)}\n`,
+  { mode });
   fs.chmodSync(file, mode);
   return file;
 };
@@ -177,7 +186,7 @@ const unitNames = {
 const releaseEnvironment = `BROKKR_RELEASE_SHA=${revision}`;
 const adapterEnvironment =
   `BROKKR_ADAPTER_REVISION=${adapterRevision} ` +
-  `BROKKR_ADAPTER_DIGEST=${sha("a")}`;
+  `BROKKR_ADAPTER_DIGEST=${adapterDigest}`;
 const execStarts = {
   apply_service:
     `{ path=/usr/local/lib/brokkr/releases/${revision}/scripts/debian-maintenance-host-adapter.mjs ; argv[]=/usr/local/lib/brokkr/releases/${revision}/scripts/debian-maintenance-host-adapter.mjs --action apply --attempt ${canary} ; }`,
@@ -186,15 +195,15 @@ const execStarts = {
   delivery_service:
     `{ path=/usr/bin/node ; argv[]=/usr/bin/node /usr/local/lib/brokkr/maintenance-result-delivery/releases/${adapterRevision}/scripts/maintenance-execution-result-delivery.mjs ; }`,
   watchdog_service:
-    `{ path=/usr/local/lib/brokkr/releases/${revision}/scripts/debian-maintenance-host-adapter.mjs ; argv[]=/usr/local/lib/brokkr/releases/${revision}/scripts/debian-maintenance-host-adapter.mjs --action watchdog --attempt ${canary} ; }`,
+    `{ path=/usr/bin/node ; argv[]=/usr/bin/node /usr/local/lib/brokkr/releases/${revision}/scripts/maintenance-canary-watchdog.mjs --action monitor --canary ${canary} ; }`,
 };
 const unitContents = {
   apply_service: `[Service]\nEnvironment=${releaseEnvironment}\nExecStart=/usr/local/lib/brokkr/releases/${revision}/scripts/debian-maintenance-host-adapter.mjs --action apply --attempt ${canary}\n`,
   recovery_service: `[Service]\nEnvironment=${releaseEnvironment}\nExecStart=/usr/local/lib/brokkr/releases/${revision}/scripts/debian-maintenance-host-adapter.mjs --action recover --attempt ${canary}\n`,
-  delivery_service: `[Service]\nEnvironment=BROKKR_ADAPTER_REVISION=${adapterRevision}\nEnvironment=BROKKR_ADAPTER_DIGEST=${sha("a")}\nExecStart=/usr/bin/node /usr/local/lib/brokkr/maintenance-result-delivery/releases/${adapterRevision}/scripts/maintenance-execution-result-delivery.mjs\n`,
+  delivery_service: `[Service]\nEnvironment=BROKKR_ADAPTER_REVISION=${adapterRevision}\nEnvironment=BROKKR_ADAPTER_DIGEST=${adapterDigest}\nExecStart=/usr/bin/node /usr/local/lib/brokkr/maintenance-result-delivery/releases/${adapterRevision}/scripts/maintenance-execution-result-delivery.mjs\n`,
   scheduler_timer: `[Timer]\nUnit=${unitNames.apply_service}\nOnCalendar=*-*-* 04:00:00\n`,
   watchdog_timer: `[Timer]\nUnit=${unitNames.watchdog_service}\nOnUnitActiveSec=5m\n`,
-  watchdog_service: `[Service]\nEnvironment=${releaseEnvironment}\nExecStart=/usr/local/lib/brokkr/releases/${revision}/scripts/debian-maintenance-host-adapter.mjs --action watchdog --attempt ${canary}\n`,
+  watchdog_service: `[Service]\nEnvironment=${releaseEnvironment}\nExecStart=/usr/bin/node /usr/local/lib/brokkr/releases/${revision}/scripts/maintenance-canary-watchdog.mjs --action monitor --canary ${canary}\n`,
 };
 const unitFiles = {};
 for (const role of [
@@ -277,15 +286,21 @@ const configurationAttestation = {
 const release = rooted(`/usr/local/lib/brokkr/releases/${revision}`);
 fs.mkdirSync(path.join(release, "scripts/lib"), { recursive: true, mode: 0o755 });
 write(`/usr/local/lib/brokkr/releases/${revision}/scripts/debian-maintenance-host-adapter.mjs`, "host\n", 0o755);
+write(`/usr/local/lib/brokkr/releases/${revision}/scripts/maintenance-canary-watchdog.mjs`, "watchdog\n", 0o755);
 write(`/usr/local/lib/brokkr/releases/${revision}/scripts/lib/fixed-debian-maintenance-host-operation.mjs`, "fixed\n", 0o644);
 write(`/usr/local/lib/brokkr/releases/${revision}/scripts/lib/bounded-recovery-dispatch.mjs`, "recover\n", 0o644);
+write(
+  `/usr/local/lib/brokkr/maintenance-result-delivery/releases/${adapterRevision}/scripts/maintenance-execution-result-delivery.mjs`,
+  deliveryAdapterBytes,
+  0o755,
+);
 
 const deliveryCredential = {
   kind: "brokkr-maintenance-result-delivery-config",
   schema_version: "v1",
   enabled: true,
   adapter_revision: adapterRevision,
-  adapter_digest: sha("a"),
+  adapter_digest: adapterDigest,
   endpoint: "https://heimdall.example.invalid/api/maintenance-execution-results",
   bearer_token: "ceremony-test-token-0001",
 };
@@ -404,7 +419,7 @@ const unsignedRecord = {
     eligibility_digest: digestValue(eligibility),
     kill_switch_digest: digestValue(killSwitch),
     delivery_adapter_revision: adapterRevision,
-    delivery_adapter_digest: sha("a"),
+    delivery_adapter_digest: adapterDigest,
     delivery_credential_digest: digestValue(deliveryCredential),
     delivery_probe_digest: digestValue(deliveryProbe),
     configuration_attestation_digest:
@@ -438,6 +453,13 @@ const deliveryReceipt = () => ({
   result_digest: deliveryProbe.result_digest,
   execution_epoch: deliveryProbe.execution_epoch,
 });
+const watchdogReceipt = mode => ({
+  kind: "brokkr-maintenance-canary-watchdog-readiness",
+  schema_version: "v1",
+  canary_id: canary,
+  mode,
+  ready: true,
+});
 const systemd = {
   enabledState(name) {
     return systemdStates.get(name)?.enabled === true ? "enabled" : "disabled";
@@ -461,6 +483,10 @@ const systemd = {
   deliverProbe() {
     systemdLog.push("deliver-probe");
     return deliveryReceipt();
+  },
+  probeWatchdog({ mode }) {
+    systemdLog.push(`watchdog-probe ${mode}`);
+    return watchdogReceipt(mode);
   },
   enableNow(name) {
     systemdLog.push(`enable-now ${name}`);
@@ -513,15 +539,18 @@ const options = {
   expectedUid: process.getuid(),
   now: utc,
   systemd,
+  schedulerPrerequisiteSatisfiedForTest: true,
 };
 const armed = armMaintenanceCanary(options);
 assert.equal(armed.state, "armed-canary");
 assert.deepEqual(systemdLog, [
   "daemon-reload",
   "deliver-probe",
+  "watchdog-probe readiness",
   `enable-now ${unitNames.watchdog_timer}`,
   `enable-now ${unitNames.scheduler_timer}`,
   "deliver-probe",
+  "watchdog-probe pre-arm",
 ]);
 assert.equal(
   fs.existsSync(rooted(`/var/lib/brokkr/debian-maintenance/disarmed/${canary}.json`)),
@@ -548,8 +577,8 @@ assert.equal(audit.every(entry =>
 
 const callsAfterArm = systemdLog.length;
 assert.equal(armMaintenanceCanary(options).idempotent, true);
-assert.equal(systemdLog.length, callsAfterArm + 1,
-  "exact replay must require one fresh delivery without re-enablement");
+assert.equal(systemdLog.length, callsAfterArm + 2,
+  "exact replay must require fresh delivery and watchdog readiness");
 
 const disabled = disableMaintenanceCanary(options);
 assert.equal(disabled.state, "disarmed");
@@ -626,6 +655,25 @@ function writeAt(base, absolute, value, mode = 0o600) {
   fs.chmodSync(file, mode);
 }
 
+{
+  const blockedRoot = cloneRoot();
+  assert.throws(() => armMaintenanceCanary({
+    rootPrefix: blockedRoot,
+    expectedUid: process.getuid(),
+    now: utc,
+    systemd: isolatedSystemd(isolatedStates()),
+  }), /scheduler_prerequisite_unimplemented/);
+  for (const role of [
+    "scheduler_timer", "watchdog_timer", "watchdog_service",
+  ]) {
+    assert.equal(fs.existsSync(path.join(
+      blockedRoot,
+      `/etc/systemd/system/${unitNames[role]}`.slice(1),
+    )), false, "blocked scheduler prerequisite must remain unpublished");
+  }
+  fs.rmSync(blockedRoot, { recursive: true, force: true });
+}
+
 for (const boundary of [
   "after-ceremony-units-installed",
   "after-delivery-configured",
@@ -664,6 +712,39 @@ for (const boundary of [
   fs.rmSync(faultRoot, { recursive: true, force: true });
 }
 
+{
+  const rollbackRoot = cloneRoot();
+  const states = isolatedStates();
+  assert.throws(() => armMaintenanceCanary({
+    ...options,
+    rootPrefix: rollbackRoot,
+    systemd: isolatedSystemd(states),
+    fault: step => {
+      if (step === "after-ceremony-units-installed") {
+        throw new Error("publication rollback");
+      }
+    },
+  }), /publication rollback/);
+  const absent = new Set([
+    unitNames.scheduler_timer,
+    unitNames.watchdog_timer,
+    unitNames.watchdog_service,
+  ]);
+  const afterRollback = isolatedSystemd(states, {
+    enabledState: name => absent.has(name) ?
+      "not-found" : states.get(name).enabled ? "enabled" : "disabled",
+    activeState: name => absent.has(name) ?
+      "not-found" : states.get(name).active ? "active" : "inactive",
+  });
+  assert.equal(disableMaintenanceCanary({
+    ...options,
+    rootPrefix: rollbackRoot,
+    systemd: afterRollback,
+  }).idempotent, true,
+  "disable after unit-publication rollback must accept absent units");
+  fs.rmSync(rollbackRoot, { recursive: true, force: true });
+}
+
 const tampered = structuredClone(record);
 tampered.release_sha = "3".repeat(40);
 write("/etc/brokkr/maintenance-owner-ceremony/record.json", tampered);
@@ -699,6 +780,7 @@ function isolatedSystemd(states, overrides = {}) {
       configuration.effective_units[roleForUnit(name)].environment,
     daemonReload: () => {},
     deliverProbe: () => deliveryReceipt(),
+    probeWatchdog: ({ mode }) => watchdogReceipt(mode),
     enableNow: name => Object.assign(
       states.get(name), { enabled: true, active: true }),
     disableNow: name => Object.assign(
@@ -772,6 +854,31 @@ function isolatedSystemd(states, overrides = {}) {
     systemd: isolatedSystemd(isolatedStates()),
   }), /configuration_binding_mismatch/);
   fs.rmSync(changedConfigurationRoot, { recursive: true, force: true });
+}
+
+for (const [name, prepare, expected] of [
+  [
+    "drifted delivery adapter",
+    file => fs.appendFileSync(file, "// drift\n"),
+    /delivery_adapter_file_drift/,
+  ],
+  [
+    "unsafe delivery adapter mode",
+    file => fs.chmodSync(file, 0o644),
+    /delivery_adapter_file_unsafe/,
+  ],
+]) {
+  const adapterRoot = cloneRoot();
+  prepare(path.join(
+    adapterRoot,
+    `/usr/local/lib/brokkr/maintenance-result-delivery/releases/${adapterRevision}/scripts/maintenance-execution-result-delivery.mjs`.slice(1),
+  ));
+  assert.throws(() => armMaintenanceCanary({
+    ...options,
+    rootPrefix: adapterRoot,
+    systemd: isolatedSystemd(isolatedStates()),
+  }), expected, name);
+  fs.rmSync(adapterRoot, { recursive: true, force: true });
 }
 
 {
@@ -961,6 +1068,71 @@ for (const [name, overrides, expected] of [
   fs.rmSync(unsafeStateRoot, { recursive: true, force: true });
 }
 
+for (const unsafeRole of [
+  "scheduler_timer", "watchdog_timer", "watchdog_service",
+  "apply_service",
+]) {
+  const missingDisarmRoot = cloneRoot();
+  fs.rmSync(path.join(
+    missingDisarmRoot,
+    `/var/lib/brokkr/debian-maintenance/disarmed/${canary}.json`.slice(1),
+  ));
+  const states = isolatedStates();
+  Object.assign(states.get(unitNames[unsafeRole]), {
+    enabled: unsafeRole.endsWith("_timer"),
+    active: true,
+  });
+  const base = isolatedSystemd(states);
+  const assertDisarmed = () => assert.equal(fs.existsSync(path.join(
+    missingDisarmRoot,
+    `/var/lib/brokkr/debian-maintenance/disarmed/${canary}.json`.slice(1),
+  )), true, `${unsafeRole}: disarm must precede lifecycle mutation`);
+  const guarded = isolatedSystemd(states, {
+    disableNow: name => {
+      assertDisarmed();
+      base.disableNow(name);
+    },
+    stop: name => {
+      assertDisarmed();
+      base.stop(name);
+    },
+  });
+  assert.throws(() => armMaintenanceCanary({
+    ...options,
+    rootPrefix: missingDisarmRoot,
+    systemd: guarded,
+  }), /partial_transition_recovered_disarmed/);
+  assert.equal(states.get(unitNames[unsafeRole]).active, false);
+  fs.rmSync(missingDisarmRoot, { recursive: true, force: true });
+}
+
+{
+  const beforeFirstArmRoot = cloneRoot();
+  const states = isolatedStates();
+  const absent = new Set([
+    unitNames.scheduler_timer,
+    unitNames.watchdog_timer,
+    unitNames.watchdog_service,
+  ]);
+  let mutations = 0;
+  const adapter = isolatedSystemd(states, {
+    enabledState: name => absent.has(name) ?
+      "not-found" : states.get(name).enabled ? "enabled" : "disabled",
+    activeState: name => absent.has(name) ?
+      "not-found" : states.get(name).active ? "active" : "inactive",
+    disableNow: () => { mutations += 1; },
+    stop: () => { mutations += 1; },
+  });
+  assert.equal(disableMaintenanceCanary({
+    ...options,
+    rootPrefix: beforeFirstArmRoot,
+    systemd: adapter,
+  }).idempotent, true);
+  assert.equal(mutations, 0,
+    "disable before first arm must accept explicitly absent ceremony units");
+  fs.rmSync(beforeFirstArmRoot, { recursive: true, force: true });
+}
+
 for (const failure of ["delivery", "watchdog", "scheduler"]) {
   const failedRoot = cloneRoot();
   const states = isolatedStates();
@@ -990,6 +1162,51 @@ for (const failure of ["delivery", "watchdog", "scheduler"]) {
   assert.equal(states.get(unitNames.scheduler_timer).enabled, false);
   assert.equal(states.get(unitNames.watchdog_timer).enabled, false);
   fs.rmSync(failedRoot, { recursive: true, force: true });
+}
+
+{
+  const readinessRoot = cloneRoot();
+  assert.throws(() => armMaintenanceCanary({
+    ...options,
+    rootPrefix: readinessRoot,
+    systemd: isolatedSystemd(isolatedStates(), {
+      probeWatchdog: ({ mode }) => ({
+        ...watchdogReceipt(mode),
+        ready: false,
+      }),
+    }),
+  }), /watchdog_readiness_failed/);
+  assert.equal(fs.existsSync(path.join(
+    readinessRoot,
+    `/var/lib/brokkr/debian-maintenance/disarmed/${canary}.json`.slice(1),
+  )), true);
+  fs.rmSync(readinessRoot, { recursive: true, force: true });
+}
+
+{
+  const deliveryDriftRoot = cloneRoot();
+  const states = isolatedStates();
+  let deliveries = 0;
+  const adapter = isolatedSystemd(states, {
+    deliverProbe: () => {
+      deliveries += 1;
+      if (deliveries === 2) {
+        states.get(unitNames.scheduler_timer).enabled = false;
+      }
+      return deliveryReceipt();
+    },
+  });
+  assert.throws(() => armMaintenanceCanary({
+    ...options,
+    rootPrefix: deliveryDriftRoot,
+    systemd: adapter,
+  }), /scheduler_readback_failed/);
+  assert.equal(deliveries, 2);
+  assert.equal(fs.existsSync(path.join(
+    deliveryDriftRoot,
+    `/var/lib/brokkr/debian-maintenance/disarmed/${canary}.json`.slice(1),
+  )), true, "post-delivery drift must disarm before arming");
+  fs.rmSync(deliveryDriftRoot, { recursive: true, force: true });
 }
 
 const activeState = {
@@ -1064,6 +1281,8 @@ function armedReplaySystemd(
   }
   mutate(states);
   const calls = [];
+  const resolvedOverrides = typeof adapterOverrides === "function" ?
+    adapterOverrides(states, calls) : adapterOverrides;
   const assertDisarmedFirst = () => assert.equal(fs.existsSync(path.join(
     replayRoot,
     `/var/lib/brokkr/debian-maintenance/disarmed/${canary}.json`.slice(1),
@@ -1090,7 +1309,7 @@ function armedReplaySystemd(
         calls.push(`stop ${name}`);
         states.get(name).active = false;
       },
-      ...adapterOverrides,
+      ...resolvedOverrides,
     },
   };
 }
@@ -1124,6 +1343,23 @@ function expectArmedReplayDisarm({
   fs.rmSync(replayRoot, { recursive: true, force: true });
 }
 
+{
+  const blockedActiveRoot = cloneArmedRoot();
+  const replay = armedReplaySystemd(blockedActiveRoot);
+  assert.throws(() => armMaintenanceCanary({
+    rootPrefix: blockedActiveRoot,
+    expectedUid: process.getuid(),
+    now: utc,
+    systemd: replay.adapter,
+  }), /armed_replay_mismatch_disarmed/);
+  const marker = JSON.parse(fs.readFileSync(path.join(
+    blockedActiveRoot,
+    `/var/lib/brokkr/debian-maintenance/disarmed/${canary}.json`.slice(1),
+  )));
+  assert.equal(marker.terminal, true);
+  fs.rmSync(blockedActiveRoot, { recursive: true, force: true });
+}
+
 expectArmedReplayDisarm({
   name: "already-armed replay with stale eligibility",
   now: later,
@@ -1138,6 +1374,13 @@ expectArmedReplayDisarm({
     replayRoot,
     `/etc/systemd/system/${unitNames.scheduler_timer}`.slice(1),
   ), "# replay drift\n"),
+});
+expectArmedReplayDisarm({
+  name: "already-armed replay with delivery adapter drift",
+  prepare: replayRoot => fs.appendFileSync(path.join(
+    replayRoot,
+    `/usr/local/lib/brokkr/maintenance-result-delivery/releases/${adapterRevision}/scripts/maintenance-execution-result-delivery.mjs`.slice(1),
+  ), "// replay drift\n"),
 });
 expectArmedReplayDisarm({
   name: "already-armed replay with unavailable delivery readback",
@@ -1193,7 +1436,7 @@ expectArmedReplayDisarm({
       schema_version: "v1",
       enabled: false,
       adapter_revision: adapterRevision,
-      adapter_digest: sha("a"),
+      adapter_digest: adapterDigest,
     },
   ),
 });
@@ -1211,6 +1454,15 @@ expectArmedReplayDisarm({
       unitNames.recovery_service :
       configuration.effective_units[roleForUnit(unit)].unit,
   },
+});
+expectArmedReplayDisarm({
+  name: "already-armed replay drifting during delivery",
+  adapterOverrides: states => ({
+    deliverProbe: () => {
+      states.get(unitNames.watchdog_timer).active = false;
+      return deliveryReceipt();
+    },
+  }),
 });
 
 {
@@ -1272,13 +1524,90 @@ expectArmedReplayDisarm({
 }
 
 {
+  const watchdogRoot = cloneArmedRoot();
+  const states = isolatedStates();
+  for (const role of ["scheduler_timer", "watchdog_timer"]) {
+    Object.assign(states.get(unitNames[role]), {
+      enabled: true,
+      active: true,
+    });
+  }
+  const healthy = probeMaintenanceCanaryWatchdog({
+    canaryId: canary,
+    mode: "monitor",
+    rootPrefix: watchdogRoot,
+    expectedUid: process.getuid(),
+    systemd: isolatedSystemd(states),
+  });
+  assert.equal(healthy.ready, true,
+    "the actual watchdog ExecStart core must succeed hermetically");
+  states.get(unitNames.scheduler_timer).active = false;
+  assert.throws(() => probeMaintenanceCanaryWatchdog({
+    canaryId: canary,
+    mode: "monitor",
+    rootPrefix: watchdogRoot,
+    expectedUid: process.getuid(),
+    systemd: isolatedSystemd(states),
+  }), /watchdog_timer_state_invalid/,
+  "watchdog faults must fail closed");
+  fs.rmSync(watchdogRoot, { recursive: true, force: true });
+}
+
+{
   const source = fs.readFileSync(new URL(
     "../maintenance-owner-ceremony-transition.mjs",
     import.meta.url,
   ), "utf8");
-  assert.match(source, /"--exclusive", "--no-fork", "3"/);
-  assert.match(source, /BROKKR_CEREMONY_LIFECYCLE_LOCKED/);
+  assert.match(
+    source,
+    /"--exclusive", "--no-fork", lockPath, \.\.\.command/,
+  );
+  assert.doesNotMatch(source, /BROKKR_CEREMONY_LIFECYCLE_LOCKED/);
   assert.match(source, /O_NOFOLLOW/);
 }
 
-console.log("ok - exact owner ceremony arms last, replays idempotently, and fails closed");
+if (fs.existsSync("/usr/bin/flock")) {
+  const lockRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "brokkr-ceremony-lock-"),
+  );
+  fs.chmodSync(lockRoot, 0o700);
+  const lock = path.join(lockRoot, "lifecycle.lock");
+  const log = path.join(lockRoot, "order.log");
+  const firstCwd = path.join(lockRoot, "cwd-a");
+  const secondCwd = path.join(lockRoot, "cwd-b");
+  fs.mkdirSync(firstCwd, { mode: 0o700 });
+  fs.mkdirSync(secondCwd, { mode: 0o700 });
+  const worker = fileURLToPath(new URL(
+    "fixtures/ceremony-lock-worker.mjs",
+    import.meta.url,
+  ));
+  const action = fileURLToPath(new URL(
+    "fixtures/ceremony-lock-action.mjs",
+    import.meta.url,
+  ));
+  const runWorker = (label, hold, cwd) => {
+    const child = spawn(process.execPath, [
+      worker, lock, action, log, label, String(hold),
+    ], { cwd, stdio: "ignore" });
+    return new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", code => code === 0 ?
+        resolve() : reject(new Error(`lock worker ${label}: ${code}`)));
+    });
+  };
+  const first = runWorker("arm", 250, firstCwd);
+  const deadline = Date.now() + 5_000;
+  while ((!fs.existsSync(log) ||
+      !fs.readFileSync(log, "utf8").includes("arm-start")) &&
+      Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  const second = runWorker("disable", 0, secondCwd);
+  await Promise.all([first, second]);
+  assert.deepEqual(fs.readFileSync(log, "utf8").trim().split("\n"), [
+    "arm-start", "arm-end", "disable-start", "disable-end",
+  ], "absolute production lock must serialize cross-CWD and disable wins");
+  fs.rmSync(lockRoot, { recursive: true, force: true });
+}
+
+console.log("ok - owner ceremony state machine is production-blocked and fails closed");
