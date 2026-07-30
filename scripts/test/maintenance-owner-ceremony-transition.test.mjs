@@ -774,6 +774,37 @@ function isolatedSystemd(states, overrides = {}) {
   fs.rmSync(changedConfigurationRoot, { recursive: true, force: true });
 }
 
+{
+  const unpublishedRoot = cloneRoot();
+  const states = isolatedStates();
+  const base = isolatedSystemd(states);
+  const assertPublishedBeforeQuery = (name, query) => {
+    const role = roleForUnit(name);
+    if (["scheduler_timer", "watchdog_timer", "watchdog_service"]
+      .includes(role) &&
+        !fs.existsSync(path.join(
+          unpublishedRoot,
+          `/etc/systemd/system/${name}`.slice(1),
+        ))) {
+      return "not-found";
+    }
+    return query(name);
+  };
+  const strict = isolatedSystemd(states, {
+    enabledState: name =>
+      assertPublishedBeforeQuery(name, base.enabledState),
+    activeState: name =>
+      assertPublishedBeforeQuery(name, base.activeState),
+  });
+  assert.equal(armMaintenanceCanary({
+    ...options,
+    rootPrefix: unpublishedRoot,
+    systemd: strict,
+  }).state, "armed-canary",
+  "initial arm must publish ceremony units before querying loaded state");
+  fs.rmSync(unpublishedRoot, { recursive: true, force: true });
+}
+
 for (const [name, overrides, expected] of [
   [
     "wrong timer Unit",

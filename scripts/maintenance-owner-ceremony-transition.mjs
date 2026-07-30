@@ -1222,15 +1222,23 @@ export function armMaintenanceCanary(options) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
+  const publishedCeremonyStateUnsafe = [
+    "scheduler_timer", "watchdog_timer",
+  ].some(role =>
+    !["disabled", "not-found"].includes(
+      enabledState(systemd, record.units[role]),
+    ) ||
+    !["inactive", "failed", "not-found"].includes(
+      activeState(systemd, record.units[role]),
+    )) ||
+    !["inactive", "failed", "not-found"].includes(
+      activeState(systemd, record.units.watchdog_service),
+    );
   const partialTransition = fs.existsSync(disarmedPath) && (
     publishedDeliveryEnabled ||
-    enabledState(systemd, record.units.scheduler_timer) !== "disabled" ||
-    activeState(systemd, record.units.scheduler_timer) !== "inactive" ||
-    enabledState(systemd, record.units.watchdog_timer) !== "disabled" ||
-    activeState(systemd, record.units.watchdog_timer) !== "inactive" ||
+    publishedCeremonyStateUnsafe ||
     activeState(systemd, record.units.apply_service) !== "inactive" ||
-    activeState(systemd, record.units.recovery_service) !== "inactive" ||
-    activeState(systemd, record.units.watchdog_service) !== "inactive"
+    activeState(systemd, record.units.recovery_service) !== "inactive"
   );
   if (partialTransition) {
     failSafeDisarm({
@@ -1500,11 +1508,11 @@ function productionSystemd() {
     enabledState: unit => state(["is-enabled", unit], [
       "enabled", "disabled", "static", "masked", "indirect",
       "generated", "transient", "linked", "linked-runtime", "alias",
-      "enabled-runtime",
+      "enabled-runtime", "not-found",
     ]),
     activeState: unit => state(["is-active", unit], [
       "active", "inactive", "failed", "activating", "deactivating",
-      "reloading", "maintenance",
+      "reloading", "maintenance", "not-found",
     ]),
     fragmentPath: unit => property(unit, "FragmentPath"),
     timerUnit: unit => property(unit, "Unit"),
