@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brokkr.gille.ai/contracts/debian-maintenance-attempt-factory-config/v1/schema.json",
+  "title": "Brokkr Debian maintenance attempt factory configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "release_digest", "target", "actors", "authority", "recovery", "watch_seconds", "deadline_seconds"],
+  "properties": {
+    "kind": { "const": "brokkr-debian-attempt-factory-configuration" },
+    "schema_version": { "const": "v1" },
+    "release_digest": { "$ref": "#/$defs/digest" },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id", "platform", "non_pillar"],
+      "properties": {
+        "node_id": { "$ref": "#/$defs/id" },
+        "platform": { "const": "debian" },
+        "non_pillar": { "const": true }
+      }
+    },
+    "actors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "controller", "watchdog", "kill_switch", "recovery_worker"],
+      "properties": {
+        "owner": { "$ref": "#/$defs/id" },
+        "controller": { "$ref": "#/$defs/id" },
+        "watchdog": { "$ref": "#/$defs/id" },
+        "kill_switch": { "$ref": "#/$defs/id" },
+        "recovery_worker": { "$ref": "#/$defs/id" }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["writer_owner", "owner_authority_ref", "owner_authority_digest", "configuration_owner", "configuration_owner_authority_ref", "configuration_owner_authority_digest", "admission_coverage_digest", "admission_binding_state", "constitution_digest"],
+      "properties": {
+        "writer_owner": { "$ref": "#/$defs/id" },
+        "owner_authority_ref": { "$ref": "#/$defs/ref" },
+        "owner_authority_digest": { "$ref": "#/$defs/digest" },
+        "configuration_owner": { "$ref": "#/$defs/id" },
+        "configuration_owner_authority_ref": { "$ref": "#/$defs/ref" },
+        "configuration_owner_authority_digest": { "$ref": "#/$defs/digest" },
+        "admission_coverage_digest": { "$ref": "#/$defs/digest" },
+        "admission_binding_state": { "enum": ["armed-canary", "armed-fleet"] },
+        "constitution_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["descriptor_id_prefix", "restart_units", "budget_seconds"],
+      "properties": {
+        "descriptor_id_prefix": { "$ref": "#/$defs/id" },
+        "restart_units": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "const": "brokkr-maintenance-safe.service" }
+        },
+        "budget_seconds": { "type": "integer", "minimum": 1, "maximum": 300 }
+      }
+    },
+    "watch_seconds": { "const": 3600 },
+    "deadline_seconds": { "const": 4200 }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "ref": { "type": "string", "pattern": "^ref:[a-z][a-z0-9-]{2,120}$" }
+  }
+}
