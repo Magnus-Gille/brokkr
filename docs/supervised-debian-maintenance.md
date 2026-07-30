@@ -93,5 +93,9 @@ registrations, fences, journals, terminal receipts, evidence, and both
 headroom reserves. Repeating the same disable is idempotent. Investigate and
 retain that evidence before any later owner-directed cleanup.
 
-No step in this runbook authorizes creation of request/registration/authority
-records, unit enablement, timer creation, canary activation, or fleet rollout.
+Installation also persists the initial disarm marker and includes the
+revision-bound, inert
+[owner-ceremony transition](maintenance-owner-ceremony-transition.md) in the
+immutable release. The installer never invokes it. No step in this runbook
+authorizes creation of request/registration/authority records, unit
+enablement, timer creation, canary activation, or fleet rollout.
