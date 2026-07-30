@@ -20,6 +20,8 @@ import {
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const ID = /^[a-z][a-z0-9-]{2,62}$/;
 const UTC = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
+const APPLY_VERIFY_BUDGET_SECONDS = 300;
+const FRESHNESS_MAX_AGE_SECONDS = 300;
 const plain = value =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const fail = code => {
@@ -137,6 +139,8 @@ function validateFreshness(snapshot, now, target) {
       snapshot.schema_version !== "v1" || !strictUtc(now) ||
       !strictUtc(snapshot.observed_at) || !strictUtc(snapshot.valid_until) ||
       Date.parse(snapshot.observed_at) > Date.parse(now) ||
+      Date.parse(now) - Date.parse(snapshot.observed_at) >
+        FRESHNESS_MAX_AGE_SECONDS * 1000 ||
       Date.parse(now) >= Date.parse(snapshot.valid_until) ||
       !exactKeys(snapshot.liveness, ["healthy"]) ||
       snapshot.liveness.healthy !== true ||
@@ -204,7 +208,7 @@ function readProtectedText(file, maxBytes = 1_000_000) {
     fs.closeSync(fd);
   }
 }
-function atomicCreate(file, value) {
+function atomicCreateResult(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.${crypto.randomUUID()}`;
   const fd = fs.openSync(temporary,
@@ -216,16 +220,21 @@ function atomicCreate(file, value) {
   } finally {
     fs.closeSync(fd);
   }
+  let created = true;
   try {
     fs.linkSync(temporary, file);
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
+    created = false;
   } finally {
     fs.unlinkSync(temporary);
   }
   const directory = fs.openSync(path.dirname(file), "r");
   try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
-  return readJson(file);
+  return { created, value: readJson(file) };
+}
+function atomicCreate(file, value) {
+  return atomicCreateResult(file, value).value;
 }
 function atomicReplace(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -274,6 +283,88 @@ function sameLockOwner(left, right) {
     "kind", "schema_version", "pid", "process_start_time",
   ]) && canonicalJson(left) === canonicalJson(right);
 }
+function validLockOwner(owner) {
+  return exactKeys(owner, [
+    "kind", "schema_version", "pid", "process_start_time",
+  ]) && owner.kind === "brokkr-attempt-factory-lock" &&
+    owner.schema_version === "v1" &&
+    Number.isSafeInteger(owner.pid) && owner.pid >= 1 &&
+    (/^\d+$/.test(owner.process_start_time) ||
+      DIGEST.test(owner.process_start_time));
+}
+function lockOwnerActive(owner) {
+  if (!validLockOwner(owner)) return true;
+  const observedStart = processStartTime(owner.pid);
+  return observedStart === null ?
+    processExists(owner.pid) :
+    observedStart === owner.process_start_time;
+}
+function sameInode(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+function staleLockSnapshot(directory) {
+  let before;
+  let after;
+  let owner;
+  try {
+    before = fs.lstatSync(directory);
+    owner = readJson(path.join(directory, "owner.json"));
+    after = fs.lstatSync(directory);
+  } catch {
+    fail("attempt_factory_occurrence_contended");
+  }
+  const expectedUid = typeof process.getuid === "function" ?
+    process.getuid() : after.uid;
+  if (!before.isDirectory() || before.isSymbolicLink() ||
+      !sameInode(before, after) || after.uid !== expectedUid ||
+      (after.mode & 0o077) !== 0 ||
+      !validLockOwner(owner) || lockOwnerActive(owner)) {
+    fail("attempt_factory_occurrence_contended");
+  }
+  return {
+    owner,
+    dev: String(after.dev),
+    ino: String(after.ino),
+    digest: digest({
+      dev: String(after.dev), ino: String(after.ino), owner,
+    }),
+  };
+}
+function claimStaleLock(directory, snapshot, claimant, previous = null,
+  depth = 0) {
+  if (depth > 32) fail("attempt_factory_occurrence_contended");
+  const previousClaimDigest = previous === null ? null : digest(previous);
+  const claimKey = digest({
+    stale_lock_digest: snapshot.digest,
+    previous_claim_digest: previousClaimDigest,
+  }).slice("sha256:".length);
+  const claimFile = `${directory}.reclaim.${claimKey}.claim`;
+  const claim = {
+    kind: "brokkr-attempt-factory-reclaim-claim",
+    schema_version: "v1",
+    stale_lock_digest: snapshot.digest,
+    previous_claim_digest: previousClaimDigest,
+    claimant,
+  };
+  let result;
+  try { result = atomicCreateResult(claimFile, claim); }
+  catch { fail("attempt_factory_occurrence_contended"); }
+  if (result.created) return { claim, claimFile };
+  const stored = result.value;
+  if (!exactKeys(stored, [
+    "kind", "schema_version", "stale_lock_digest",
+    "previous_claim_digest", "claimant",
+  ]) || stored.kind !== claim.kind || stored.schema_version !== "v1" ||
+      stored.stale_lock_digest !== snapshot.digest ||
+      stored.previous_claim_digest !== previousClaimDigest ||
+      !validLockOwner(stored.claimant) ||
+      lockOwnerActive(stored.claimant)) {
+    fail("attempt_factory_occurrence_contended");
+  }
+  return claimStaleLock(
+    directory, snapshot, claimant, stored, depth + 1,
+  );
+}
 function acquireLock(directory, owner) {
   try {
     fs.mkdirSync(directory, { mode: 0o700 });
@@ -291,21 +382,22 @@ function acquireLock(directory, owner) {
   }
 }
 function inspectExistingLock(directory, owner) {
-  let existing;
-  try { existing = readJson(path.join(directory, "owner.json")); }
-  catch { fail("attempt_factory_occurrence_contended"); }
-  const observedStart = Number.isSafeInteger(existing?.pid) ?
-    processStartTime(existing.pid) : null;
-  if (!exactKeys(existing, [
-    "kind", "schema_version", "pid", "process_start_time",
-  ]) || existing.kind !== "brokkr-attempt-factory-lock" ||
-      existing.schema_version !== "v1" ||
-      !Number.isSafeInteger(existing.pid) || existing.pid < 1 ||
-      !(/^\d+$/.test(existing.process_start_time) ||
-        DIGEST.test(existing.process_start_time)) ||
-      (observedStart === null ?
-        processExists(existing.pid) :
-        observedStart === existing.process_start_time)) {
+  const snapshot = staleLockSnapshot(directory);
+  const claimed = claimStaleLock(directory, snapshot, owner);
+  let currentStat;
+  let currentOwner;
+  let storedClaim;
+  try {
+    currentStat = fs.lstatSync(directory);
+    currentOwner = readJson(path.join(directory, "owner.json"));
+    storedClaim = readJson(claimed.claimFile);
+  } catch {
+    fail("attempt_factory_occurrence_contended");
+  }
+  if (String(currentStat.dev) !== snapshot.dev ||
+      String(currentStat.ino) !== snapshot.ino ||
+      !sameLockOwner(currentOwner, snapshot.owner) ||
+      canonicalJson(storedClaim) !== canonicalJson(claimed.claim)) {
     fail("attempt_factory_occurrence_contended");
   }
   const stale = `${directory}.stale.${process.pid}.${crypto.randomUUID()}`;
@@ -339,10 +431,18 @@ function freshnessBinding(snapshot) {
     kill_switch_identity: snapshot.kill_switch.identity,
   };
 }
+function hostEffectVerified(stateRoot, attemptId) {
+  const journal = path.join(stateRoot, "journals", `${attemptId}.json`);
+  if (!fs.existsSync(journal)) return false;
+  const value = readJson(journal);
+  return Array.isArray(value.entries) &&
+    value.entries.at(-1)?.phase === "verify";
+}
 
 export function composeAttempt({
-  config, freshness, identities, releaseDigest,
+  config, freshness, identities, releaseDigest, at,
 }) {
+  if (!strictUtc(at)) fail("attempt_factory_watch_unreachable");
   const execution = deriveDebianAutonomyExecution({
     plan: freshness.plan, policy: freshness.policy, target: config.target,
     inventory: freshness.inventory, adapterRevisionDigest: releaseDigest,
@@ -370,8 +470,8 @@ export function composeAttempt({
     Date.parse(freshness.window.end),
     Date.parse(freshness.observed_at) + config.deadline_seconds * 1000,
   )).toISOString().replace(".000Z", "Z");
-  if (Date.parse(deadline) - Date.parse(freshness.observed_at) <
-      config.watch_seconds * 1000) {
+  if (Date.parse(deadline) - Date.parse(at) <
+      (APPLY_VERIFY_BUDGET_SECONDS + config.watch_seconds) * 1000) {
     fail("attempt_factory_watch_unreachable");
   }
   const binding = {
@@ -814,13 +914,14 @@ export function runDebianMaintenanceAttemptFactory({
       proposal = readJson(proposalFile);
       const expected = composeAttempt({
         config, freshness: proposal.evidence, identities, releaseDigest,
+        at: proposal.evidence.observed_at,
       });
       if (canonicalJson(expected) !== canonicalJson(proposal)) {
         fail("attempt_factory_occurrence_conflict");
       }
     } else {
       proposal = composeAttempt({
-        config, freshness: fresh, identities, releaseDigest,
+        config, freshness: fresh, identities, releaseDigest, at,
       });
       proposal = atomicCreate(proposalFile, proposal);
       fault("after-occurrence-persist");
@@ -832,6 +933,11 @@ export function runDebianMaintenanceAttemptFactory({
     if (canonicalJson(freshnessBinding(beforeEffect)) !==
         canonicalJson(freshnessBinding(proposal.evidence))) {
       fail("attempt_factory_freshness_drifted");
+    }
+    if (!hostEffectVerified(stateRoot, proposal.binding.attempt_id) &&
+        Date.parse(proposal.binding.deadline) - Date.parse(effectAt) <
+          (APPLY_VERIFY_BUDGET_SECONDS + config.watch_seconds) * 1000) {
+      fail("attempt_factory_watch_unreachable");
     }
     fault("before-run-attempt");
     const options = buildRunOptions === null ?

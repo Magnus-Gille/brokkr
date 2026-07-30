@@ -439,6 +439,7 @@ function validateRequest(request, registration, action) {
   if (!exactKeys(fence, ["kind", "schema_version", "domain", "target_scope_digest", "attempt_id", "mutation_id", "binding_digest", "epoch", "holder_token", "activated_at", "expires_at"]) ||
     fence.kind !== "brokkr-effect-lease-fence" || fence.schema_version !== "v1" || fence.domain !== "no-reboot-security-bugfix-maintenance" ||
     !DIGEST.test(fence.target_scope_digest) || fence.attempt_id !== request.attempt_id || !ID.test(fence.mutation_id) ||
+    (requestV2 && fence.mutation_id !== request.binding.mutation_id) ||
     fence.binding_digest !== request.binding_digest || !Number.isSafeInteger(fence.epoch) || fence.epoch < 1 ||
     typeof fence.holder_token !== "string" || fence.holder_token.length < 16 || !iso(fence.activated_at) || !iso(fence.expires_at) ||
     Date.parse(fence.activated_at) > Date.parse(fence.expires_at)) fail(code);

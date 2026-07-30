@@ -24,7 +24,8 @@ Every evaluation reads a fresh record covering liveness, eligibility, kill
 switch, hold, exact policy, canonical window, fixed target, plan, inventory
 baseline, expected postconditions, and apt-source evidence. Unavailable,
 unknown, stale, held, killed, ineligible, or non-due evidence creates no
-occurrence.
+occurrence. `observed_at` may be at most 300 seconds old even when
+`valid_until` is later.
 
 For a due record, the occurrence key is exactly the canonical SHA-256 of
 `policy_digest + target_scope_digest + window.start`. Under an exclusive
@@ -32,6 +33,10 @@ occurrence lock this maps to deterministic attempt, mutation, recovery-disarm,
 and idempotency identities. The complete proposal is atomically persisted
 before dispatch. A crash, persistent-timer retry, or duplicate invocation
 therefore resumes the same proposal; it cannot mint another identity set.
+Stale-lock takeover first wins an immutable hard-link claim for the exact
+owner and directory inode generation, then revalidates both immediately before
+rename. Competing reclaimers cannot rename a winner's replacement lock; a
+crashed reclaimer is superseded through another atomically claimed generation.
 
 Immediately before W2 effect, the factory re-reads the protected freshness
 record. Policy, target, window, and kill-switch identity must still match and
@@ -74,9 +79,11 @@ target, package set, unit, or replacement proposal.
 The ceremony configuration fixes `watch_seconds` to 3600 and
 `deadline_seconds` to 4200. The binding deadline is the earlier of the
 canonical window end or 4200 seconds after the freshness observation; the
-factory refuses an attempt unless at least the full constitutional watch hour
-remains. W2's durable watch anchor, retry, recovery, quarantine, and disarm
-machinery remains authoritative.
+factory refuses a new or not-yet-applied attempt unless 300 seconds of
+apply/verify budget plus the full 3600-second constitutional watch remain at
+the current pre-effect time. An already verified effect may resume its durable
+watch without pretending it needs another apply budget. W2's durable watch
+anchor, retry, recovery, quarantine, and disarm machinery remains authoritative.
 
 ## Release closure
 

@@ -130,5 +130,7 @@ attempt, mutation, disarm, target, candidate, postcondition, worker, package,
 restart, and budget claims—but no `binding_digest`. Its digest is then included
 in the full W2 binding; that binding is digested and included with its complete
 value in the host request. The adapter recomputes both digests and every exact
-echo before effect. Legacy v1 request/descriptor pairs remain readable for
-already-installed canaries, but the attempt factory never emits them.
+echo before effect, including equality between the v2 binding's mutation
+identity and the lease fence's mutation identity. Legacy v1 request/descriptor
+pairs remain readable for already-installed canaries, but the attempt factory
+never emits them.

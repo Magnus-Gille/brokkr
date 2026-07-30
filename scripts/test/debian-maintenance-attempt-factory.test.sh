@@ -7,6 +7,7 @@ ROOT="$ROOT" TMP="$TMP" node --input-type=module <<'NODE'
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 const {
   canonicalJson, composeAttempt, digest, occurrenceIdentity,
   runDebianMaintenanceAttemptFactory,
@@ -106,6 +107,7 @@ const identities = {
 };
 const proposal = composeAttempt({
   config, freshness: fresh, identities, releaseDigest,
+  at: "2026-07-30T18:00:00Z",
 });
 assert.equal(proposal.binding_digest, digest(proposal.binding));
 assert.equal(
@@ -170,6 +172,24 @@ assert.deepEqual(noAttempt, {
 });
 assert.equal(fs.existsSync(`${process.env.TMP}/stale/occurrences`), false);
 
+const oldButValid = structuredClone(fresh);
+oldButValid.observed_at = "2026-07-30T17:50:00Z";
+oldButValid.valid_until = "2026-07-30T18:15:00Z";
+let oldSnapshotRuns = 0;
+const oldSnapshotAttempt = runDebianMaintenanceAttemptFactory({
+  ...base, stateRoot: `${process.env.TMP}/old-but-valid`,
+  readFreshness: () => structuredClone(oldButValid),
+  runAttempt: () => {
+    oldSnapshotRuns += 1;
+    return { reason: "unexpected" };
+  },
+});
+assert.deepEqual(oldSnapshotAttempt, {
+  outcome: "no-attempt", reason: "attempt_factory_freshness_ineligible",
+});
+assert.equal(oldSnapshotRuns, 0,
+  "an old snapshot fails closed even while valid_until is in the future");
+
 const notDue = structuredClone(fresh);
 notDue.window.due = false;
 const noWindowAttempt = runDebianMaintenanceAttemptFactory({
@@ -180,6 +200,26 @@ assert.deepEqual(noWindowAttempt, {
   outcome: "no-attempt", reason: "attempt_factory_freshness_ineligible",
 });
 assert.equal(fs.existsSync(`${process.env.TMP}/not-due/occurrences`), false);
+
+let budgetClockReads = 0;
+let budgetRuns = 0;
+const refreshedAtEffect = structuredClone(fresh);
+refreshedAtEffect.observed_at = "2026-07-30T18:05:00Z";
+refreshedAtEffect.valid_until = "2026-07-30T18:10:00Z";
+assert.throws(() => runDebianMaintenanceAttemptFactory({
+  ...base, stateRoot: `${process.env.TMP}/spent-budget`,
+  now: () => budgetClockReads++ === 0 ?
+    "2026-07-30T18:00:00Z" : "2026-07-30T18:05:01Z",
+  readFreshness: () => structuredClone(
+    budgetClockReads <= 1 ? fresh : refreshedAtEffect,
+  ),
+  runAttempt: () => {
+    budgetRuns += 1;
+    return { reason: "unexpected" };
+  },
+}), /attempt_factory_watch_unreachable/);
+assert.equal(budgetRuns, 0,
+  "spent apply/verify budget fails closed before an effect");
 
 let reads = 0;
 const drifted = structuredClone(fresh);
@@ -213,6 +253,92 @@ const recoveredLock = runDebianMaintenanceAttemptFactory({
 assert.equal(recoveredLock.attempt_id, first.attempt_id);
 assert.equal(fs.existsSync(crashedLock), false,
   "a crash residue owned by a departed process is recovered");
+
+const reclaimRaceRoot = `${process.env.TMP}/reclaim-race`;
+const reclaimRaceLock =
+  `${reclaimRaceRoot}/occurrences/${proposalName}.json.lock`;
+const reclaimReady = `${process.env.TMP}/reclaim-ready`;
+const reclaimEffect = `${process.env.TMP}/reclaim-effect`;
+fs.mkdirSync(reclaimRaceLock, { recursive: true, mode: 0o700 });
+fs.writeFileSync(`${reclaimRaceLock}/owner.json`, `${canonicalJson({
+  kind: "brokkr-attempt-factory-lock", schema_version: "v1",
+  pid: 2147483647, process_start_time: digest("departed-race-owner"),
+})}\n`, { mode: 0o600 });
+const raceBundleFile = `${process.env.TMP}/reclaim-race-input.json`;
+fs.writeFileSync(raceBundleFile, `${canonicalJson({
+  stateRoot: reclaimRaceRoot, releaseDigest, config, fresh,
+  readyDir: reclaimReady, effectFile: reclaimEffect,
+})}\n`, { mode: 0o600 });
+const raceWorker = String.raw`
+  import fs from "node:fs";
+  const [moduleFile, bundleFile] = process.argv.slice(1);
+  const { runDebianMaintenanceAttemptFactory } = await import(moduleFile);
+  const bundle = JSON.parse(fs.readFileSync(bundleFile));
+  const wait = milliseconds => Atomics.wait(
+    new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds,
+  );
+  fs.mkdirSync(bundle.readyDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(bundle.readyDir + "/" + process.pid, "", {
+    flag: "wx", mode: 0o600,
+  });
+  const readyDeadline = Date.now() + 5_000;
+  while (fs.readdirSync(bundle.readyDir).length < 2) {
+    if (Date.now() >= readyDeadline) throw Error("worker_barrier_timeout");
+    wait(10);
+  }
+  try {
+    const result = runDebianMaintenanceAttemptFactory({
+      stateRoot: bundle.stateRoot,
+      releaseDigest: bundle.releaseDigest,
+      readConfiguration: () => structuredClone(bundle.config),
+      readFreshness: () => structuredClone(bundle.fresh),
+      now: () => "2026-07-30T18:00:01Z",
+      runAttempt: () => {
+        fs.writeFileSync(bundle.effectFile, String(process.pid), {
+          flag: "wx", mode: 0o600,
+        });
+        wait(750);
+        return { reason: "watching" };
+      },
+      buildRunOptions: (stored, freshness) => ({
+        proposal: stored, freshness,
+      }),
+    });
+    process.stdout.write(JSON.stringify({ outcome: result.outcome }));
+  } catch (error) {
+    process.stdout.write(JSON.stringify({
+      error: String(error?.code ?? error?.message),
+    }));
+    process.exitCode = 2;
+  }
+`;
+const runRaceWorker = () => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, [
+    "--input-type=module", "-e", raceWorker,
+    `${process.env.ROOT}/scripts/lib/debian-maintenance-attempt-factory.mjs`,
+    raceBundleFile,
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", chunk => { stdout += chunk; });
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  child.on("error", reject);
+  child.on("close", status => resolve({
+    status, stdout, stderr,
+  }));
+});
+const reclaimResults = await Promise.all([
+  runRaceWorker(), runRaceWorker(),
+]);
+assert.deepEqual(reclaimResults.map(result => result.status).sort(), [0, 2],
+  JSON.stringify(reclaimResults));
+const reclaimOutputs = reclaimResults.map(result =>
+  JSON.parse(result.stdout));
+assert.equal(reclaimOutputs.filter(result =>
+  result.outcome === "attempt-dispatched").length, 1);
+assert.equal(reclaimOutputs.filter(result =>
+  result.error === "attempt_factory_occurrence_contended").length, 1);
+assert.equal(fs.readFileSync(reclaimEffect, "utf8").length > 0, true);
 
 const tampered = structuredClone(proposal);
 tampered.request.recovery_descriptor.packages = ["curl"];

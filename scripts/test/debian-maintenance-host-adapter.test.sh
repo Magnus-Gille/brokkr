@@ -248,6 +248,20 @@ const v2Result = adapter.runHostAdapter({
   env: v2Scenario.env,
 });
 assert.equal(v2Result.outcome, "applied");
+const v2FenceMutationMismatch = structuredClone(v2);
+v2FenceMutationMismatch.lease_fence.mutation_id = "mutation-elsewhere";
+v2FenceMutationMismatch.lease_fence_digest =
+  digest(v2FenceMutationMismatch.lease_fence);
+const v2FenceMutationRegistration = {
+  ...structuredClone(v2Registration),
+  lease_fence_digest: v2FenceMutationMismatch.lease_fence_digest,
+};
+assert.throws(() => adapter.runHostAdapter({
+  action: "apply", request: v2FenceMutationMismatch,
+  registration: v2FenceMutationRegistration,
+  env: isolatedEnvironment({ readJournal: () => null }).env,
+}), /host_fence_invalid/,
+  "a recomputed fence digest cannot hide a mutation identity mismatch");
 const v2Cycle = structuredClone(v2);
 v2Cycle.recovery_descriptor.binding_digest = v2Cycle.binding_digest;
 v2Cycle.recovery_descriptor_digest = digest(v2Cycle.recovery_descriptor);
