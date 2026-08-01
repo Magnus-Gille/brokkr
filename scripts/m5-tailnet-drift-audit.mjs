@@ -9,8 +9,6 @@ const MANAGED_TAGS = new Set([
   "tag:m5-gateway-client",
   "tag:m5-whisper-client",
   "tag:m5-runtime-client",
-  "tag:ordinary-client",
-  "tag:guest-client",
 ]);
 const ROLE_TAG = new Map([
   ["m5-server", "tag:m5-server"],
@@ -18,6 +16,11 @@ const ROLE_TAG = new Map([
   ["m5-gateway-client", "tag:m5-gateway-client"],
   ["m5-whisper-client", "tag:m5-whisper-client"],
   ["m5-runtime-client", "tag:m5-runtime-client"],
+]);
+const USER_ROLES = new Set([
+  "m5-operator",
+  "m5-ordinary-deny-probe",
+  "m5-guest-deny-probe",
 ]);
 
 function fail(code) {
@@ -74,8 +77,8 @@ function sortedUnique(values) {
 function validateBindings(manifest) {
   if (manifest?.schema_version !== "v1" || !Array.isArray(manifest.bindings)) fail("bindings_invalid");
   const ids = new Set();
+  const addresses = new Set();
   const roleCounts = new Map();
-  let operatorId = null;
   for (const binding of manifest.bindings) {
     if (!binding || typeof binding.stable_id !== "string" || !binding.stable_id || ids.has(binding.stable_id)) fail("bindings_invalid");
     ids.add(binding.stable_id);
@@ -83,24 +86,25 @@ function validateBindings(manifest) {
     const managedTags = sortedUnique(binding.managed_tags);
     if (!roles || !managedTags) fail("bindings_invalid");
     for (const role of roles) {
-      if (role !== "m5-operator" && !ROLE_TAG.has(role)) fail("bindings_invalid");
+      if (!USER_ROLES.has(role) && !ROLE_TAG.has(role)) fail("bindings_invalid");
       roleCounts.set(role, (roleCounts.get(role) ?? 0) + 1);
     }
     const expectedTags = roles.filter((role) => ROLE_TAG.has(role)).map((role) => ROLE_TAG.get(role)).sort();
     if (canonical(managedTags) !== canonical(expectedTags)) fail("bindings_invalid");
-    if (roles.includes("m5-operator")) {
-      if (binding.identity_kind !== "user" || roles.length !== 1 || managedTags.length !== 0 || operatorId !== null) fail("bindings_invalid");
+    const userRoles = roles.filter((role) => USER_ROLES.has(role));
+    if (userRoles.length > 0) {
+      if (binding.identity_kind !== "user" || roles.length !== 1 || managedTags.length !== 0) fail("bindings_invalid");
       if (typeof binding.observed_user !== "string" || !binding.observed_user) fail("bindings_invalid");
-      if (typeof binding.operator_address !== "string" || net.isIP(binding.operator_address) === 0) fail("bindings_invalid");
-      operatorId = binding.stable_id;
-    } else if (binding.identity_kind !== "tagged" || binding.operator_address !== undefined) {
+      if (typeof binding.address !== "string" || net.isIP(binding.address) === 0 || addresses.has(binding.address)) fail("bindings_invalid");
+      addresses.add(binding.address);
+    } else if (binding.identity_kind !== "tagged" || binding.address !== undefined || binding.observed_user !== undefined) {
       fail("bindings_invalid");
     }
   }
-  for (const role of ["m5-operator", ...ROLE_TAG.keys()]) if (roleCounts.get(role) !== 1) fail("bindings_invalid");
+  for (const role of [...USER_ROLES, ...ROLE_TAG.keys()]) if (roleCounts.get(role) !== 1) fail("bindings_invalid");
   const server = manifest.bindings.find((binding) => binding.roles.includes("m5-server"))?.stable_id;
   const inference = manifest.bindings.find((binding) => binding.roles.includes("m5-inference"))?.stable_id;
-  if (!server || server !== inference || operatorId === null) fail("bindings_invalid");
+  if (!server || server !== inference) fail("bindings_invalid");
   return manifest;
 }
 
@@ -136,8 +140,11 @@ function bindingsMatch(manifest, devices) {
     const actualManaged = sortedUnique((Array.isArray(device.tags) ? device.tags : []).filter((tag) => MANAGED_TAGS.has(tag)));
     if (!actualManaged || canonical(actualManaged) !== canonical([...binding.managed_tags].sort())) return false;
     if (binding.identity_kind === "user") {
+      if (!Array.isArray(device.tags) || device.tags.length !== 0) return false;
       if (String(device.user ?? "") !== binding.observed_user) return false;
-      if (!Array.isArray(device.addresses) || !device.addresses.includes(binding.operator_address)) return false;
+      if (!Array.isArray(device.addresses) || !device.addresses.includes(binding.address)) return false;
+      const addressOwners = devices.filter((candidate) => Array.isArray(candidate?.addresses) && candidate.addresses.includes(binding.address));
+      if (addressOwners.length !== 1 || String(addressOwners[0]?.id ?? "") !== binding.stable_id) return false;
     }
   }
   for (const device of devices) {

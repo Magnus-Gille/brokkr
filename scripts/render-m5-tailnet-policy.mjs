@@ -2,6 +2,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
+import crypto from "node:crypto";
+
+const TRACKED_FRAGMENT_SHA256 = "1d0f253f028ad9474835d9dbb35b19cb946ed6b56074343ae6ffbdbef65e39dd";
 
 function fail(code) {
   process.stderr.write(`${JSON.stringify({ schema_version: "v1", outcome: "error", error: code })}\n`);
@@ -36,6 +39,23 @@ const ROLE_TAG = new Map([
   ["m5-whisper-client", "tag:m5-whisper-client"],
   ["m5-runtime-client", "tag:m5-runtime-client"],
 ]);
+const USER_ROLE_HOST = new Map([
+  ["m5-operator", ["m5-operator-device", "__BROKKR_OPERATOR_ADDRESS__"]],
+  ["m5-ordinary-deny-probe", ["m5-ordinary-deny-probe", "__BROKKR_ORDINARY_DENY_PROBE_ADDRESS__"]],
+  ["m5-guest-deny-probe", ["m5-guest-deny-probe", "__BROKKR_GUEST_DENY_PROBE_ADDRESS__"]],
+]);
+
+function ordered(value) {
+  if (Array.isArray(value)) return value.map(ordered);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, ordered(value[key])]));
+  }
+  return value;
+}
+
+function canonical(value) {
+  return JSON.stringify(ordered(value));
+}
 
 function sortedUnique(values) {
   if (!Array.isArray(values) || values.some((value) => typeof value !== "string")) return null;
@@ -46,6 +66,7 @@ function sortedUnique(values) {
 function validBindings(manifest) {
   if (manifest?.schema_version !== "v1" || !Array.isArray(manifest.bindings)) return false;
   const ids = new Set();
+  const addresses = new Set();
   const roleCounts = new Map();
   let serverId = null;
   let inferenceId = null;
@@ -56,22 +77,24 @@ function validBindings(manifest) {
     const managedTags = sortedUnique(binding.managed_tags);
     if (!roles || !managedTags) return false;
     for (const role of roles) {
-      if (role !== "m5-operator" && !ROLE_TAG.has(role)) return false;
+      if (!USER_ROLE_HOST.has(role) && !ROLE_TAG.has(role)) return false;
       roleCounts.set(role, (roleCounts.get(role) ?? 0) + 1);
     }
     const expectedTags = roles.filter((role) => ROLE_TAG.has(role)).map((role) => ROLE_TAG.get(role)).sort();
     if (JSON.stringify(managedTags) !== JSON.stringify(expectedTags)) return false;
-    if (roles.includes("m5-operator")) {
+    const userRoles = roles.filter((role) => USER_ROLE_HOST.has(role));
+    if (userRoles.length > 0) {
       if (binding.identity_kind !== "user" || roles.length !== 1 || managedTags.length !== 0) return false;
       if (typeof binding.observed_user !== "string" || !binding.observed_user) return false;
-      if (typeof binding.operator_address !== "string" || net.isIP(binding.operator_address) === 0) return false;
-    } else if (binding.identity_kind !== "tagged" || binding.operator_address !== undefined) {
+      if (typeof binding.address !== "string" || net.isIP(binding.address) === 0 || addresses.has(binding.address)) return false;
+      addresses.add(binding.address);
+    } else if (binding.identity_kind !== "tagged" || binding.address !== undefined || binding.observed_user !== undefined) {
       return false;
     }
     if (roles.includes("m5-server")) serverId = binding.stable_id;
     if (roles.includes("m5-inference")) inferenceId = binding.stable_id;
   }
-  for (const role of ["m5-operator", ...ROLE_TAG.keys()]) if (roleCounts.get(role) !== 1) return false;
+  for (const role of [...USER_ROLE_HOST.keys(), ...ROLE_TAG.keys()]) if (roleCounts.get(role) !== 1) return false;
   return serverId !== null && serverId === inferenceId;
 }
 
@@ -84,12 +107,15 @@ if (!templatePath || !bindingsPath || !outputPath || args.size !== 3) fail("inva
 const template = readJson(templatePath, false);
 const bindings = readJson(bindingsPath, true);
 if (!validBindings(bindings)) fail("bindings_invalid");
-const operator = bindings.bindings.find((binding) => binding.roles.includes("m5-operator"));
-if (JSON.stringify(template.hosts) !== JSON.stringify({ "m5-operator-device": "__BROKKR_OPERATOR_ADDRESS__" })) {
+const fragmentDigest = crypto.createHash("sha256").update(canonical(template)).digest("hex");
+if (fragmentDigest !== TRACKED_FRAGMENT_SHA256) {
   fail("template_invalid");
 }
-template.hosts["m5-operator-device"] = operator.operator_address;
-if (JSON.stringify(template).includes("__BROKKR_OPERATOR_ADDRESS__")) fail("template_invalid");
+for (const [role, [host, marker]] of USER_ROLE_HOST) {
+  if (template.hosts?.[host] !== marker) fail("template_invalid");
+  template.hosts[host] = bindings.bindings.find((binding) => binding.roles.includes(role)).address;
+}
+if (JSON.stringify(template).includes("__BROKKR_")) fail("template_invalid");
 
 const output = path.resolve(outputPath);
 let descriptor;

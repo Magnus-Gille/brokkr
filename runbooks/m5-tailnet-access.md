@@ -6,16 +6,20 @@ step. Do not apply the policy, change tags, enable or disable approval, approve 
 device, or change the M5 host firewall from an unattended session.
 
 The tracked policy is intentionally free of account identities and network
-locators. It contains a non-live operator-address marker and role tags for
-non-human service machines. `scripts/render-m5-tailnet-policy.mjs` replaces that
-marker from an owner-only role-binding manifest and writes a new mode-0600
-candidate without printing the address or user binding. Strict JSON is also
-valid HuJSON.
+locators. It contains non-live address markers for the operator workstation and
+two exact, untagged deny-probe devices, plus role tags for non-human service
+machines. `scripts/render-m5-tailnet-policy.mjs` replaces all three markers from
+an owner-only role-binding manifest and writes a new mode-0600 candidate without
+printing addresses or user bindings. The renderer pins the canonical digest of
+the entire tracked security fragment and rejects any altered or broadened
+template. Strict JSON is also valid HuJSON.
 
 The rendered file is a minimal standalone example and a mergeable fragment; if
 the tailnet already has policy, merge its `hosts`, `tagOwners`,
 `grants`, `tests`, `ssh`, and `sshTests` entries into an owner-only complete
-candidate. Never replace unrelated policy blindly. The owner-only merged
+candidate. Never replace unrelated policy blindly. Do not pass the complete
+merged policy back through the fragment renderer: its digest pin deliberately
+accepts only the tracked fragment. The owner-only merged
 candidate, not the tracked template, is the expected input to the drift audit.
 
 Current Tailscale grants are deny-by-default, but a newly created tailnet retains
@@ -28,6 +32,7 @@ Primary references:
 
 - [Grant syntax and deny-by-default evaluation](https://tailscale.com/docs/reference/syntax/grants)
 - [Policy tags, tests, and SSH tests](https://tailscale.com/docs/reference/syntax/policy-file)
+- [Targets, exact IP selectors, and host aliases](https://tailscale.com/docs/reference/targets-and-selectors)
 - [Device tags](https://tailscale.com/docs/features/tags)
 - [Default allow-all policy warning](https://tailscale.com/docs/reference/examples/acls)
 - [Device approval and manual approval](https://tailscale.com/docs/features/access-control/device-management/device-approval)
@@ -50,9 +55,10 @@ Sources receive only the role they require:
 - `tag:m5-gateway-client` reaches only TCP 8080.
 - `tag:m5-whisper-client` reaches only TCP 8092.
 - `tag:m5-runtime-client` reaches only TCP 8091.
-- Ordinary and guest identities receive no grant. `tag:ordinary-client` and
-  `tag:guest-client` exist only to make this denial executable in policy tests;
-  do not assign them merely to obtain access.
+- `m5-ordinary-deny-probe` is the private exact-address selector for one
+  user-authenticated, untagged ordinary phone and receives no grant.
+- `m5-guest-deny-probe` is the private exact-address selector for one
+  user-authenticated, untagged guest/shared device and receives no grant.
 
 Do not tag the operator laptop or another end-user device. Tailscale's current
 tag guidance says tags are service identities for non-human machines; applying a
@@ -60,9 +66,12 @@ tag removes user authentication, and Tailscale explicitly advises against tags
 for laptops and phones. The private exact-address binding preserves the laptop's
 user identity and uses only the all-plan host-selector policy syntax. Owner
 phones may share the user identity, but they have different device addresses and
-therefore receive no operator grant. The drift audit binds the rendered address
-to the expected stable device and observed user; an address moved to a phone is
-drift.
+therefore receive no operator grant. The two denial tests use real untagged
+device selectors, not service tags: tagged devices lose user identity and would
+not exercise grants addressed to users, groups, or `autogroup:member`. The drift
+audit binds every rendered user selector to its expected stable device, observed
+user, exact address, and empty tag list; an address or identity moved to another
+device is drift.
 
 The policy intentionally leaves Tailscale SSH disabled with an empty `ssh`
 section and a denial regression. TCP 22 is for the M5 host's existing normal
@@ -84,16 +93,18 @@ bash scripts/test/m5-tailnet-policy.test.sh
 ```
 
 This proves the tracked policy has the exact role-to-port matrix, wildcard-free
-grants, default-deny ordinary/guest cases, and a Tailscale SSH denial. It does not
-prove the live control plane matches.
+grants, exact untagged ordinary/guest denial selectors, all-five-path denials,
+and Tailscale SSH denials. It also proves the renderer rejects an altered tracked
+fragment. It does not prove the live control plane matches.
 
 Create a mode-0600, current-user-owned, regular, non-symlink role-binding
-manifest. It contains one binding per allowed device. Each binding records a
+manifest. It contains one binding per managed device. Each binding records a
 stable API device identifier, identity kind, exact roles, and exact managed tags.
-The operator binding also records the API's observed user value and one exact
-operator address. The five service roles each occur exactly once; the M5 server
-and inference roles must resolve to the same device. Keep this file outside the
-repository.
+The operator, ordinary-phone deny probe, and guest/shared deny probe each use a
+single distinct `user` binding with `observed_user`, one exact `address`, and an
+empty `managed_tags` list. The service bindings use `tagged` identity. Every role
+occurs exactly once; the M5 server and inference roles must resolve to the same
+device. Keep this file outside the repository.
 
 Render the public template without exposing the binding:
 
@@ -108,16 +119,21 @@ The renderer refuses a loose-mode, wrong-owner, or symlinked binding and refuses
 to overwrite an output. Merge the rendered entries with the current complete
 policy, preserving unrelated least-privilege rules and tests. Keep the final
 complete candidate mode 0600.
-Review every existing grant: because grants combine as a union, a broader grant
-can still authorize an M5 path even when this fragment is narrow. Store the
-candidate and the prior complete policy in an owner-only mode-0600 directory.
+Tailscale evaluates the complete policy as a union, so do not infer an effective
+deny from this fragment alone. Store the candidate and the prior complete policy
+in an owner-only mode-0600 directory.
 Record their cryptographic digests, never their contents, in public evidence.
 
 Use the admin console policy editor's preview and the official
 `POST /api/v2/tailnet/:tailnet/acl/validate` endpoint to validate the complete
-candidate without applying it. Confirm every embedded test passes. This API
-validation cannot happen from the public template because its private operator
-selector is deliberately absent, and it was not run in this unattended session.
+candidate without applying it. Confirm the exact rendered ordinary and guest
+deny-probe tests, all five port denials for each, and all three Tailscale SSH
+denials pass alongside every pre-existing test. Rely on this official validation
+of the complete candidate rather than attempting to reproduce Tailscale's union
+semantics locally. This API
+validation cannot happen from the public template because its three private
+device selectors are deliberately absent, and it was not run in this unattended
+session.
 A successful owner-attended validation receipt is a mandatory live acceptance
 gate, not authorization to apply.
 
@@ -129,11 +145,12 @@ Do not start without all of the following:
 2. Two independent, currently working admin-console sessions.
 3. The exact prior complete policy stored owner-only and its digest recorded.
 4. The Configuration logs page open to the current policy revision.
-5. The operator workstation, each required service client, one ordinary phone,
-   and one guest/shared test identity available for probes.
+5. The operator workstation, each required service client, the exact untagged
+   ordinary phone deny probe, and the exact untagged guest/shared deny probe
+   available for validation and probes.
 6. The reviewed role-binding manifest. It maps every managed source role to its
-   stable device and maps the M5 node to both destination roles. No managed role
-   tag may appear on an unbound device.
+   stable device and maps the M5 node to both destination roles. The three user
+   devices must have no tags; no managed role tag may appear on an unbound device.
 
 Do not create an automatic approval webhook or a reusable pre-approved key for
 this rollout. Recovery remains a manual identity-verification path.
@@ -147,13 +164,13 @@ With the owner present:
    traffic. Do not approve it for this test.
 2. Review each existing device in the admin console. Approve only the devices
    mapped in the owner-only plan. Assign both M5 destination tags and only the
-   required source tag to each non-human service client. Ordinary phones and
-   guests stay untagged.
-3. Keep the operator workstation user-authenticated. Match its stable identifier,
-   observed user, and exact address against the reviewed binding and rendered
-   host selector. Prove no owner's phone or guest has that address. If the
-   address changed, stop and render, review, and validate a new candidate before
-   continuing.
+   required source tag to each non-human service client. The exact ordinary and
+   guest deny probes stay user-authenticated and have no tags.
+3. Keep all three human devices user-authenticated. Match each stable identifier,
+   observed user, exact address, and empty tag list against the reviewed binding
+   and rendered host selector. Prove each address belongs only to its bound
+   device. If any address, user, or tag state changed, stop and render, review,
+   and validate a new candidate before continuing.
 4. Re-run policy validation against the owner-only complete candidate after tag
    assignment. Confirm all built-in tests pass.
 5. Apply the complete candidate from the admin console. Keep the old policy,
@@ -170,8 +187,9 @@ workstation, prove normal OpenSSH, authenticated SMB over TCP 445, and the
 gateway on TCP 8080 work. Prove direct Whisper and runtime connections fail.
 
 From each tagged service identity, prove its one permitted endpoint works and
-that SSH, Samba, and the other inference endpoints fail. From the ordinary phone
-and guest/shared identity, prove all five endpoints fail. A TSMP ping does not
+that SSH, Samba, and the other inference endpoints fail. From the exactly bound,
+untagged ordinary phone and guest/shared device, prove all five endpoints fail.
+A TSMP ping does not
 exercise access policy; use ICMP or real TCP probes as described in the official
 policy debugging documentation. Sanitize probe evidence to outcomes and role
 names before posting publicly.
@@ -184,14 +202,15 @@ test device after evidence capture; do not approve it merely to clean the queue.
 
 `scripts/m5-tailnet-drift-audit.mjs` reads complete policy, settings, and devices.
 It compares every managed role tag to the exact stable-device binding and binds
-the rendered operator address to the expected stable device and API user value.
-A role or address moved to another device is drift even when aggregate counts are
-unchanged. It emits only booleans and the aggregate pending-approval count. It
+all three rendered user addresses to their expected stable devices and API user
+values, requiring an empty tag list for each. A role, identity, or address moved
+to another device is drift even when aggregate counts are unchanged. It emits
+only booleans and the aggregate pending-approval count. It
 never emits response bodies, stable identifiers, tags, account identities,
 network locators, or request URLs.
 
 Use a short-lived trust credential restricted to the official read scopes:
-`policy_file:read` plus its documented prerequisite read scopes,
+`policy_file:read`, its explicit `devices:posture_attributes:read` prerequisite,
 `devices:core:read`, and `feature_settings:read`. Do not use a full-access API
 credential. Acquire the
 bearer value through the owner's approved credential flow and keep both it and
