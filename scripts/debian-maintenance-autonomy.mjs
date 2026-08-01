@@ -4,6 +4,8 @@
 // owner attestation, recovery keys, and the protected narrowing tail.
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
+import { performance } from "node:perf_hooks";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -63,12 +65,84 @@ const exactKeys = (value, keys) => (
 const sha256 = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const LOCK_TICKET_FILE = /^(\d+)\.json$/;
 const LOCK_TICKET_DONE_FILE = /^(\d+)\.done$/;
+const LOCK_TICKET_IMMUTABLE_CHECKPOINT_FILE = /^checkpoint\.(\d+)\.json$/;
 const LOCK_TICKET_TMP_FILE =
-  /^((?:\d+\.json)|(?:\d+\.done)|(?:checkpoint\.json))\.(\d+)\.([0-9a-f-]{36})\.tmp$/;
+  /^((?:\d+\.json)|(?:\d+\.done)|(?:checkpoint(?:\.\d+)?\.json))\.(\d+)(?:\.([a-f0-9]{16}))?\.([0-9a-f-]{36})\.tmp$/;
 const LOCK_TICKET_CHECKPOINT = "checkpoint.json";
 const LOCK_TICKET_COMPACTION_THRESHOLD = 256;
 const LOCK_TICKET_ACQUIRE_RETRIES = 8;
+const LOCK_TICKET_LIVE_HARD_LIMIT = LOCK_TICKET_COMPACTION_THRESHOLD;
 const LOCK_TICKET_TMP_HARD_LIMIT = 64;
+const LOCK_TICKET_OWNER_STAMP_HEX = 16;
+const testLockOwnerProbe = () => globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ ?? null;
+const parsePositiveInteger = value => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+};
+const readLinuxProcessStartTime = pid => {
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = raw.lastIndexOf(")");
+    if (close < 0) return null;
+    const fields = raw.slice(close + 2).trim().split(/\s+/);
+    const startTime = fields[19];
+    return /^\d+$/.test(startTime) ? `linux-start:${startTime}` : null;
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error?.code)) return null;
+    throw error;
+  }
+};
+const FALLBACK_BOOT_ID = (() => {
+  try {
+    return `boot-at:${new Date(
+      Math.floor(Date.now() - os.uptime() * 1000),
+    ).toISOString()}`;
+  } catch {
+    try { return `boot-id-unavailable:${os.hostname()}`; }
+    catch { return "boot-id-unavailable"; }
+  }
+})();
+const SYSTEM_BOOT_ID = (() => {
+  try {
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return bootId.length >= 1 ? bootId : FALLBACK_BOOT_ID;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return FALLBACK_BOOT_ID;
+  }
+})();
+const SELF_PROCESS_START_TIME =
+  readLinuxProcessStartTime(process.pid) ?? `time-origin:${Math.trunc(performance.timeOrigin)}`;
+const currentBootId = () => {
+  const value = testLockOwnerProbe()?.currentBootId?.();
+  return typeof value === "string" && value.length >= 1 ? value : SYSTEM_BOOT_ID;
+};
+const currentProcessStartTime = () => {
+  const value = testLockOwnerProbe()?.processStartTime?.(process.pid);
+  return typeof value === "string" && value.length >= 1 ? value : SELF_PROCESS_START_TIME;
+};
+const lockOwnerIdentityStamp = ({ boot_id, process_start_time }) =>
+  sha256(`${boot_id}\n${process_start_time}`).slice(0, LOCK_TICKET_OWNER_STAMP_HEX);
+const currentLockOwnerIdentity = () => ({
+  pid: process.pid,
+  boot_id: currentBootId(),
+  process_start_time: currentProcessStartTime(),
+});
+const readProcessStartTime = pid => {
+  const testValue = testLockOwnerProbe()?.processStartTime?.(pid);
+  if (testValue === null) return null;
+  if (typeof testValue === "string" && testValue.length >= 1) return testValue;
+  if (pid === process.pid) return currentProcessStartTime();
+  return readLinuxProcessStartTime(pid);
+};
+const readLiveOwnerStamp = pid => {
+  const processStartTime = readProcessStartTime(pid);
+  if (processStartTime === null) return null;
+  return lockOwnerIdentityStamp({
+    boot_id: currentBootId(),
+    process_start_time: processStartTime,
+  });
+};
 const boundedJson = file => {
   const raw = fs.readFileSync(file, "utf8");
   assert(Buffer.byteLength(raw) <= MAX_BYTES, "journal_too_large");
@@ -114,7 +188,9 @@ function createExclusive(file, value, options = {}) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const encoded = `${canonicalJson(value)}\n`;
   assert(Buffer.byteLength(encoded) <= MAX_BYTES, "journal_too_large");
-  const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  const temporary = `${file}.${process.pid}.${lockOwnerIdentityStamp(
+    currentLockOwnerIdentity(),
+  )}.${crypto.randomUUID()}.tmp`;
   const fd = fs.openSync(temporary, "wx", 0o600);
   publishFault(faultTag, "open");
   try {
@@ -144,8 +220,9 @@ const targetKey = binding => binding.target_scope_digest.slice("sha256:".length)
 const domainStateFile = journalDir => path.join(stateRoot(journalDir), "domain-state.json");
 const domainLockDir = journalDir => path.join(stateRoot(journalDir), "domain-state.lock");
 const lockTicketPrefix = sequence => String(sequence).padStart(8, "0");
-function readLockCheckpoint(tickets) {
-  const checkpoint = readOptional(path.join(tickets, LOCK_TICKET_CHECKPOINT));
+const lockTicketCheckpointFile = sequence => `checkpoint.${lockTicketPrefix(sequence)}.json`;
+function readLockCheckpointRecord(file, sequence = null) {
+  const checkpoint = readOptional(file);
   if (checkpoint === null) return null;
   assert(exactKeys(checkpoint, [
     "kind", "schema_version", "last_completed_sequence",
@@ -159,24 +236,78 @@ function readLockCheckpoint(tickets) {
     Number.isSafeInteger(checkpoint.next_sequence) &&
     checkpoint.next_sequence === checkpoint.last_completed_sequence + 1,
   "lock_checkpoint_invalid");
+  if (sequence !== null) {
+    assert(
+      checkpoint.last_completed_sequence === sequence &&
+      checkpoint.next_sequence === sequence + 1,
+      "lock_checkpoint_invalid",
+    );
+  }
   return checkpoint;
+}
+function selectLockCheckpoint(current, candidate) {
+  if (candidate === null) return current;
+  if (current === null) return candidate;
+  if (candidate.record.last_completed_sequence > current.record.last_completed_sequence) {
+    return candidate;
+  }
+  if (candidate.record.last_completed_sequence < current.record.last_completed_sequence) {
+    return current;
+  }
+  assert(
+    candidate.record.last_completed_token === current.record.last_completed_token,
+    "lock_checkpoint_conflict",
+  );
+  if (current.name === LOCK_TICKET_CHECKPOINT && candidate.name !== LOCK_TICKET_CHECKPOINT) {
+    return candidate;
+  }
+  return current;
+}
+function selectedLockCheckpoint(tickets) {
+  let selected = null;
+  for (const name of fs.readdirSync(tickets)) {
+    if (name === LOCK_TICKET_CHECKPOINT) {
+      const record = readLockCheckpointRecord(path.join(tickets, name));
+      if (record !== null) {
+        selected = selectLockCheckpoint(selected, { name, record });
+      }
+      continue;
+    }
+    const sequence = parsePositiveInteger(LOCK_TICKET_IMMUTABLE_CHECKPOINT_FILE.exec(name)?.[1]);
+    if (sequence === null) continue;
+    const record = readLockCheckpointRecord(path.join(tickets, name), sequence);
+    if (record !== null) {
+      selected = selectLockCheckpoint(selected, { name, record });
+    }
+  }
+  return selected;
+}
+function readLockCheckpoint(tickets) {
+  return selectedLockCheckpoint(tickets)?.record ?? null;
 }
 function lockTicketTemp(name) {
   if (!name.endsWith(".tmp")) return null;
   const match = LOCK_TICKET_TMP_FILE.exec(name);
-  assert(match, "lock_ticket_tmp_invalid");
-  const pid = Number.parseInt(match[2], 10);
-  assert(Number.isSafeInteger(pid) && pid > 0, "lock_ticket_tmp_invalid");
-  return { name, pid };
+  if (!match) return { name, pid: null, ownerStamp: null };
+  return {
+    name,
+    pid: parsePositiveInteger(match[2]),
+    ownerStamp: match[3] ?? null,
+  };
 }
 function pruneCheckpointedLockTickets(tickets, floor) {
   let pruned = false;
+  const selected = selectedLockCheckpoint(tickets);
   for (const name of fs.readdirSync(tickets)) {
-    const match = LOCK_TICKET_FILE.exec(name) ?? LOCK_TICKET_DONE_FILE.exec(name);
-    if (!match) continue;
-    const sequence = Number.parseInt(match[1], 10);
-    if (!Number.isSafeInteger(sequence) || sequence <= 0) fail("lock_owner_invalid");
-    if (sequence > floor) continue;
+    if (name === LOCK_TICKET_CHECKPOINT) {
+      if (selected?.name === name && selected.record.last_completed_sequence >= floor) continue;
+    } else {
+      const sequence = parsePositiveInteger(LOCK_TICKET_FILE.exec(name)?.[1]) ??
+        parsePositiveInteger(LOCK_TICKET_DONE_FILE.exec(name)?.[1]) ??
+        parsePositiveInteger(LOCK_TICKET_IMMUTABLE_CHECKPOINT_FILE.exec(name)?.[1]);
+      if (sequence === null || sequence > floor) continue;
+      if (selected?.name === name && sequence === floor) continue;
+    }
     lockTicketFault("before-lock-prune-unlink");
     try {
       fs.unlinkSync(path.join(tickets, name));
@@ -189,24 +320,37 @@ function pruneCheckpointedLockTickets(tickets, floor) {
 }
 function lockTicketEntries(tickets, floor) {
   return fs.readdirSync(tickets).flatMap(name => {
-    const match = LOCK_TICKET_FILE.exec(name);
-    if (!match) return [];
-    const sequence = Number.parseInt(match[1], 10);
-    assert(Number.isSafeInteger(sequence) && sequence > 0, "lock_owner_invalid");
-    if (sequence <= floor) return [];
-    return [{ name, prefix: match[1], sequence }];
+    const sequence = parsePositiveInteger(LOCK_TICKET_FILE.exec(name)?.[1]);
+    if (sequence === null || sequence <= floor) return [];
+    return [{ name, prefix: lockTicketPrefix(sequence), sequence }];
   }).sort((left, right) => left.sequence - right.sequence);
 }
 function readLockTicketRecord(tickets, entry) {
   let existing;
   try { existing = boundedJson(path.join(tickets, entry.name)); }
   catch (error) { if (error.code === "ENOENT") return null; throw error; }
-  assert(exactKeys(existing, ["kind", "schema_version", "pid", "token", "sequence"]) &&
+  const legacyOwner = exactKeys(existing, [
+    "kind", "schema_version", "pid", "token", "sequence",
+  ]);
+  const stampedOwner = exactKeys(existing, [
+    "kind", "schema_version", "pid", "boot_id", "process_start_time", "token", "sequence",
+  ]);
+  assert((legacyOwner || stampedOwner) &&
     existing.kind === "brokkr-lock-ticket" && existing.schema_version === "v1" &&
-    Number.isSafeInteger(existing.pid) && typeof existing.token === "string" &&
-    existing.token.length >= 1 && existing.sequence === entry.sequence,
+    Number.isSafeInteger(existing.pid) && existing.pid > 0 &&
+    typeof existing.token === "string" && existing.token.length >= 1 &&
+    existing.sequence === entry.sequence &&
+    (!stampedOwner || (
+      typeof existing.boot_id === "string" && existing.boot_id.length >= 1 &&
+      typeof existing.process_start_time === "string" &&
+      existing.process_start_time.length >= 1
+    )),
   "lock_owner_invalid");
-  return existing;
+  return stampedOwner ? existing : {
+    ...existing,
+    boot_id: null,
+    process_start_time: null,
+  };
 }
 function checkpointCompletesLockTicket(checkpoint, ticket) {
   if (checkpoint === null || checkpoint.last_completed_sequence < ticket.sequence) return false;
@@ -234,23 +378,52 @@ function hasValidLockCompletion(tickets, entry, ticket, checkpoint) {
     throw error;
   }
 }
-// PID liveness is only authoritative for this single-host, single-PID-namespace
-// local lock directory. EPERM therefore means "some owner still exists here".
-function lockOwnerAlive(pid) {
+function lockOwnerAlive(owner) {
+  assert(Number.isSafeInteger(owner.pid) && owner.pid > 0, "lock_owner_invalid");
+  if (owner.boot_id !== null) {
+    assert(typeof owner.boot_id === "string" && owner.boot_id.length >= 1 &&
+      typeof owner.process_start_time === "string" &&
+      owner.process_start_time.length >= 1,
+    "lock_owner_invalid");
+    if (owner.boot_id !== currentBootId()) return false;
+  }
   try {
-    process.kill(pid, 0);
-    return true;
+    process.kill(owner.pid, 0);
   } catch (error) {
     if (error.code === "ESRCH") return false;
-    if (error.code === "EPERM") return true;
-    throw error;
+    if (error.code !== "EPERM") throw error;
+  }
+  if (owner.boot_id === null) return true;
+  const liveStamp = readLiveOwnerStamp(owner.pid);
+  if (liveStamp === null) return true;
+  return liveStamp === lockOwnerIdentityStamp(owner);
+}
+function lockTicketTempAlive(temporary) {
+  if (temporary.pid === null) return false;
+  try {
+    process.kill(temporary.pid, 0);
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    if (error.code !== "EPERM") throw error;
+  }
+  if (temporary.ownerStamp === null) return true;
+  const liveStamp = readLiveOwnerStamp(temporary.pid);
+  if (liveStamp === null) return true;
+  return liveStamp === temporary.ownerStamp;
+}
+function reclaimLockTicketCandidate(tickets, ticket) {
+  try {
+    fs.unlinkSync(path.join(tickets, `${lockTicketPrefix(ticket.sequence)}.json`));
+    fsyncDirectory(tickets);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
   }
 }
 function reclaimLockTicketTemps(tickets) {
   let reclaimed = false;
   for (const name of fs.readdirSync(tickets)) {
     const temporary = lockTicketTemp(name);
-    if (!temporary || lockOwnerAlive(temporary.pid)) continue;
+    if (!temporary || lockTicketTempAlive(temporary)) continue;
     try {
       fs.unlinkSync(path.join(tickets, temporary.name));
       reclaimed = true;
@@ -271,7 +444,10 @@ function publishLockCheckpoint(tickets, ticket) {
   if (current !== null && current.last_completed_sequence > ticket.sequence) {
     return current;
   }
-  writeAtomic(path.join(tickets, LOCK_TICKET_CHECKPOINT), {
+  createExclusive(path.join(
+    tickets,
+    lockTicketCheckpointFile(ticket.sequence),
+  ), {
     kind: "brokkr-lock-ticket-checkpoint",
     schema_version: "v1",
     last_completed_sequence: ticket.sequence,
@@ -287,12 +463,46 @@ function publishLockCheckpoint(tickets, ticket) {
   }
   return published;
 }
+function completedLockTicketPrefix(tickets, checkpoint = readLockCheckpoint(tickets)) {
+  const floor = checkpoint?.last_completed_sequence ?? 0;
+  let nextSequence = floor + 1;
+  let candidate = null;
+  let length = 0;
+  for (const entry of lockTicketEntries(tickets, floor)) {
+    if (entry.sequence !== nextSequence) break;
+    const ticket = readLockTicketRecord(tickets, entry);
+    if (ticket === null || !hasValidLockCompletion(tickets, entry, ticket, checkpoint)) break;
+    candidate = ticket;
+    length += 1;
+    nextSequence += 1;
+  }
+  return { candidate, length };
+}
+function compactCompletedLockTicketPrefix(
+  tickets,
+  checkpoint = readLockCheckpoint(tickets),
+  options = {},
+) {
+  const { allowTailCompaction = true } = options;
+  const prefix = completedLockTicketPrefix(tickets, checkpoint);
+  const floor = checkpoint?.last_completed_sequence ?? 0;
+  const unresolvedTail = lockTicketEntries(tickets, floor).length - prefix.length;
+  if (prefix.candidate === null ||
+      (prefix.length < LOCK_TICKET_COMPACTION_THRESHOLD &&
+        (!allowTailCompaction || unresolvedTail === 0))) {
+    return checkpoint;
+  }
+  const current = publishLockCheckpoint(tickets, prefix.candidate);
+  pruneCheckpointedLockTickets(tickets, current.last_completed_sequence);
+  return current;
+}
 function completionFailure(error) {
   if ([
     "lock_completion_conflict",
     "lock_checkpoint_conflict",
     "lock_checkpoint_invalid",
     "lock_checkpoint_regressed",
+    "lock_ticket_stale_below_floor",
   ].includes(error?.code)) {
     return error;
   }
@@ -300,17 +510,33 @@ function completionFailure(error) {
   wrapped.code = "lock_completion_ambiguous";
   return wrapped;
 }
+function preserveReleaseFailure(operationError, releaseError) {
+  if (!operationError) return;
+  operationError.lock_release_error = completionFailure(releaseError);
+  if (operationError.cause === undefined) {
+    operationError.cause = operationError.lock_release_error;
+  }
+}
 function releaseLockTicket(tickets, ticket) {
-  let checkpoint = readLockCheckpoint(tickets);
-  if (checkpointCompletesLockTicket(checkpoint, ticket)) {
-    try {
-      lockTicketFault("after-lock-release-visible-before-prune");
-      pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
-      return;
-    } catch (error) { return error; }
+  const startingCheckpoint = readLockCheckpoint(tickets);
+  let checkpoint = compactCompletedLockTicketPrefix(tickets, startingCheckpoint, {
+    allowTailCompaction: false,
+  });
+  if (checkpoint !== null && checkpoint.last_completed_sequence >= ticket.sequence) {
+    if (checkpoint.last_completed_sequence === ticket.sequence) {
+      assert(checkpoint.last_completed_token === ticket.token, "lock_checkpoint_conflict");
+      try {
+        lockTicketFault("after-lock-release-visible-before-prune");
+        pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
+        return;
+      } catch (error) { return error; }
+    }
+    fail("lock_ticket_stale_below_floor");
   }
   const floor = checkpoint?.last_completed_sequence ?? 0;
-  if (lockTicketEntries(tickets, floor).length >= LOCK_TICKET_COMPACTION_THRESHOLD) {
+  const releasePrefix = completedLockTicketPrefix(tickets, checkpoint);
+  if (releasePrefix.length + 1 >= LOCK_TICKET_COMPACTION_THRESHOLD &&
+      ticket.sequence === floor + releasePrefix.length + 1) {
     checkpoint = publishLockCheckpoint(tickets, ticket);
     try {
       lockTicketFault("after-lock-release-visible-before-prune");
@@ -341,10 +567,13 @@ function withExclusiveDirectory(lockDir, code, operation) {
   let ticket = null;
   for (let attempt = 0; attempt < LOCK_TICKET_ACQUIRE_RETRIES; attempt += 1) {
     reclaimLockTicketTemps(tickets);
-    const checkpoint = readLockCheckpoint(tickets);
+    let checkpoint = readLockCheckpoint(tickets);
+    if (checkpoint !== null) pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
+    checkpoint = compactCompletedLockTicketPrefix(tickets, checkpoint);
     const floor = checkpoint?.last_completed_sequence ?? 0;
-    if (checkpoint !== null) pruneCheckpointedLockTickets(tickets, floor);
     const entries = lockTicketEntries(tickets, floor);
+    const unresolvedEntries = entries.length - completedLockTicketPrefix(tickets, checkpoint).length;
+    assert(unresolvedEntries < LOCK_TICKET_LIVE_HARD_LIMIT, "lock_ticket_live_limit");
     let sequence = checkpoint?.next_sequence ?? 1;
     if (entries.length) {
       const latestEntry = entries.at(-1);
@@ -352,7 +581,10 @@ function withExclusiveDirectory(lockDir, code, operation) {
       lockTicketFault("before-lock-ticket-read");
       const existing = readLockTicketRecord(tickets, latestEntry);
       if (existing === null) continue;
-      const refreshedCheckpoint = readLockCheckpoint(tickets);
+      const refreshedCheckpoint = compactCompletedLockTicketPrefix(
+        tickets,
+        readLockCheckpoint(tickets),
+      );
       if (refreshedCheckpoint?.last_completed_sequence >= latestEntry.sequence) {
         if (refreshedCheckpoint.last_completed_sequence === latestEntry.sequence) {
           assert(refreshedCheckpoint.last_completed_token === existing.token,
@@ -361,14 +593,14 @@ function withExclusiveDirectory(lockDir, code, operation) {
         continue;
       }
       if (!hasValidLockCompletion(tickets, latestEntry, existing, refreshedCheckpoint) &&
-          lockOwnerAlive(existing.pid)) {
+          lockOwnerAlive(existing)) {
         fail(code);
       }
     }
     const candidate = {
       kind: "brokkr-lock-ticket",
       schema_version: "v1",
-      pid: process.pid,
+      ...currentLockOwnerIdentity(),
       token,
       sequence,
     };
@@ -378,6 +610,12 @@ function withExclusiveDirectory(lockDir, code, operation) {
     ), candidate, {
       faultTag: "lock-ticket",
     })) {
+      continue;
+    }
+    checkpoint = readLockCheckpoint(tickets);
+    if (checkpoint !== null && checkpoint.last_completed_sequence >= candidate.sequence) {
+      reclaimLockTicketCandidate(tickets, candidate);
+      pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
       continue;
     }
     ticket = candidate;
@@ -391,11 +629,17 @@ function withExclusiveDirectory(lockDir, code, operation) {
   try {
     lockTicketFault("after-lock-owner-operation");
     const compactionError = releaseLockTicket(tickets, ticket);
-    if (operationError) throw operationError;
+    if (operationError) {
+      if (compactionError) preserveReleaseFailure(operationError, compactionError);
+      throw operationError;
+    }
     if (!compactionError) return result;
     return result;
   } catch (error) {
-    if (operationError) throw operationError;
+    if (operationError) {
+      preserveReleaseFailure(operationError, error);
+      throw operationError;
+    }
     throw completionFailure(error);
   }
 }
@@ -2409,8 +2653,12 @@ const DEBIAN_API = (() => {
 export const { deriveDebianAutonomyExecution } = DEBIAN_API;
 export const __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS = Object.freeze({
   compaction_threshold: LOCK_TICKET_COMPACTION_THRESHOLD,
+  live_hard_limit: LOCK_TICKET_LIVE_HARD_LIMIT,
   tmp_hard_limit: LOCK_TICKET_TMP_HARD_LIMIT,
 });
+export function __BROKKR_TEST_ONLY__currentLockOwnerIdentity() {
+  return currentLockOwnerIdentity();
+}
 export function __BROKKR_TEST_ONLY__probeExclusiveDirectory(lockDir, operation = () => true) {
   return withExclusiveDirectory(lockDir, "lock_probe_contended", operation);
 }
