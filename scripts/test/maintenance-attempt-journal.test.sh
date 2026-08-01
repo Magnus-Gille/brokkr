@@ -1939,6 +1939,66 @@ try {
 } finally {
   process.kill = originalKill;
 }
+const legacyReusedPidDir = `${tmp}/lock-liveness-legacy-reused-pid.lock`;
+const legacyReusedPidTickets = `${legacyReusedPidDir}.tickets`;
+fs.mkdirSync(legacyReusedPidTickets, { recursive: true, mode: 0o700 });
+const legacyReusedPidTicket = `${legacyReusedPidTickets}/00000001.json`;
+fs.writeFileSync(legacyReusedPidTicket, `${canonicalJson({
+  kind: "brokkr-lock-ticket",
+  schema_version: "v1",
+  pid: 424244,
+  token: "legacy-reused-owner",
+  sequence: 1,
+})}\n`);
+process.kill = ((pid, signal) => {
+  if (pid === 424244 && signal === 0) {
+    throw Object.assign(new Error("eperm-legacy-reused-owner"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  withLockOwnerProbe({
+    processStartedAfterLegacyTicket: (pid, ticketMtimeMs) => {
+      assert.equal(pid, 424244);
+      assert.equal(Number.isFinite(ticketMtimeMs), true);
+      return true;
+    },
+  }, () => {
+    assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(legacyReusedPidDir), true,
+      "a legacy ticket cannot be pinned forever by a demonstrably newer reused PID");
+  });
+} finally {
+  process.kill = originalKill;
+}
+const legacyAmbiguousPidDir = `${tmp}/lock-liveness-legacy-ambiguous-pid.lock`;
+const legacyAmbiguousPidTickets = `${legacyAmbiguousPidDir}.tickets`;
+fs.mkdirSync(legacyAmbiguousPidTickets, { recursive: true, mode: 0o700 });
+fs.writeFileSync(`${legacyAmbiguousPidTickets}/00000001.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket",
+  schema_version: "v1",
+  pid: 424245,
+  token: "legacy-ambiguous-owner",
+  sequence: 1,
+})}\n`);
+process.kill = ((pid, signal) => {
+  if (pid === 424245 && signal === 0) {
+    throw Object.assign(new Error("eperm-legacy-ambiguous-owner"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  withLockOwnerProbe({
+    processStartedAfterLegacyTicket: () => false,
+  }, () => {
+    assert.throws(
+      () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(legacyAmbiguousPidDir),
+      /lock_probe_contended/,
+      "a legacy ticket remains fail-closed when PID reuse cannot be proven",
+    );
+  });
+} finally {
+  process.kill = originalKill;
+}
 const invalidPidDir = `${tmp}/lock-invalid-pid.lock`;
 const invalidPidTickets = `${invalidPidDir}.tickets`;
 fs.mkdirSync(invalidPidTickets, { recursive: true, mode: 0o700 });

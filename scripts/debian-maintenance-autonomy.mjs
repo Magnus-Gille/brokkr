@@ -3,6 +3,7 @@
 // every attempt must independently verify W0.2 owner authorization, coverage,
 // owner attestation, recovery keys, and the protected narrowing tail.
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import { performance } from "node:perf_hooks";
@@ -74,8 +75,9 @@ const LOCK_TICKET_ACQUIRE_RETRIES = 8;
 const LOCK_TICKET_LIVE_HARD_LIMIT = LOCK_TICKET_COMPACTION_THRESHOLD;
 const LOCK_TICKET_TMP_HARD_LIMIT = 64;
 const LOCK_TICKET_OWNER_STAMP_HEX = 16;
+const LEGACY_LOCK_TICKET_REUSE_MARGIN_MS = 5_000;
 const LOCK_OWNER_PROBE_ENV = "BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE";
-const AUTHORITATIVE_PROCESS_START = /^linux-start:/;
+const AUTHORITATIVE_PROCESS_START = /^linux-start:[1-9]\d*$/;
 const ESTIMATED_BOOT_ID = /^(boot-estimate:|boot-id-unavailable(?::|$))/;
 const testLockOwnerProbe = () => (
   process.env[LOCK_OWNER_PROBE_ENV] === "1" ?
@@ -109,7 +111,7 @@ const readLinuxProcessStartTime = pid => {
     if (close < 0) return null;
     const fields = raw.slice(close + 2).trim().split(/\s+/);
     const startTime = fields[19];
-    return /^\d+$/.test(startTime) ? {
+    return /^[1-9]\d*$/.test(startTime) ? {
       value: `linux-start:${startTime}`,
       authoritative: true,
     } : null;
@@ -117,6 +119,53 @@ const readLinuxProcessStartTime = pid => {
     if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error?.code)) return null;
     throw error;
   }
+};
+let linuxClockTicksPerSecond;
+const readLinuxClockTicksPerSecond = () => {
+  if (linuxClockTicksPerSecond !== undefined) return linuxClockTicksPerSecond;
+  try {
+    const raw = execFileSync("/usr/bin/getconf", ["CLK_TCK"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1_000,
+    }).trim();
+    const parsed = parsePositiveInteger(raw);
+    linuxClockTicksPerSecond = parsed;
+  } catch {
+    linuxClockTicksPerSecond = null;
+  }
+  return linuxClockTicksPerSecond;
+};
+const readLinuxBootEpochMs = () => {
+  try {
+    const raw = fs.readFileSync("/proc/stat", "utf8");
+    const matched = /^btime\s+([1-9]\d*)$/m.exec(raw);
+    const seconds = matched ? Number.parseInt(matched[1], 10) : NaN;
+    return Number.isSafeInteger(seconds) ? seconds * 1_000 : null;
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error?.code)) return null;
+    throw error;
+  }
+};
+const legacyLockOwnerPidReused = owner => {
+  const testValue = testLockOwnerProbe()?.processStartedAfterLegacyTicket?.(
+    owner.pid,
+    owner.legacy_ticket_mtime_ms,
+  );
+  if (typeof testValue === "boolean") return testValue;
+  if (!Number.isFinite(owner.legacy_ticket_mtime_ms) ||
+      owner.legacy_ticket_mtime_ms <= 0) return false;
+  const processStart = readLinuxProcessStartTime(owner.pid);
+  const ticksPerSecond = readLinuxClockTicksPerSecond();
+  const bootEpochMs = readLinuxBootEpochMs();
+  const ticks = processStart?.authoritative === true ?
+    Number.parseInt(processStart.value.slice("linux-start:".length), 10) :
+    NaN;
+  if (!Number.isSafeInteger(ticks) || ticks <= 0 ||
+      ticksPerSecond === null || bootEpochMs === null) return false;
+  const processStartEpochMs = bootEpochMs + ticks * 1_000 / ticksPerSecond;
+  return processStartEpochMs >=
+    owner.legacy_ticket_mtime_ms + LEGACY_LOCK_TICKET_REUSE_MARGIN_MS;
 };
 const FALLBACK_BOOT_IDENTITY = (() => {
   try {
@@ -411,7 +460,12 @@ function lockTicketEntries(tickets, floor) {
 }
 function readLockTicketRecord(tickets, entry) {
   let existing;
-  try { existing = boundedJson(path.join(tickets, entry.name)); }
+  let ticketMtimeMs;
+  const ticketPath = path.join(tickets, entry.name);
+  try {
+    existing = boundedJson(ticketPath);
+    ticketMtimeMs = fs.statSync(ticketPath).mtimeMs;
+  }
   catch (error) { if (error.code === "ENOENT") return null; throw error; }
   const legacyOwner = exactKeys(existing, [
     "kind", "schema_version", "pid", "token", "sequence",
@@ -452,6 +506,7 @@ function readLockTicketRecord(tickets, entry) {
     boot_id_authoritative: false,
     process_start_time: null,
     process_start_time_authoritative: false,
+    legacy_ticket_mtime_ms: ticketMtimeMs,
   };
 }
 function checkpointCompletesLockTicket(checkpoint, ticket) {
@@ -504,7 +559,9 @@ function lockOwnerProvablyDead(owner) {
       return true;
     }
   }
-  if (owner.process_start_time === null) return false;
+  if (owner.process_start_time === null) {
+    return legacyLockOwnerPidReused(owner);
+  }
   const processStartIdentity = readProcessStartIdentity(owner.pid);
   if (processStartIdentity === null) return false;
   return owner.process_start_time_authoritative &&
