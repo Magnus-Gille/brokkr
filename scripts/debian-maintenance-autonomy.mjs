@@ -74,7 +74,30 @@ const LOCK_TICKET_ACQUIRE_RETRIES = 8;
 const LOCK_TICKET_LIVE_HARD_LIMIT = LOCK_TICKET_COMPACTION_THRESHOLD;
 const LOCK_TICKET_TMP_HARD_LIMIT = 64;
 const LOCK_TICKET_OWNER_STAMP_HEX = 16;
-const testLockOwnerProbe = () => globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ ?? null;
+const LOCK_OWNER_PROBE_ENV = "BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE";
+const AUTHORITATIVE_PROCESS_START = /^linux-start:/;
+const ESTIMATED_BOOT_ID = /^(boot-estimate:|boot-id-unavailable(?::|$))/;
+const testLockOwnerProbe = () => (
+  process.env[LOCK_OWNER_PROBE_ENV] === "1" ?
+    globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ ?? null :
+    null
+);
+const inferBootIdAuthoritative = value => !ESTIMATED_BOOT_ID.test(value);
+const inferProcessStartAuthoritative = value => AUTHORITATIVE_PROCESS_START.test(value);
+function normalizeLockOwnerEvidence(value, inferAuthoritative) {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value === "string" && value.length >= 1) {
+    return { value, authoritative: inferAuthoritative(value) };
+  }
+  if (plain(value) &&
+      typeof value.value === "string" &&
+      value.value.length >= 1 &&
+      typeof value.authoritative === "boolean") {
+    return { value: value.value, authoritative: value.authoritative };
+  }
+  return undefined;
+}
 const parsePositiveInteger = value => {
   const parsed = Number.parseInt(value, 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
@@ -86,61 +109,106 @@ const readLinuxProcessStartTime = pid => {
     if (close < 0) return null;
     const fields = raw.slice(close + 2).trim().split(/\s+/);
     const startTime = fields[19];
-    return /^\d+$/.test(startTime) ? `linux-start:${startTime}` : null;
+    return /^\d+$/.test(startTime) ? {
+      value: `linux-start:${startTime}`,
+      authoritative: true,
+    } : null;
   } catch (error) {
     if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error?.code)) return null;
     throw error;
   }
 };
-const FALLBACK_BOOT_ID = (() => {
+const FALLBACK_BOOT_IDENTITY = (() => {
   try {
-    return `boot-at:${new Date(
-      Math.floor(Date.now() - os.uptime() * 1000),
-    ).toISOString()}`;
+    // This stays an estimate, but bucket it at a host-wide second boundary so
+    // concurrent processes do not trivially diverge by millisecond jitter.
+    return {
+      value: `boot-estimate:${Math.max(0, Math.round(Date.now() / 1000 - os.uptime()))}`,
+      authoritative: false,
+    };
   } catch {
-    try { return `boot-id-unavailable:${os.hostname()}`; }
-    catch { return "boot-id-unavailable"; }
+    try {
+      return { value: `boot-id-unavailable:${os.hostname()}`, authoritative: false };
+    } catch {
+      return { value: "boot-id-unavailable", authoritative: false };
+    }
   }
 })();
-const SYSTEM_BOOT_ID = (() => {
+const SYSTEM_BOOT_IDENTITY = (() => {
   try {
     const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-    return bootId.length >= 1 ? bootId : FALLBACK_BOOT_ID;
+    return bootId.length >= 1 ? {
+      value: bootId,
+      authoritative: true,
+    } : FALLBACK_BOOT_IDENTITY;
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
-    return FALLBACK_BOOT_ID;
+    return FALLBACK_BOOT_IDENTITY;
   }
 })();
-const SELF_PROCESS_START_TIME =
-  readLinuxProcessStartTime(process.pid) ?? `time-origin:${Math.trunc(performance.timeOrigin)}`;
-const currentBootId = () => {
-  const value = testLockOwnerProbe()?.currentBootId?.();
-  return typeof value === "string" && value.length >= 1 ? value : SYSTEM_BOOT_ID;
+const SELF_PROCESS_START_IDENTITY =
+  readLinuxProcessStartTime(process.pid) ?? {
+    value: `time-origin:${Math.trunc(performance.timeOrigin)}`,
+    authoritative: false,
+  };
+const currentBootIdentity = () => {
+  const value = normalizeLockOwnerEvidence(
+    testLockOwnerProbe()?.currentBootId?.(),
+    inferBootIdAuthoritative,
+  );
+  return value ?? SYSTEM_BOOT_IDENTITY;
 };
-const currentProcessStartTime = () => {
-  const value = testLockOwnerProbe()?.processStartTime?.(process.pid);
-  return typeof value === "string" && value.length >= 1 ? value : SELF_PROCESS_START_TIME;
+const currentProcessStartIdentity = () => {
+  const value = normalizeLockOwnerEvidence(
+    testLockOwnerProbe()?.processStartTime?.(process.pid),
+    inferProcessStartAuthoritative,
+  );
+  return value ?? SELF_PROCESS_START_IDENTITY;
 };
-const lockOwnerIdentityStamp = ({ boot_id, process_start_time }) =>
-  sha256(`${boot_id}\n${process_start_time}`).slice(0, LOCK_TICKET_OWNER_STAMP_HEX);
-const currentLockOwnerIdentity = () => ({
-  pid: process.pid,
-  boot_id: currentBootId(),
-  process_start_time: currentProcessStartTime(),
-});
-const readProcessStartTime = pid => {
-  const testValue = testLockOwnerProbe()?.processStartTime?.(pid);
-  if (testValue === null) return null;
-  if (typeof testValue === "string" && testValue.length >= 1) return testValue;
-  if (pid === process.pid) return currentProcessStartTime();
+const lockOwnerIdentityStamp = ({
+  boot_id,
+  boot_id_authoritative = false,
+  process_start_time,
+  process_start_time_authoritative = false,
+}) => sha256([
+  boot_id_authoritative ? "1" : "0",
+  boot_id ?? "",
+  process_start_time_authoritative ? "1" : "0",
+  process_start_time ?? "",
+].join("\n")).slice(0, LOCK_TICKET_OWNER_STAMP_HEX);
+const currentLockOwnerIdentity = () => {
+  const bootIdentity = currentBootIdentity();
+  const processStartIdentity = currentProcessStartIdentity();
+  return {
+    pid: process.pid,
+    boot_id: bootIdentity.value,
+    boot_id_authoritative: bootIdentity.authoritative,
+    process_start_time: processStartIdentity.value,
+    process_start_time_authoritative: processStartIdentity.authoritative,
+  };
+};
+const readProcessStartIdentity = pid => {
+  const testValue = normalizeLockOwnerEvidence(
+    testLockOwnerProbe()?.processStartTime?.(pid),
+    inferProcessStartAuthoritative,
+  );
+  if (testValue !== undefined) return testValue;
+  if (pid === process.pid) return currentProcessStartIdentity();
   return readLinuxProcessStartTime(pid);
 };
 const readLiveOwnerStamp = pid => {
-  const processStartTime = readProcessStartTime(pid);
-  if (processStartTime === null) return null;
+  const bootIdentity = currentBootIdentity();
+  const processStartIdentity = readProcessStartIdentity(pid);
+  if (processStartIdentity === null ||
+      !bootIdentity.authoritative ||
+      !processStartIdentity.authoritative) {
+    return null;
+  }
   return lockOwnerIdentityStamp({
-    boot_id: currentBootId(),
-    process_start_time: processStartTime,
+    boot_id: bootIdentity.value,
+    boot_id_authoritative: bootIdentity.authoritative,
+    process_start_time: processStartIdentity.value,
+    process_start_time_authoritative: processStartIdentity.authoritative,
   });
 };
 const boundedJson = file => {
@@ -295,6 +363,22 @@ function lockTicketTemp(name) {
     ownerStamp: match[3] ?? null,
   };
 }
+function reclaimInvalidLockTicketArtifacts(tickets) {
+  let reclaimed = false;
+  for (const name of fs.readdirSync(tickets)) {
+    const rawSequence = LOCK_TICKET_FILE.exec(name)?.[1] ??
+      LOCK_TICKET_DONE_FILE.exec(name)?.[1] ??
+      LOCK_TICKET_IMMUTABLE_CHECKPOINT_FILE.exec(name)?.[1];
+    if (rawSequence === undefined || parsePositiveInteger(rawSequence) !== null) continue;
+    try {
+      fs.unlinkSync(path.join(tickets, name));
+      reclaimed = true;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  if (reclaimed) fsyncDirectory(tickets);
+}
 function pruneCheckpointedLockTickets(tickets, floor) {
   let pruned = false;
   const selected = selectedLockCheckpoint(tickets);
@@ -335,21 +419,39 @@ function readLockTicketRecord(tickets, entry) {
   const stampedOwner = exactKeys(existing, [
     "kind", "schema_version", "pid", "boot_id", "process_start_time", "token", "sequence",
   ]);
-  assert((legacyOwner || stampedOwner) &&
+  const stampedOwnerWithAuthority = exactKeys(existing, [
+    "kind", "schema_version", "pid", "boot_id", "boot_id_authoritative",
+    "process_start_time", "process_start_time_authoritative", "token", "sequence",
+  ]);
+  assert((legacyOwner || stampedOwner || stampedOwnerWithAuthority) &&
     existing.kind === "brokkr-lock-ticket" && existing.schema_version === "v1" &&
     Number.isSafeInteger(existing.pid) && existing.pid > 0 &&
     typeof existing.token === "string" && existing.token.length >= 1 &&
     existing.sequence === entry.sequence &&
-    (!stampedOwner || (
+    (!(stampedOwner || stampedOwnerWithAuthority) || (
       typeof existing.boot_id === "string" && existing.boot_id.length >= 1 &&
       typeof existing.process_start_time === "string" &&
       existing.process_start_time.length >= 1
+    )) &&
+    (!stampedOwnerWithAuthority || (
+      typeof existing.boot_id_authoritative === "boolean" &&
+      typeof existing.process_start_time_authoritative === "boolean"
     )),
   "lock_owner_invalid");
-  return stampedOwner ? existing : {
+  return (stampedOwner || stampedOwnerWithAuthority) ? {
+    ...existing,
+    boot_id_authoritative: stampedOwnerWithAuthority ?
+      existing.boot_id_authoritative :
+      inferBootIdAuthoritative(existing.boot_id),
+    process_start_time_authoritative: stampedOwnerWithAuthority ?
+      existing.process_start_time_authoritative :
+      inferProcessStartAuthoritative(existing.process_start_time),
+  } : {
     ...existing,
     boot_id: null,
+    boot_id_authoritative: false,
     process_start_time: null,
+    process_start_time_authoritative: false,
   };
 }
 function checkpointCompletesLockTicket(checkpoint, ticket) {
@@ -378,25 +480,39 @@ function hasValidLockCompletion(tickets, entry, ticket, checkpoint) {
     throw error;
   }
 }
-function lockOwnerAlive(owner) {
+function lockOwnerProvablyDead(owner) {
   assert(Number.isSafeInteger(owner.pid) && owner.pid > 0, "lock_owner_invalid");
   if (owner.boot_id !== null) {
     assert(typeof owner.boot_id === "string" && owner.boot_id.length >= 1 &&
+      typeof owner.boot_id_authoritative === "boolean" &&
       typeof owner.process_start_time === "string" &&
-      owner.process_start_time.length >= 1,
+      owner.process_start_time.length >= 1 &&
+      typeof owner.process_start_time_authoritative === "boolean",
     "lock_owner_invalid");
-    if (owner.boot_id !== currentBootId()) return false;
   }
   try {
     process.kill(owner.pid, 0);
   } catch (error) {
-    if (error.code === "ESRCH") return false;
+    if (error.code === "ESRCH") return true;
     if (error.code !== "EPERM") throw error;
   }
-  if (owner.boot_id === null) return true;
-  const liveStamp = readLiveOwnerStamp(owner.pid);
-  if (liveStamp === null) return true;
-  return liveStamp === lockOwnerIdentityStamp(owner);
+  if (owner.boot_id !== null) {
+    const bootIdentity = currentBootIdentity();
+    if (owner.boot_id_authoritative &&
+        bootIdentity.authoritative &&
+        owner.boot_id !== bootIdentity.value) {
+      return true;
+    }
+  }
+  if (owner.process_start_time === null) return false;
+  const processStartIdentity = readProcessStartIdentity(owner.pid);
+  if (processStartIdentity === null) return false;
+  return owner.process_start_time_authoritative &&
+    processStartIdentity.authoritative &&
+    owner.process_start_time !== processStartIdentity.value;
+}
+function lockOwnerAlive(owner) {
+  return !lockOwnerProvablyDead(owner);
 }
 function lockTicketTempAlive(temporary) {
   if (temporary.pid === null) return false;
@@ -567,6 +683,7 @@ function withExclusiveDirectory(lockDir, code, operation) {
   let ticket = null;
   for (let attempt = 0; attempt < LOCK_TICKET_ACQUIRE_RETRIES; attempt += 1) {
     reclaimLockTicketTemps(tickets);
+    reclaimInvalidLockTicketArtifacts(tickets);
     let checkpoint = readLockCheckpoint(tickets);
     if (checkpoint !== null) pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
     checkpoint = compactCompletedLockTicketPrefix(tickets, checkpoint);
@@ -592,9 +709,11 @@ function withExclusiveDirectory(lockDir, code, operation) {
         }
         continue;
       }
-      if (!hasValidLockCompletion(tickets, latestEntry, existing, refreshedCheckpoint) &&
-          lockOwnerAlive(existing)) {
-        fail(code);
+      if (!hasValidLockCompletion(tickets, latestEntry, existing, refreshedCheckpoint)) {
+        if (lockOwnerAlive(existing)) fail(code);
+        reclaimLockTicketCandidate(tickets, existing);
+        attempt -= 1;
+        continue;
       }
     }
     const candidate = {
@@ -633,7 +752,8 @@ function withExclusiveDirectory(lockDir, code, operation) {
       if (compactionError) preserveReleaseFailure(operationError, compactionError);
       throw operationError;
     }
-    if (!compactionError) return result;
+    // A successful owner operation remains committed even if best-effort
+    // post-release compaction or prune work later faults.
     return result;
   } catch (error) {
     if (operationError) {

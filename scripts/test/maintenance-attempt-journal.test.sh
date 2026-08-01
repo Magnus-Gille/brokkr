@@ -503,7 +503,9 @@ function writeLockTicketRecord(ticketsDir, {
   token = `completed-${String(sequence).padStart(8, "0")}`,
   pid = process.pid,
   boot_id = currentLockOwnerIdentity().boot_id,
+  boot_id_authoritative = currentLockOwnerIdentity().boot_id_authoritative,
   process_start_time = currentLockOwnerIdentity().process_start_time,
+  process_start_time_authoritative = currentLockOwnerIdentity().process_start_time_authoritative,
 } = {}) {
   const prefix = String(sequence).padStart(8, "0");
   fs.mkdirSync(ticketsDir, { recursive: true, mode: 0o700 });
@@ -512,7 +514,9 @@ function writeLockTicketRecord(ticketsDir, {
     schema_version: "v1",
     pid,
     boot_id,
+    boot_id_authoritative,
     process_start_time,
+    process_start_time_authoritative,
     token,
     sequence,
   })}\n`);
@@ -560,11 +564,28 @@ function readHighestLockCheckpoint(ticketsDir) {
   }
   return selected;
 }
+function withEnv(name, value, fn) {
+  const previous = process.env[name];
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = previous;
+    }
+  }
+}
 function withLockOwnerProbe(probe, fn) {
   const previousProbe = globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__;
   globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ = probe;
   try {
-    return fn();
+    return withEnv("BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE", "1", fn);
   } finally {
     if (previousProbe === undefined) {
       delete globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__;
@@ -596,16 +617,68 @@ function withLockTicketFaults(fn) {
     delete globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__;
   }
 }
+const fallbackOwnerProbeEnv = ({
+  bootId,
+  selfProcessStart,
+  otherProcessStart = "__NULL__",
+} = {}) => ({
+  BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE: "1",
+  TEST_OWNER_PROBE_BOOT_ID: bootId,
+  TEST_OWNER_PROBE_BOOT_ID_AUTHORITATIVE: "0",
+  TEST_OWNER_PROBE_SELF_PROCESS_START: selfProcessStart,
+  TEST_OWNER_PROBE_SELF_PROCESS_START_AUTHORITATIVE: "0",
+  TEST_OWNER_PROBE_OTHER_PROCESS_START: otherProcessStart,
+  TEST_OWNER_PROBE_OTHER_PROCESS_START_AUTHORITATIVE: "0",
+});
 
 if (process.env.WORKER_MODE) {
   process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS = "1";
+  const holdDeadlineMs = Number.parseInt(process.env.CHILD_HOLD_TIMEOUT_MS ?? "15000", 10);
+  const waitBriefly = (timeoutMs = 1) =>
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, timeoutMs);
+  const waitForReleaseFile = (file, label) => {
+    const deadline = Date.now() + holdDeadlineMs;
+    while (!file || !fs.existsSync(file)) {
+      if (Date.now() >= deadline) {
+        throw Object.assign(new Error(`${label}-timeout`), {
+          code: "worker_hold_timeout",
+        });
+      }
+      waitBriefly();
+    }
+  };
+  const envProbeValue = (name, authoritativeName) => {
+    const value = process.env[name];
+    if (value === undefined) return undefined;
+    if (value === "__NULL__") return null;
+    return {
+      value,
+      authoritative: process.env[authoritativeName] === "1",
+    };
+  };
+  const bootProbe = envProbeValue(
+    "TEST_OWNER_PROBE_BOOT_ID",
+    "TEST_OWNER_PROBE_BOOT_ID_AUTHORITATIVE",
+  );
+  const selfStartProbe = envProbeValue(
+    "TEST_OWNER_PROBE_SELF_PROCESS_START",
+    "TEST_OWNER_PROBE_SELF_PROCESS_START_AUTHORITATIVE",
+  );
+  const otherStartProbe = envProbeValue(
+    "TEST_OWNER_PROBE_OTHER_PROCESS_START",
+    "TEST_OWNER_PROBE_OTHER_PROCESS_START_AUTHORITATIVE",
+  );
+  if ([bootProbe, selfStartProbe, otherStartProbe].some(value => value !== undefined)) {
+    process.env.BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE = "1";
+    globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ = {
+      currentBootId: () => bootProbe,
+      processStartTime: pid => (pid === process.pid ? selfStartProbe : otherStartProbe),
+    };
+  }
   globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
     if (process.env.HOLD_POINT === point) {
       if (process.env.HOLD_READY) fs.writeFileSync(process.env.HOLD_READY, `${point}\n`);
-      while (!process.env.HOLD_RELEASE ||
-          !fs.existsSync(process.env.HOLD_RELEASE)) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
-      }
+      waitForReleaseFile(process.env.HOLD_RELEASE, process.env.HOLD_POINT);
     }
     if (process.env.FAULT_POINT === point) process.exit(78);
   };
@@ -627,9 +700,7 @@ if (process.env.WORKER_MODE) {
   if (process.env.WORKER_MODE === "lock-hold") {
     __BROKKR_TEST_ONLY__probeExclusiveDirectory(process.env.LOCK_DIR, () => {
       if (process.env.OP_READY) fs.writeFileSync(process.env.OP_READY, "ready\n");
-      while (!process.env.OP_RELEASE || !fs.existsSync(process.env.OP_RELEASE)) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
-      }
+      waitForReleaseFile(process.env.OP_RELEASE, "lock-hold-release");
       return true;
     });
     process.exit(0);
@@ -640,14 +711,16 @@ if (process.env.WORKER_MODE) {
     const owner = currentLockOwnerIdentity();
     fs.writeFileSync(`${tickets}/00000001.json`, JSON.stringify({
       kind: "brokkr-lock-ticket", schema_version: "v1", pid: process.pid,
-      boot_id: owner.boot_id, process_start_time: owner.process_start_time,
+      boot_id: owner.boot_id, boot_id_authoritative: owner.boot_id_authoritative,
+      process_start_time: owner.process_start_time,
+      process_start_time_authoritative: owner.process_start_time_authoritative,
       token: "child-lock-owner", sequence: 1,
     }));
     fs.writeFileSync(process.env.READY, "ready");
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);
+    waitBriefly(holdDeadlineMs);
     process.exit(0);
   }
-  while (process.env.BARRIER && !fs.existsSync(process.env.BARRIER)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+  if (process.env.BARRIER) waitForReleaseFile(process.env.BARRIER, "worker-barrier");
   const workerArtifacts = bundle();
   const overBudgetWorkerTimes = process.env.OVER_BUDGET_WATCH_ANCHOR ?
     Array(12).fill("2026-07-26T00:00:00Z") : null;
@@ -703,9 +776,11 @@ if (process.env.WORKER_MODE) {
       if (process.env.RECOVERY_CALL_LOG) {
         fs.appendFileSync(process.env.RECOVERY_CALL_LOG, "recovery-call\n");
       }
-      while (process.env.HOLD_BEFORE_RECOVERY_EFFECT &&
-          !fs.existsSync(process.env.HOLD_BEFORE_RECOVERY_EFFECT)) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+      if (process.env.HOLD_BEFORE_RECOVERY_EFFECT) {
+        waitForReleaseFile(
+          process.env.HOLD_BEFORE_RECOVERY_EFFECT,
+          "hold-before-recovery-effect",
+        );
       }
       return withWorkerLock(recoveryTransactionLock, () => {
         const state = readWorkerRecoveryState();
@@ -836,9 +911,8 @@ if (process.env.WORKER_MODE) {
           if (process.env.APPLY_LOG) fs.appendFileSync(process.env.APPLY_LOG, "apply\n");
           if (process.env.WORKER_MODE === "crash") process.exit(77);
           if (process.env.FORCE_RECOVERY) throw Error("force-recovery");
-          while (process.env.HOLD_BEFORE_EFFECT &&
-              !fs.existsSync(process.env.HOLD_BEFORE_EFFECT)) {
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+          if (process.env.HOLD_BEFORE_EFFECT) {
+            waitForReleaseFile(process.env.HOLD_BEFORE_EFFECT, "hold-before-effect");
           }
           try {
             effectTransaction(() => {
@@ -873,10 +947,10 @@ if (process.env.WORKER_MODE) {
           if (process.env.HOLD_AFTER_APPLY_READY) {
             fs.writeFileSync(process.env.HOLD_AFTER_APPLY_READY, "ready\n");
           }
-          while (process.env.HOLD_AFTER_APPLY && !fs.existsSync(process.env.HOLD_AFTER_APPLY)) {
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+          if (process.env.HOLD_AFTER_APPLY) {
+            waitForReleaseFile(process.env.HOLD_AFTER_APPLY, "hold-after-apply");
           }
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+          waitBriefly(100);
           return { applied: true };
         },
       }),
@@ -1644,6 +1718,96 @@ const runWorker = (env, timeoutMs = 15_000) => new Promise((resolve, reject) => 
   child.on("error", finish(reject));
   child.on("exit", finish(resolve));
 });
+const productionProbeIdentity = (() => {
+  const previousProbe = globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__;
+  globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ = {
+    currentBootId: () => ({
+      value: "probe-boot-id",
+      authoritative: true,
+    }),
+    processStartTime: () => ({
+      value: "probe-process-start",
+      authoritative: true,
+    }),
+  };
+  try {
+    return withEnv("BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE", undefined, () =>
+      currentLockOwnerIdentity());
+  } finally {
+    if (previousProbe === undefined) {
+      delete globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__;
+    } else {
+      globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ = previousProbe;
+    }
+  }
+})();
+assert.notEqual(productionProbeIdentity.boot_id, "probe-boot-id",
+  "production owner identity ignores injected test probes without the explicit env gate");
+assert.notEqual(productionProbeIdentity.process_start_time, "probe-process-start",
+  "production owner identity ignores injected process-start probes without the explicit env gate");
+const fallbackContentionDir = `${tmp}/fallback-contention.lock`;
+const fallbackContentionTickets = `${fallbackContentionDir}.tickets`;
+const fallbackContentionReady = `${tmp}/fallback-contention.ready`;
+const fallbackContentionRelease = `${tmp}/fallback-contention.release`;
+const fallbackHolder = runWorker({
+  WORKER_MODE: "lock-hold",
+  LOCK_DIR: fallbackContentionDir,
+  OP_READY: fallbackContentionReady,
+  OP_RELEASE: fallbackContentionRelease,
+  CHILD_HOLD_TIMEOUT_MS: "5000",
+  ...fallbackOwnerProbeEnv({
+    bootId: "boot-estimate:holder-a",
+    selfProcessStart: "time-origin:holder-a",
+  }),
+});
+waitForFile(fallbackContentionReady);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe-status",
+  LOCK_DIR: fallbackContentionDir,
+  CHILD_HOLD_TIMEOUT_MS: "5000",
+  ...fallbackOwnerProbeEnv({
+    bootId: "boot-estimate:holder-b",
+    selfProcessStart: "time-origin:holder-b",
+  }),
+}), 73,
+  "fallback boot/process estimates stay fail-closed across processes while the holder is live");
+assert.deepEqual(
+  lockTicketArtifacts(fallbackContentionTickets).filter(name => /^\d+\.json$/.test(name)),
+  ["00000001.json"],
+  "an ambiguous live fallback tail does not grow a successor ticket",
+);
+fs.writeFileSync(fallbackContentionRelease, "");
+assert.equal(await fallbackHolder, 0);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: fallbackContentionDir,
+  ...fallbackOwnerProbeEnv({
+    bootId: "boot-estimate:holder-c",
+    selfProcessStart: "time-origin:holder-c",
+  }),
+}), 0,
+  "the fallback-path holder still releases cleanly once the live owner exits");
+const reclaimAfterCrashDir = `${tmp}/lock-reclaim-after-crash.lock`;
+const reclaimAfterCrashTickets = `${reclaimAfterCrashDir}.tickets`;
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: reclaimAfterCrashDir,
+  FAULT_POINT: "after-lock-owner-operation",
+}), 78, "the synthetic crash lands after publishing the owner ticket");
+assert.deepEqual(
+  lockTicketArtifacts(reclaimAfterCrashTickets).filter(name => /^\d+\.json$/.test(name)),
+  ["00000001.json"],
+  "the crash leaves exactly one unresolved owner ticket",
+);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: reclaimAfterCrashDir,
+}), 0, "restart can reclaim a single provably dead crashed ticket");
+assert.deepEqual(
+  lockTicketArtifacts(reclaimAfterCrashTickets).filter(name => /^(\d+)\.(done|json)$/.test(name)),
+  ["00000001.done", "00000001.json"],
+  "restart reuses the reclaimed sequence instead of growing a dead-tail chain",
+);
 const staleLockDir = `${tmp}/stale-lock`, staleLockReady = `${tmp}/stale-lock-ready`;
 const staleLockChild = spawn(process.execPath, [...process.execArgv, process.argv[1]], {
   env: {
@@ -1742,7 +1906,9 @@ writeLockTicketRecord(reusedPidTickets, {
   sequence: 1,
   pid: 424243,
   boot_id: reusedPidOwner.boot_id,
-  process_start_time: "old-owner-start",
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:old-owner-start",
+  process_start_time_authoritative: true,
   token: "reused-owner",
 });
 process.kill = ((pid, signal) => {
@@ -1753,9 +1919,18 @@ process.kill = ((pid, signal) => {
 });
 try {
   withLockOwnerProbe({
-    currentBootId: () => reusedPidOwner.boot_id,
+    currentBootId: () => ({
+      value: reusedPidOwner.boot_id,
+      authoritative: true,
+    }),
     processStartTime: pid => (
-      pid === 424243 ? "new-owner-start" : reusedPidOwner.process_start_time
+      pid === 424243 ? {
+        value: "linux-start:new-owner-start",
+        authoritative: true,
+      } : {
+        value: reusedPidOwner.process_start_time,
+        authoritative: reusedPidOwner.process_start_time_authoritative,
+      }
     ),
   }, () => {
     assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(reusedPidDir), true,
@@ -1791,6 +1966,8 @@ assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(strayNamesDir), true,
   "stray temp and invalid ticket names do not wedge acquisition");
 assert.deepEqual(lockTicketTemps(strayNamesTickets), [],
   "stray temp names are reclaimed on the next acquisition");
+assert.equal(fs.existsSync(`${strayNamesTickets}/00000000.json`), false,
+  "non-positive stray ticket artifacts are reclaimed when acquisition succeeds");
 const delayedCompactorDir = `${tmp}/delayed-compactor.lock`;
 const delayedCompactorTickets = `${delayedCompactorDir}.tickets`;
 for (let sequence = 1;
@@ -2118,39 +2295,31 @@ withLockTicketFaults(() => {
 });
 const liveLimitDir = `${tmp}/lock-live-limit.lock`;
 const liveLimitTickets = `${liveLimitDir}.tickets`;
-let liveLimitBounded = false;
-for (let attempt = 1;
-  attempt <= __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.live_hard_limit + 8;
-  attempt += 1) {
-  const code = await runWorker({
+for (let attempt = 1; attempt <= 8; attempt += 1) {
+  assert.equal(await runWorker({
     WORKER_MODE: "lock-probe",
     LOCK_DIR: liveLimitDir,
     FAULT_POINT: "after-lock-ticket-link",
-  });
-  if (attempt <= __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.live_hard_limit) {
-    assert.equal(code, 78, `crash-only live ticket growth remains reproducible at attempt ${attempt}`);
-    continue;
-  }
-  assert.notEqual(code, 78,
-    "crash-only live ticket growth stops before another post-link ticket can be published");
-  liveLimitBounded = true;
-  break;
+  }), 78, `post-link crash remains reproducible at attempt ${attempt}`);
+  assert.deepEqual(
+    lockTicketArtifacts(liveLimitTickets).filter(name => /^\d+\.json$/.test(name)),
+    ["00000001.json"],
+    "restart reclaims the prior dead tail before another post-link crash republishes it",
+  );
 }
-assert.equal(liveLimitBounded, true,
-  "crash-after-acquire loops eventually fail closed instead of growing without bound");
-assert.throws(
-  () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(liveLimitDir),
-  /lock_ticket_live_limit/,
-  "excess crash-only live tickets fail closed at the acquisition ceiling",
-);
-assert.equal(
-  lockTicketFinalArtifacts(liveLimitTickets).length <=
-    __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.live_hard_limit,
-  true,
-  "crash-after-acquire growth leaves a bounded final artifact set",
-);
+assert.equal(lockTicketTemps(liveLimitTickets).length, 1,
+  "repeated post-link crashes leave exactly one reclaimable staging file");
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: liveLimitDir,
+}), 0, "a later successful run can still reuse the reclaimed post-link sequence");
 assert.deepEqual(lockTicketTemps(liveLimitTickets), [],
-  "recovery of crash-only live growth does not leave orphan staging files behind");
+  "the successful post-link recovery clears the last staging orphan");
+assert.deepEqual(
+  lockTicketArtifacts(liveLimitTickets).filter(name => /^(\d+)\.(done|json)$/.test(name)),
+  ["00000001.done", "00000001.json"],
+  "repeated post-link crashes stay bounded to one reclaimable final ticket",
+);
 const tmpCeilingDir = `${tmp}/lock-tmp-ceiling.lock`;
 const tmpCeilingTickets = `${tmpCeilingDir}.tickets`;
 fs.mkdirSync(tmpCeilingTickets, { recursive: true, mode: 0o700 });
