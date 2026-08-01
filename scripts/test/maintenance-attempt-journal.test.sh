@@ -492,8 +492,29 @@ const run = ({
   }
   return result;
 };
+function writeCompletedLockTicket(ticketsDir, sequence) {
+  const prefix = String(sequence).padStart(8, "0");
+  const token = `completed-${prefix}`;
+  fs.mkdirSync(ticketsDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(`${ticketsDir}/${prefix}.json`, `${canonicalJson({
+    kind: "brokkr-lock-ticket",
+    schema_version: "v1",
+    pid: process.pid,
+    token,
+    sequence,
+  })}\n`);
+  fs.writeFileSync(`${ticketsDir}/${prefix}.done`, `${canonicalJson({
+    kind: "brokkr-lock-ticket-completion",
+    schema_version: "v1",
+    token,
+    sequence,
+  })}\n`);
+}
 
 if (process.env.WORKER_MODE) {
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (process.env.FAULT_POINT === point) process.exit(78);
+  };
   if (process.env.WORKER_MODE === "hold-lock") {
     const tickets = `${process.env.WORKER_DIR}/.autonomy-state/domain-state.lock.tickets`;
     fs.mkdirSync(tickets, { recursive: true });
@@ -1504,6 +1525,96 @@ assert.equal(run({ dir: staleLockDir }).reason, "committed",
 assert.throws(() => run({
   dir: staleLockDir, bind: { ...binding(), candidate_digest: "sha256:" + "7".repeat(64) },
 }), /attempt_conflicting_replay/, "terminal retry is idempotent only for the exact binding");
+for (const faultPoint of [
+  "after-lock-ticket-open",
+  "after-lock-ticket-write",
+  "after-lock-ticket-fsync",
+]) {
+  const faultDir = `${tmp}/${faultPoint}`;
+  const faultTickets = `${faultDir}/.autonomy-state/domain-state.lock.tickets`;
+  assert.equal(await runWorker({
+    WORKER_MODE: "fault", WORKER_DIR: faultDir, FAULT_POINT: faultPoint,
+  }), 78, `${faultPoint}: crash is injected before ticket publication`);
+  assert.deepEqual(
+    fs.existsSync(faultTickets) ?
+      fs.readdirSync(faultTickets).filter(name => /^\d+\.json$/.test(name)) : [],
+    [],
+    `${faultPoint}: no torn final ticket is published before durability`,
+  );
+  assert.equal(run({ dir: faultDir }).reason, "committed",
+    `${faultPoint}: restart recovers without delete races`);
+}
+for (const faultPoint of [
+  "after-lock-owner-operation",
+  "after-lock-completion-open",
+  "after-lock-completion-write",
+  "after-lock-completion-fsync",
+]) {
+  const faultDir = `${tmp}/${faultPoint}`;
+  const faultTickets = `${faultDir}/.autonomy-state/domain-state.lock.tickets`;
+  assert.equal(await runWorker({
+    WORKER_MODE: "fault", WORKER_DIR: faultDir, FAULT_POINT: faultPoint,
+  }), 78, `${faultPoint}: crash is injected before completion publication`);
+  const latestTicket = fs.readdirSync(faultTickets)
+    .filter(name => /^\d+\.json$/.test(name))
+    .sort()
+    .at(-1);
+  assert.equal(typeof latestTicket, "string", `${faultPoint}: owner ticket is durable`);
+  assert.equal(
+    fs.existsSync(
+      `${faultTickets}/${latestTicket.slice(0, latestTicket.length - ".json".length)}.done`,
+    ),
+    false,
+    `${faultPoint}: no completion marker is published before durability`,
+  );
+  assert.equal(run({
+    dir: faultDir,
+    admit: takeoverAdmission(),
+  }).reason, "recovered-disarmed",
+    `${faultPoint}: a dead predecessor is recoverable without unlink races`);
+}
+const exhaustedLockDir = `${tmp}/bounded-lock-tickets`;
+const exhaustedTickets =
+  `${exhaustedLockDir}/.autonomy-state/domain-state.lock.tickets`;
+for (let sequence = 1; sequence <= 10_000; sequence += 1) {
+  writeCompletedLockTicket(exhaustedTickets, sequence);
+}
+assert.equal(run({ dir: exhaustedLockDir }).reason, "committed",
+  "a completed 10,000-ticket prefix compacts instead of failing closed forever");
+const compactedArtifacts = fs.readdirSync(exhaustedTickets)
+  .filter(name => name === "checkpoint.json" || /^\d+\.(json|done)$/.test(name));
+assert.equal(compactedArtifacts.length <= 64, true,
+  "lock-ticket compaction leaves bounded final artifacts after >10,000 acquisitions");
+assert.equal(compactedArtifacts.includes("checkpoint.json"), true,
+  "bounded lock compaction records a durable checkpoint");
+const checkpointCrashDir = `${tmp}/lock-checkpoint-rename`;
+const checkpointCrashTickets =
+  `${checkpointCrashDir}/.autonomy-state/domain-state.lock.tickets`;
+for (let sequence = 1; sequence <= 10_000; sequence += 1) {
+  writeCompletedLockTicket(checkpointCrashTickets, sequence);
+}
+assert.equal(await runWorker({
+  WORKER_MODE: "fault",
+  WORKER_DIR: checkpointCrashDir,
+  FAULT_POINT: "after-lock-checkpoint-rename",
+}), 78, "checkpoint publication can crash after the atomic rename");
+assert.equal(
+  fs.readdirSync(checkpointCrashTickets).includes("checkpoint.json"),
+  true,
+  "the checkpoint rename boundary leaves a durable checkpoint artifact",
+);
+assert.equal(run({
+  dir: checkpointCrashDir,
+  admit: takeoverAdmission(),
+}).reason, "recovered-disarmed",
+  "checkpoint replay prunes the already-checkpointed prefix and proceeds");
+assert.equal(
+  fs.readdirSync(checkpointCrashTickets)
+    .filter(name => name === "checkpoint.json" || /^\d+\.(json|done)$/.test(name))
+    .length <= 64,
+  true,
+  "checkpoint replay re-bounds storage after a crash between rename and prune",
+);
 
 const sigkillDir = `${tmp}/controller-sigkill`;
 const sigkillApplyLog = `${tmp}/controller-sigkill-apply.log`;

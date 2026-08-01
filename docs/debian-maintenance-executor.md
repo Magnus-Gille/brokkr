@@ -168,8 +168,11 @@ The initial journal uses
 exclusive creation and all durable replacements are fsynced. Every append is a
 tail-digest compare-and-swap under a monotonic, exclusive-create lock ticket.
 A successor may advance past an incomplete ticket only after its owning
-process is proven dead; tickets are never unlinked or reused, eliminating
-read-then-delete takeover races. An exact
+process is proven dead. Ticket and completion publication are staged and
+fsynced before they become visible, so a crash cannot publish a torn latest
+ticket. Completed prefixes may be durably checkpoint-compacted, but no live
+ticket is ever deleted or reused; takeover therefore never depends on a
+read-then-delete race. An exact
 terminal retry is read-only even after signed demotion; conflicting bindings
 cannot masquerade as that retry.
 

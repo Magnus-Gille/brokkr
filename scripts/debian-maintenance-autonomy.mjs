@@ -61,6 +61,10 @@ const exactKeys = (value, keys) => (
   plain(value) && Object.keys(value).sort().join(",") === [...keys].sort().join(",")
 );
 const sha256 = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
+const LOCK_TICKET_FILE = /^(\d+)\.json$/;
+const LOCK_TICKET_DONE_FILE = /^(\d+)\.done$/;
+const LOCK_TICKET_CHECKPOINT = "checkpoint.json";
+const LOCK_TICKET_COMPACTION_THRESHOLD = 256;
 const boundedJson = file => {
   const raw = fs.readFileSync(file, "utf8");
   assert(Buffer.byteLength(raw) <= MAX_BYTES, "journal_too_large");
@@ -71,68 +75,191 @@ const fsyncDirectory = directory => {
   const fd = fs.openSync(directory, "r");
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 };
-function writeAtomic(file, value) {
+const lockTicketFault = point => globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__?.(point);
+const publishFault = (tag, boundary) => {
+  if (tag) lockTicketFault(`after-${tag}-${boundary}`);
+};
+const unlinkIfExists = file => {
+  try { fs.unlinkSync(file); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+};
+function writeAtomic(file, value, options = {}) {
+  const { faultTag = null } = options;
   const encoded = `${canonicalJson(value)}\n`;
   assert(Buffer.byteLength(encoded) <= MAX_BYTES, "journal_too_large");
   const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
   const fd = fs.openSync(temporary, "wx", 0o600);
-  try { fs.writeFileSync(fd, encoded); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  publishFault(faultTag, "open");
+  try {
+    fs.writeFileSync(fd, encoded);
+    publishFault(faultTag, "write");
+    fs.fsyncSync(fd);
+    publishFault(faultTag, "fsync");
+  } finally { fs.closeSync(fd); }
   fs.renameSync(temporary, file);
+  publishFault(faultTag, "rename");
   fsyncDirectory(path.dirname(file));
 }
-function createExclusive(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+function createExclusive(file, value, options = {}) {
+  const { faultTag = null } = options;
+  const directory = path.dirname(file);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const encoded = `${canonicalJson(value)}\n`;
   assert(Buffer.byteLength(encoded) <= MAX_BYTES, "journal_too_large");
-  let fd;
-  try { fd = fs.openSync(file, "wx", 0o600); }
-  catch (error) { if (error.code === "EEXIST") return false; throw error; }
-  try { fs.writeFileSync(fd, encoded); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  fsyncDirectory(path.dirname(file));
+  const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  const fd = fs.openSync(temporary, "wx", 0o600);
+  publishFault(faultTag, "open");
+  try {
+    fs.writeFileSync(fd, encoded);
+    publishFault(faultTag, "write");
+    fs.fsyncSync(fd);
+    publishFault(faultTag, "fsync");
+  } finally { fs.closeSync(fd); }
+  try { fs.linkSync(temporary, file); }
+  catch (error) {
+    unlinkIfExists(temporary);
+    if (error.code === "EEXIST") return false;
+    throw error;
+  }
+  publishFault(faultTag, "link");
+  fsyncDirectory(directory);
+  unlinkIfExists(temporary);
+  fsyncDirectory(directory);
   return true;
+}
+function readOptional(file) {
+  try { return boundedJson(file); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
 }
 const stateRoot = journalDir => path.join(journalDir, ".autonomy-state");
 const targetKey = binding => binding.target_scope_digest.slice("sha256:".length);
 const domainStateFile = journalDir => path.join(stateRoot(journalDir), "domain-state.json");
 const domainLockDir = journalDir => path.join(stateRoot(journalDir), "domain-state.lock");
+const lockTicketPrefix = sequence => String(sequence).padStart(8, "0");
+function readLockCheckpoint(tickets) {
+  const checkpoint = readOptional(path.join(tickets, LOCK_TICKET_CHECKPOINT));
+  if (checkpoint === null) return null;
+  assert(exactKeys(checkpoint, [
+    "kind", "schema_version", "last_completed_sequence",
+    "last_completed_token", "next_sequence",
+  ]) && checkpoint.kind === "brokkr-lock-ticket-checkpoint" &&
+    checkpoint.schema_version === "v1" &&
+    Number.isSafeInteger(checkpoint.last_completed_sequence) &&
+    checkpoint.last_completed_sequence >= 0 &&
+    typeof checkpoint.last_completed_token === "string" &&
+    checkpoint.last_completed_token.length >= 1 &&
+    Number.isSafeInteger(checkpoint.next_sequence) &&
+    checkpoint.next_sequence === checkpoint.last_completed_sequence + 1,
+  "lock_checkpoint_invalid");
+  return checkpoint;
+}
+function pruneCheckpointedLockTickets(tickets, floor) {
+  let pruned = false;
+  for (const name of fs.readdirSync(tickets)) {
+    const match = LOCK_TICKET_FILE.exec(name) ?? LOCK_TICKET_DONE_FILE.exec(name);
+    if (!match) continue;
+    const sequence = Number.parseInt(match[1], 10);
+    if (!Number.isSafeInteger(sequence) || sequence <= 0) fail("lock_owner_invalid");
+    if (sequence > floor) continue;
+    fs.unlinkSync(path.join(tickets, name));
+    pruned = true;
+  }
+  if (pruned) fsyncDirectory(tickets);
+}
+function lockTicketEntries(tickets, floor) {
+  return fs.readdirSync(tickets).flatMap(name => {
+    const match = LOCK_TICKET_FILE.exec(name);
+    if (!match) return [];
+    const sequence = Number.parseInt(match[1], 10);
+    assert(Number.isSafeInteger(sequence) && sequence > 0, "lock_owner_invalid");
+    if (sequence <= floor) return [];
+    return [{ name, prefix: match[1], sequence }];
+  }).sort((left, right) => left.sequence - right.sequence);
+}
+function readLockTicketRecord(tickets, entry) {
+  const existing = boundedJson(path.join(tickets, entry.name));
+  assert(exactKeys(existing, ["kind", "schema_version", "pid", "token", "sequence"]) &&
+    existing.kind === "brokkr-lock-ticket" && existing.schema_version === "v1" &&
+    Number.isSafeInteger(existing.pid) && typeof existing.token === "string" &&
+    existing.token.length >= 1 && existing.sequence === entry.sequence,
+  "lock_owner_invalid");
+  return existing;
+}
+function hasValidLockCompletion(tickets, entry, ticket) {
+  try {
+    const completion = boundedJson(path.join(tickets, `${entry.prefix}.done`));
+    assert(exactKeys(completion, ["kind", "schema_version", "token", "sequence"]) &&
+      completion.kind === "brokkr-lock-ticket-completion" &&
+      completion.schema_version === "v1" &&
+      completion.token === ticket.token &&
+      completion.sequence === ticket.sequence,
+    "lock_completion_invalid");
+    return true;
+  } catch (error) {
+    if (["ENOENT", "journal_invalid_json", "journal_too_large", "lock_completion_invalid"]
+      .includes(error.code)) {
+      return false;
+    }
+    throw error;
+  }
+}
+function lockOwnerAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+function compactLockTickets(tickets, ticket) {
+  const checkpoint = readLockCheckpoint(tickets);
+  const floor = checkpoint?.last_completed_sequence ?? 0;
+  if (lockTicketEntries(tickets, floor).length < LOCK_TICKET_COMPACTION_THRESHOLD) return;
+  writeAtomic(path.join(tickets, LOCK_TICKET_CHECKPOINT), {
+    kind: "brokkr-lock-ticket-checkpoint",
+    schema_version: "v1",
+    last_completed_sequence: ticket.sequence,
+    last_completed_token: ticket.token,
+    next_sequence: ticket.sequence + 1,
+  }, { faultTag: "lock-checkpoint" });
+  pruneCheckpointedLockTickets(tickets, ticket.sequence);
+}
 function withExclusiveDirectory(lockDir, code, operation) {
   const tickets = `${lockDir}.tickets`;
   fs.mkdirSync(tickets, { recursive: true, mode: 0o700 });
   const token = crypto.randomUUID();
-  const entries = fs.readdirSync(tickets).filter(name => /^\d{8}\.json$/.test(name)).sort();
-  assert(entries.length < 10_000, "lock_ticket_limit");
-  let sequence = 1;
+  const checkpoint = readLockCheckpoint(tickets);
+  const floor = checkpoint?.last_completed_sequence ?? 0;
+  if (checkpoint !== null) pruneCheckpointedLockTickets(tickets, floor);
+  const entries = lockTicketEntries(tickets, floor);
+  let sequence = checkpoint?.next_sequence ?? 1;
   if (entries.length) {
-    const latestName = entries.at(-1);
-    sequence = Number.parseInt(latestName.slice(0, 8), 10) + 1;
-    const existing = boundedJson(path.join(tickets, latestName));
-    assert(exactKeys(existing, ["kind", "schema_version", "pid", "token", "sequence"]) &&
-      existing.kind === "brokkr-lock-ticket" && existing.schema_version === "v1" &&
-      Number.isSafeInteger(existing.pid) && typeof existing.token === "string" &&
-      existing.sequence === sequence - 1, "lock_owner_invalid");
-    const completed = fs.existsSync(path.join(tickets, `${latestName.slice(0, 8)}.done`));
-    if (!completed) {
-    let alive = true;
-    try { process.kill(existing.pid, 0); }
-    catch (error) { if (error.code === "ESRCH") alive = false; else throw error; }
-    if (alive) fail(code);
+    const latestEntry = entries.at(-1);
+    sequence = latestEntry.sequence + 1;
+    const existing = readLockTicketRecord(tickets, latestEntry);
+    if (!hasValidLockCompletion(tickets, latestEntry, existing) &&
+        lockOwnerAlive(existing.pid)) {
+      fail(code);
     }
   }
-  const prefix = String(sequence).padStart(8, "0");
+  const prefix = lockTicketPrefix(sequence);
   const ticket = {
     kind: "brokkr-lock-ticket", schema_version: "v1", pid: process.pid, token, sequence,
   };
-  assert(createExclusive(path.join(tickets, `${prefix}.json`), ticket), code);
+  assert(createExclusive(path.join(tickets, `${prefix}.json`), ticket, {
+    faultTag: "lock-ticket",
+  }), code);
   try { return operation(); }
   finally {
+    lockTicketFault("after-lock-owner-operation");
     assert(createExclusive(path.join(tickets, `${prefix}.done`), {
       kind: "brokkr-lock-ticket-completion", schema_version: "v1", token, sequence,
+    }, {
+      faultTag: "lock-completion",
     }), "lock_completion_conflict");
+    compactLockTickets(tickets, ticket);
   }
-}
-function readOptional(file) {
-  try { return boundedJson(file); }
-  catch (error) { if (error.code === "ENOENT") return null; throw error; }
 }
 function claimTarget({
   journalDir, binding, bindingDigest, now, policy, resumeWatch = false,
