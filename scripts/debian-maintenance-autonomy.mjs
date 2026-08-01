@@ -63,8 +63,12 @@ const exactKeys = (value, keys) => (
 const sha256 = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const LOCK_TICKET_FILE = /^(\d+)\.json$/;
 const LOCK_TICKET_DONE_FILE = /^(\d+)\.done$/;
+const LOCK_TICKET_TMP_FILE =
+  /^((?:\d+\.json)|(?:\d+\.done)|(?:checkpoint\.json))\.(\d+)\.([0-9a-f-]{36})\.tmp$/;
 const LOCK_TICKET_CHECKPOINT = "checkpoint.json";
 const LOCK_TICKET_COMPACTION_THRESHOLD = 256;
+const LOCK_TICKET_ACQUIRE_RETRIES = 8;
+const LOCK_TICKET_TMP_HARD_LIMIT = 64;
 const boundedJson = file => {
   const raw = fs.readFileSync(file, "utf8");
   assert(Buffer.byteLength(raw) <= MAX_BYTES, "journal_too_large");
@@ -75,7 +79,11 @@ const fsyncDirectory = directory => {
   const fd = fs.openSync(directory, "r");
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 };
-const lockTicketFault = point => globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__?.(point);
+const lockTicketFault = point => {
+  if (process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS === "1") {
+    globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__?.(point);
+  }
+};
 const publishFault = (tag, boundary) => {
   if (tag) lockTicketFault(`after-${tag}-${boundary}`);
 };
@@ -153,6 +161,14 @@ function readLockCheckpoint(tickets) {
   "lock_checkpoint_invalid");
   return checkpoint;
 }
+function lockTicketTemp(name) {
+  if (!name.endsWith(".tmp")) return null;
+  const match = LOCK_TICKET_TMP_FILE.exec(name);
+  assert(match, "lock_ticket_tmp_invalid");
+  const pid = Number.parseInt(match[2], 10);
+  assert(Number.isSafeInteger(pid) && pid > 0, "lock_ticket_tmp_invalid");
+  return { name, pid };
+}
 function pruneCheckpointedLockTickets(tickets, floor) {
   let pruned = false;
   for (const name of fs.readdirSync(tickets)) {
@@ -161,8 +177,13 @@ function pruneCheckpointedLockTickets(tickets, floor) {
     const sequence = Number.parseInt(match[1], 10);
     if (!Number.isSafeInteger(sequence) || sequence <= 0) fail("lock_owner_invalid");
     if (sequence > floor) continue;
-    fs.unlinkSync(path.join(tickets, name));
-    pruned = true;
+    lockTicketFault("before-lock-prune-unlink");
+    try {
+      fs.unlinkSync(path.join(tickets, name));
+      pruned = true;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
   }
   if (pruned) fsyncDirectory(tickets);
 }
@@ -177,7 +198,9 @@ function lockTicketEntries(tickets, floor) {
   }).sort((left, right) => left.sequence - right.sequence);
 }
 function readLockTicketRecord(tickets, entry) {
-  const existing = boundedJson(path.join(tickets, entry.name));
+  let existing;
+  try { existing = boundedJson(path.join(tickets, entry.name)); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
   assert(exactKeys(existing, ["kind", "schema_version", "pid", "token", "sequence"]) &&
     existing.kind === "brokkr-lock-ticket" && existing.schema_version === "v1" &&
     Number.isSafeInteger(existing.pid) && typeof existing.token === "string" &&
@@ -185,7 +208,15 @@ function readLockTicketRecord(tickets, entry) {
   "lock_owner_invalid");
   return existing;
 }
-function hasValidLockCompletion(tickets, entry, ticket) {
+function checkpointCompletesLockTicket(checkpoint, ticket) {
+  if (checkpoint === null || checkpoint.last_completed_sequence < ticket.sequence) return false;
+  if (checkpoint.last_completed_sequence === ticket.sequence) {
+    assert(checkpoint.last_completed_token === ticket.token, "lock_checkpoint_conflict");
+  }
+  return true;
+}
+function hasValidLockCompletion(tickets, entry, ticket, checkpoint) {
+  if (checkpointCompletesLockTicket(checkpoint, ticket)) return true;
   try {
     const completion = boundedJson(path.join(tickets, `${entry.prefix}.done`));
     assert(exactKeys(completion, ["kind", "schema_version", "token", "sequence"]) &&
@@ -203,19 +234,43 @@ function hasValidLockCompletion(tickets, entry, ticket) {
     throw error;
   }
 }
+// PID liveness is only authoritative for this single-host, single-PID-namespace
+// local lock directory. EPERM therefore means "some owner still exists here".
 function lockOwnerAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
     if (error.code === "ESRCH") return false;
+    if (error.code === "EPERM") return true;
     throw error;
   }
 }
-function compactLockTickets(tickets, ticket) {
-  const checkpoint = readLockCheckpoint(tickets);
-  const floor = checkpoint?.last_completed_sequence ?? 0;
-  if (lockTicketEntries(tickets, floor).length < LOCK_TICKET_COMPACTION_THRESHOLD) return;
+function reclaimLockTicketTemps(tickets) {
+  let reclaimed = false;
+  for (const name of fs.readdirSync(tickets)) {
+    const temporary = lockTicketTemp(name);
+    if (!temporary || lockOwnerAlive(temporary.pid)) continue;
+    try {
+      fs.unlinkSync(path.join(tickets, temporary.name));
+      reclaimed = true;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  if (reclaimed) fsyncDirectory(tickets);
+  let remainingTemps = 0;
+  for (const name of fs.readdirSync(tickets)) {
+    if (lockTicketTemp(name)) remainingTemps += 1;
+  }
+  assert(remainingTemps <= LOCK_TICKET_TMP_HARD_LIMIT, "lock_ticket_tmp_limit");
+}
+function publishLockCheckpoint(tickets, ticket) {
+  const current = readLockCheckpoint(tickets);
+  if (checkpointCompletesLockTicket(current, ticket)) return current;
+  if (current !== null && current.last_completed_sequence > ticket.sequence) {
+    return current;
+  }
   writeAtomic(path.join(tickets, LOCK_TICKET_CHECKPOINT), {
     kind: "brokkr-lock-ticket-checkpoint",
     schema_version: "v1",
@@ -223,42 +278,125 @@ function compactLockTickets(tickets, ticket) {
     last_completed_token: ticket.token,
     next_sequence: ticket.sequence + 1,
   }, { faultTag: "lock-checkpoint" });
-  pruneCheckpointedLockTickets(tickets, ticket.sequence);
+  const published = readLockCheckpoint(tickets);
+  assert(published !== null &&
+    published.last_completed_sequence >= ticket.sequence,
+  "lock_checkpoint_regressed");
+  if (published.last_completed_sequence === ticket.sequence) {
+    assert(published.last_completed_token === ticket.token, "lock_checkpoint_conflict");
+  }
+  return published;
+}
+function completionFailure(error) {
+  if ([
+    "lock_completion_conflict",
+    "lock_checkpoint_conflict",
+    "lock_checkpoint_invalid",
+    "lock_checkpoint_regressed",
+  ].includes(error?.code)) {
+    return error;
+  }
+  const wrapped = new Error("lock_completion_ambiguous", { cause: error });
+  wrapped.code = "lock_completion_ambiguous";
+  return wrapped;
+}
+function releaseLockTicket(tickets, ticket) {
+  let checkpoint = readLockCheckpoint(tickets);
+  if (checkpointCompletesLockTicket(checkpoint, ticket)) {
+    try {
+      lockTicketFault("after-lock-release-visible-before-prune");
+      pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
+      return;
+    } catch (error) { return error; }
+  }
+  const floor = checkpoint?.last_completed_sequence ?? 0;
+  if (lockTicketEntries(tickets, floor).length >= LOCK_TICKET_COMPACTION_THRESHOLD) {
+    checkpoint = publishLockCheckpoint(tickets, ticket);
+    try {
+      lockTicketFault("after-lock-release-visible-before-prune");
+      pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
+      return;
+    } catch (error) { return error; }
+  }
+  assert(createExclusive(path.join(
+    tickets,
+    `${lockTicketPrefix(ticket.sequence)}.done`,
+  ), {
+    kind: "brokkr-lock-ticket-completion",
+    schema_version: "v1",
+    token: ticket.token,
+    sequence: ticket.sequence,
+  }, {
+    faultTag: "lock-completion",
+  }), "lock_completion_conflict");
+  try {
+    lockTicketFault("after-lock-release-visible-before-prune");
+    return;
+  } catch (error) { return error; }
 }
 function withExclusiveDirectory(lockDir, code, operation) {
   const tickets = `${lockDir}.tickets`;
   fs.mkdirSync(tickets, { recursive: true, mode: 0o700 });
   const token = crypto.randomUUID();
-  const checkpoint = readLockCheckpoint(tickets);
-  const floor = checkpoint?.last_completed_sequence ?? 0;
-  if (checkpoint !== null) pruneCheckpointedLockTickets(tickets, floor);
-  const entries = lockTicketEntries(tickets, floor);
-  let sequence = checkpoint?.next_sequence ?? 1;
-  if (entries.length) {
-    const latestEntry = entries.at(-1);
-    sequence = latestEntry.sequence + 1;
-    const existing = readLockTicketRecord(tickets, latestEntry);
-    if (!hasValidLockCompletion(tickets, latestEntry, existing) &&
-        lockOwnerAlive(existing.pid)) {
-      fail(code);
+  let ticket = null;
+  for (let attempt = 0; attempt < LOCK_TICKET_ACQUIRE_RETRIES; attempt += 1) {
+    reclaimLockTicketTemps(tickets);
+    const checkpoint = readLockCheckpoint(tickets);
+    const floor = checkpoint?.last_completed_sequence ?? 0;
+    if (checkpoint !== null) pruneCheckpointedLockTickets(tickets, floor);
+    const entries = lockTicketEntries(tickets, floor);
+    let sequence = checkpoint?.next_sequence ?? 1;
+    if (entries.length) {
+      const latestEntry = entries.at(-1);
+      sequence = latestEntry.sequence + 1;
+      lockTicketFault("before-lock-ticket-read");
+      const existing = readLockTicketRecord(tickets, latestEntry);
+      if (existing === null) continue;
+      const refreshedCheckpoint = readLockCheckpoint(tickets);
+      if (refreshedCheckpoint?.last_completed_sequence >= latestEntry.sequence) {
+        if (refreshedCheckpoint.last_completed_sequence === latestEntry.sequence) {
+          assert(refreshedCheckpoint.last_completed_token === existing.token,
+            "lock_checkpoint_conflict");
+        }
+        continue;
+      }
+      if (!hasValidLockCompletion(tickets, latestEntry, existing, refreshedCheckpoint) &&
+          lockOwnerAlive(existing.pid)) {
+        fail(code);
+      }
     }
+    const candidate = {
+      kind: "brokkr-lock-ticket",
+      schema_version: "v1",
+      pid: process.pid,
+      token,
+      sequence,
+    };
+    if (!createExclusive(path.join(
+      tickets,
+      `${lockTicketPrefix(sequence)}.json`,
+    ), candidate, {
+      faultTag: "lock-ticket",
+    })) {
+      continue;
+    }
+    ticket = candidate;
+    break;
   }
-  const prefix = lockTicketPrefix(sequence);
-  const ticket = {
-    kind: "brokkr-lock-ticket", schema_version: "v1", pid: process.pid, token, sequence,
-  };
-  assert(createExclusive(path.join(tickets, `${prefix}.json`), ticket, {
-    faultTag: "lock-ticket",
-  }), code);
-  try { return operation(); }
-  finally {
+  assert(ticket !== null, "lock_ticket_acquire_retry_exhausted");
+  let result = true;
+  let operationError = null;
+  try { result = operation(); }
+  catch (error) { operationError = error; }
+  try {
     lockTicketFault("after-lock-owner-operation");
-    assert(createExclusive(path.join(tickets, `${prefix}.done`), {
-      kind: "brokkr-lock-ticket-completion", schema_version: "v1", token, sequence,
-    }, {
-      faultTag: "lock-completion",
-    }), "lock_completion_conflict");
-    compactLockTickets(tickets, ticket);
+    const compactionError = releaseLockTicket(tickets, ticket);
+    if (operationError) throw operationError;
+    if (!compactionError) return result;
+    return result;
+  } catch (error) {
+    if (operationError) throw operationError;
+    throw completionFailure(error);
   }
 }
 function claimTarget({
@@ -2269,6 +2407,13 @@ const DEBIAN_API = (() => {
 })();
 
 export const { deriveDebianAutonomyExecution } = DEBIAN_API;
+export const __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS = Object.freeze({
+  compaction_threshold: LOCK_TICKET_COMPACTION_THRESHOLD,
+  tmp_hard_limit: LOCK_TICKET_TMP_HARD_LIMIT,
+});
+export function __BROKKR_TEST_ONLY__probeExclusiveDirectory(lockDir, operation = () => true) {
+  return withExclusiveDirectory(lockDir, "lock_probe_contended", operation);
+}
 
 // The raw W2a runner stays in DEBIAN_API's closure.  This is intentionally the
 // only exported production runner so every ambiguous effect must cross the

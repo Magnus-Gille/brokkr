@@ -168,11 +168,16 @@ The initial journal uses
 exclusive creation and all durable replacements are fsynced. Every append is a
 tail-digest compare-and-swap under a monotonic, exclusive-create lock ticket.
 A successor may advance past an incomplete ticket only after its owning
-process is proven dead. Ticket and completion publication are staged and
-fsynced before they become visible, so a crash cannot publish a torn latest
-ticket. Completed prefixes may be durably checkpoint-compacted, but no live
-ticket is ever deleted or reused; takeover therefore never depends on a
-read-then-delete race. An exact
+process is proven dead inside the local single-host, single-PID-namespace lock
+scope; `kill(pid, 0)` `EPERM` is treated as still alive. Ticket publication is
+staged and fsynced before visibility, so a crash cannot publish a torn latest
+ticket. When the live suffix reaches the compaction threshold, the owner
+publishes a monotonic checkpoint as the completion marker before pruning that
+completed prefix; a later writer may only advance that checkpoint, never
+regress it. Acquisition retries boundedly across prune-vs-read races, and dead
+staging files are reclaimed under a fail-closed local ceiling so crash-only
+growth stays bounded. Completed prefixes may therefore be durably
+checkpoint-compacted without deleting or reusing a live ticket. An exact
 terminal retry is read-only even after signed demotion; conflicting bindings
 cannot masquerade as that retry.
 

@@ -18,6 +18,10 @@ const {
   deriveDebianAutonomyExecution, runDebianMaintenance,
 } = await import(`${root}/scripts/debian-maintenance-executor.mjs`);
 const {
+  __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS,
+  __BROKKR_TEST_ONLY__probeExclusiveDirectory,
+} = await import(`${root}/scripts/debian-maintenance-autonomy.mjs`);
+const {
   autonomyDigest, canonicalJson,
 } = await import(`${root}/scripts/lib/autonomy-authorization.mjs`);
 const {
@@ -510,11 +514,57 @@ function writeCompletedLockTicket(ticketsDir, sequence) {
     sequence,
   })}\n`);
 }
+const lockTicketArtifacts = ticketsDir => (
+  fs.existsSync(ticketsDir) ? fs.readdirSync(ticketsDir).sort() : []
+);
+const lockTicketSequences = ticketsDir => lockTicketArtifacts(ticketsDir)
+  .flatMap(name => {
+    const match = /^(\d+)\.json$/.exec(name);
+    return match ? [Number.parseInt(match[1], 10)] : [];
+  })
+  .sort((left, right) => left - right);
+const lockTicketTemps = ticketsDir => lockTicketArtifacts(ticketsDir)
+  .filter(name => name.endsWith(".tmp"));
+function waitForFile(file, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(file)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${file}`);
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+  }
+}
+function withLockTicketFaults(fn) {
+  const previousEnabled = process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS;
+  process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS = "1";
+  try {
+    return fn();
+  } finally {
+    if (previousEnabled === undefined) {
+      delete process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS;
+    } else {
+      process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS = previousEnabled;
+    }
+    delete globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__;
+  }
+}
 
 if (process.env.WORKER_MODE) {
+  process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS = "1";
   globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (process.env.HOLD_POINT === point) {
+      if (process.env.HOLD_READY) fs.writeFileSync(process.env.HOLD_READY, `${point}\n`);
+      while (!process.env.HOLD_RELEASE ||
+          !fs.existsSync(process.env.HOLD_RELEASE)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+      }
+    }
     if (process.env.FAULT_POINT === point) process.exit(78);
   };
+  if (process.env.WORKER_MODE === "lock-probe") {
+    __BROKKR_TEST_ONLY__probeExclusiveDirectory(process.env.LOCK_DIR);
+    process.exit(0);
+  }
   if (process.env.WORKER_MODE === "hold-lock") {
     const tickets = `${process.env.WORKER_DIR}/.autonomy-state/domain-state.lock.tickets`;
     fs.mkdirSync(tickets, { recursive: true });
@@ -1525,6 +1575,183 @@ assert.equal(run({ dir: staleLockDir }).reason, "committed",
 assert.throws(() => run({
   dir: staleLockDir, bind: { ...binding(), candidate_digest: "sha256:" + "7".repeat(64) },
 }), /attempt_conflicting_replay/, "terminal retry is idempotent only for the exact binding");
+const directCompactionDir = `${tmp}/direct-lock-compaction.lock`;
+const directCompactionTickets = `${directCompactionDir}.tickets`;
+for (let sequence = 1;
+  sequence < __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold;
+  sequence += 1) {
+  writeCompletedLockTicket(directCompactionTickets, sequence);
+}
+withLockTicketFaults(() => {
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (point === "after-lock-release-visible-before-prune") {
+      throw Object.assign(new Error("synthetic-lock-compaction-failure"), {
+        code: "synthetic_lock_compaction_failure",
+      });
+    }
+  };
+  assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(directCompactionDir), true,
+    "post-release compaction faults do not mask the successful primary operation");
+});
+assert.equal(
+  bounded(`${directCompactionTickets}/checkpoint.json`).last_completed_sequence,
+  __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold,
+  "compaction durability survives best-effort prune failure after visible completion",
+);
+const directAmbiguousDir = `${tmp}/direct-lock-ambiguous.lock`;
+const directAmbiguousTickets = `${directAmbiguousDir}.tickets`;
+for (let sequence = 1;
+  sequence < __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold;
+  sequence += 1) {
+  writeCompletedLockTicket(directAmbiguousTickets, sequence);
+}
+withLockTicketFaults(() => {
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (point === "after-lock-checkpoint-fsync") {
+      throw Object.assign(new Error("synthetic-lock-checkpoint-fsync"), {
+        code: "synthetic_lock_checkpoint_fsync",
+      });
+    }
+  };
+  assert.throws(
+    () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(directAmbiguousDir),
+    /lock_completion_ambiguous/,
+    "a successful operation is not reported as safely retryable when checkpoint completion is ambiguous",
+  );
+});
+assert.equal(lockTicketTemps(directAmbiguousTickets).length, 1,
+  "an ambiguous checkpoint boundary leaves exactly one orphaned staging file");
+const epermDir = `${tmp}/lock-liveness-eperm.lock`;
+const epermTickets = `${epermDir}.tickets`;
+fs.mkdirSync(epermTickets, { recursive: true, mode: 0o700 });
+fs.writeFileSync(`${epermTickets}/00000001.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket",
+  schema_version: "v1",
+  pid: 424242,
+  token: "eperm-owner",
+  sequence: 1,
+})}\n`);
+const originalKill = process.kill;
+process.kill = ((pid, signal) => {
+  if (pid === 424242 && signal === 0) {
+    throw Object.assign(new Error("eperm-owner"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  assert.throws(
+    () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(epermDir),
+    /lock_probe_contended/,
+    "EPERM is treated as evidence that the recorded owner is still alive",
+  );
+} finally {
+  process.kill = originalKill;
+}
+const delayedCompactorDir = `${tmp}/delayed-compactor.lock`;
+const delayedCompactorTickets = `${delayedCompactorDir}.tickets`;
+for (let sequence = 1;
+  sequence < __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold;
+  sequence += 1) {
+  writeCompletedLockTicket(delayedCompactorTickets, sequence);
+}
+const delayedCompactorReady = `${tmp}/delayed-compactor.ready`;
+const delayedCompactorRelease = `${tmp}/delayed-compactor.release`;
+const delayedCompactor = runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: delayedCompactorDir,
+  HOLD_POINT: "after-lock-release-visible-before-prune",
+  HOLD_READY: delayedCompactorReady,
+  HOLD_RELEASE: delayedCompactorRelease,
+});
+waitForFile(delayedCompactorReady);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: delayedCompactorDir,
+}), 0, "a successor can enter after the visible release boundary");
+fs.writeFileSync(delayedCompactorRelease, "");
+assert.equal(await delayedCompactor, 0);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: delayedCompactorDir,
+}), 0);
+assert.equal(
+  bounded(`${delayedCompactorTickets}/checkpoint.json`).last_completed_sequence,
+  __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold,
+  "the delayed compactor leaves its monotonic completion checkpoint in place",
+);
+assert.deepEqual(
+  lockTicketSequences(delayedCompactorTickets),
+  [
+    __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold + 1,
+    __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold + 2,
+  ],
+  "a delayed compactor cannot regress the checkpoint or reuse a sequence",
+);
+const pruneRaceDir = `${tmp}/lock-prune-race.lock`;
+const pruneRaceTickets = `${pruneRaceDir}.tickets`;
+fs.mkdirSync(pruneRaceTickets, { recursive: true, mode: 0o700 });
+fs.writeFileSync(`${pruneRaceTickets}/checkpoint.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket-checkpoint",
+  schema_version: "v1",
+  last_completed_sequence: 2,
+  last_completed_token: "completed-00000002",
+  next_sequence: 3,
+})}\n`);
+writeCompletedLockTicket(pruneRaceTickets, 1);
+writeCompletedLockTicket(pruneRaceTickets, 2);
+const pruneRaceReady = `${tmp}/lock-prune-race.ready`;
+const pruneRaceRelease = `${tmp}/lock-prune-race.release`;
+const pruneRace = runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: pruneRaceDir,
+  HOLD_POINT: "before-lock-prune-unlink",
+  HOLD_READY: pruneRaceReady,
+  HOLD_RELEASE: pruneRaceRelease,
+});
+waitForFile(pruneRaceReady);
+for (const name of [
+  "00000001.json", "00000001.done", "00000002.json", "00000002.done",
+]) {
+  fs.unlinkSync(`${pruneRaceTickets}/${name}`);
+}
+fs.writeFileSync(pruneRaceRelease, "");
+assert.equal(await pruneRace, 0,
+  "pruning tolerates ENOENT when another pruner wins the unlink race");
+assert.deepEqual(lockTicketSequences(pruneRaceTickets), [3]);
+const readRaceDir = `${tmp}/lock-read-race.lock`;
+const readRaceTickets = `${readRaceDir}.tickets`;
+for (let sequence = 1; sequence <= 256; sequence += 1) {
+  writeCompletedLockTicket(readRaceTickets, sequence);
+}
+const readRaceReady = `${tmp}/lock-read-race.ready`;
+const readRaceRelease = `${tmp}/lock-read-race.release`;
+const readRace = runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: readRaceDir,
+  HOLD_POINT: "before-lock-ticket-read",
+  HOLD_READY: readRaceReady,
+  HOLD_RELEASE: readRaceRelease,
+});
+waitForFile(readRaceReady);
+fs.writeFileSync(`${readRaceTickets}/checkpoint.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket-checkpoint",
+  schema_version: "v1",
+  last_completed_sequence: 256,
+  last_completed_token: "completed-00000256",
+  next_sequence: 257,
+})}\n`);
+for (const name of lockTicketArtifacts(readRaceTickets)) {
+  if (name === "checkpoint.json") continue;
+  fs.unlinkSync(`${readRaceTickets}/${name}`);
+}
+fs.writeFileSync(readRaceRelease, "");
+assert.equal(await readRace, 0,
+  "bounded retry survives a prune-vs-read race on the latest completed ticket");
+assert.equal(
+  bounded(`${readRaceTickets}/checkpoint.json`).last_completed_sequence,
+  256,
+);
+assert.deepEqual(lockTicketSequences(readRaceTickets), [257]);
 for (const faultPoint of [
   "after-lock-ticket-open",
   "after-lock-ticket-write",
@@ -1573,6 +1800,96 @@ for (const faultPoint of [
   }).reason, "recovered-disarmed",
     `${faultPoint}: a dead predecessor is recoverable without unlink races`);
 }
+for (const faultPoint of [
+  "after-lock-ticket-link",
+  "after-lock-checkpoint-open",
+  "after-lock-checkpoint-write",
+  "after-lock-checkpoint-fsync",
+]) {
+  const faultDir = `${tmp}/lock-probe-${faultPoint}`;
+  const faultTickets = `${faultDir}.tickets`;
+  for (let sequence = 1;
+    sequence < __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold;
+    sequence += 1) {
+    writeCompletedLockTicket(faultTickets, sequence);
+  }
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: faultDir,
+    FAULT_POINT: faultPoint,
+  }), 78, faultPoint);
+  assert.equal(lockTicketTemps(faultTickets).length >= 1, true,
+    `${faultPoint}: the crash boundary leaves a reclaimable staging file`);
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: faultDir,
+  }), 0, `${faultPoint}: restart reclaims orphan staging and finishes`);
+  assert.deepEqual(lockTicketTemps(faultTickets), [],
+    `${faultPoint}: restart removes orphan staging files`);
+  assert.equal(
+    bounded(`${faultTickets}/checkpoint.json`).last_completed_sequence >=
+      __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold,
+    true,
+    `${faultPoint}: recovery leaves a monotonic durable checkpoint`,
+  );
+}
+for (const faultPoint of ["after-lock-completion-link"]) {
+  const faultDir = `${tmp}/lock-probe-${faultPoint}`;
+  const faultTickets = `${faultDir}.tickets`;
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: faultDir,
+    FAULT_POINT: faultPoint,
+  }), 78, faultPoint);
+  assert.equal(lockTicketTemps(faultTickets).length, 1,
+    `${faultPoint}: the crash boundary leaves exactly one orphaned staging file`);
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: faultDir,
+  }), 0, `${faultPoint}: restart cleans the orphaned completion staging file`);
+  assert.deepEqual(lockTicketTemps(faultTickets), [],
+    `${faultPoint}: restart removes the orphaned completion staging file`);
+}
+const repeatedTmpDir = `${tmp}/repeated-lock-tmp.lock`;
+const repeatedTmpTickets = `${repeatedTmpDir}.tickets`;
+for (let attempt = 1; attempt <= 8; attempt += 1) {
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: repeatedTmpDir,
+    FAULT_POINT: "after-lock-ticket-write",
+  }), 78, `repeated tmp crash ${attempt}`);
+  assert.equal(lockTicketTemps(repeatedTmpTickets).length <= 1, true,
+    "repeated fault injection stays bounded by reclaiming the prior orphan before the next attempt");
+}
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: repeatedTmpDir,
+}), 0);
+assert.deepEqual(lockTicketTemps(repeatedTmpTickets), [],
+  "a subsequent successful run clears the last orphaned staging file");
+assert.deepEqual(
+  lockTicketArtifacts(repeatedTmpTickets).filter(
+    name => /^(\d+)\.(done|json)$/.test(name),
+  ),
+  ["00000001.done", "00000001.json"],
+  "repeated crash-only growth leaves an exact bounded final artifact set",
+);
+const tmpCeilingDir = `${tmp}/lock-tmp-ceiling.lock`;
+const tmpCeilingTickets = `${tmpCeilingDir}.tickets`;
+fs.mkdirSync(tmpCeilingTickets, { recursive: true, mode: 0o700 });
+for (let count = 0;
+  count <= __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.tmp_hard_limit;
+  count += 1) {
+  fs.writeFileSync(
+    `${tmpCeilingTickets}/00000001.json.${process.pid}.${crypto.randomUUID()}.tmp`,
+    "{}\n",
+  );
+}
+assert.throws(
+  () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(tmpCeilingDir),
+  /lock_ticket_tmp_limit/,
+  "live staging growth above the hard ceiling fails closed",
+);
 const exhaustedLockDir = `${tmp}/bounded-lock-tickets`;
 const exhaustedTickets =
   `${exhaustedLockDir}/.autonomy-state/domain-state.lock.tickets`;
