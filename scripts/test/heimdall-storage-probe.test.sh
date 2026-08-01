@@ -5,8 +5,17 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 PROBE="$REPO/scripts/heimdall-storage-probe.sh"
+TMP_ROOT=${TMPDIR:-/tmp}
+while [[ "$TMP_ROOT" == */ ]]; do
+  TMP_ROOT=${TMP_ROOT%/}
+done
+[[ -n "$TMP_ROOT" ]] || TMP_ROOT=/
+if ! TMP_ROOT="$(cd "$TMP_ROOT" && pwd -P)"; then
+  echo 'could not normalize temporary test root' >&2
+  exit 1
+fi
 TMP=
-if ! TMP="$(mktemp -d "${TMPDIR:-/tmp}/brokkr-heimdall-storage-probe.XXXXXX")"; then
+if ! TMP="$(mktemp -d "${TMP_ROOT%/}/brokkr-heimdall-storage-probe.XXXXXX")"; then
   echo 'could not allocate temporary test directory' >&2
   exit 1
 fi
@@ -134,6 +143,21 @@ else
 fi
 check 'mixed legacy and v1 Mimir configuration is refused' '[[ $CONFIG_RC -ne 0 ]]'
 
+write_config
+BROKKR_STORAGE_PROBE_CONFIG="$TMP/probe.conf" bash "$PROBE" --validate-config
+check 'clean v1 config validates before duplicate-separator mutation' '[[ $? -eq 0 ]]'
+sed -i.bak "s|MIMIR_BACKUP_RECORD=.*|MIMIR_BACKUP_RECORD=$TMP//backup.json|" "$TMP/probe.conf"
+if BROKKR_STORAGE_PROBE_CONFIG="$TMP/probe.conf" bash "$PROBE" --validate-config >/dev/null 2>&1; then
+  CONFIG_RC=0
+else
+  # shellcheck disable=SC2034 # Assertion consumes CONFIG_RC through check/eval.
+  CONFIG_RC=$?
+fi
+check 'duplicate separator in configured record path is refused' '[[ $CONFIG_RC -ne 0 ]]'
+
+write_config
+BROKKR_STORAGE_PROBE_CONFIG="$TMP/probe.conf" bash "$PROBE" --validate-config
+check 'clean v1 config validates before traversal mutation' '[[ $? -eq 0 ]]'
 sed -i.bak 's|MIMIR_BACKUP_RECORD=.*|MIMIR_BACKUP_RECORD=/tmp/../backup.json|' "$TMP/probe.conf"
 if BROKKR_STORAGE_PROBE_CONFIG="$TMP/probe.conf" bash "$PROBE" --validate-config >/dev/null 2>&1; then
   CONFIG_RC=0
