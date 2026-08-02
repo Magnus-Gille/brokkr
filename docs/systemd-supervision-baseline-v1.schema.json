@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grimnir.gille.ai/contracts/systemd-supervision-baseline/v1/schema.json",
+  "title": "Brokkr systemd supervision baseline v1",
+  "description": "Versioned, read-only substrate policy for systemd service and timer supervision. It describes required and allowed semantics; it never edits a unit or authorizes deployment.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "baseline_id", "authority", "freshness", "scopes", "workloads", "watchdog", "observations", "extensions"],
+  "properties": {
+    "kind": { "const": "systemd-supervision-baseline" },
+    "schema_version": { "const": "v1" },
+    "baseline_id": { "$ref": "#/$defs/id" },
+    "authority": { "$ref": "#/$defs/authority" },
+    "freshness": { "$ref": "#/$defs/freshness" },
+    "scopes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "user"],
+      "properties": {
+        "system": { "$ref": "#/$defs/system-scope" },
+        "user": { "$ref": "#/$defs/user-scope" }
+      }
+    },
+    "workloads": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["long-running", "oneshot", "timer"],
+      "properties": {
+        "long-running": { "$ref": "#/$defs/service-workload" },
+        "oneshot": { "$ref": "#/$defs/service-workload" },
+        "timer": { "$ref": "#/$defs/timer-workload" }
+      }
+    },
+    "watchdog": { "$ref": "#/$defs/watchdog" },
+    "observations": { "$ref": "#/$defs/observations" },
+    "extensions": { "type": "array", "items": {} }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["topology", "failure_delivery", "audit"],
+      "properties": {
+        "topology": { "const": "grimnir-service-registry" },
+        "failure_delivery": { "const": "brokkr-systemd-failure-v1" },
+        "audit": { "const": "brokkr-systemd-supervision-audit-v1" }
+      }
+    },
+    "freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_age_seconds", "future_skew_seconds"],
+      "properties": {
+        "max_age_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+        "future_skew_seconds": { "type": "integer", "minimum": 0, "maximum": 300 }
+      }
+    },
+    "scope-delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "mode"],
+      "properties": {
+        "required": { "const": true },
+        "mode": { "enum": ["brokkr-systemd-failure", "component-owner"] }
+      }
+    },
+    "system-scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manager", "failure_delivery"],
+      "properties": {
+        "manager": { "const": "system" },
+        "failure_delivery": { "$ref": "#/$defs/scope-delivery" }
+      }
+    },
+    "user-scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manager", "failure_delivery"],
+      "properties": {
+        "manager": { "const": "user" },
+        "failure_delivery": { "$ref": "#/$defs/scope-delivery" }
+      }
+    },
+    "bound": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "min_seconds", "max_seconds"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "min_seconds": { "type": "integer", "minimum": 0, "maximum": 31536000 },
+        "max_seconds": { "type": "integer", "minimum": 0, "maximum": 31536000 }
+      }
+    },
+    "count-bound": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "min", "max"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "min": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "max": { "type": "integer", "minimum": 1, "maximum": 100000 }
+      }
+    },
+    "restart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "allowed", "delay"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "allowed": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "delay": { "$ref": "#/$defs/bound" }
+      }
+    },
+    "timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "stop", "runtime"],
+      "properties": {
+        "start": { "$ref": "#/$defs/bound" },
+        "stop": { "$ref": "#/$defs/bound" },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["required", "allow_infinity", "min_seconds", "max_seconds"],
+          "properties": {
+            "required": { "type": "boolean" },
+            "allow_infinity": { "type": "boolean" },
+            "min_seconds": { "type": "integer", "minimum": 0, "maximum": 31536000 },
+            "max_seconds": { "type": "integer", "minimum": 1, "maximum": 31536000 }
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interval", "burst"],
+      "properties": {
+        "interval": { "$ref": "#/$defs/bound" },
+        "burst": { "$ref": "#/$defs/count-bound" }
+      }
+    },
+    "oom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "allowed"],
+      "properties": {
+        "required": { "const": true },
+        "allowed": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["stop", "kill", "continue"] } }
+      }
+    },
+    "service-workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_type", "restart", "start_limits", "timeouts", "oom", "failure_delivery", "readiness"],
+      "properties": {
+        "unit_type": { "const": "service" },
+        "restart": { "$ref": "#/$defs/restart" },
+        "start_limits": { "$ref": "#/$defs/limits" },
+        "timeouts": { "$ref": "#/$defs/timeouts" },
+        "oom": { "$ref": "#/$defs/oom" },
+        "failure_delivery": { "$ref": "#/$defs/scope-delivery" },
+        "readiness": { "type": "object", "additionalProperties": false, "required": ["required"], "properties": { "required": { "type": "boolean" } } }
+      }
+    },
+    "timer-workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_type", "persistence", "accuracy", "schedule", "missed_runs"],
+      "properties": {
+        "unit_type": { "const": "timer" },
+        "persistence": { "type": "object", "additionalProperties": false, "required": ["required", "allowed"], "properties": { "required": { "const": true }, "allowed": { "type": "array", "minItems": 1, "items": { "type": "boolean" } } } },
+        "accuracy": { "$ref": "#/$defs/bound" },
+        "schedule": { "type": "object", "additionalProperties": false, "required": ["required", "directives"], "properties": { "required": { "const": true }, "directives": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnUnitInactiveSec"] } } } },
+        "missed_runs": { "const": true }
+      }
+    },
+    "watchdog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["directive", "requires_type", "min_seconds", "max_seconds", "requires_app_heartbeat", "requires_live_lock_fixture"],
+      "properties": {
+        "directive": { "const": "WatchdogSec" },
+        "requires_type": { "const": "notify" },
+        "min_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "max_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "requires_app_heartbeat": { "const": true },
+        "requires_live_lock_fixture": { "const": true }
+      }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_blind", "fields"],
+      "properties": {
+        "content_blind": { "const": true },
+        "fields": { "type": "array", "minItems": 5, "uniqueItems": true, "items": { "enum": ["unit_result", "restart_count_window", "watchdog_result", "oom_result", "timer_last_next_run", "audit_freshness"] } }
+      }
+    }
+  }
+}

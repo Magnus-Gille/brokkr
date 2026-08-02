@@ -1,0 +1,36 @@
+{
+  "base": "observations-positive.json",
+  "cases": [
+    {
+      "id": "restart-storm",
+      "mutations": {
+        "units.0.restart.count": 5
+      }
+    },
+    {
+      "id": "oom",
+      "mutations": {
+        "units.0.oom.result": "killed"
+      }
+    },
+    {
+      "id": "missed-timer",
+      "mutations": {
+        "units.2.timer.missed_runs": 2,
+        "units.2.timer.persistent": false
+      }
+    },
+    {
+      "id": "absent-notifier",
+      "mutations": {
+        "notifier": null
+      }
+    },
+    {
+      "id": "stale-audit",
+      "mutations": {
+        "observed_at": "2026-08-01T11:55:00Z"
+      }
+    }
+  ]
+}

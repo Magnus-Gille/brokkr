@@ -1,0 +1,65 @@
+{
+  "base": "declarations-positive.json",
+  "cases": [
+    {
+      "id": "unsafe-long-running",
+      "mutations": {
+        "units.0.directives.Restart": "always",
+        "units.0.directives.RestartSec": "0s",
+        "units.0.directives.StartLimitBurst": "0",
+        "units.0.directives.TimeoutStartSec": "infinity",
+        "units.0.directives.OOMPolicy": "continue",
+        "units.0.directives.OnFailure": "other-notifier.service",
+        "units.0.directives.WatchdogSec": "1s",
+        "units.0.heartbeat.app_heartbeat": "absent",
+        "units.0.heartbeat.live_lock_fixture": "absent",
+        "units.0.readiness": "absent"
+      }
+    },
+    {
+      "id": "contradictory-oneshot",
+      "mutations": {
+        "units.1.directives.Restart": "on-failure",
+        "units.1.directives.RestartSec": "5s"
+      }
+    },
+    {
+      "id": "user-system-delivery",
+      "mutations": {
+        "units.3.directives.OnFailure": "brokkr-systemd-failure@%n.service"
+      }
+    },
+    {
+      "id": "user-failure-delivery-missing",
+      "mutations": {
+        "units.3.directives.OnFailure": []
+      }
+    },
+    {
+      "id": "user-failure-delivery-unsafe",
+      "mutations": {
+        "units.3.directives.OnFailure": "private path"
+      }
+    },
+    {
+      "id": "timer-persistence",
+      "mutations": {
+        "units.2.directives.Persistent": false,
+        "units.2.directives.AccuracySec": "0s",
+        "units.2.directives.Unit": "workshop"
+      }
+    },
+    {
+      "id": "unsupported-content",
+      "mutations": {
+        "units.0.directives.Description": "private content must not be projected"
+      }
+    },
+    {
+      "id": "rogue-unit",
+      "mutations": {
+        "units.0.name": "rogue.service"
+      }
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "kind": "systemd-unit-declarations",
+  "schema_version": "v1",
+  "topology_authority": "grimnir-service-registry",
+  "units": [
+    {
+      "name": "heimdall.service",
+      "directives": {
+        "Type": "simple",
+        "Restart": "on-failure",
+        "RestartSec": "5s",
+        "StartLimitIntervalSec": "60s",
+        "StartLimitBurst": "5",
+        "TimeoutStartSec": "30s",
+        "TimeoutStopSec": "30s",
+        "RuntimeMaxSec": "1h",
+        "OOMPolicy": "stop",
+        "OnFailure": "brokkr-systemd-failure@%n.service"
+      },
+      "heartbeat": { "app_heartbeat": "present", "live_lock_fixture": "passed" },
+      "readiness": "present",
+      "failure_delivery": "brokkr-systemd-failure"
+    },
+    {
+      "name": "heimdall-collect.timer",
+      "directives": {
+        "Unit": "heimdall",
+        "OnCalendar": "*:0/5",
+        "Persistent": true,
+        "AccuracySec": "30s"
+      },
+      "heartbeat": { "app_heartbeat": "not-applicable", "live_lock_fixture": "not-applicable" },
+      "readiness": "not-applicable",
+      "failure_delivery": "not-declared"
+    },
+    {
+      "name": "heimdall-maintain.timer",
+      "directives": {
+        "Unit": "heimdall",
+        "OnCalendar": "*-*-* 02:00:00",
+        "Persistent": true,
+        "AccuracySec": "30s"
+      },
+      "heartbeat": { "app_heartbeat": "not-applicable", "live_lock_fixture": "not-applicable" },
+      "readiness": "not-applicable",
+      "failure_delivery": "not-declared"
+    },
+    {
+      "name": "nightly.service",
+      "directives": {
+        "Type": "oneshot",
+        "Restart": "no",
+        "StartLimitIntervalSec": "60s",
+        "StartLimitBurst": "3",
+        "TimeoutStartSec": "120s",
+        "TimeoutStopSec": "30s",
+        "RuntimeMaxSec": "10m",
+        "OOMPolicy": "stop",
+        "OnFailure": "brokkr-systemd-failure@%n.service"
+      },
+      "heartbeat": { "app_heartbeat": "not-applicable", "live_lock_fixture": "not-applicable" },
+      "readiness": "not-applicable",
+      "failure_delivery": "brokkr-systemd-failure"
+    },
+    {
+      "name": "nightly.timer",
+      "directives": {
+        "OnCalendar": "*-*-* 03:00:00",
+        "Persistent": true,
+        "AccuracySec": "30s"
+      },
+      "heartbeat": { "app_heartbeat": "not-applicable", "live_lock_fixture": "not-applicable" },
+      "readiness": "not-applicable",
+      "failure_delivery": "not-declared"
+    }
+  ]
+}

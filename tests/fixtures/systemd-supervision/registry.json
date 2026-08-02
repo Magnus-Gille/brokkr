@@ -1,0 +1,23 @@
+{
+  "components": [
+    {
+      "name": "api",
+      "systemd_units": [
+        { "name": "grimnir-api.service", "type": "service", "scope": "system" }
+      ]
+    },
+    {
+      "name": "worker",
+      "systemd_units": [
+        { "name": "grimnir-worker.service", "type": "service", "scope": "system" },
+        { "name": "grimnir-worker.timer", "type": "timer", "scope": "system" }
+      ]
+    },
+    {
+      "name": "workshop",
+      "systemd_units": [
+        { "name": "workshop.service", "type": "service", "scope": "user" }
+      ]
+    }
+  ]
+}

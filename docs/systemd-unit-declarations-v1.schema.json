@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grimnir.gille.ai/contracts/systemd-unit-declarations/v1/schema.json",
+  "title": "Brokkr systemd unit declaration projection v1",
+  "description": "Content-blind audited directive projection. Names use canonical effective .service/.timer identities; scope, owner, and workload shape are intentionally absent and must be joined from the Grimnir service registry. User-manager failure delivery is evidenced by a non-empty sanitized OnFailure projection and is checked semantically by the audit.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "topology_authority", "units"],
+  "properties": {
+    "kind": { "const": "systemd-unit-declarations" },
+    "schema_version": { "const": "v1" },
+    "topology_authority": { "const": "grimnir-service-registry" },
+    "units": { "type": "array", "items": { "$ref": "#/$defs/unit" } }
+  },
+  "$defs": {
+    "unit-name": { "type": "string", "pattern": "^[A-Za-z0-9:_.@-]+\\.(?:service|timer)$" },
+    "scalar": { "oneOf": [{ "type": "string" }, { "type": "boolean" }, { "type": "integer" }, { "type": "array", "items": { "type": "string" } }] },
+    "failure-target": { "type": "string", "pattern": "^(?!.*[\\r\\n])[A-Za-z0-9:_.@%+-]+\\.(?:service|target)$" },
+    "failure-target-projection": { "oneOf": [{ "$ref": "#/$defs/failure-target" }, { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/failure-target" } }] },
+    "directives": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "Type": { "$ref": "#/$defs/scalar" },
+        "Restart": { "$ref": "#/$defs/scalar" },
+        "RestartSec": { "$ref": "#/$defs/scalar" },
+        "StartLimitIntervalSec": { "$ref": "#/$defs/scalar" },
+        "StartLimitBurst": { "$ref": "#/$defs/scalar" },
+        "TimeoutStartSec": { "$ref": "#/$defs/scalar" },
+        "TimeoutStopSec": { "$ref": "#/$defs/scalar" },
+        "RuntimeMaxSec": { "$ref": "#/$defs/scalar" },
+        "OOMPolicy": { "$ref": "#/$defs/scalar" },
+        "OnFailure": { "$ref": "#/$defs/failure-target-projection" },
+        "WatchdogSec": { "$ref": "#/$defs/scalar" },
+        "Unit": { "$ref": "#/$defs/scalar" },
+        "OnCalendar": { "$ref": "#/$defs/scalar" },
+        "OnBootSec": { "$ref": "#/$defs/scalar" },
+        "OnStartupSec": { "$ref": "#/$defs/scalar" },
+        "OnUnitActiveSec": { "$ref": "#/$defs/scalar" },
+        "OnUnitInactiveSec": { "$ref": "#/$defs/scalar" },
+        "Persistent": { "$ref": "#/$defs/scalar" },
+        "AccuracySec": { "$ref": "#/$defs/scalar" }
+      }
+    },
+    "heartbeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["app_heartbeat", "live_lock_fixture"],
+      "properties": {
+        "app_heartbeat": { "enum": ["present", "absent", "unknown", "not-applicable"] },
+        "live_lock_fixture": { "enum": ["passed", "absent", "unknown", "not-applicable"] }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "directives", "heartbeat", "readiness", "failure_delivery"],
+      "properties": {
+        "name": { "$ref": "#/$defs/unit-name" },
+        "directives": { "$ref": "#/$defs/directives" },
+        "heartbeat": { "$ref": "#/$defs/heartbeat" },
+        "readiness": { "enum": ["present", "absent", "unknown", "not-applicable"] },
+        "failure_delivery": { "enum": ["brokkr-systemd-failure", "component-owner", "not-declared", "unknown"] }
+      }
+    }
+  }
+}

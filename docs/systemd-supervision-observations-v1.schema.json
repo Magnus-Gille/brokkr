@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grimnir.gille.ai/contracts/systemd-supervision-observations/v1/schema.json",
+  "title": "Brokkr systemd supervision observations v1",
+  "description": "Content-blind systemd state evidence. It contains no unit content, command lines, environment, journal text, credentials, or locators.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "observed_at", "notifier", "units"],
+  "properties": {
+    "kind": { "const": "systemd-supervision-observations" },
+    "schema_version": { "const": "v1" },
+    "observed_at": { "$ref": "#/$defs/utc" },
+    "notifier": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/notifier" }] },
+    "units": { "type": "array", "items": { "$ref": "#/$defs/unit" } }
+  },
+  "$defs": {
+    "utc": { "type": "string", "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ$", "format": "date-time" },
+    "notifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": { "status": { "enum": ["available", "absent", "unknown"] } }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active_state", "sub_state", "result"],
+      "properties": {
+        "active_state": { "enum": ["active", "inactive", "failed", "activating", "deactivating", "unknown"] },
+        "sub_state": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,32}$" },
+        "result": { "enum": ["success", "exit-code", "signal", "core-dump", "watchdog", "oom-kill", "timeout", "start-limit-hit", "resources", "protocol", "condition", "unknown"] }
+      }
+    },
+    "restart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "window_start", "window_end"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "window_start": { "$ref": "#/$defs/utc" },
+        "window_end": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "watchdog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result"],
+      "properties": { "result": { "enum": ["not-requested", "ok", "timeout", "unknown"] } }
+    },
+    "oom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result"],
+      "properties": { "result": { "enum": ["not-applicable", "none", "killed", "unknown"] } }
+    },
+    "timer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["last_run_at", "next_run_at", "last_result", "missed_runs", "persistent"],
+      "properties": {
+        "last_run_at": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/utc" }] },
+        "next_run_at": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/utc" }] },
+        "last_result": { "enum": ["success", "failed", "not-run", "unknown"] },
+        "missed_runs": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "persistent": { "type": "boolean" }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "result", "restart", "watchdog", "oom", "timer"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9:_.@-]+\\.(?:service|timer)$" },
+        "result": { "$ref": "#/$defs/result" },
+        "restart": { "$ref": "#/$defs/restart" },
+        "watchdog": { "$ref": "#/$defs/watchdog" },
+        "oom": { "$ref": "#/$defs/oom" },
+        "timer": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/timer" }] }
+      }
+    }
+  }
+}
