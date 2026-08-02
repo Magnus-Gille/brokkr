@@ -90,7 +90,9 @@ before publishing an activation the bridge structurally binds the exact
 attempt, binding, target scope, mutation, descriptor, idempotency key, and
 successor epoch/token. The operation then revalidates the exact root-owned
 recovery authorization, atomically publishes that fixed activation, and starts
-only `brokkr-debian-maintenance-recovery-<canonical-attempt>.service`. A matching
+only `brokkr-debian-maintenance-recovery@<canonical-attempt>.service`. The
+single template accepts no command, path, package, target, or unit selection;
+`%i` reaches the adapter only as its already-strict `--attempt` value. A matching
 terminal receipt makes the operation idempotent without another unit start. A
 strictly advancing, exactly authorized successor activation may replace a
 crashed worker's activation. Recovery resumes from each durable recovery phase,
@@ -115,9 +117,20 @@ and preallocated headroom even if systemd reports failure. A separate owner
 ceremony is still required for any live installation or activation.
 
 `systemd/brokkr-debian-maintenance-recovery.service.in` is the tracked source
-for each concrete, revision-bound recovery unit. The installer copies that
-template into the immutable release and substitutes only the validated canary
-ID and full release SHA. Its root capability exists because dpkg repair itself
+for the revision-bound recovery template. The installer copies that template
+into the immutable release and substitutes only the full release SHA. Its root
+capability exists because dpkg repair itself
 requires root. Its sole executable is the exact fixed recovery wrapper, with
 no sudo transition and `NoNewPrivileges=yes`; it cannot accept a plan or
 arbitrary command.
+
+Production requests use schema version `v2` to remove the former recovery
+digest cycle. The recovery descriptor is computed first and contains the exact
+attempt, mutation, disarm, target, candidate, postcondition, worker, package,
+restart, and budget claims—but no `binding_digest`. Its digest is then included
+in the full W2 binding; that binding is digested and included with its complete
+value in the host request. The adapter recomputes both digests and every exact
+echo before effect, including equality between the v2 binding's mutation
+identity and the lease fence's mutation identity. Legacy v1 request/descriptor
+pairs remain readable for already-installed canaries, but the attempt factory
+never emits them.

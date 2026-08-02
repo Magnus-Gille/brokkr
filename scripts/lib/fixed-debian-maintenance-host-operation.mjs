@@ -260,24 +260,74 @@ function candidateSet(request) {
 
 function validateRequest(request, registration, action) {
   if (!plain(request) || request.action !== "apply" || !["apply", "recover"].includes(action)) fail("host_action_invalid");
-  if (!exactKeys(request, [
+  const requestV1Keys = [
     "kind", "schema_version", "action", "attempt_id", "binding_digest", "plan_digest",
     "constitution_digest", "release_digest", "execution_request", "execution_request_digest",
     "recovery_descriptor", "recovery_descriptor_digest", "lease_fence", "lease_fence_digest", "apt_source_evidence", "apt_source_evidence_digest",
-  ]) || request.kind !== "brokkr-debian-host-adapter-request" || request.schema_version !== "v1" ||
+  ];
+  const requestV2Keys = [
+    ...requestV1Keys, "binding", "freshness_digest", "actors",
+  ];
+  const requestV2 = request.schema_version === "v2";
+  if (!exactKeys(request, requestV2 ? requestV2Keys : requestV1Keys) ||
+    request.kind !== "brokkr-debian-host-adapter-request" ||
+    !["v1", "v2"].includes(request.schema_version) ||
     request.action !== "apply" || !ID.test(request.attempt_id) || ![
       request.binding_digest, request.plan_digest, request.constitution_digest, request.release_digest,
       request.execution_request_digest, request.recovery_descriptor_digest, request.lease_fence_digest, request.apt_source_evidence_digest,
     ].every(value => DIGEST.test(value)) || request.execution_request_digest !== digest(request.execution_request) ||
     request.recovery_descriptor_digest !== digest(request.recovery_descriptor) || request.lease_fence_digest !== digest(request.lease_fence) || request.apt_source_evidence_digest !== digest(request.apt_source_evidence)) fail("host_request_invalid");
-  if (!exactKeys(registration, [
+  if (requestV2 && (!DIGEST.test(request.freshness_digest) ||
+      request.binding_digest !== digest(request.binding) ||
+      !exactKeys(request.binding, [
+        "mutation_id", "attempt_id", "recovery_disarm_id", "idempotency_key",
+        "writer_owner", "owner_authority_ref", "owner_authority_digest",
+        "configuration_owner", "configuration_owner_authority_ref",
+        "configuration_owner_authority_digest", "target_scope_digest",
+        "admission_coverage_digest", "admission_binding_state",
+        "owner_identity", "controller_identity", "watchdog_identity",
+        "kill_switch_identity", "recovery_worker_identity", "risk_scope",
+        "candidate_digest", "config_digest", "evidence_digest",
+        "policy_digest", "baseline_digest", "postconditions_digest",
+        "deadline", "canary", "recovery",
+      ]) ||
+      request.binding?.attempt_id !== request.attempt_id ||
+      request.binding?.recovery?.descriptor_digest !==
+        request.recovery_descriptor_digest ||
+      !exactKeys(request.actors, [
+        "owner", "controller", "watchdog", "kill_switch", "recovery_worker",
+      ]) ||
+      request.binding.owner_identity !== request.actors.owner ||
+      request.binding.controller_identity !== request.actors.controller ||
+      request.binding.watchdog_identity !== request.actors.watchdog ||
+      request.binding.kill_switch_identity !== request.actors.kill_switch ||
+      request.binding.recovery_worker_identity !==
+        request.actors.recovery_worker)) {
+    fail("host_binding_graph_invalid");
+  }
+  const registrationV1Keys = [
     "kind", "schema_version", "attempt_id", "binding_digest", "plan_digest", "constitution_digest",
     "release_digest", "execution_request_digest", "recovery_descriptor_digest", "lease_fence_digest", "apt_source_evidence_digest",
-  ]) || registration.kind !== "brokkr-debian-host-adapter-registration" || registration.schema_version !== "v1" ||
+  ];
+  const registrationV2Keys = [
+    ...registrationV1Keys, "mutation_id", "idempotency_key",
+    "recovery_disarm_id", "freshness_digest", "actors",
+  ];
+  if (!exactKeys(registration,
+    requestV2 ? registrationV2Keys : registrationV1Keys) ||
+    registration.kind !== "brokkr-debian-host-adapter-registration" ||
+    registration.schema_version !== request.schema_version ||
     !Object.keys(registration).filter(key => key.endsWith("digest")).every(key => DIGEST.test(registration[key])) ||
     ["attempt_id", "binding_digest", "plan_digest", "constitution_digest", "release_digest", "execution_request_digest", "recovery_descriptor_digest", "lease_fence_digest", "apt_source_evidence_digest"].some(key => registration[key] !== request[key])) {
     fail("host_registration_mismatch");
   }
+  if (requestV2 && (
+    registration.mutation_id !== request.binding.mutation_id ||
+    registration.idempotency_key !== request.binding.idempotency_key ||
+    registration.recovery_disarm_id !== request.binding.recovery_disarm_id ||
+    registration.freshness_digest !== request.freshness_digest ||
+    canonicalJson(registration.actors) !== canonicalJson(request.actors)
+  )) fail("host_registration_mismatch");
   const execution = request.execution_request;
   if (!exactKeys(execution, ["kind", "schema_version", "target", "candidates", "config", "pre_state", "expected_postconditions"]) ||
     execution.kind !== "brokkr-bounded-debian-maintenance-request" || execution.schema_version !== "v1" ||
@@ -288,15 +338,98 @@ function validateRequest(request, registration, action) {
     execution.config.plan_digest !== request.plan_digest || execution.config.adapter_revision_digest !== request.release_digest ||
     execution.config.no_reboot !== true || execution.config.no_drain !== true) fail("host_request_scope_invalid");
   if (request.lease_fence?.target_scope_digest !== digest({ node_id: execution.target.node_id, platform: execution.target.platform })) fail("host_fence_target_invalid");
+  if (requestV2) {
+    const binding = request.binding;
+    const targetScopeDigest = digest({
+      node_id: execution.target.node_id, platform: execution.target.platform,
+    });
+    const configDigest = digest({
+      adapter_revision_digest: request.release_digest,
+      node_id: execution.target.node_id,
+      target_scope_digest: targetScopeDigest,
+    });
+    const baselineDigest = digest({
+      inventory: execution.pre_state, node_id: execution.target.node_id,
+      target_scope_digest: targetScopeDigest,
+    });
+    const evidenceDigest = digest({
+      baseline_digest: baselineDigest,
+      candidate_digest: request.plan_digest, config_digest: configDigest,
+      policy_digest: execution.config.policy_digest,
+    });
+    if (![binding.mutation_id, binding.attempt_id,
+      binding.recovery_disarm_id, binding.idempotency_key,
+      binding.writer_owner, binding.configuration_owner,
+      binding.owner_identity, binding.controller_identity,
+      binding.watchdog_identity, binding.kill_switch_identity,
+      binding.recovery_worker_identity, binding.risk_scope]
+      .every(value => ID.test(value)) ||
+      ![binding.owner_authority_ref,
+        binding.configuration_owner_authority_ref]
+        .every(value => /^ref:[a-z][a-z0-9-]{2,120}$/.test(value)) ||
+      ![
+        binding.owner_authority_digest,
+        binding.configuration_owner_authority_digest,
+        binding.target_scope_digest, binding.admission_coverage_digest,
+        binding.candidate_digest, binding.config_digest,
+        binding.evidence_digest, binding.policy_digest,
+        binding.baseline_digest, binding.postconditions_digest,
+      ].every(value => DIGEST.test(value)) ||
+      !["armed-canary", "armed-fleet"]
+        .includes(binding.admission_binding_state) ||
+      binding.risk_scope !==
+        "no-reboot-security-bugfix-maintenance" ||
+      binding.target_scope_digest !== targetScopeDigest ||
+      binding.candidate_digest !== request.plan_digest ||
+      binding.config_digest !== configDigest ||
+      binding.evidence_digest !== evidenceDigest ||
+      binding.policy_digest !== execution.config.policy_digest ||
+      binding.baseline_digest !== baselineDigest ||
+      binding.postconditions_digest !==
+        digest(execution.expected_postconditions) ||
+      !iso(binding.deadline) ||
+      !exactKeys(binding.canary, ["scope_digest", "target_count"]) ||
+      binding.canary.scope_digest !== targetScopeDigest ||
+      binding.canary.target_count !== 1 ||
+      !exactKeys(binding.recovery, [
+        "class", "worker_identity", "descriptor_digest",
+        "disarms_after_action",
+      ]) || binding.recovery.class !== "R-forward" ||
+      binding.recovery.worker_identity !==
+        binding.recovery_worker_identity ||
+      binding.recovery.disarms_after_action !== true) {
+      fail("host_binding_graph_invalid");
+    }
+  }
   const candidates = candidateSet(request);
   if (!exactKeys(request.apt_source_evidence, ["kind", "schema_version", "plan_digest", "policy_digest", "trust_config_digest", "candidates"]) || request.apt_source_evidence.kind !== "brokkr-debian-apt-source-evidence" || request.apt_source_evidence.schema_version !== "v1" || request.apt_source_evidence.plan_digest !== request.plan_digest || request.apt_source_evidence.policy_digest !== execution.config.policy_digest || !DIGEST.test(request.apt_source_evidence.trust_config_digest) || !Array.isArray(request.apt_source_evidence.candidates) || request.apt_source_evidence.candidates.length !== candidates.length || canonicalJson(request.apt_source_evidence.candidates.map(item => item.name)) !== canonicalJson(candidates.map(item => item.name)) || !request.apt_source_evidence.candidates.every(item => exactKeys(item, ["name", "policy_output_digest"]) && DIGEST.test(item.policy_output_digest))) fail("host_apt_evidence_invalid");
   validateInventory(execution.pre_state, candidates, "host_pre_state_invalid");
   validateInventory(execution.expected_postconditions, candidates, "host_postconditions_invalid");
   const descriptor = request.recovery_descriptor;
-  if (!exactKeys(descriptor, ["kind", "schema_version", "descriptor_id", "attempt_id", "binding_digest", "packages", "restart_units", "budget_seconds"]) ||
-    descriptor.kind !== "brokkr-debian-recovery-descriptor" || descriptor.schema_version !== "v1" ||
+  const descriptorV1Keys = [
+    "kind", "schema_version", "descriptor_id", "attempt_id",
+    "binding_digest", "packages", "restart_units", "budget_seconds",
+  ];
+  const descriptorV2Keys = [
+    "kind", "schema_version", "descriptor_id", "attempt_id", "mutation_id",
+    "recovery_disarm_id", "target_scope_digest", "candidate_digest",
+    "postconditions_digest", "worker_identity", "packages", "restart_units",
+    "budget_seconds",
+  ];
+  if (!exactKeys(descriptor, requestV2 ? descriptorV2Keys : descriptorV1Keys) ||
+    descriptor.kind !== "brokkr-debian-recovery-descriptor" ||
+    descriptor.schema_version !== (requestV2 ? "v2" : "v1") ||
     !ID.test(descriptor.descriptor_id) || descriptor.attempt_id !== request.attempt_id ||
-    descriptor.binding_digest !== request.binding_digest || !Array.isArray(descriptor.packages) ||
+    (!requestV2 && descriptor.binding_digest !== request.binding_digest) ||
+    (requestV2 && (
+      descriptor.mutation_id !== request.binding.mutation_id ||
+      descriptor.recovery_disarm_id !== request.binding.recovery_disarm_id ||
+      descriptor.target_scope_digest !== request.binding.target_scope_digest ||
+      descriptor.candidate_digest !== request.binding.candidate_digest ||
+      descriptor.postconditions_digest !==
+        request.binding.postconditions_digest ||
+      descriptor.worker_identity !== request.binding.recovery_worker_identity
+    )) || !Array.isArray(descriptor.packages) ||
     canonicalJson(descriptor.packages) !== canonicalJson(candidates.map(item => item.name)) ||
     !Array.isArray(descriptor.restart_units) || descriptor.restart_units.length > 16 ||
     new Set(descriptor.restart_units).size !== descriptor.restart_units.length ||
@@ -306,6 +439,7 @@ function validateRequest(request, registration, action) {
   if (!exactKeys(fence, ["kind", "schema_version", "domain", "target_scope_digest", "attempt_id", "mutation_id", "binding_digest", "epoch", "holder_token", "activated_at", "expires_at"]) ||
     fence.kind !== "brokkr-effect-lease-fence" || fence.schema_version !== "v1" || fence.domain !== "no-reboot-security-bugfix-maintenance" ||
     !DIGEST.test(fence.target_scope_digest) || fence.attempt_id !== request.attempt_id || !ID.test(fence.mutation_id) ||
+    (requestV2 && fence.mutation_id !== request.binding.mutation_id) ||
     fence.binding_digest !== request.binding_digest || !Number.isSafeInteger(fence.epoch) || fence.epoch < 1 ||
     typeof fence.holder_token !== "string" || fence.holder_token.length < 16 || !iso(fence.activated_at) || !iso(fence.expires_at) ||
     Date.parse(fence.activated_at) > Date.parse(fence.expires_at)) fail(code);
@@ -832,6 +966,20 @@ function dispatchFixedRecovery(request, activation) {
   const attempt = validateRecoveryDispatch(request, activation);
   if (process.getuid() !== 0) fail("host_root_required");
   protectedDirectory(STATE_ROOT);
+  const authorization = {
+    kind: "brokkr-debian-recovery-authorization", schema_version: "v1",
+    attempt_id: attempt, activation: clone(activation),
+    recovery_request: clone(request),
+  };
+  const existingAuthorization = fixedReadOptional(
+    "recovery-authorizations", attempt,
+  );
+  if (existingAuthorization === null) {
+    atomicWriteFixed("recovery-authorizations", attempt, authorization);
+  } else if (canonicalJson(existingAuthorization) !==
+      canonicalJson(authorization)) {
+    fail("bounded_recovery_authorization_conflict");
+  }
   assertRecoveryAuthorization(attempt, activation, request);
   protectedDirectory(path.join(STATE_ROOT, "recovery-activations"));
   const existingActivation = fixedReadOptional(
@@ -862,7 +1010,7 @@ function dispatchFixedRecovery(request, activation) {
       // durable receipt without widening or replaying the original effect.
     }
   }
-  const unit = `brokkr-debian-maintenance-recovery-${attempt}.service`;
+  const unit = `brokkr-debian-maintenance-recovery@${attempt}.service`;
   const result = fixedSpawnSync(
     "/usr/bin/systemctl", ["start", unit],
     { encoding: "utf8", timeout: 300_000 },

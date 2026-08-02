@@ -9,11 +9,29 @@ SOURCE="$TMP/source"
 INSTALL_ROOT="$TMP/install-root"
 SYSTEMCTL_LOG="$TMP/systemctl.log"
 NODE_BIN="$(command -v node)"
-mkdir -p "$SOURCE/scripts/lib" "$SOURCE/systemd"
-cp "$ROOT/scripts/debian-maintenance-host-adapter.mjs" "$SOURCE/scripts/"
+mkdir -p "$SOURCE/docs" "$SOURCE/scripts/lib" "$SOURCE/systemd"
+cp \
+  "$ROOT/docs/autonomous-mutation-journal-v2.schema.json" \
+  "$ROOT/docs/debian-maintenance-attempt-factory-config-v1.schema.json" \
+  "$ROOT/docs/debian-maintenance-window-freshness-v1.schema.json" \
+  "$SOURCE/docs/"
+cp \
+  "$ROOT/scripts/debian-maintenance-attempt-factory.mjs" \
+  "$ROOT/scripts/debian-maintenance-autonomy.mjs" \
+  "$ROOT/scripts/debian-maintenance-executor.mjs" \
+  "$ROOT/scripts/debian-maintenance-host-adapter.mjs" \
+  "$ROOT/scripts/maintenance-controller.mjs" \
+  "$SOURCE/scripts/"
 cp "$ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs" \
+  "$ROOT/scripts/lib/autonomy-authorization.mjs" \
+  "$ROOT/scripts/lib/debian-maintenance-attempt-factory.mjs" \
+  "$ROOT/scripts/lib/maintenance-policy-contract.mjs" \
   "$ROOT/scripts/lib/bounded-recovery-dispatch.mjs" "$SOURCE/scripts/lib/"
-cp "$ROOT/systemd/brokkr-debian-maintenance-recovery.service.in" "$SOURCE/systemd/"
+cp \
+  "$ROOT/systemd/brokkr-debian-maintenance-attempt-factory.service.in" \
+  "$ROOT/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+  "$ROOT/systemd/brokkr-debian-maintenance-recovery.service.in" \
+  "$SOURCE/systemd/"
 cp "$ROOT/scripts/install-debian-maintenance-canary.sh" "$SOURCE/scripts/"
 
 git -C "$SOURCE" init -q
@@ -61,16 +79,31 @@ env \
 RELEASE_ROOT="$INSTALL_ROOT/usr/local/lib/brokkr/releases/$REVISION"
 STATE_ROOT="$INSTALL_ROOT/var/lib/brokkr/debian-maintenance"
 APPLY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-canary-canary-fi.service"
-RECOVERY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery-canary-fi.service"
+RECOVERY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery@.service"
+FACTORY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-attempt-factory.service"
+FACTORY_TIMER="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-attempt-factory.timer"
 
 test -x "$RELEASE_ROOT/scripts/debian-maintenance-host-adapter.mjs"
+test -x "$RELEASE_ROOT/scripts/debian-maintenance-attempt-factory.mjs"
 test -r "$RELEASE_ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
 test -r "$RELEASE_ROOT/scripts/lib/bounded-recovery-dispatch.mjs"
 test -r "$RELEASE_ROOT/systemd/brokkr-debian-maintenance-recovery.service.in"
 for file in \
+  docs/autonomous-mutation-journal-v2.schema.json \
+  docs/debian-maintenance-attempt-factory-config-v1.schema.json \
+  docs/debian-maintenance-window-freshness-v1.schema.json \
+  scripts/debian-maintenance-attempt-factory.mjs \
+  scripts/debian-maintenance-autonomy.mjs \
+  scripts/debian-maintenance-executor.mjs \
   scripts/debian-maintenance-host-adapter.mjs \
+  scripts/maintenance-controller.mjs \
+  scripts/lib/autonomy-authorization.mjs \
+  scripts/lib/debian-maintenance-attempt-factory.mjs \
   scripts/lib/fixed-debian-maintenance-host-operation.mjs \
+  scripts/lib/maintenance-policy-contract.mjs \
   scripts/lib/bounded-recovery-dispatch.mjs \
+  systemd/brokkr-debian-maintenance-attempt-factory.service.in \
+  systemd/brokkr-debian-maintenance-attempt-factory.timer \
   systemd/brokkr-debian-maintenance-recovery.service.in; do
   git -C "$SOURCE" show "$REVISION:$file" >"$TMP/expected-commit-file"
   cmp "$TMP/expected-commit-file" "$RELEASE_ROOT/$file"
@@ -80,10 +113,17 @@ grep -Fqx \
   "ExecStart=/usr/local/lib/brokkr/releases/$REVISION/scripts/debian-maintenance-host-adapter.mjs --action apply --attempt canary-fi" \
   "$APPLY_UNIT"
 grep -Fqx \
-  "ExecStart=/usr/local/lib/brokkr/releases/$REVISION/scripts/debian-maintenance-host-adapter.mjs --action recover --attempt canary-fi" \
+  "ExecStart=/usr/local/lib/brokkr/releases/$REVISION/scripts/debian-maintenance-host-adapter.mjs --action recover --attempt %i" \
   "$RECOVERY_UNIT"
+grep -Fqx \
+  "ExecStart=/usr/local/lib/brokkr/releases/$REVISION/scripts/debian-maintenance-attempt-factory.mjs" \
+  "$FACTORY_UNIT"
+cmp \
+  "$SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+  "$FACTORY_TIMER"
+! grep -Eq '^(WantedBy=)' "$FACTORY_UNIT"
+grep -Fqx "WantedBy=timers.target" "$FACTORY_TIMER"
 sed \
-  -e 's/@CANARY_ID@/canary-fi/g' \
   -e "s/@RELEASE_SHA@/$REVISION/g" \
   "$SOURCE/systemd/brokkr-debian-maintenance-recovery.service.in" \
   >"$TMP/expected-recovery.service"
@@ -211,7 +251,11 @@ OTHER_REVISION="ffffffffffffffffffffffffffffffffffffffff"
 printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$OTHER_REVISION" \
   >"$UNIT_CONFLICT_DIR/brokkr-debian-maintenance-canary-canary-fi.service"
 printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$OTHER_REVISION" \
-  >"$UNIT_CONFLICT_DIR/brokkr-debian-maintenance-recovery-canary-fi.service"
+  >"$UNIT_CONFLICT_DIR/brokkr-debian-maintenance-recovery@.service"
+printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$OTHER_REVISION" \
+  >"$UNIT_CONFLICT_DIR/brokkr-debian-maintenance-attempt-factory.service"
+cp "$SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+  "$UNIT_CONFLICT_DIR/brokkr-debian-maintenance-attempt-factory.timer"
 if env \
   BROKKR_CANARY_INSTALL_TEST_ROOT="$UNIT_CONFLICT_ROOT" \
   BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
@@ -239,7 +283,11 @@ mkdir -p "$UNSAFE_UNIT_DIR"
 printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$REVISION" \
   >"$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-canary-canary-fi.service"
 printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$REVISION" \
-  >"$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-recovery-canary-fi.service"
+  >"$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-recovery@.service"
+printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$REVISION" \
+  >"$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-attempt-factory.service"
+cp "$SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+  "$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-attempt-factory.timer"
 chmod 0666 \
   "$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-canary-canary-fi.service"
 if env \
@@ -393,7 +441,7 @@ grep -Fq "recovery unit template has unresolved placeholders" \
 test ! -e \
   "$BROKEN_ROOT/etc/systemd/system/brokkr-debian-maintenance-canary-canary-broken.service"
 test ! -e \
-  "$BROKEN_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery-canary-broken.service"
+  "$BROKEN_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery@.service"
 test ! -e \
   "$BROKEN_ROOT/usr/local/lib/brokkr/releases/$BROKEN_REVISION"
 
@@ -438,7 +486,7 @@ grep -Fqx \
   "disable --now brokkr-debian-maintenance-canary-canary-stop-failure.service" \
   "$STOP_FAILURE_LOG"
 grep -Fqx \
-  "stop brokkr-debian-maintenance-recovery-canary-stop-failure.service" \
+  "stop brokkr-debian-maintenance-recovery@canary-stop-failure.service" \
   "$STOP_FAILURE_LOG"
 
 printf '%s\n' '{"redacted":"evidence-preserved"}' \
@@ -456,7 +504,7 @@ env \
 
 grep -Fqx "disable --now brokkr-debian-maintenance-canary-canary-fi.service" \
   "$SYSTEMCTL_LOG"
-grep -Fqx "stop brokkr-debian-maintenance-recovery-canary-fi.service" \
+grep -Fqx "stop brokkr-debian-maintenance-recovery@canary-fi.service" \
   "$SYSTEMCTL_LOG"
 test -r "$STATE_ROOT/evidence/canary-fi.json"
 test -r "$STATE_ROOT/disarmed/canary-fi.json"
@@ -481,6 +529,10 @@ env \
     --canary canary-fi
 test -r "$STATE_ROOT/evidence/canary-fi.json"
 
+case "$REVISION" in
+  *0) WRONG_REVISION="${REVISION%?}1" ;;
+  *) WRONG_REVISION="${REVISION%?}0" ;;
+esac
 if env \
   BROKKR_CANARY_INSTALL_TEST_ROOT="$TMP/wrong-revision-root" \
   BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
@@ -489,7 +541,7 @@ if env \
   BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
   "$INSTALLER" install \
     --source "$SOURCE" \
-    --revision "${REVISION%?}0" \
+    --revision "$WRONG_REVISION" \
     --canary canary-fi >"$TMP/wrong.out" 2>&1; then
   echo "wrong revision unexpectedly installed" >&2
   exit 1

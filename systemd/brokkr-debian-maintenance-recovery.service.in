@@ -1,13 +1,14 @@
 [Unit]
-Description=Brokkr bounded Debian forward recovery for attempt @CANARY_ID@
+Description=Brokkr bounded Debian forward recovery for attempt %i
 Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/supervised-debian-maintenance.md
 After=network-online.target local-fs.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-# Rendered by the source-bound owner ceremony. Both the unit name and argv bind
-# one canonical attempt to one immutable release directory.
+# The installed template is release-bound. The instance is accepted only as
+# the fixed adapter's canonical --attempt value; no command, path or unit can
+# be selected by the recovery request.
 User=root
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -20,5 +21,5 @@ ProtectKernelLogs=yes
 PrivateDevices=yes
 RestrictSUIDSGID=yes
 Environment=BROKKR_RELEASE_SHA=@RELEASE_SHA@
-ExecStart=/usr/local/lib/brokkr/releases/@RELEASE_SHA@/scripts/debian-maintenance-host-adapter.mjs --action recover --attempt @CANARY_ID@
+ExecStart=/usr/local/lib/brokkr/releases/@RELEASE_SHA@/scripts/debian-maintenance-host-adapter.mjs --action recover --attempt %i
 TimeoutStartSec=300

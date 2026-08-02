@@ -92,17 +92,33 @@ RELEASE_PARENT="$(root_path "$RELEASE_PARENT_PATH")"
 STATE_ROOT="$(root_path "$STATE_PATH")"
 UNIT_ROOT="$(root_path "$UNIT_PATH")"
 APPLY_UNIT="brokkr-debian-maintenance-canary-$CANARY.service"
-RECOVERY_UNIT="brokkr-debian-maintenance-recovery-$CANARY.service"
+RECOVERY_UNIT="brokkr-debian-maintenance-recovery@.service"
+FACTORY_UNIT="brokkr-debian-maintenance-attempt-factory.service"
+FACTORY_TIMER="brokkr-debian-maintenance-attempt-factory.timer"
 RELEASE_FILES=(
+  docs/autonomous-mutation-journal-v2.schema.json
+  docs/debian-maintenance-attempt-factory-config-v1.schema.json
+  docs/debian-maintenance-window-freshness-v1.schema.json
+  scripts/debian-maintenance-attempt-factory.mjs
+  scripts/debian-maintenance-autonomy.mjs
+  scripts/debian-maintenance-executor.mjs
   scripts/debian-maintenance-host-adapter.mjs
+  scripts/maintenance-controller.mjs
+  scripts/lib/autonomy-authorization.mjs
+  scripts/lib/debian-maintenance-attempt-factory.mjs
   scripts/lib/fixed-debian-maintenance-host-operation.mjs
+  scripts/lib/maintenance-policy-contract.mjs
   scripts/lib/bounded-recovery-dispatch.mjs
+  systemd/brokkr-debian-maintenance-attempt-factory.service.in
+  systemd/brokkr-debian-maintenance-attempt-factory.timer
   systemd/brokkr-debian-maintenance-recovery.service.in
 )
 STAGE_ROOT=""
 INSTALL_LOCK=""
 PUBLISHED_APPLY=0
 PUBLISHED_RECOVERY=0
+PUBLISHED_FACTORY=0
+PUBLISHED_FACTORY_TIMER=0
 HEADROOM_TEMP=""
 
 cleanup() {
@@ -112,6 +128,10 @@ cleanup() {
       rm -f "$UNIT_ROOT/$APPLY_UNIT"
     [[ "$PUBLISHED_RECOVERY" -eq 0 ]] ||
       rm -f "$UNIT_ROOT/$RECOVERY_UNIT"
+    [[ "$PUBLISHED_FACTORY" -eq 0 ]] ||
+      rm -f "$UNIT_ROOT/$FACTORY_UNIT"
+    [[ "$PUBLISHED_FACTORY_TIMER" -eq 0 ]] ||
+      rm -f "$UNIT_ROOT/$FACTORY_TIMER"
   fi
   [[ -z "$STAGE_ROOT" || ! -d "$STAGE_ROOT" ]] ||
     rm -rf "$STAGE_ROOT"
@@ -296,17 +316,29 @@ verify_install_source() {
 preflight_installed_units() {
   local apply="$UNIT_ROOT/$APPLY_UNIT"
   local recovery="$UNIT_ROOT/$RECOVERY_UNIT"
+  local factory="$UNIT_ROOT/$FACTORY_UNIT"
+  local factory_timer="$UNIT_ROOT/$FACTORY_TIMER"
   local apply_exists=0
   local recovery_exists=0
+  local factory_exists=0
+  local factory_timer_exists=0
   [[ ! -e "$apply" && ! -L "$apply" ]] || apply_exists=1
   [[ ! -e "$recovery" && ! -L "$recovery" ]] || recovery_exists=1
-  [[ "$apply_exists" -eq "$recovery_exists" ]] ||
+  [[ ! -e "$factory" && ! -L "$factory" ]] || factory_exists=1
+  [[ ! -e "$factory_timer" && ! -L "$factory_timer" ]] ||
+    factory_timer_exists=1
+  [[ "$apply_exists" -eq "$recovery_exists" &&
+    "$apply_exists" -eq "$factory_exists" &&
+    "$apply_exists" -eq "$factory_timer_exists" ]] ||
     die "installed canary unit set is incomplete"
   if [[ "$apply_exists" -eq 1 ]]; then
     verify_secure_path "$apply" file 0 0644
     verify_secure_path "$recovery" file 0 0644
+    verify_secure_path "$factory" file 0 0644
+    verify_secure_path "$factory_timer" file 0 0644
     grep -Fqx "Environment=BROKKR_RELEASE_SHA=$REVISION" "$apply" &&
-      grep -Fqx "Environment=BROKKR_RELEASE_SHA=$REVISION" "$recovery" ||
+      grep -Fqx "Environment=BROKKR_RELEASE_SHA=$REVISION" "$recovery" &&
+      grep -Fqx "Environment=BROKKR_RELEASE_SHA=$REVISION" "$factory" ||
       die "installed canary revision does not match"
   fi
 }
@@ -333,13 +365,27 @@ stage_exact_release() {
   done
   chmod 0755 \
     "$staged_release" \
+    "$staged_release/docs" \
     "$staged_release/scripts" \
     "$staged_release/scripts/lib" \
     "$staged_release/systemd"
-  chmod 0755 "$staged_release/scripts/debian-maintenance-host-adapter.mjs"
+  chmod 0755 \
+    "$staged_release/scripts/debian-maintenance-attempt-factory.mjs" \
+    "$staged_release/scripts/debian-maintenance-host-adapter.mjs"
   chmod 0644 \
+    "$staged_release/docs/autonomous-mutation-journal-v2.schema.json" \
+    "$staged_release/docs/debian-maintenance-attempt-factory-config-v1.schema.json" \
+    "$staged_release/docs/debian-maintenance-window-freshness-v1.schema.json" \
+    "$staged_release/scripts/debian-maintenance-autonomy.mjs" \
+    "$staged_release/scripts/debian-maintenance-executor.mjs" \
+    "$staged_release/scripts/maintenance-controller.mjs" \
+    "$staged_release/scripts/lib/autonomy-authorization.mjs" \
+    "$staged_release/scripts/lib/debian-maintenance-attempt-factory.mjs" \
     "$staged_release/scripts/lib/fixed-debian-maintenance-host-operation.mjs" \
+    "$staged_release/scripts/lib/maintenance-policy-contract.mjs" \
     "$staged_release/scripts/lib/bounded-recovery-dispatch.mjs" \
+    "$staged_release/systemd/brokkr-debian-maintenance-attempt-factory.service.in" \
+    "$staged_release/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
     "$staged_release/systemd/brokkr-debian-maintenance-recovery.service.in"
 }
 
@@ -413,16 +459,25 @@ render_apply_unit() {
 render_recovery_unit() {
   local destination="$1"
   local template="$2"
-  grep -Fq '@CANARY_ID@' "$template" ||
-    die "recovery unit template lacks canary placeholder"
   grep -Fq '@RELEASE_SHA@' "$template" ||
     die "recovery unit template lacks release placeholder"
   sed \
-    -e "s/@CANARY_ID@/$CANARY/g" \
     -e "s/@RELEASE_SHA@/$REVISION/g" \
     "$template" >"$destination"
   if grep -Eq '@[A-Za-z0-9_]+@' "$destination"; then
     die "recovery unit template has unresolved placeholders"
+  fi
+  chmod 0644 "$destination"
+}
+
+render_factory_unit() {
+  local destination="$1"
+  local template="$2"
+  grep -Fq '@RELEASE_SHA@' "$template" ||
+    die "attempt factory unit template lacks release placeholder"
+  sed -e "s/@RELEASE_SHA@/$REVISION/g" "$template" >"$destination"
+  if grep -Eq '@[A-Za-z0-9_]+@' "$destination"; then
+    die "attempt factory unit template has unresolved placeholders"
   fi
   chmod 0644 "$destination"
 }
@@ -445,18 +500,30 @@ verify_or_publish_units() {
   local staged_recovery="$STAGE_ROOT/$RECOVERY_UNIT"
   local apply="$UNIT_ROOT/$APPLY_UNIT"
   local recovery="$UNIT_ROOT/$RECOVERY_UNIT"
+  local staged_factory="$STAGE_ROOT/$FACTORY_UNIT"
+  local staged_factory_timer="$STAGE_ROOT/$FACTORY_TIMER"
+  local factory="$UNIT_ROOT/$FACTORY_UNIT"
+  local factory_timer="$UNIT_ROOT/$FACTORY_TIMER"
   if [[ -e "$apply" || -L "$apply" ]]; then
     preflight_installed_units
     cmp -s "$staged_apply" "$apply" &&
-      cmp -s "$staged_recovery" "$recovery" ||
+      cmp -s "$staged_recovery" "$recovery" &&
+      cmp -s "$staged_factory" "$factory" &&
+      cmp -s "$staged_factory_timer" "$factory_timer" ||
       die "installed canary units differ from exact revision"
     return
   fi
+  mv "$staged_factory_timer" "$factory_timer"
+  PUBLISHED_FACTORY_TIMER=1
+  mv "$staged_factory" "$factory"
+  PUBLISHED_FACTORY=1
   mv "$staged_recovery" "$recovery"
   PUBLISHED_RECOVERY=1
   mv "$staged_apply" "$apply"
   PUBLISHED_APPLY=1
   PUBLISHED_RECOVERY=0
+  PUBLISHED_FACTORY=0
+  PUBLISHED_FACTORY_TIMER=0
   PUBLISHED_APPLY=0
 }
 
@@ -526,6 +593,13 @@ case "$ACTION" in
     render_recovery_unit \
       "$STAGE_ROOT/$RECOVERY_UNIT" \
       "$STAGE_ROOT/release/systemd/brokkr-debian-maintenance-recovery.service.in"
+    render_factory_unit \
+      "$STAGE_ROOT/$FACTORY_UNIT" \
+      "$STAGE_ROOT/release/systemd/brokkr-debian-maintenance-attempt-factory.service.in"
+    cp \
+      "$STAGE_ROOT/release/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+      "$STAGE_ROOT/$FACTORY_TIMER"
+    chmod 0644 "$STAGE_ROOT/$FACTORY_TIMER"
     if [[ -e "$RELEASE_ROOT" || -L "$RELEASE_ROOT" ]]; then
       verify_secure_path "$RELEASE_ROOT" dir
       verify_secure_release_tree "$RELEASE_ROOT"
@@ -538,7 +612,9 @@ case "$ACTION" in
       -L "$UNIT_ROOT/$APPLY_UNIT" ]]; then
       preflight_installed_units
       cmp -s "$STAGE_ROOT/$APPLY_UNIT" "$UNIT_ROOT/$APPLY_UNIT" &&
-        cmp -s "$STAGE_ROOT/$RECOVERY_UNIT" "$UNIT_ROOT/$RECOVERY_UNIT" ||
+        cmp -s "$STAGE_ROOT/$RECOVERY_UNIT" "$UNIT_ROOT/$RECOVERY_UNIT" &&
+        cmp -s "$STAGE_ROOT/$FACTORY_UNIT" "$UNIT_ROOT/$FACTORY_UNIT" &&
+        cmp -s "$STAGE_ROOT/$FACTORY_TIMER" "$UNIT_ROOT/$FACTORY_TIMER" ||
         die "installed canary units differ from exact revision"
     fi
     install_directories
@@ -556,7 +632,7 @@ case "$ACTION" in
     set +e
     "$SYSTEMCTL" disable --now "$APPLY_UNIT"
     apply_status=$?
-    "$SYSTEMCTL" stop "$RECOVERY_UNIT"
+    "$SYSTEMCTL" stop "brokkr-debian-maintenance-recovery@$CANARY.service"
     recovery_status=$?
     set -e
     [[ "$apply_status" -eq 0 && "$recovery_status" -eq 0 ]] ||

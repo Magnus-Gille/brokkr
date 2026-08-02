@@ -1,0 +1,11 @@
+[Unit]
+Description=Evaluate the protected Debian maintenance window
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+RandomizedDelaySec=30
+Unit=brokkr-debian-maintenance-attempt-factory.service
+
+[Install]
+WantedBy=timers.target
