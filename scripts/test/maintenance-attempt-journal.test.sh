@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 const root = process.env.ROOT, tmp = process.env.TMP;
 const {
   loadPinnedJournalSchema, validateJournalConformance,
@@ -17,6 +18,11 @@ const {
 const {
   deriveDebianAutonomyExecution, runDebianMaintenance,
 } = await import(`${root}/scripts/debian-maintenance-executor.mjs`);
+const {
+  __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS,
+  __BROKKR_TEST_ONLY__currentLockOwnerIdentity,
+  __BROKKR_TEST_ONLY__probeExclusiveDirectory,
+} = await import(`${root}/scripts/debian-maintenance-autonomy.mjs`);
 const {
   autonomyDigest, canonicalJson,
 } = await import(`${root}/scripts/lib/autonomy-authorization.mjs`);
@@ -492,20 +498,261 @@ const run = ({
   }
   return result;
 };
+const currentLockOwnerIdentity = () => __BROKKR_TEST_ONLY__currentLockOwnerIdentity();
+function writeLockTicketRecord(ticketsDir, {
+  sequence,
+  token = `completed-${String(sequence).padStart(8, "0")}`,
+  pid = process.pid,
+  boot_id = currentLockOwnerIdentity().boot_id,
+  boot_id_authoritative = currentLockOwnerIdentity().boot_id_authoritative,
+  process_start_time = currentLockOwnerIdentity().process_start_time,
+  process_start_time_authoritative = currentLockOwnerIdentity().process_start_time_authoritative,
+} = {}) {
+  const prefix = String(sequence).padStart(8, "0");
+  fs.mkdirSync(ticketsDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(`${ticketsDir}/${prefix}.json`, `${canonicalJson({
+    kind: "brokkr-lock-ticket",
+    schema_version: "v1",
+    pid,
+    boot_id,
+    boot_id_authoritative,
+    process_start_time,
+    process_start_time_authoritative,
+    token,
+    sequence,
+  })}\n`);
+  return { prefix, token };
+}
+function writeCompletedLockTicket(ticketsDir, sequence) {
+  const { prefix, token } = writeLockTicketRecord(ticketsDir, { sequence });
+  fs.writeFileSync(`${ticketsDir}/${prefix}.done`, `${canonicalJson({
+    kind: "brokkr-lock-ticket-completion",
+    schema_version: "v1",
+    token,
+    sequence,
+  })}\n`);
+}
+function writeRetiredLockTicket(ticketsDir, {
+  sequence,
+  token = `completed-${String(sequence).padStart(8, "0")}`,
+  reason = "owner-dead",
+} = {}) {
+  const prefix = String(sequence).padStart(8, "0");
+  fs.mkdirSync(ticketsDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(`${ticketsDir}/${prefix}.done`, `${canonicalJson({
+    kind: "brokkr-lock-ticket-retirement",
+    schema_version: "v1",
+    token,
+    sequence,
+    reason,
+  })}\n`);
+}
+const lockTicketArtifacts = ticketsDir => (
+  fs.existsSync(ticketsDir) ? fs.readdirSync(ticketsDir).sort() : []
+);
+const lockCheckpointArtifacts = ticketsDir => lockTicketArtifacts(ticketsDir)
+  .filter(name => name === "checkpoint.json" || /^checkpoint\.\d+\.json$/.test(name));
+const lockTicketSequences = ticketsDir => lockTicketArtifacts(ticketsDir)
+  .flatMap(name => {
+    const match = /^(\d+)\.json$/.exec(name);
+    return match ? [Number.parseInt(match[1], 10)] : [];
+  })
+  .sort((left, right) => left - right);
+const lockTicketFinalArtifacts = ticketsDir => lockTicketArtifacts(ticketsDir)
+  .filter(name =>
+    /^(\d+)\.(done|json)$/.test(name) ||
+    name === "checkpoint.json" ||
+    /^checkpoint\.\d+\.json$/.test(name),
+  );
+const lockTicketTemps = ticketsDir => lockTicketArtifacts(ticketsDir)
+  .filter(name => name.endsWith(".tmp"));
+function readHighestLockCheckpoint(ticketsDir) {
+  let selected = null;
+  for (const name of lockCheckpointArtifacts(ticketsDir)) {
+    const record = bounded(`${ticketsDir}/${name}`);
+    if (selected === null || record.last_completed_sequence > selected.last_completed_sequence) {
+      selected = record;
+      continue;
+    }
+    if (record.last_completed_sequence === selected.last_completed_sequence) {
+      assert.equal(record.last_completed_token, selected.last_completed_token);
+    }
+  }
+  return selected;
+}
+function withEnv(name, value, fn) {
+  const previous = process.env[name];
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = previous;
+    }
+  }
+}
+function withLockOwnerProbe(probe, fn) {
+  const previousProbe = globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__;
+  globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ = probe;
+  try {
+    return withEnv("BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE", "1", fn);
+  } finally {
+    if (previousProbe === undefined) {
+      delete globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__;
+    } else {
+      globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ = previousProbe;
+    }
+  }
+}
+async function importFreshAutonomyModuleWithBootIdFailure(code) {
+  const originalReadFileSync = fs.readFileSync;
+  fs.readFileSync = ((file, ...args) => {
+    if (file === "/proc/sys/kernel/random/boot_id") {
+      throw Object.assign(new Error(`synthetic-boot-id-${code}`), { code });
+    }
+    return originalReadFileSync.call(fs, file, ...args);
+  });
+  const autonomyUrl = pathToFileURL(`${root}/scripts/debian-maintenance-autonomy.mjs`);
+  autonomyUrl.searchParams.set("test", crypto.randomUUID());
+  try {
+    return await import(autonomyUrl.href);
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+}
+function waitForFile(file, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(file)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${file}`);
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+  }
+}
+function withLockTicketFaults(fn) {
+  const previousEnabled = process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS;
+  process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS = "1";
+  try {
+    return fn();
+  } finally {
+    if (previousEnabled === undefined) {
+      delete process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS;
+    } else {
+      process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS = previousEnabled;
+    }
+    delete globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__;
+  }
+}
+const fallbackOwnerProbeEnv = ({
+  bootId,
+  selfProcessStart,
+  otherProcessStart = "__NULL__",
+} = {}) => ({
+  BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE: "1",
+  TEST_OWNER_PROBE_BOOT_ID: bootId,
+  TEST_OWNER_PROBE_BOOT_ID_AUTHORITATIVE: "0",
+  TEST_OWNER_PROBE_SELF_PROCESS_START: selfProcessStart,
+  TEST_OWNER_PROBE_SELF_PROCESS_START_AUTHORITATIVE: "0",
+  TEST_OWNER_PROBE_OTHER_PROCESS_START: otherProcessStart,
+  TEST_OWNER_PROBE_OTHER_PROCESS_START_AUTHORITATIVE: "0",
+});
 
 if (process.env.WORKER_MODE) {
+  process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS = "1";
+  const holdDeadlineMs = Number.parseInt(process.env.CHILD_HOLD_TIMEOUT_MS ?? "15000", 10);
+  const waitBriefly = (timeoutMs = 1) =>
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, timeoutMs);
+  const waitForReleaseFile = (file, label) => {
+    const deadline = Date.now() + holdDeadlineMs;
+    while (!file || !fs.existsSync(file)) {
+      if (Date.now() >= deadline) {
+        throw Object.assign(new Error(`${label}-timeout`), {
+          code: "worker_hold_timeout",
+        });
+      }
+      waitBriefly();
+    }
+  };
+  const envProbeValue = (name, authoritativeName) => {
+    const value = process.env[name];
+    if (value === undefined) return undefined;
+    if (value === "__NULL__") return null;
+    return {
+      value,
+      authoritative: process.env[authoritativeName] === "1",
+    };
+  };
+  const bootProbe = envProbeValue(
+    "TEST_OWNER_PROBE_BOOT_ID",
+    "TEST_OWNER_PROBE_BOOT_ID_AUTHORITATIVE",
+  );
+  const selfStartProbe = envProbeValue(
+    "TEST_OWNER_PROBE_SELF_PROCESS_START",
+    "TEST_OWNER_PROBE_SELF_PROCESS_START_AUTHORITATIVE",
+  );
+  const otherStartProbe = envProbeValue(
+    "TEST_OWNER_PROBE_OTHER_PROCESS_START",
+    "TEST_OWNER_PROBE_OTHER_PROCESS_START_AUTHORITATIVE",
+  );
+  if ([bootProbe, selfStartProbe, otherStartProbe].some(value => value !== undefined)) {
+    process.env.BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE = "1";
+    globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ = {
+      currentBootId: () => bootProbe,
+      processStartTime: pid => (pid === process.pid ? selfStartProbe : otherStartProbe),
+    };
+  }
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (process.env.HOLD_POINT === point) {
+      if (process.env.HOLD_READY) fs.writeFileSync(process.env.HOLD_READY, `${point}\n`);
+      waitForReleaseFile(process.env.HOLD_RELEASE, process.env.HOLD_POINT);
+    }
+    if (process.env.FAULT_POINT === point) process.exit(78);
+  };
+  if (process.env.WORKER_MODE === "lock-probe") {
+    __BROKKR_TEST_ONLY__probeExclusiveDirectory(process.env.LOCK_DIR);
+    process.exit(0);
+  }
+  if (process.env.WORKER_MODE === "lock-probe-status") {
+    try {
+      __BROKKR_TEST_ONLY__probeExclusiveDirectory(process.env.LOCK_DIR);
+      process.exit(0);
+    } catch (error) {
+      if (process.env.ERROR_LOG) {
+        fs.writeFileSync(process.env.ERROR_LOG, `${error?.code ?? error?.message ?? error}\n`);
+      }
+      process.exit(error?.code === "lock_probe_contended" ? 73 : 74);
+    }
+  }
+  if (process.env.WORKER_MODE === "lock-hold") {
+    __BROKKR_TEST_ONLY__probeExclusiveDirectory(process.env.LOCK_DIR, () => {
+      if (process.env.OP_READY) fs.writeFileSync(process.env.OP_READY, "ready\n");
+      waitForReleaseFile(process.env.OP_RELEASE, "lock-hold-release");
+      return true;
+    });
+    process.exit(0);
+  }
   if (process.env.WORKER_MODE === "hold-lock") {
     const tickets = `${process.env.WORKER_DIR}/.autonomy-state/domain-state.lock.tickets`;
     fs.mkdirSync(tickets, { recursive: true });
+    const owner = currentLockOwnerIdentity();
     fs.writeFileSync(`${tickets}/00000001.json`, JSON.stringify({
       kind: "brokkr-lock-ticket", schema_version: "v1", pid: process.pid,
+      boot_id: owner.boot_id, boot_id_authoritative: owner.boot_id_authoritative,
+      process_start_time: owner.process_start_time,
+      process_start_time_authoritative: owner.process_start_time_authoritative,
       token: "child-lock-owner", sequence: 1,
     }));
     fs.writeFileSync(process.env.READY, "ready");
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);
+    waitBriefly(holdDeadlineMs);
     process.exit(0);
   }
-  while (process.env.BARRIER && !fs.existsSync(process.env.BARRIER)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+  if (process.env.BARRIER) waitForReleaseFile(process.env.BARRIER, "worker-barrier");
   const workerArtifacts = bundle();
   const overBudgetWorkerTimes = process.env.OVER_BUDGET_WATCH_ANCHOR ?
     Array(12).fill("2026-07-26T00:00:00Z") : null;
@@ -561,9 +808,11 @@ if (process.env.WORKER_MODE) {
       if (process.env.RECOVERY_CALL_LOG) {
         fs.appendFileSync(process.env.RECOVERY_CALL_LOG, "recovery-call\n");
       }
-      while (process.env.HOLD_BEFORE_RECOVERY_EFFECT &&
-          !fs.existsSync(process.env.HOLD_BEFORE_RECOVERY_EFFECT)) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+      if (process.env.HOLD_BEFORE_RECOVERY_EFFECT) {
+        waitForReleaseFile(
+          process.env.HOLD_BEFORE_RECOVERY_EFFECT,
+          "hold-before-recovery-effect",
+        );
       }
       return withWorkerLock(recoveryTransactionLock, () => {
         const state = readWorkerRecoveryState();
@@ -694,9 +943,8 @@ if (process.env.WORKER_MODE) {
           if (process.env.APPLY_LOG) fs.appendFileSync(process.env.APPLY_LOG, "apply\n");
           if (process.env.WORKER_MODE === "crash") process.exit(77);
           if (process.env.FORCE_RECOVERY) throw Error("force-recovery");
-          while (process.env.HOLD_BEFORE_EFFECT &&
-              !fs.existsSync(process.env.HOLD_BEFORE_EFFECT)) {
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+          if (process.env.HOLD_BEFORE_EFFECT) {
+            waitForReleaseFile(process.env.HOLD_BEFORE_EFFECT, "hold-before-effect");
           }
           try {
             effectTransaction(() => {
@@ -731,10 +979,10 @@ if (process.env.WORKER_MODE) {
           if (process.env.HOLD_AFTER_APPLY_READY) {
             fs.writeFileSync(process.env.HOLD_AFTER_APPLY_READY, "ready\n");
           }
-          while (process.env.HOLD_AFTER_APPLY && !fs.existsSync(process.env.HOLD_AFTER_APPLY)) {
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+          if (process.env.HOLD_AFTER_APPLY) {
+            waitForReleaseFile(process.env.HOLD_AFTER_APPLY, "hold-after-apply");
           }
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+          waitBriefly(100);
           return { applied: true };
         },
       }),
@@ -1484,9 +1732,233 @@ assert.throws(() => run({
 }), /trusted_clock_backdated/);
 
 const crashDir = `${tmp}/crash`;
-const runWorker = env => new Promise(resolve => {
-  const child = spawn(process.execPath, [...process.execArgv, process.argv[1]], { env: { ...process.env, ...env } });
-  child.on("exit", code => resolve(code));
+const runWorker = (env, timeoutMs = 15_000) => new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, [...process.execArgv, process.argv[1]], {
+    env: { ...process.env, ...env },
+  });
+  let settled = false;
+  const finish = callback => value => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    callback(value);
+  };
+  const timer = setTimeout(() => {
+    if (!settled) child.kill("SIGKILL");
+    finish(reject)(new Error(`worker timeout: ${JSON.stringify(env)}`));
+  }, timeoutMs);
+  child.on("error", finish(reject));
+  child.on("exit", finish(resolve));
+});
+const productionProbeIdentity = (() => {
+  const previousProbe = globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__;
+  globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ = {
+    currentBootId: () => ({
+      value: "probe-boot-id",
+      authoritative: true,
+    }),
+    processStartTime: () => ({
+      value: "probe-process-start",
+      authoritative: true,
+    }),
+  };
+  try {
+    return withEnv("BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE", undefined, () =>
+      currentLockOwnerIdentity());
+  } finally {
+    if (previousProbe === undefined) {
+      delete globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__;
+    } else {
+      globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ = previousProbe;
+    }
+  }
+})();
+assert.notEqual(productionProbeIdentity.boot_id, "probe-boot-id",
+  "production owner identity ignores injected test probes without the explicit env gate");
+assert.notEqual(productionProbeIdentity.process_start_time, "probe-process-start",
+  "production owner identity ignores injected process-start probes without the explicit env gate");
+for (const bootIdErrorCode of ["ENOTDIR", "EACCES", "EPERM"]) {
+  const freshAutonomyModule = await importFreshAutonomyModuleWithBootIdFailure(bootIdErrorCode);
+  const fallbackBootOwner = freshAutonomyModule.__BROKKR_TEST_ONLY__currentLockOwnerIdentity();
+  assert.equal(fallbackBootOwner.boot_id_authoritative, false,
+    `${bootIdErrorCode}: boot-id probe falls back non-authoritatively`);
+  assert.equal(typeof fallbackBootOwner.boot_id, "string",
+    `${bootIdErrorCode}: boot-id fallback remains populated`);
+  assert.equal(fallbackBootOwner.boot_id.length >= 1, true,
+    `${bootIdErrorCode}: boot-id fallback stays non-empty`);
+}
+const fallbackContentionDir = `${tmp}/fallback-contention.lock`;
+const fallbackContentionTickets = `${fallbackContentionDir}.tickets`;
+const fallbackContentionReady = `${tmp}/fallback-contention.ready`;
+const fallbackContentionRelease = `${tmp}/fallback-contention.release`;
+const fallbackHolder = runWorker({
+  WORKER_MODE: "lock-hold",
+  LOCK_DIR: fallbackContentionDir,
+  OP_READY: fallbackContentionReady,
+  OP_RELEASE: fallbackContentionRelease,
+  CHILD_HOLD_TIMEOUT_MS: "5000",
+  ...fallbackOwnerProbeEnv({
+    bootId: "boot-estimate:holder-a",
+    selfProcessStart: "time-origin:holder-a",
+  }),
+});
+waitForFile(fallbackContentionReady);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe-status",
+  LOCK_DIR: fallbackContentionDir,
+  CHILD_HOLD_TIMEOUT_MS: "5000",
+  ...fallbackOwnerProbeEnv({
+    bootId: "boot-estimate:holder-b",
+    selfProcessStart: "time-origin:holder-b",
+  }),
+}), 73,
+  "fallback boot/process estimates stay fail-closed across processes while the holder is live");
+assert.deepEqual(
+  lockTicketArtifacts(fallbackContentionTickets).filter(name => /^\d+\.json$/.test(name)),
+  ["00000001.json"],
+  "an ambiguous live fallback tail does not grow a successor ticket",
+);
+fs.writeFileSync(fallbackContentionRelease, "");
+assert.equal(await fallbackHolder, 0);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: fallbackContentionDir,
+  ...fallbackOwnerProbeEnv({
+    bootId: "boot-estimate:holder-c",
+    selfProcessStart: "time-origin:holder-c",
+  }),
+}), 0,
+  "the fallback-path holder still releases cleanly once the live owner exits");
+const reclaimAfterCrashDir = `${tmp}/lock-reclaim-after-crash.lock`;
+const reclaimAfterCrashTickets = `${reclaimAfterCrashDir}.tickets`;
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: reclaimAfterCrashDir,
+  FAULT_POINT: "after-lock-owner-operation",
+}), 78, "the synthetic crash lands after publishing the owner ticket");
+assert.deepEqual(
+  lockTicketArtifacts(reclaimAfterCrashTickets).filter(name => /^\d+\.json$/.test(name)),
+  ["00000001.json"],
+  "the crash leaves exactly one unresolved owner ticket",
+);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: reclaimAfterCrashDir,
+}), 0, "restart can reclaim a single provably dead crashed ticket");
+assert.deepEqual(
+  lockTicketArtifacts(reclaimAfterCrashTickets).filter(name => /^(\d+)\.(done|json)$/.test(name)),
+  ["00000001.done", "00000001.json", "00000002.done", "00000002.json"],
+  "restart retires the dead ticket and advances with a fresh sequence",
+);
+const reclaimerRaceDir = `${tmp}/lock-reclaimer-race.lock`;
+const reclaimerRaceTickets = `${reclaimerRaceDir}.tickets`;
+writeLockTicketRecord(reclaimerRaceTickets, {
+  sequence: 1,
+  pid: 999999,
+  boot_id: "11111111-1111-1111-1111-111111111111",
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:111",
+  process_start_time_authoritative: true,
+  token: "dead-race-owner",
+});
+const reclaimerRaceReady = `${tmp}/lock-reclaimer-race.ready`;
+const reclaimerRaceRelease = `${tmp}/lock-reclaimer-race.release`;
+const reclaimerRaceHeld = `${tmp}/lock-reclaimer-race-held`;
+const reclaimerRaceDone = `${tmp}/lock-reclaimer-race.done`;
+const delayedReclaimer = runWorker({
+  WORKER_MODE: "lock-probe-status",
+  LOCK_DIR: reclaimerRaceDir,
+  HOLD_POINT: "before-lock-ticket-retire-claim",
+  HOLD_READY: reclaimerRaceReady,
+  HOLD_RELEASE: reclaimerRaceRelease,
+  CHILD_HOLD_TIMEOUT_MS: "5000",
+});
+waitForFile(reclaimerRaceReady);
+const liveSuccessor = runWorker({
+  WORKER_MODE: "lock-hold",
+  LOCK_DIR: reclaimerRaceDir,
+  OP_READY: reclaimerRaceHeld,
+  OP_RELEASE: reclaimerRaceDone,
+  CHILD_HOLD_TIMEOUT_MS: "5000",
+});
+waitForFile(reclaimerRaceHeld);
+assert.deepEqual(
+  lockTicketArtifacts(reclaimerRaceTickets).filter(name => /^(\d+)\.(done|json)$/.test(name)),
+  ["00000001.done", "00000001.json", "00000002.json"],
+  "the first live successor publishes a fresh sequence after retiring the dead ticket",
+);
+fs.writeFileSync(reclaimerRaceRelease, "");
+assert.equal(await delayedReclaimer, 73,
+  "a delayed second reclaimer cannot retire or replace the fresh live successor");
+assert.deepEqual(lockTicketSequences(reclaimerRaceTickets), [2],
+  "the stale reclaimer leaves the fresh successor sequence intact");
+assert.equal(fs.existsSync(`${reclaimerRaceTickets}/00000002.json`), true,
+  "the stale reclaimer does not delete the fresh successor path");
+fs.writeFileSync(reclaimerRaceDone, "");
+assert.equal(await liveSuccessor, 0);
+const conflictingRetirementDir = `${tmp}/lock-retirement-conflicting-done.lock`;
+const conflictingRetirementTickets = `${conflictingRetirementDir}.tickets`;
+writeLockTicketRecord(conflictingRetirementTickets, {
+  sequence: 1,
+  pid: 999999,
+  boot_id: "11111111-1111-1111-1111-111111111111",
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:111",
+  process_start_time_authoritative: true,
+  token: "dead-conflicting-owner",
+});
+withLockTicketFaults(() => {
+  let retireClaims = 0;
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (point !== "before-lock-ticket-retire-claim") return;
+    retireClaims += 1;
+    if (retireClaims === 1) {
+      writeRetiredLockTicket(conflictingRetirementTickets, {
+        sequence: 1,
+        token: "some-other-owner",
+        reason: "owner-dead",
+      });
+      return;
+    }
+    throw Object.assign(new Error("unexpected-retirement-retry-loop"), {
+      code: "unexpected_retirement_retry_loop",
+    });
+  };
+  assert.throws(
+    () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(conflictingRetirementDir),
+    /lock_completion_conflict/,
+    "a conflicting completion at retirement EEXIST fails closed instead of retrying forever",
+  );
+});
+const malformedRetirementDir = `${tmp}/lock-retirement-malformed-done.lock`;
+const malformedRetirementTickets = `${malformedRetirementDir}.tickets`;
+writeLockTicketRecord(malformedRetirementTickets, {
+  sequence: 1,
+  pid: 999998,
+  boot_id: "11111111-1111-1111-1111-111111111111",
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:112",
+  process_start_time_authoritative: true,
+  token: "dead-malformed-owner",
+});
+withLockTicketFaults(() => {
+  let retireClaims = 0;
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (point !== "before-lock-ticket-retire-claim") return;
+    retireClaims += 1;
+    if (retireClaims === 1) {
+      fs.writeFileSync(`${malformedRetirementTickets}/00000001.done`, "{not-json}\n");
+      return;
+    }
+    throw Object.assign(new Error("unexpected-retirement-retry-loop"), {
+      code: "unexpected_retirement_retry_loop",
+    });
+  };
+  assert.throws(
+    () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(malformedRetirementDir),
+    /lock_completion_invalid/,
+    "a malformed completion at retirement EEXIST fails closed instead of retrying forever",
+  );
 });
 const staleLockDir = `${tmp}/stale-lock`, staleLockReady = `${tmp}/stale-lock-ready`;
 const staleLockChild = spawn(process.execPath, [...process.execArgv, process.argv[1]], {
@@ -1504,6 +1976,725 @@ assert.equal(run({ dir: staleLockDir }).reason, "committed",
 assert.throws(() => run({
   dir: staleLockDir, bind: { ...binding(), candidate_digest: "sha256:" + "7".repeat(64) },
 }), /attempt_conflicting_replay/, "terminal retry is idempotent only for the exact binding");
+const directCompactionDir = `${tmp}/direct-lock-compaction.lock`;
+const directCompactionTickets = `${directCompactionDir}.tickets`;
+for (let sequence = 1;
+  sequence < __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold;
+  sequence += 1) {
+  writeCompletedLockTicket(directCompactionTickets, sequence);
+}
+withLockTicketFaults(() => {
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (point === "after-lock-release-visible-before-prune") {
+      throw Object.assign(new Error("synthetic-lock-compaction-failure"), {
+        code: "synthetic_lock_compaction_failure",
+      });
+    }
+  };
+  assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(directCompactionDir), true,
+    "post-release compaction faults do not mask the successful primary operation");
+});
+assert.equal(
+  readHighestLockCheckpoint(directCompactionTickets).last_completed_sequence,
+  __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold,
+  "compaction durability survives best-effort prune failure after visible completion",
+);
+const directAmbiguousDir = `${tmp}/direct-lock-ambiguous.lock`;
+const directAmbiguousTickets = `${directAmbiguousDir}.tickets`;
+for (let sequence = 1;
+  sequence < __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold;
+  sequence += 1) {
+  writeCompletedLockTicket(directAmbiguousTickets, sequence);
+}
+withLockTicketFaults(() => {
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (point === "after-lock-checkpoint-fsync") {
+      throw Object.assign(new Error("synthetic-lock-checkpoint-fsync"), {
+        code: "synthetic_lock_checkpoint_fsync",
+      });
+    }
+  };
+  assert.throws(
+    () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(directAmbiguousDir),
+    /lock_completion_ambiguous/,
+    "a successful operation is not reported as safely retryable when checkpoint completion is ambiguous",
+  );
+});
+assert.equal(lockTicketTemps(directAmbiguousTickets).length, 1,
+  "an ambiguous checkpoint boundary leaves exactly one orphaned staging file");
+const epermDir = `${tmp}/lock-liveness-eperm.lock`;
+const epermTickets = `${epermDir}.tickets`;
+fs.mkdirSync(epermTickets, { recursive: true, mode: 0o700 });
+const epermOwner = currentLockOwnerIdentity();
+fs.writeFileSync(`${epermTickets}/00000001.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket",
+  schema_version: "v1",
+  pid: 424242,
+  boot_id: epermOwner.boot_id,
+  process_start_time: epermOwner.process_start_time,
+  token: "eperm-owner",
+  sequence: 1,
+})}\n`);
+const originalKill = process.kill;
+process.kill = ((pid, signal) => {
+  if (pid === 424242 && signal === 0) {
+    throw Object.assign(new Error("eperm-owner"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  assert.throws(
+    () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(epermDir),
+    /lock_probe_contended/,
+    "EPERM is treated as evidence that the recorded owner is still alive",
+  );
+} finally {
+  process.kill = originalKill;
+}
+const reusedPidDir = `${tmp}/lock-liveness-reused-pid.lock`;
+const reusedPidTickets = `${reusedPidDir}.tickets`;
+const reusedPidBootId = "22222222-2222-2222-2222-222222222222";
+const reusedPidOldStart = "linux-start:222";
+const reusedPidNewStart = "linux-start:333";
+writeLockTicketRecord(reusedPidTickets, {
+  sequence: 1,
+  pid: 424243,
+  boot_id: reusedPidBootId,
+  boot_id_authoritative: true,
+  process_start_time: reusedPidOldStart,
+  process_start_time_authoritative: true,
+  token: "reused-owner",
+});
+process.kill = ((pid, signal) => {
+  if (pid === 424243 && signal === 0) {
+    throw Object.assign(new Error("eperm-reused-owner"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  withLockOwnerProbe({
+    currentBootId: () => ({
+      value: reusedPidBootId,
+      authoritative: true,
+    }),
+    processStartTime: pid => (
+      pid === 424243 ? {
+        value: reusedPidNewStart,
+        authoritative: true,
+      } : {
+        value: "linux-start:444",
+        authoritative: true,
+      }
+    ),
+  }, () => {
+    assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(reusedPidDir), true,
+      "EPERM does not pin a stale owner when the process start identity changed");
+  });
+} finally {
+  process.kill = originalKill;
+}
+const malformedBootIdDir = `${tmp}/lock-liveness-malformed-boot-id.lock`;
+const malformedBootIdTickets = `${malformedBootIdDir}.tickets`;
+writeLockTicketRecord(malformedBootIdTickets, {
+  sequence: 1,
+  pid: 424246,
+  boot_id: "not-a-linux-boot-id",
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:500",
+  process_start_time_authoritative: true,
+  token: "malformed-boot-id-owner",
+});
+process.kill = ((pid, signal) => {
+  if (pid === 424246 && signal === 0) {
+    throw Object.assign(new Error("eperm-malformed-boot-id"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  withLockOwnerProbe({
+    currentBootId: () => ({
+      value: reusedPidBootId,
+      authoritative: true,
+    }),
+    processStartTime: pid => (
+      pid === 424246 ? {
+        value: "linux-start:500",
+        authoritative: true,
+      } : {
+        value: "linux-start:444",
+        authoritative: true,
+      }
+    ),
+  }, () => {
+    assert.throws(
+      () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(malformedBootIdDir),
+      /lock_probe_contended/,
+      "a malformed authoritative boot ID stays ambiguous and fail-closed while the owner is live",
+    );
+  });
+} finally {
+  process.kill = originalKill;
+}
+const malformedProcessStartDir = `${tmp}/lock-liveness-malformed-process-start.lock`;
+const malformedProcessStartTickets = `${malformedProcessStartDir}.tickets`;
+writeLockTicketRecord(malformedProcessStartTickets, {
+  sequence: 1,
+  pid: 424247,
+  boot_id: reusedPidBootId,
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:not-a-positive-integer",
+  process_start_time_authoritative: true,
+  token: "malformed-process-start-owner",
+});
+process.kill = ((pid, signal) => {
+  if (pid === 424247 && signal === 0) {
+    throw Object.assign(new Error("eperm-malformed-process-start"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  withLockOwnerProbe({
+    currentBootId: () => ({
+      value: reusedPidBootId,
+      authoritative: true,
+    }),
+    processStartTime: pid => (
+      pid === 424247 ? {
+        value: "linux-start:600",
+        authoritative: true,
+      } : {
+        value: "linux-start:444",
+        authoritative: true,
+      }
+    ),
+  }, () => {
+    assert.throws(
+      () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(malformedProcessStartDir),
+      /lock_probe_contended/,
+      "a malformed authoritative process-start stamp stays ambiguous and fail-closed while the owner is live",
+    );
+  });
+} finally {
+  process.kill = originalKill;
+}
+const legacyReusedPidDir = `${tmp}/lock-liveness-legacy-reused-pid.lock`;
+const legacyReusedPidTickets = `${legacyReusedPidDir}.tickets`;
+fs.mkdirSync(legacyReusedPidTickets, { recursive: true, mode: 0o700 });
+const legacyReusedPidTicket = `${legacyReusedPidTickets}/00000001.json`;
+fs.writeFileSync(legacyReusedPidTicket, `${canonicalJson({
+  kind: "brokkr-lock-ticket",
+  schema_version: "v1",
+  pid: 424244,
+  token: "legacy-reused-owner",
+  sequence: 1,
+})}\n`);
+process.kill = ((pid, signal) => {
+  if (pid === 424244 && signal === 0) {
+    throw Object.assign(new Error("eperm-legacy-reused-owner"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  withLockOwnerProbe({
+    processStartedAfterLegacyTicket: (pid, ticketMtimeMs) => {
+      assert.equal(pid, 424244);
+      assert.equal(Number.isFinite(ticketMtimeMs), true);
+      return true;
+    },
+  }, () => {
+    assert.throws(
+      () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(legacyReusedPidDir),
+      /lock_probe_contended/,
+      "a legacy five-field ticket remains fail-closed even when PID reuse looks newer",
+    );
+  });
+} finally {
+  process.kill = originalKill;
+}
+writeRetiredLockTicket(legacyReusedPidTickets, {
+  sequence: 1,
+  token: "legacy-reused-owner",
+  reason: "legacy-owner-identity-ambiguous",
+});
+assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(legacyReusedPidDir), true,
+  "an operator can non-destructively retire an ambiguous legacy ticket");
+assert.deepEqual(
+  lockTicketArtifacts(legacyReusedPidTickets).filter(name => /^(\d+)\.(done|json)$/.test(name)),
+  [
+    "00000001.done",
+    "00000001.json",
+    "00000002.done",
+    "00000002.json",
+  ],
+  "manual retirement advances above the legacy ticket without deleting it",
+);
+const legacyAmbiguousPidDir = `${tmp}/lock-liveness-legacy-ambiguous-pid.lock`;
+const legacyAmbiguousPidTickets = `${legacyAmbiguousPidDir}.tickets`;
+fs.mkdirSync(legacyAmbiguousPidTickets, { recursive: true, mode: 0o700 });
+fs.writeFileSync(`${legacyAmbiguousPidTickets}/00000001.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket",
+  schema_version: "v1",
+  pid: 424245,
+  token: "legacy-ambiguous-owner",
+  sequence: 1,
+})}\n`);
+process.kill = ((pid, signal) => {
+  if (pid === 424245 && signal === 0) {
+    throw Object.assign(new Error("eperm-legacy-ambiguous-owner"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  withLockOwnerProbe({
+    processStartedAfterLegacyTicket: () => false,
+  }, () => {
+    assert.throws(
+      () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(legacyAmbiguousPidDir),
+      /lock_probe_contended/,
+      "a legacy ticket remains fail-closed when PID reuse cannot be proven",
+    );
+  });
+} finally {
+  process.kill = originalKill;
+}
+const invalidPidDir = `${tmp}/lock-invalid-pid.lock`;
+const invalidPidTickets = `${invalidPidDir}.tickets`;
+fs.mkdirSync(invalidPidTickets, { recursive: true, mode: 0o700 });
+fs.writeFileSync(`${invalidPidTickets}/00000001.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket",
+  schema_version: "v1",
+  pid: 0,
+  boot_id: reusedPidBootId,
+  process_start_time: reusedPidOldStart,
+  token: "invalid-pid",
+  sequence: 1,
+})}\n`);
+assert.throws(
+  () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(invalidPidDir),
+  /lock_owner_invalid/,
+  "non-positive owner PIDs are rejected",
+);
+const strayNamesDir = `${tmp}/lock-stray-names.lock`;
+const strayNamesTickets = `${strayNamesDir}.tickets`;
+fs.mkdirSync(strayNamesTickets, { recursive: true, mode: 0o700 });
+fs.writeFileSync(`${strayNamesTickets}/nonsense.tmp`, "{}\n");
+fs.writeFileSync(`${strayNamesTickets}/checkpoint.bad.tmp`, "{}\n");
+fs.writeFileSync(`${strayNamesTickets}/00000000.json`, "{}\n");
+assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(strayNamesDir), true,
+  "stray temp and invalid ticket names do not wedge acquisition");
+assert.deepEqual(lockTicketTemps(strayNamesTickets), [],
+  "stray temp names are reclaimed on the next acquisition");
+assert.equal(fs.existsSync(`${strayNamesTickets}/00000000.json`), false,
+  "non-positive stray ticket artifacts are reclaimed when acquisition succeeds");
+const delayedCompactorDir = `${tmp}/delayed-compactor.lock`;
+const delayedCompactorTickets = `${delayedCompactorDir}.tickets`;
+for (let sequence = 1;
+  sequence < __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold;
+  sequence += 1) {
+  writeCompletedLockTicket(delayedCompactorTickets, sequence);
+}
+const delayedCompactorReady = `${tmp}/delayed-compactor.ready`;
+const delayedCompactorRelease = `${tmp}/delayed-compactor.release`;
+const delayedCompactor = runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: delayedCompactorDir,
+  HOLD_POINT: "after-lock-release-visible-before-prune",
+  HOLD_READY: delayedCompactorReady,
+  HOLD_RELEASE: delayedCompactorRelease,
+});
+waitForFile(delayedCompactorReady);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: delayedCompactorDir,
+}), 0, "a successor can enter after the visible release boundary");
+fs.writeFileSync(delayedCompactorRelease, "");
+assert.equal(await delayedCompactor, 0);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: delayedCompactorDir,
+}), 0);
+assert.equal(
+  readHighestLockCheckpoint(delayedCompactorTickets).last_completed_sequence,
+  __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold,
+  "the delayed compactor leaves its monotonic completion checkpoint in place",
+);
+assert.deepEqual(
+  lockTicketSequences(delayedCompactorTickets),
+  [
+    __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold + 1,
+    __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold + 2,
+  ],
+  "a delayed compactor cannot regress the checkpoint or reuse a sequence",
+);
+const delayedAcquirerDir = `${tmp}/delayed-acquirer.lock`;
+const delayedAcquirerTickets = `${delayedAcquirerDir}.tickets`;
+for (let sequence = 1;
+  sequence < __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold;
+  sequence += 1) {
+  writeCompletedLockTicket(delayedAcquirerTickets, sequence);
+}
+const delayedAcquirerReady = `${tmp}/delayed-acquirer.ready`;
+const delayedAcquirerRelease = `${tmp}/delayed-acquirer.release`;
+const delayedAcquirerHeld = `${tmp}/delayed-acquirer-held`;
+const delayedAcquirerDone = `${tmp}/delayed-acquirer.done`;
+const delayedAcquirer = runWorker({
+  WORKER_MODE: "lock-hold",
+  LOCK_DIR: delayedAcquirerDir,
+  HOLD_POINT: "after-lock-ticket-fsync",
+  HOLD_READY: delayedAcquirerReady,
+  HOLD_RELEASE: delayedAcquirerRelease,
+  OP_READY: delayedAcquirerHeld,
+  OP_RELEASE: delayedAcquirerDone,
+});
+waitForFile(delayedAcquirerReady);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: delayedAcquirerDir,
+}), 0, "a successor can compact the completed prefix while another acquirer is still delayed");
+fs.writeFileSync(delayedAcquirerRelease, "");
+waitForFile(delayedAcquirerHeld);
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe-status",
+  LOCK_DIR: delayedAcquirerDir,
+}), 73, "a delayed acquirer retries above the advanced floor and still blocks concurrent entry");
+fs.writeFileSync(delayedAcquirerDone, "");
+assert.equal(await delayedAcquirer, 0);
+assert.equal(
+  readHighestLockCheckpoint(delayedAcquirerTickets).last_completed_sequence,
+  __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold,
+  "the delayed acquirer does not let a stale post-compaction ticket advance the floor",
+);
+assert.deepEqual(
+  lockTicketSequences(delayedAcquirerTickets),
+  [__BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold + 1],
+  "the delayed acquirer retries with a visible sequence above the compacted floor",
+);
+const staleCheckpointSelectionDir = `${tmp}/stale-checkpoint-selection.lock`;
+const staleCheckpointSelectionTickets = `${staleCheckpointSelectionDir}.tickets`;
+fs.mkdirSync(staleCheckpointSelectionTickets, { recursive: true, mode: 0o700 });
+fs.writeFileSync(`${staleCheckpointSelectionTickets}/checkpoint.00000003.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket-checkpoint",
+  schema_version: "v1",
+  last_completed_sequence: 3,
+  last_completed_token: "completed-00000003",
+  next_sequence: 4,
+})}\n`);
+fs.writeFileSync(`${staleCheckpointSelectionTickets}/checkpoint.00000002.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket-checkpoint",
+  schema_version: "v1",
+  last_completed_sequence: 2,
+  last_completed_token: "completed-00000002",
+  next_sequence: 3,
+})}\n`);
+assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(staleCheckpointSelectionDir), true,
+  "the highest immutable checkpoint selects the next sequence");
+assert.equal(readHighestLockCheckpoint(staleCheckpointSelectionTickets).last_completed_sequence, 3);
+assert.deepEqual(
+  lockCheckpointArtifacts(staleCheckpointSelectionTickets),
+  ["checkpoint.00000003.json"],
+  "lower immutable checkpoints are pruned once a higher floor exists",
+);
+assert.deepEqual(lockTicketSequences(staleCheckpointSelectionTickets), [4]);
+const pruneRaceDir = `${tmp}/lock-prune-race.lock`;
+const pruneRaceTickets = `${pruneRaceDir}.tickets`;
+fs.mkdirSync(pruneRaceTickets, { recursive: true, mode: 0o700 });
+fs.writeFileSync(`${pruneRaceTickets}/checkpoint.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket-checkpoint",
+  schema_version: "v1",
+  last_completed_sequence: 2,
+  last_completed_token: "completed-00000002",
+  next_sequence: 3,
+})}\n`);
+writeCompletedLockTicket(pruneRaceTickets, 1);
+writeCompletedLockTicket(pruneRaceTickets, 2);
+const pruneRaceReady = `${tmp}/lock-prune-race.ready`;
+const pruneRaceRelease = `${tmp}/lock-prune-race.release`;
+const pruneRace = runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: pruneRaceDir,
+  HOLD_POINT: "before-lock-prune-unlink",
+  HOLD_READY: pruneRaceReady,
+  HOLD_RELEASE: pruneRaceRelease,
+});
+waitForFile(pruneRaceReady);
+for (const name of [
+  "00000001.json", "00000001.done", "00000002.json", "00000002.done",
+]) {
+  fs.unlinkSync(`${pruneRaceTickets}/${name}`);
+}
+fs.writeFileSync(pruneRaceRelease, "");
+assert.equal(await pruneRace, 0,
+  "pruning tolerates ENOENT when another pruner wins the unlink race");
+assert.deepEqual(lockTicketSequences(pruneRaceTickets), [3]);
+const readRaceDir = `${tmp}/lock-read-race.lock`;
+const readRaceTickets = `${readRaceDir}.tickets`;
+fs.mkdirSync(readRaceTickets, { recursive: true, mode: 0o700 });
+fs.writeFileSync(`${readRaceTickets}/checkpoint.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket-checkpoint",
+  schema_version: "v1",
+  last_completed_sequence: 255,
+  last_completed_token: "completed-00000255",
+  next_sequence: 256,
+})}\n`);
+writeCompletedLockTicket(readRaceTickets, 256);
+const readRaceReady = `${tmp}/lock-read-race.ready`;
+const readRaceRelease = `${tmp}/lock-read-race.release`;
+const readRace = runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: readRaceDir,
+  HOLD_POINT: "before-lock-ticket-read",
+  HOLD_READY: readRaceReady,
+  HOLD_RELEASE: readRaceRelease,
+});
+waitForFile(readRaceReady);
+fs.writeFileSync(`${readRaceTickets}/checkpoint.00000256.json`, `${canonicalJson({
+  kind: "brokkr-lock-ticket-checkpoint",
+  schema_version: "v1",
+  last_completed_sequence: 256,
+  last_completed_token: "completed-00000256",
+  next_sequence: 257,
+})}\n`);
+for (const name of lockTicketArtifacts(readRaceTickets)) {
+  if (name === "checkpoint.json" || /^checkpoint\.\d+\.json$/.test(name)) continue;
+  fs.unlinkSync(`${readRaceTickets}/${name}`);
+}
+fs.writeFileSync(readRaceRelease, "");
+assert.equal(await readRace, 0,
+  "bounded retry survives a prune-vs-read race on the latest completed ticket");
+assert.equal(
+  readHighestLockCheckpoint(readRaceTickets).last_completed_sequence,
+  256,
+);
+assert.deepEqual(lockTicketSequences(readRaceTickets), [257]);
+for (const faultPoint of [
+  "after-lock-ticket-open",
+  "after-lock-ticket-write",
+  "after-lock-ticket-fsync",
+]) {
+  const faultDir = `${tmp}/${faultPoint}`;
+  const faultTickets = `${faultDir}/.autonomy-state/domain-state.lock.tickets`;
+  assert.equal(await runWorker({
+    WORKER_MODE: "fault", WORKER_DIR: faultDir, FAULT_POINT: faultPoint,
+  }), 78, `${faultPoint}: crash is injected before ticket publication`);
+  assert.deepEqual(
+    fs.existsSync(faultTickets) ?
+      fs.readdirSync(faultTickets).filter(name => /^\d+\.json$/.test(name)) : [],
+    [],
+    `${faultPoint}: no torn final ticket is published before durability`,
+  );
+  assert.equal(run({ dir: faultDir }).reason, "committed",
+    `${faultPoint}: restart recovers without delete races`);
+}
+for (const faultPoint of [
+  "after-lock-owner-operation",
+  "after-lock-completion-open",
+  "after-lock-completion-write",
+  "after-lock-completion-fsync",
+]) {
+  const faultDir = `${tmp}/${faultPoint}`;
+  const faultTickets = `${faultDir}/.autonomy-state/domain-state.lock.tickets`;
+  assert.equal(await runWorker({
+    WORKER_MODE: "fault", WORKER_DIR: faultDir, FAULT_POINT: faultPoint,
+  }), 78, `${faultPoint}: crash is injected before completion publication`);
+  const latestTicket = fs.readdirSync(faultTickets)
+    .filter(name => /^\d+\.json$/.test(name))
+    .sort()
+    .at(-1);
+  assert.equal(typeof latestTicket, "string", `${faultPoint}: owner ticket is durable`);
+  assert.equal(
+    fs.existsSync(
+      `${faultTickets}/${latestTicket.slice(0, latestTicket.length - ".json".length)}.done`,
+    ),
+    false,
+    `${faultPoint}: no completion marker is published before durability`,
+  );
+  assert.equal(run({
+    dir: faultDir,
+    admit: takeoverAdmission(),
+  }).reason, "recovered-disarmed",
+    `${faultPoint}: a dead predecessor is recoverable without unlink races`);
+}
+for (const faultPoint of [
+  "after-lock-ticket-link",
+  "after-lock-checkpoint-open",
+  "after-lock-checkpoint-write",
+  "after-lock-checkpoint-fsync",
+]) {
+  const faultDir = `${tmp}/lock-probe-${faultPoint}`;
+  const faultTickets = `${faultDir}.tickets`;
+  for (let sequence = 1;
+    sequence < __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold;
+    sequence += 1) {
+    writeCompletedLockTicket(faultTickets, sequence);
+  }
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: faultDir,
+    FAULT_POINT: faultPoint,
+  }), 78, faultPoint);
+  assert.equal(lockTicketTemps(faultTickets).length >= 1, true,
+    `${faultPoint}: the crash boundary leaves a reclaimable staging file`);
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: faultDir,
+  }), 0, `${faultPoint}: restart reclaims orphan staging and finishes`);
+  assert.deepEqual(lockTicketTemps(faultTickets), [],
+    `${faultPoint}: restart removes orphan staging files`);
+  const recoveredLockCheckpoint = readHighestLockCheckpoint(faultTickets);
+  assert.equal(
+    recoveredLockCheckpoint !== null &&
+      recoveredLockCheckpoint.last_completed_sequence >=
+      __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.compaction_threshold - 1,
+    true,
+    `${faultPoint}: recovery leaves the highest safe durable checkpoint`,
+  );
+}
+for (const faultPoint of ["after-lock-completion-link"]) {
+  const faultDir = `${tmp}/lock-probe-${faultPoint}`;
+  const faultTickets = `${faultDir}.tickets`;
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: faultDir,
+    FAULT_POINT: faultPoint,
+  }), 78, faultPoint);
+  assert.equal(lockTicketTemps(faultTickets).length, 1,
+    `${faultPoint}: the crash boundary leaves exactly one orphaned staging file`);
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: faultDir,
+  }), 0, `${faultPoint}: restart cleans the orphaned completion staging file`);
+  assert.deepEqual(lockTicketTemps(faultTickets), [],
+    `${faultPoint}: restart removes the orphaned completion staging file`);
+}
+const repeatedTmpDir = `${tmp}/repeated-lock-tmp.lock`;
+const repeatedTmpTickets = `${repeatedTmpDir}.tickets`;
+for (let attempt = 1; attempt <= 8; attempt += 1) {
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: repeatedTmpDir,
+    FAULT_POINT: "after-lock-ticket-write",
+  }), 78, `repeated tmp crash ${attempt}`);
+  assert.equal(lockTicketTemps(repeatedTmpTickets).length <= 1, true,
+    "repeated fault injection stays bounded by reclaiming the prior orphan before the next attempt");
+}
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: repeatedTmpDir,
+}), 0);
+assert.deepEqual(lockTicketTemps(repeatedTmpTickets), [],
+  "a subsequent successful run clears the last orphaned staging file");
+assert.deepEqual(
+  lockTicketArtifacts(repeatedTmpTickets).filter(
+    name => /^(\d+)\.(done|json)$/.test(name),
+  ),
+  ["00000001.done", "00000001.json"],
+  "repeated crash-only growth leaves an exact bounded final artifact set",
+);
+const dualFailureDir = `${tmp}/lock-dual-failure.lock`;
+withLockTicketFaults(() => {
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (point === "after-lock-owner-operation") {
+      throw Object.assign(new Error("synthetic-release-failure"), {
+        code: "synthetic_release_failure",
+      });
+    }
+  };
+  assert.throws(
+    () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(dualFailureDir, () => {
+      throw Object.assign(new Error("synthetic-operation-failure"), {
+        code: "synthetic_operation_failure",
+      });
+    }),
+    error => error?.code === "synthetic_operation_failure" &&
+      error.lock_release_error?.code === "lock_completion_ambiguous" &&
+      error.lock_release_error.cause?.code === "synthetic_release_failure",
+    "operation failures retain the release fault context when unlock also fails",
+  );
+});
+const liveLimitDir = `${tmp}/lock-live-limit.lock`;
+const liveLimitTickets = `${liveLimitDir}.tickets`;
+for (let attempt = 1; attempt <= 8; attempt += 1) {
+  assert.equal(await runWorker({
+    WORKER_MODE: "lock-probe",
+    LOCK_DIR: liveLimitDir,
+    FAULT_POINT: "after-lock-ticket-link",
+  }), 78, `post-link crash remains reproducible at attempt ${attempt}`);
+  assert.equal(lockTicketSequences(liveLimitTickets).at(-1), attempt,
+    "restart retires the prior dead tail before another post-link crash advances the sequence");
+}
+assert.equal(lockTicketTemps(liveLimitTickets).length, 1,
+  "repeated post-link crashes leave exactly one reclaimable staging file");
+assert.equal(await runWorker({
+  WORKER_MODE: "lock-probe",
+  LOCK_DIR: liveLimitDir,
+}), 0, "a later successful run can recover after the retired dead-tail chain");
+assert.deepEqual(lockTicketTemps(liveLimitTickets), [],
+  "the successful post-link recovery clears the last staging orphan");
+const liveLimitSequences = lockTicketSequences(liveLimitTickets);
+assert.equal(liveLimitSequences.at(-1), 9,
+  "repeated post-link crashes keep advancing to fresh sequences");
+assert.equal(liveLimitSequences.length <= 2, true,
+  "repeated post-link crashes stay bounded after prefix compaction prunes retired tickets");
+const tmpCeilingDir = `${tmp}/lock-tmp-ceiling.lock`;
+const tmpCeilingTickets = `${tmpCeilingDir}.tickets`;
+fs.mkdirSync(tmpCeilingTickets, { recursive: true, mode: 0o700 });
+for (let count = 0;
+  count <= __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS.tmp_hard_limit;
+  count += 1) {
+  fs.writeFileSync(
+    `${tmpCeilingTickets}/00000001.json.${process.pid}.${crypto.randomUUID()}.tmp`,
+    "{}\n",
+  );
+}
+assert.throws(
+  () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(tmpCeilingDir),
+  /lock_ticket_tmp_limit/,
+  "live staging growth above the hard ceiling fails closed",
+);
+const exhaustedLockDir = `${tmp}/bounded-lock-tickets`;
+const exhaustedTickets =
+  `${exhaustedLockDir}/.autonomy-state/domain-state.lock.tickets`;
+for (let sequence = 1; sequence <= 10_000; sequence += 1) {
+  writeCompletedLockTicket(exhaustedTickets, sequence);
+}
+assert.equal(run({ dir: exhaustedLockDir }).reason, "committed",
+  "a completed 10,000-ticket prefix compacts instead of failing closed forever");
+const compactedArtifacts = fs.readdirSync(exhaustedTickets)
+  .filter(name =>
+    name === "checkpoint.json" ||
+    /^checkpoint\.\d+\.json$/.test(name) ||
+    /^\d+\.(json|done)$/.test(name),
+  );
+assert.equal(compactedArtifacts.length <= 64, true,
+  "lock-ticket compaction leaves bounded final artifacts after >10,000 acquisitions");
+assert.equal(readHighestLockCheckpoint(exhaustedTickets) !== null, true,
+  "bounded lock compaction records a durable checkpoint");
+const checkpointCrashDir = `${tmp}/lock-checkpoint-rename`;
+const checkpointCrashTickets =
+  `${checkpointCrashDir}/.autonomy-state/domain-state.lock.tickets`;
+for (let sequence = 1; sequence <= 10_000; sequence += 1) {
+  writeCompletedLockTicket(checkpointCrashTickets, sequence);
+}
+assert.equal(await runWorker({
+  WORKER_MODE: "fault",
+  WORKER_DIR: checkpointCrashDir,
+  FAULT_POINT: "after-lock-checkpoint-link",
+}), 78, "checkpoint publication can crash after the exclusive link boundary");
+assert.equal(
+  lockCheckpointArtifacts(checkpointCrashTickets).length >= 1,
+  true,
+  "the checkpoint link boundary leaves a durable checkpoint artifact",
+);
+assert.equal(run({
+  dir: checkpointCrashDir,
+  admit: takeoverAdmission(),
+}).reason, "recovered-disarmed",
+  "checkpoint replay prunes the already-checkpointed prefix and proceeds");
+assert.equal(
+  lockTicketFinalArtifacts(checkpointCrashTickets).length <= 64,
+  true,
+  "checkpoint replay re-bounds storage after a crash between link and prune",
+);
 
 const sigkillDir = `${tmp}/controller-sigkill`;
 const sigkillApplyLog = `${tmp}/controller-sigkill-apply.log`;
