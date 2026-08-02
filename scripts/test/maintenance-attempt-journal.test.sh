@@ -531,6 +531,21 @@ function writeCompletedLockTicket(ticketsDir, sequence) {
     sequence,
   })}\n`);
 }
+function writeRetiredLockTicket(ticketsDir, {
+  sequence,
+  token = `completed-${String(sequence).padStart(8, "0")}`,
+  reason = "owner-dead",
+} = {}) {
+  const prefix = String(sequence).padStart(8, "0");
+  fs.mkdirSync(ticketsDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(`${ticketsDir}/${prefix}.done`, `${canonicalJson({
+    kind: "brokkr-lock-ticket-retirement",
+    schema_version: "v1",
+    token,
+    sequence,
+    reason,
+  })}\n`);
+}
 const lockTicketArtifacts = ticketsDir => (
   fs.existsSync(ticketsDir) ? fs.readdirSync(ticketsDir).sort() : []
 );
@@ -1805,9 +1820,55 @@ assert.equal(await runWorker({
 }), 0, "restart can reclaim a single provably dead crashed ticket");
 assert.deepEqual(
   lockTicketArtifacts(reclaimAfterCrashTickets).filter(name => /^(\d+)\.(done|json)$/.test(name)),
-  ["00000001.done", "00000001.json"],
-  "restart reuses the reclaimed sequence instead of growing a dead-tail chain",
+  ["00000001.done", "00000001.json", "00000002.done", "00000002.json"],
+  "restart retires the dead ticket and advances with a fresh sequence",
 );
+const reclaimerRaceDir = `${tmp}/lock-reclaimer-race.lock`;
+const reclaimerRaceTickets = `${reclaimerRaceDir}.tickets`;
+writeLockTicketRecord(reclaimerRaceTickets, {
+  sequence: 1,
+  pid: 999999,
+  boot_id: "11111111-1111-1111-1111-111111111111",
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:111",
+  process_start_time_authoritative: true,
+  token: "dead-race-owner",
+});
+const reclaimerRaceReady = `${tmp}/lock-reclaimer-race.ready`;
+const reclaimerRaceRelease = `${tmp}/lock-reclaimer-race.release`;
+const reclaimerRaceHeld = `${tmp}/lock-reclaimer-race-held`;
+const reclaimerRaceDone = `${tmp}/lock-reclaimer-race.done`;
+const delayedReclaimer = runWorker({
+  WORKER_MODE: "lock-probe-status",
+  LOCK_DIR: reclaimerRaceDir,
+  HOLD_POINT: "before-lock-ticket-retire-claim",
+  HOLD_READY: reclaimerRaceReady,
+  HOLD_RELEASE: reclaimerRaceRelease,
+  CHILD_HOLD_TIMEOUT_MS: "5000",
+});
+waitForFile(reclaimerRaceReady);
+const liveSuccessor = runWorker({
+  WORKER_MODE: "lock-hold",
+  LOCK_DIR: reclaimerRaceDir,
+  OP_READY: reclaimerRaceHeld,
+  OP_RELEASE: reclaimerRaceDone,
+  CHILD_HOLD_TIMEOUT_MS: "5000",
+});
+waitForFile(reclaimerRaceHeld);
+assert.deepEqual(
+  lockTicketArtifacts(reclaimerRaceTickets).filter(name => /^(\d+)\.(done|json)$/.test(name)),
+  ["00000001.done", "00000001.json", "00000002.json"],
+  "the first live successor publishes a fresh sequence after retiring the dead ticket",
+);
+fs.writeFileSync(reclaimerRaceRelease, "");
+assert.equal(await delayedReclaimer, 73,
+  "a delayed second reclaimer cannot retire or replace the fresh live successor");
+assert.deepEqual(lockTicketSequences(reclaimerRaceTickets), [2],
+  "the stale reclaimer leaves the fresh successor sequence intact");
+assert.equal(fs.existsSync(`${reclaimerRaceTickets}/00000002.json`), true,
+  "the stale reclaimer does not delete the fresh successor path");
+fs.writeFileSync(reclaimerRaceDone, "");
+assert.equal(await liveSuccessor, 0);
 const staleLockDir = `${tmp}/stale-lock`, staleLockReady = `${tmp}/stale-lock-ready`;
 const staleLockChild = spawn(process.execPath, [...process.execArgv, process.argv[1]], {
   env: {
@@ -1901,13 +1962,15 @@ try {
 }
 const reusedPidDir = `${tmp}/lock-liveness-reused-pid.lock`;
 const reusedPidTickets = `${reusedPidDir}.tickets`;
-const reusedPidOwner = currentLockOwnerIdentity();
+const reusedPidBootId = "22222222-2222-2222-2222-222222222222";
+const reusedPidOldStart = "linux-start:222";
+const reusedPidNewStart = "linux-start:333";
 writeLockTicketRecord(reusedPidTickets, {
   sequence: 1,
   pid: 424243,
-  boot_id: reusedPidOwner.boot_id,
+  boot_id: reusedPidBootId,
   boot_id_authoritative: true,
-  process_start_time: "linux-start:old-owner-start",
+  process_start_time: reusedPidOldStart,
   process_start_time_authoritative: true,
   token: "reused-owner",
 });
@@ -1920,21 +1983,105 @@ process.kill = ((pid, signal) => {
 try {
   withLockOwnerProbe({
     currentBootId: () => ({
-      value: reusedPidOwner.boot_id,
+      value: reusedPidBootId,
       authoritative: true,
     }),
     processStartTime: pid => (
       pid === 424243 ? {
-        value: "linux-start:new-owner-start",
+        value: reusedPidNewStart,
         authoritative: true,
       } : {
-        value: reusedPidOwner.process_start_time,
-        authoritative: reusedPidOwner.process_start_time_authoritative,
+        value: "linux-start:444",
+        authoritative: true,
       }
     ),
   }, () => {
     assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(reusedPidDir), true,
       "EPERM does not pin a stale owner when the process start identity changed");
+  });
+} finally {
+  process.kill = originalKill;
+}
+const malformedBootIdDir = `${tmp}/lock-liveness-malformed-boot-id.lock`;
+const malformedBootIdTickets = `${malformedBootIdDir}.tickets`;
+writeLockTicketRecord(malformedBootIdTickets, {
+  sequence: 1,
+  pid: 424246,
+  boot_id: "not-a-linux-boot-id",
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:500",
+  process_start_time_authoritative: true,
+  token: "malformed-boot-id-owner",
+});
+process.kill = ((pid, signal) => {
+  if (pid === 424246 && signal === 0) {
+    throw Object.assign(new Error("eperm-malformed-boot-id"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  withLockOwnerProbe({
+    currentBootId: () => ({
+      value: reusedPidBootId,
+      authoritative: true,
+    }),
+    processStartTime: pid => (
+      pid === 424246 ? {
+        value: "linux-start:500",
+        authoritative: true,
+      } : {
+        value: "linux-start:444",
+        authoritative: true,
+      }
+    ),
+  }, () => {
+    assert.throws(
+      () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(malformedBootIdDir),
+      /lock_probe_contended/,
+      "a malformed authoritative boot ID stays ambiguous and fail-closed while the owner is live",
+    );
+  });
+} finally {
+  process.kill = originalKill;
+}
+const malformedProcessStartDir = `${tmp}/lock-liveness-malformed-process-start.lock`;
+const malformedProcessStartTickets = `${malformedProcessStartDir}.tickets`;
+writeLockTicketRecord(malformedProcessStartTickets, {
+  sequence: 1,
+  pid: 424247,
+  boot_id: reusedPidBootId,
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:not-a-positive-integer",
+  process_start_time_authoritative: true,
+  token: "malformed-process-start-owner",
+});
+process.kill = ((pid, signal) => {
+  if (pid === 424247 && signal === 0) {
+    throw Object.assign(new Error("eperm-malformed-process-start"), { code: "EPERM" });
+  }
+  return originalKill(pid, signal);
+});
+try {
+  withLockOwnerProbe({
+    currentBootId: () => ({
+      value: reusedPidBootId,
+      authoritative: true,
+    }),
+    processStartTime: pid => (
+      pid === 424247 ? {
+        value: "linux-start:600",
+        authoritative: true,
+      } : {
+        value: "linux-start:444",
+        authoritative: true,
+      }
+    ),
+  }, () => {
+    assert.throws(
+      () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(malformedProcessStartDir),
+      /lock_probe_contended/,
+      "a malformed authoritative process-start stamp stays ambiguous and fail-closed while the owner is live",
+    );
   });
 } finally {
   process.kill = originalKill;
@@ -1964,12 +2111,32 @@ try {
       return true;
     },
   }, () => {
-    assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(legacyReusedPidDir), true,
-      "a legacy ticket cannot be pinned forever by a demonstrably newer reused PID");
+    assert.throws(
+      () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(legacyReusedPidDir),
+      /lock_probe_contended/,
+      "a legacy five-field ticket remains fail-closed even when PID reuse looks newer",
+    );
   });
 } finally {
   process.kill = originalKill;
 }
+writeRetiredLockTicket(legacyReusedPidTickets, {
+  sequence: 1,
+  token: "legacy-reused-owner",
+  reason: "legacy-owner-identity-ambiguous",
+});
+assert.equal(__BROKKR_TEST_ONLY__probeExclusiveDirectory(legacyReusedPidDir), true,
+  "an operator can non-destructively retire an ambiguous legacy ticket");
+assert.deepEqual(
+  lockTicketArtifacts(legacyReusedPidTickets).filter(name => /^(\d+)\.(done|json)$/.test(name)),
+  [
+    "00000001.done",
+    "00000001.json",
+    "00000002.done",
+    "00000002.json",
+  ],
+  "manual retirement advances above the legacy ticket without deleting it",
+);
 const legacyAmbiguousPidDir = `${tmp}/lock-liveness-legacy-ambiguous-pid.lock`;
 const legacyAmbiguousPidTickets = `${legacyAmbiguousPidDir}.tickets`;
 fs.mkdirSync(legacyAmbiguousPidTickets, { recursive: true, mode: 0o700 });
@@ -2006,8 +2173,8 @@ fs.writeFileSync(`${invalidPidTickets}/00000001.json`, `${canonicalJson({
   kind: "brokkr-lock-ticket",
   schema_version: "v1",
   pid: 0,
-  boot_id: reusedPidOwner.boot_id,
-  process_start_time: reusedPidOwner.process_start_time,
+  boot_id: reusedPidBootId,
+  process_start_time: reusedPidOldStart,
   token: "invalid-pid",
   sequence: 1,
 })}\n`);
@@ -2361,25 +2528,22 @@ for (let attempt = 1; attempt <= 8; attempt += 1) {
     LOCK_DIR: liveLimitDir,
     FAULT_POINT: "after-lock-ticket-link",
   }), 78, `post-link crash remains reproducible at attempt ${attempt}`);
-  assert.deepEqual(
-    lockTicketArtifacts(liveLimitTickets).filter(name => /^\d+\.json$/.test(name)),
-    ["00000001.json"],
-    "restart reclaims the prior dead tail before another post-link crash republishes it",
-  );
+  assert.equal(lockTicketSequences(liveLimitTickets).at(-1), attempt,
+    "restart retires the prior dead tail before another post-link crash advances the sequence");
 }
 assert.equal(lockTicketTemps(liveLimitTickets).length, 1,
   "repeated post-link crashes leave exactly one reclaimable staging file");
 assert.equal(await runWorker({
   WORKER_MODE: "lock-probe",
   LOCK_DIR: liveLimitDir,
-}), 0, "a later successful run can still reuse the reclaimed post-link sequence");
+}), 0, "a later successful run can recover after the retired dead-tail chain");
 assert.deepEqual(lockTicketTemps(liveLimitTickets), [],
   "the successful post-link recovery clears the last staging orphan");
-assert.deepEqual(
-  lockTicketArtifacts(liveLimitTickets).filter(name => /^(\d+)\.(done|json)$/.test(name)),
-  ["00000001.done", "00000001.json"],
-  "repeated post-link crashes stay bounded to one reclaimable final ticket",
-);
+const liveLimitSequences = lockTicketSequences(liveLimitTickets);
+assert.equal(liveLimitSequences.at(-1), 9,
+  "repeated post-link crashes keep advancing to fresh sequences");
+assert.equal(liveLimitSequences.length <= 2, true,
+  "repeated post-link crashes stay bounded after prefix compaction prunes retired tickets");
 const tmpCeilingDir = `${tmp}/lock-tmp-ceiling.lock`;
 const tmpCeilingTickets = `${tmpCeilingDir}.tickets`;
 fs.mkdirSync(tmpCeilingTickets, { recursive: true, mode: 0o700 });

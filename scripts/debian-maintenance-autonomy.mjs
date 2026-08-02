@@ -3,7 +3,6 @@
 // every attempt must independently verify W0.2 owner authorization, coverage,
 // owner attestation, recovery keys, and the protected narrowing tail.
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import { performance } from "node:perf_hooks";
@@ -75,16 +74,16 @@ const LOCK_TICKET_ACQUIRE_RETRIES = 8;
 const LOCK_TICKET_LIVE_HARD_LIMIT = LOCK_TICKET_COMPACTION_THRESHOLD;
 const LOCK_TICKET_TMP_HARD_LIMIT = 64;
 const LOCK_TICKET_OWNER_STAMP_HEX = 16;
-const LEGACY_LOCK_TICKET_REUSE_MARGIN_MS = 5_000;
 const LOCK_OWNER_PROBE_ENV = "BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE";
+const AUTHORITATIVE_BOOT_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const AUTHORITATIVE_PROCESS_START = /^linux-start:[1-9]\d*$/;
-const ESTIMATED_BOOT_ID = /^(boot-estimate:|boot-id-unavailable(?::|$))/;
 const testLockOwnerProbe = () => (
   process.env[LOCK_OWNER_PROBE_ENV] === "1" ?
     globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ ?? null :
     null
 );
-const inferBootIdAuthoritative = value => !ESTIMATED_BOOT_ID.test(value);
+const inferBootIdAuthoritative = value => AUTHORITATIVE_BOOT_ID.test(value);
 const inferProcessStartAuthoritative = value => AUTHORITATIVE_PROCESS_START.test(value);
 function normalizeLockOwnerEvidence(value, inferAuthoritative) {
   if (value === undefined) return undefined;
@@ -96,7 +95,10 @@ function normalizeLockOwnerEvidence(value, inferAuthoritative) {
       typeof value.value === "string" &&
       value.value.length >= 1 &&
       typeof value.authoritative === "boolean") {
-    return { value: value.value, authoritative: value.authoritative };
+    return {
+      value: value.value,
+      authoritative: value.authoritative && inferAuthoritative(value.value),
+    };
   }
   return undefined;
 }
@@ -120,53 +122,6 @@ const readLinuxProcessStartTime = pid => {
     throw error;
   }
 };
-let linuxClockTicksPerSecond;
-const readLinuxClockTicksPerSecond = () => {
-  if (linuxClockTicksPerSecond !== undefined) return linuxClockTicksPerSecond;
-  try {
-    const raw = execFileSync("/usr/bin/getconf", ["CLK_TCK"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 1_000,
-    }).trim();
-    const parsed = parsePositiveInteger(raw);
-    linuxClockTicksPerSecond = parsed;
-  } catch {
-    linuxClockTicksPerSecond = null;
-  }
-  return linuxClockTicksPerSecond;
-};
-const readLinuxBootEpochMs = () => {
-  try {
-    const raw = fs.readFileSync("/proc/stat", "utf8");
-    const matched = /^btime\s+([1-9]\d*)$/m.exec(raw);
-    const seconds = matched ? Number.parseInt(matched[1], 10) : NaN;
-    return Number.isSafeInteger(seconds) ? seconds * 1_000 : null;
-  } catch (error) {
-    if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error?.code)) return null;
-    throw error;
-  }
-};
-const legacyLockOwnerPidReused = owner => {
-  const testValue = testLockOwnerProbe()?.processStartedAfterLegacyTicket?.(
-    owner.pid,
-    owner.legacy_ticket_mtime_ms,
-  );
-  if (typeof testValue === "boolean") return testValue;
-  if (!Number.isFinite(owner.legacy_ticket_mtime_ms) ||
-      owner.legacy_ticket_mtime_ms <= 0) return false;
-  const processStart = readLinuxProcessStartTime(owner.pid);
-  const ticksPerSecond = readLinuxClockTicksPerSecond();
-  const bootEpochMs = readLinuxBootEpochMs();
-  const ticks = processStart?.authoritative === true ?
-    Number.parseInt(processStart.value.slice("linux-start:".length), 10) :
-    NaN;
-  if (!Number.isSafeInteger(ticks) || ticks <= 0 ||
-      ticksPerSecond === null || bootEpochMs === null) return false;
-  const processStartEpochMs = bootEpochMs + ticks * 1_000 / ticksPerSecond;
-  return processStartEpochMs >=
-    owner.legacy_ticket_mtime_ms + LEGACY_LOCK_TICKET_REUSE_MARGIN_MS;
-};
 const FALLBACK_BOOT_IDENTITY = (() => {
   try {
     // This stays an estimate, but bucket it at a host-wide second boundary so
@@ -186,7 +141,7 @@ const FALLBACK_BOOT_IDENTITY = (() => {
 const SYSTEM_BOOT_IDENTITY = (() => {
   try {
     const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-    return bootId.length >= 1 ? {
+    return inferBootIdAuthoritative(bootId) ? {
       value: bootId,
       authoritative: true,
     } : FALLBACK_BOOT_IDENTITY;
@@ -460,11 +415,9 @@ function lockTicketEntries(tickets, floor) {
 }
 function readLockTicketRecord(tickets, entry) {
   let existing;
-  let ticketMtimeMs;
   const ticketPath = path.join(tickets, entry.name);
   try {
     existing = boundedJson(ticketPath);
-    ticketMtimeMs = fs.statSync(ticketPath).mtimeMs;
   }
   catch (error) { if (error.code === "ENOENT") return null; throw error; }
   const legacyOwner = exactKeys(existing, [
@@ -495,10 +448,11 @@ function readLockTicketRecord(tickets, entry) {
   return (stampedOwner || stampedOwnerWithAuthority) ? {
     ...existing,
     boot_id_authoritative: stampedOwnerWithAuthority ?
-      existing.boot_id_authoritative :
+      existing.boot_id_authoritative && inferBootIdAuthoritative(existing.boot_id) :
       inferBootIdAuthoritative(existing.boot_id),
     process_start_time_authoritative: stampedOwnerWithAuthority ?
-      existing.process_start_time_authoritative :
+      existing.process_start_time_authoritative &&
+        inferProcessStartAuthoritative(existing.process_start_time) :
       inferProcessStartAuthoritative(existing.process_start_time),
   } : {
     ...existing,
@@ -506,7 +460,6 @@ function readLockTicketRecord(tickets, entry) {
     boot_id_authoritative: false,
     process_start_time: null,
     process_start_time_authoritative: false,
-    legacy_ticket_mtime_ms: ticketMtimeMs,
   };
 }
 function checkpointCompletesLockTicket(checkpoint, ticket) {
@@ -516,12 +469,19 @@ function checkpointCompletesLockTicket(checkpoint, ticket) {
   }
   return true;
 }
-function hasValidLockCompletion(tickets, entry, ticket, checkpoint) {
+function hasValidLockResolution(tickets, entry, ticket, checkpoint) {
   if (checkpointCompletesLockTicket(checkpoint, ticket)) return true;
   try {
     const completion = boundedJson(path.join(tickets, `${entry.prefix}.done`));
-    assert(exactKeys(completion, ["kind", "schema_version", "token", "sequence"]) &&
-      completion.kind === "brokkr-lock-ticket-completion" &&
+    const completed = exactKeys(completion, [
+      "kind", "schema_version", "token", "sequence",
+    ]) && completion.kind === "brokkr-lock-ticket-completion";
+    const retired = exactKeys(completion, [
+      "kind", "schema_version", "token", "sequence", "reason",
+    ]) && completion.kind === "brokkr-lock-ticket-retirement" &&
+      typeof completion.reason === "string" &&
+      completion.reason.length >= 1;
+    assert((completed || retired) &&
       completion.schema_version === "v1" &&
       completion.token === ticket.token &&
       completion.sequence === ticket.sequence,
@@ -559,9 +519,7 @@ function lockOwnerProvablyDead(owner) {
       return true;
     }
   }
-  if (owner.process_start_time === null) {
-    return legacyLockOwnerPidReused(owner);
-  }
+  if (owner.process_start_time === null) return false;
   const processStartIdentity = readProcessStartIdentity(owner.pid);
   if (processStartIdentity === null) return false;
   return owner.process_start_time_authoritative &&
@@ -584,13 +542,26 @@ function lockTicketTempAlive(temporary) {
   if (liveStamp === null) return true;
   return liveStamp === temporary.ownerStamp;
 }
-function reclaimLockTicketCandidate(tickets, ticket) {
-  try {
-    fs.unlinkSync(path.join(tickets, `${lockTicketPrefix(ticket.sequence)}.json`));
-    fsyncDirectory(tickets);
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-  }
+function writeLockTicketResolution(tickets, ticket, resolution, options = {}) {
+  return createExclusive(path.join(
+    tickets,
+    `${lockTicketPrefix(ticket.sequence)}.done`,
+  ), {
+    kind: resolution.kind,
+    schema_version: "v1",
+    token: ticket.token,
+    sequence: ticket.sequence,
+    ...resolution.fields,
+  }, options);
+}
+function retireLockTicketCandidate(tickets, ticket) {
+  lockTicketFault("before-lock-ticket-retire-claim");
+  return writeLockTicketResolution(tickets, ticket, {
+    kind: "brokkr-lock-ticket-retirement",
+    fields: { reason: "owner-dead" },
+  }, {
+    faultTag: "lock-retirement",
+  });
 }
 function reclaimLockTicketTemps(tickets) {
   let reclaimed = false;
@@ -644,7 +615,7 @@ function completedLockTicketPrefix(tickets, checkpoint = readLockCheckpoint(tick
   for (const entry of lockTicketEntries(tickets, floor)) {
     if (entry.sequence !== nextSequence) break;
     const ticket = readLockTicketRecord(tickets, entry);
-    if (ticket === null || !hasValidLockCompletion(tickets, entry, ticket, checkpoint)) break;
+    if (ticket === null || !hasValidLockResolution(tickets, entry, ticket, checkpoint)) break;
     candidate = ticket;
     length += 1;
     nextSequence += 1;
@@ -717,14 +688,9 @@ function releaseLockTicket(tickets, ticket) {
       return;
     } catch (error) { return error; }
   }
-  assert(createExclusive(path.join(
-    tickets,
-    `${lockTicketPrefix(ticket.sequence)}.done`,
-  ), {
+  assert(writeLockTicketResolution(tickets, ticket, {
     kind: "brokkr-lock-ticket-completion",
-    schema_version: "v1",
-    token: ticket.token,
-    sequence: ticket.sequence,
+    fields: {},
   }, {
     faultTag: "lock-completion",
   }), "lock_completion_conflict");
@@ -766,9 +732,9 @@ function withExclusiveDirectory(lockDir, code, operation) {
         }
         continue;
       }
-      if (!hasValidLockCompletion(tickets, latestEntry, existing, refreshedCheckpoint)) {
+      if (!hasValidLockResolution(tickets, latestEntry, existing, refreshedCheckpoint)) {
         if (lockOwnerAlive(existing)) fail(code);
-        reclaimLockTicketCandidate(tickets, existing);
+        retireLockTicketCandidate(tickets, existing);
         attempt -= 1;
         continue;
       }
@@ -790,7 +756,6 @@ function withExclusiveDirectory(lockDir, code, operation) {
     }
     checkpoint = readLockCheckpoint(tickets);
     if (checkpoint !== null && checkpoint.last_completed_sequence >= candidate.sequence) {
-      reclaimLockTicketCandidate(tickets, candidate);
       pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
       continue;
     }
