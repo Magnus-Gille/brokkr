@@ -146,7 +146,7 @@ const SYSTEM_BOOT_IDENTITY = (() => {
       authoritative: true,
     } : FALLBACK_BOOT_IDENTITY;
   } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+    if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error?.code)) throw error;
     return FALLBACK_BOOT_IDENTITY;
   }
 })();
@@ -495,6 +495,31 @@ function hasValidLockResolution(tickets, entry, ticket, checkpoint) {
     throw error;
   }
 }
+function assertExistingLockResolutionAfterEexist(tickets, entry, ticket) {
+  let completion;
+  try {
+    completion = boundedJson(path.join(tickets, `${entry.prefix}.done`));
+  } catch (error) {
+    if (["ENOENT", "journal_invalid_json", "journal_too_large"].includes(error?.code)) {
+      fail("lock_completion_invalid", error);
+    }
+    throw error;
+  }
+  const completed = exactKeys(completion, [
+    "kind", "schema_version", "token", "sequence",
+  ]) && completion.kind === "brokkr-lock-ticket-completion";
+  const retired = exactKeys(completion, [
+    "kind", "schema_version", "token", "sequence", "reason",
+  ]) && completion.kind === "brokkr-lock-ticket-retirement" &&
+    typeof completion.reason === "string" &&
+    completion.reason.length >= 1;
+  assert((completed || retired) && completion.schema_version === "v1", "lock_completion_invalid");
+  assert(
+    completion.sequence === ticket.sequence &&
+    completion.token === ticket.token,
+    "lock_completion_conflict",
+  );
+}
 function lockOwnerProvablyDead(owner) {
   assert(Number.isSafeInteger(owner.pid) && owner.pid > 0, "lock_owner_invalid");
   if (owner.boot_id !== null) {
@@ -554,14 +579,15 @@ function writeLockTicketResolution(tickets, ticket, resolution, options = {}) {
     ...resolution.fields,
   }, options);
 }
-function retireLockTicketCandidate(tickets, ticket) {
+function retireLockTicketCandidate(tickets, entry, ticket) {
   lockTicketFault("before-lock-ticket-retire-claim");
-  return writeLockTicketResolution(tickets, ticket, {
+  if (writeLockTicketResolution(tickets, ticket, {
     kind: "brokkr-lock-ticket-retirement",
     fields: { reason: "owner-dead" },
   }, {
     faultTag: "lock-retirement",
-  });
+  })) return;
+  assertExistingLockResolutionAfterEexist(tickets, entry, ticket);
 }
 function reclaimLockTicketTemps(tickets) {
   let reclaimed = false;
@@ -734,7 +760,7 @@ function withExclusiveDirectory(lockDir, code, operation) {
       }
       if (!hasValidLockResolution(tickets, latestEntry, existing, refreshedCheckpoint)) {
         if (lockOwnerAlive(existing)) fail(code);
-        retireLockTicketCandidate(tickets, existing);
+        retireLockTicketCandidate(tickets, latestEntry, existing);
         attempt -= 1;
         continue;
       }

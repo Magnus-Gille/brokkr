@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 const root = process.env.ROOT, tmp = process.env.TMP;
 const {
   loadPinnedJournalSchema, validateJournalConformance,
@@ -607,6 +608,22 @@ function withLockOwnerProbe(probe, fn) {
     } else {
       globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ = previousProbe;
     }
+  }
+}
+async function importFreshAutonomyModuleWithBootIdFailure(code) {
+  const originalReadFileSync = fs.readFileSync;
+  fs.readFileSync = ((file, ...args) => {
+    if (file === "/proc/sys/kernel/random/boot_id") {
+      throw Object.assign(new Error(`synthetic-boot-id-${code}`), { code });
+    }
+    return originalReadFileSync.call(fs, file, ...args);
+  });
+  const autonomyUrl = pathToFileURL(`${root}/scripts/debian-maintenance-autonomy.mjs`);
+  autonomyUrl.searchParams.set("test", crypto.randomUUID());
+  try {
+    return await import(autonomyUrl.href);
+  } finally {
+    fs.readFileSync = originalReadFileSync;
   }
 }
 function waitForFile(file, timeoutMs = 10_000) {
@@ -1760,6 +1777,16 @@ assert.notEqual(productionProbeIdentity.boot_id, "probe-boot-id",
   "production owner identity ignores injected test probes without the explicit env gate");
 assert.notEqual(productionProbeIdentity.process_start_time, "probe-process-start",
   "production owner identity ignores injected process-start probes without the explicit env gate");
+for (const bootIdErrorCode of ["ENOTDIR", "EACCES", "EPERM"]) {
+  const freshAutonomyModule = await importFreshAutonomyModuleWithBootIdFailure(bootIdErrorCode);
+  const fallbackBootOwner = freshAutonomyModule.__BROKKR_TEST_ONLY__currentLockOwnerIdentity();
+  assert.equal(fallbackBootOwner.boot_id_authoritative, false,
+    `${bootIdErrorCode}: boot-id probe falls back non-authoritatively`);
+  assert.equal(typeof fallbackBootOwner.boot_id, "string",
+    `${bootIdErrorCode}: boot-id fallback remains populated`);
+  assert.equal(fallbackBootOwner.boot_id.length >= 1, true,
+    `${bootIdErrorCode}: boot-id fallback stays non-empty`);
+}
 const fallbackContentionDir = `${tmp}/fallback-contention.lock`;
 const fallbackContentionTickets = `${fallbackContentionDir}.tickets`;
 const fallbackContentionReady = `${tmp}/fallback-contention.ready`;
@@ -1869,6 +1896,70 @@ assert.equal(fs.existsSync(`${reclaimerRaceTickets}/00000002.json`), true,
   "the stale reclaimer does not delete the fresh successor path");
 fs.writeFileSync(reclaimerRaceDone, "");
 assert.equal(await liveSuccessor, 0);
+const conflictingRetirementDir = `${tmp}/lock-retirement-conflicting-done.lock`;
+const conflictingRetirementTickets = `${conflictingRetirementDir}.tickets`;
+writeLockTicketRecord(conflictingRetirementTickets, {
+  sequence: 1,
+  pid: 999999,
+  boot_id: "11111111-1111-1111-1111-111111111111",
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:111",
+  process_start_time_authoritative: true,
+  token: "dead-conflicting-owner",
+});
+withLockTicketFaults(() => {
+  let retireClaims = 0;
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (point !== "before-lock-ticket-retire-claim") return;
+    retireClaims += 1;
+    if (retireClaims === 1) {
+      writeRetiredLockTicket(conflictingRetirementTickets, {
+        sequence: 1,
+        token: "some-other-owner",
+        reason: "owner-dead",
+      });
+      return;
+    }
+    throw Object.assign(new Error("unexpected-retirement-retry-loop"), {
+      code: "unexpected_retirement_retry_loop",
+    });
+  };
+  assert.throws(
+    () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(conflictingRetirementDir),
+    /lock_completion_conflict/,
+    "a conflicting completion at retirement EEXIST fails closed instead of retrying forever",
+  );
+});
+const malformedRetirementDir = `${tmp}/lock-retirement-malformed-done.lock`;
+const malformedRetirementTickets = `${malformedRetirementDir}.tickets`;
+writeLockTicketRecord(malformedRetirementTickets, {
+  sequence: 1,
+  pid: 999998,
+  boot_id: "11111111-1111-1111-1111-111111111111",
+  boot_id_authoritative: true,
+  process_start_time: "linux-start:112",
+  process_start_time_authoritative: true,
+  token: "dead-malformed-owner",
+});
+withLockTicketFaults(() => {
+  let retireClaims = 0;
+  globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__ = point => {
+    if (point !== "before-lock-ticket-retire-claim") return;
+    retireClaims += 1;
+    if (retireClaims === 1) {
+      fs.writeFileSync(`${malformedRetirementTickets}/00000001.done`, "{not-json}\n");
+      return;
+    }
+    throw Object.assign(new Error("unexpected-retirement-retry-loop"), {
+      code: "unexpected_retirement_retry_loop",
+    });
+  };
+  assert.throws(
+    () => __BROKKR_TEST_ONLY__probeExclusiveDirectory(malformedRetirementDir),
+    /lock_completion_invalid/,
+    "a malformed completion at retirement EEXIST fails closed instead of retrying forever",
+  );
+});
 const staleLockDir = `${tmp}/stale-lock`, staleLockReady = `${tmp}/stale-lock-ready`;
 const staleLockChild = spawn(process.execPath, [...process.execArgv, process.argv[1]], {
   env: {
