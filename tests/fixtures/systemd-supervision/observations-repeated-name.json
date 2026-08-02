@@ -1,0 +1,12 @@
+{
+  "kind": "systemd-supervision-observations",
+  "schema_version": "v1",
+  "observed_at": "2026-08-02T11:55:00Z",
+  "notifier": { "status": "available" },
+  "units": [
+    { "target_node_id": "node-alpha", "scope": "system", "name": "shared.service", "result": { "active_state": "active", "sub_state": "running", "result": "success" }, "restart": { "count": 0, "window_start": "2026-08-02T11:54:00Z", "window_end": "2026-08-02T11:55:00Z" }, "watchdog": { "result": "not-requested" }, "oom": { "result": "none" }, "timer": null },
+    { "target_node_id": "node-beta", "scope": "system", "name": "shared.service", "result": { "active_state": "active", "sub_state": "running", "result": "success" }, "restart": { "count": 0, "window_start": "2026-08-02T11:54:00Z", "window_end": "2026-08-02T11:55:00Z" }, "watchdog": { "result": "not-requested" }, "oom": { "result": "none" }, "timer": null },
+    { "target_node_id": "node-alpha", "scope": "user", "name": "shared.service", "result": { "active_state": "active", "sub_state": "running", "result": "success" }, "restart": { "count": 0, "window_start": "2026-08-02T11:54:00Z", "window_end": "2026-08-02T11:55:00Z" }, "watchdog": { "result": "not-requested" }, "oom": { "result": "none" }, "timer": null },
+    { "target_node_id": "node-alpha", "scope": "user", "name": "gamma-failure.service", "result": { "active_state": "inactive", "sub_state": "dead", "result": "success" }, "restart": { "count": 0, "window_start": "2026-08-02T11:54:00Z", "window_end": "2026-08-02T11:55:00Z" }, "watchdog": { "result": "not-requested" }, "oom": { "result": "not-applicable" }, "timer": null }
+  ]
+}

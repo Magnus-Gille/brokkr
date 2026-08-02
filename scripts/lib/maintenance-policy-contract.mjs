@@ -184,7 +184,7 @@ export function decisionEffect(policy, { missedOccurrences, deferralElapsedMs })
 // --- schema uses and the node-substrate schema does not).
 const SUPPORTED_KEYWORDS = new Set([
   "$schema", "$id", "$defs", "$ref", "title", "description", "oneOf", "const", "enum",
-  "type", "minLength", "pattern", "format", "minimum", "maximum", "minItems", "uniqueItems",
+  "type", "minLength", "maxLength", "pattern", "format", "minimum", "maximum", "minItems", "maxItems", "uniqueItems",
   "items", "required", "properties", "additionalProperties",
 ]);
 const resolveRef = (schema, ref) => {
@@ -219,6 +219,7 @@ export function schemaErrors(schema, value, node = schema, at = "$") {
   if (node.type && !typeMatches(node.type, value)) return [...errors, `${at}: expected ${node.type}`];
   if (typeof value === "string") {
     if (node.minLength !== undefined && value.length < node.minLength) errors.push(`${at}: minLength`);
+    if (node.maxLength !== undefined && value.length > node.maxLength) errors.push(`${at}: maxLength`);
     if (node.pattern && !new RegExp(node.pattern).test(value)) errors.push(`${at}: pattern`);
     if (node.format === "date-time" && !UTC_SHAPE.test(value)) errors.push(`${at}: date-time`);
   }
@@ -228,6 +229,7 @@ export function schemaErrors(schema, value, node = schema, at = "$") {
   }
   if (Array.isArray(value)) {
     if (node.minItems !== undefined && value.length < node.minItems) errors.push(`${at}: minItems`);
+    if (node.maxItems !== undefined && value.length > node.maxItems) errors.push(`${at}: maxItems`);
     if (node.uniqueItems && new Set(value.map(canonicalJson)).size !== value.length) errors.push(`${at}: duplicate items`);
     if (node.items) value.forEach((item, index) => errors.push(...schemaErrors(schema, item, node.items, `${at}[${index}]`)));
   }

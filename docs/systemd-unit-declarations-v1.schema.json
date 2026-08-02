@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://grimnir.gille.ai/contracts/systemd-unit-declarations/v1/schema.json",
   "title": "Brokkr systemd unit declaration projection v1",
-  "description": "Content-blind audited directive projection. Names use canonical effective .service/.timer identities; scope, owner, and workload shape are intentionally absent and must be joined from the Grimnir service registry. User-manager failure delivery is evidenced by a non-empty sanitized OnFailure projection and is checked semantically by the audit.",
+  "description": "Bounded sanitized audit projection. target_node_id, scope, and canonical effective name form a join key checked against the authoritative Grimnir registry; owner and service-vs-timer identity remain registry-owned. Sanitized Type distinguishes oneshot from long-running semantics. failure_handler_role is a finite audit role: terminal is valid only for a component-owned user oneshot with no OnFailure and never creates topology.",
   "type": "object",
   "additionalProperties": false,
   "required": ["kind", "schema_version", "topology_authority", "units"],
@@ -10,36 +10,41 @@
     "kind": { "const": "systemd-unit-declarations" },
     "schema_version": { "const": "v1" },
     "topology_authority": { "const": "grimnir-service-registry" },
-    "units": { "type": "array", "items": { "$ref": "#/$defs/unit" } }
+    "units": { "type": "array", "maxItems": 512, "items": { "$ref": "#/$defs/unit" } }
   },
   "$defs": {
-    "unit-name": { "type": "string", "pattern": "^[A-Za-z0-9:_.@-]+\\.(?:service|timer)$" },
-    "scalar": { "oneOf": [{ "type": "string" }, { "type": "boolean" }, { "type": "integer" }, { "type": "array", "items": { "type": "string" } }] },
-    "failure-target": { "type": "string", "pattern": "^(?!.*[\\r\\n])[A-Za-z0-9:_.@%+-]+\\.(?:service|target)$" },
-    "failure-target-projection": { "oneOf": [{ "$ref": "#/$defs/failure-target" }, { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/failure-target" } }] },
+    "id": { "type": "string", "minLength": 3, "maxLength": 63, "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+    "unit-name": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^(?!.*[\\r\\n])[A-Za-z0-9:_.@-]+\\.(?:service|timer)$" },
+    "small-string": { "type": "string", "maxLength": 32 },
+    "duration": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^(?:infinity|\\d+(?:ms|s|m|min|h|d)?)$" },
+    "count": { "oneOf": [{ "type": "integer", "minimum": 0, "maximum": 100000 }, { "type": "string", "minLength": 1, "maxLength": 16 }] },
+    "failure-target": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^(?:brokkr-systemd-failure@%n\\.service|(?!.*[\\r\\n%])[A-Za-z0-9:_.@-]+\\.service)$" },
+    "failure-target-projection": { "oneOf": [{ "$ref": "#/$defs/failure-target" }, { "type": "array", "minItems": 1, "maxItems": 4, "items": { "$ref": "#/$defs/failure-target" } }] },
+    "calendar-value": { "oneOf": [{ "type": "string", "maxLength": 256 }, { "type": "boolean" }] },
+    "monotonic-value": { "oneOf": [{ "$ref": "#/$defs/duration" }, { "type": "boolean" }] },
     "directives": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "Type": { "$ref": "#/$defs/scalar" },
-        "Restart": { "$ref": "#/$defs/scalar" },
-        "RestartSec": { "$ref": "#/$defs/scalar" },
-        "StartLimitIntervalSec": { "$ref": "#/$defs/scalar" },
-        "StartLimitBurst": { "$ref": "#/$defs/scalar" },
-        "TimeoutStartSec": { "$ref": "#/$defs/scalar" },
-        "TimeoutStopSec": { "$ref": "#/$defs/scalar" },
-        "RuntimeMaxSec": { "$ref": "#/$defs/scalar" },
-        "OOMPolicy": { "$ref": "#/$defs/scalar" },
+        "Type": { "$ref": "#/$defs/small-string" },
+        "Restart": { "$ref": "#/$defs/small-string" },
+        "RestartSec": { "$ref": "#/$defs/duration" },
+        "StartLimitIntervalSec": { "$ref": "#/$defs/duration" },
+        "StartLimitBurst": { "$ref": "#/$defs/count" },
+        "TimeoutStartSec": { "$ref": "#/$defs/duration" },
+        "TimeoutStopSec": { "$ref": "#/$defs/duration" },
+        "RuntimeMaxSec": { "$ref": "#/$defs/duration" },
+        "OOMPolicy": { "$ref": "#/$defs/small-string" },
         "OnFailure": { "$ref": "#/$defs/failure-target-projection" },
-        "WatchdogSec": { "$ref": "#/$defs/scalar" },
-        "Unit": { "$ref": "#/$defs/scalar" },
-        "OnCalendar": { "$ref": "#/$defs/scalar" },
-        "OnBootSec": { "$ref": "#/$defs/scalar" },
-        "OnStartupSec": { "$ref": "#/$defs/scalar" },
-        "OnUnitActiveSec": { "$ref": "#/$defs/scalar" },
-        "OnUnitInactiveSec": { "$ref": "#/$defs/scalar" },
-        "Persistent": { "$ref": "#/$defs/scalar" },
-        "AccuracySec": { "$ref": "#/$defs/scalar" }
+        "WatchdogSec": { "$ref": "#/$defs/duration" },
+        "Unit": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "OnCalendar": { "$ref": "#/$defs/calendar-value" },
+        "OnBootSec": { "$ref": "#/$defs/monotonic-value" },
+        "OnStartupSec": { "$ref": "#/$defs/monotonic-value" },
+        "OnUnitActiveSec": { "$ref": "#/$defs/monotonic-value" },
+        "OnUnitInactiveSec": { "$ref": "#/$defs/monotonic-value" },
+        "Persistent": { "type": "boolean" },
+        "AccuracySec": { "$ref": "#/$defs/duration" }
       }
     },
     "heartbeat": {
@@ -54,13 +59,15 @@
     "unit": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "directives", "heartbeat", "readiness", "failure_delivery"],
+      "required": ["target_node_id", "scope", "name", "failure_handler_role", "directives", "heartbeat", "readiness"],
       "properties": {
+        "target_node_id": { "$ref": "#/$defs/id" },
+        "scope": { "enum": ["system", "user"] },
         "name": { "$ref": "#/$defs/unit-name" },
+        "failure_handler_role": { "enum": ["none", "terminal"] },
         "directives": { "$ref": "#/$defs/directives" },
         "heartbeat": { "$ref": "#/$defs/heartbeat" },
-        "readiness": { "enum": ["present", "absent", "unknown", "not-applicable"] },
-        "failure_delivery": { "enum": ["brokkr-systemd-failure", "component-owner", "not-declared", "unknown"] }
+        "readiness": { "enum": ["present", "absent", "unknown", "not-applicable"] }
       }
     }
   }

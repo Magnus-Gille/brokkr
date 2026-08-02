@@ -1,65 +1,40 @@
 {
   "base": "declarations-positive.json",
   "cases": [
-    {
-      "id": "unsafe-long-running",
-      "mutations": {
-        "units.0.directives.Restart": "always",
-        "units.0.directives.RestartSec": "0s",
-        "units.0.directives.StartLimitBurst": "0",
-        "units.0.directives.TimeoutStartSec": "infinity",
-        "units.0.directives.OOMPolicy": "continue",
-        "units.0.directives.OnFailure": "other-notifier.service",
-        "units.0.directives.WatchdogSec": "1s",
-        "units.0.heartbeat.app_heartbeat": "absent",
-        "units.0.heartbeat.live_lock_fixture": "absent",
-        "units.0.readiness": "absent"
-      }
-    },
-    {
-      "id": "contradictory-oneshot",
-      "mutations": {
-        "units.1.directives.Restart": "on-failure",
-        "units.1.directives.RestartSec": "5s"
-      }
-    },
-    {
-      "id": "user-system-delivery",
-      "mutations": {
-        "units.3.directives.OnFailure": "brokkr-systemd-failure@%n.service"
-      }
-    },
-    {
-      "id": "user-failure-delivery-missing",
-      "mutations": {
-        "units.3.directives.OnFailure": []
-      }
-    },
-    {
-      "id": "user-failure-delivery-unsafe",
-      "mutations": {
-        "units.3.directives.OnFailure": "private path"
-      }
-    },
-    {
-      "id": "timer-persistence",
-      "mutations": {
-        "units.2.directives.Persistent": false,
-        "units.2.directives.AccuracySec": "0s",
-        "units.2.directives.Unit": "workshop"
-      }
-    },
-    {
-      "id": "unsupported-content",
-      "mutations": {
-        "units.0.directives.Description": "private content must not be projected"
-      }
-    },
-    {
-      "id": "rogue-unit",
-      "mutations": {
-        "units.0.name": "rogue.service"
-      }
-    }
+    { "id": "unsafe-long-running", "mutations": { "units.0.directives.Restart": "always", "units.0.directives.RestartSec": "0s", "units.0.directives.StartLimitBurst": "0", "units.0.directives.TimeoutStartSec": "infinity", "units.0.directives.OOMPolicy": "continue", "units.0.directives.OnFailure": "other-notifier.service", "units.0.directives.WatchdogSec": "1s", "units.0.heartbeat.app_heartbeat": "absent", "units.0.heartbeat.live_lock_fixture": "absent", "units.0.readiness": "absent" } },
+    { "id": "oom-continue", "mutations": { "units.0.directives.OOMPolicy": "continue" } },
+    { "id": "system-wrong-target", "mutations": { "units.0.directives.OnFailure": "other-notifier.service" } },
+    { "id": "contradictory-oneshot", "mutations": { "units.1.directives.Restart": "on-failure", "units.1.directives.RestartSec": "5s" } },
+    { "id": "user-system-delivery", "mutations": { "units.3.directives.OnFailure": "brokkr-systemd-failure@%n.service" } },
+    { "id": "user-failure-delivery-missing", "mutations": { "units.3.directives.OnFailure": { "$delete": true } } },
+    { "id": "user-failure-delivery-unsafe", "mutations": { "units.3.directives.OnFailure": "private path" } },
+    { "id": "user-failure-delivery-unregistered", "mutations": { "units.3.directives.OnFailure": "does-not-exist.service" } },
+    { "id": "system-failure-delivery-repeated", "mutations": { "units.0.directives.OnFailure": ["brokkr-systemd-failure@%n.service", "brokkr-systemd-failure@%n.service"] } },
+    { "id": "duplicate-user-failure-target", "mutations": { "units.3.directives.OnFailure": ["workshop-failure.service", "workshop-failure.service"] } },
+    { "id": "user-failure-self-target", "mutations": { "units.3.directives.OnFailure": "workshop.service" } },
+    { "id": "user-failure-nonterminal-target", "mutations": { "units.5.failure_handler_role": "none" } },
+    { "id": "user-failure-cycle", "mutations": { "units.5.failure_handler_role": "none", "units.5.directives.OnFailure": "workshop.service" } },
+    { "id": "terminal-failure-delivery", "mutations": { "units.5.directives.OnFailure": "workshop.service" } },
+    { "id": "terminal-failure-wrong-type", "mutations": { "units.5.directives.Type": "simple", "units.5.directives.Restart": "on-failure", "units.5.directives.RestartSec": "5s", "units.5.heartbeat.app_heartbeat": "present", "units.5.heartbeat.live_lock_fixture": "passed", "units.5.readiness": "present" } },
+    { "id": "terminal-role-system-scope", "mutations": { "units.0.failure_handler_role": "terminal" } },
+    { "id": "terminal-role-timer", "mutations": { "units.2.failure_handler_role": "terminal" } },
+    { "id": "timer-calendar-false", "mutations": { "units.2.directives.OnCalendar": false } },
+    { "id": "timer-calendar-blank", "mutations": { "units.2.directives.OnCalendar": "" } },
+    { "id": "timer-monotonic-false", "mutations": { "units.4.directives.OnUnitActiveSec": false } },
+    { "id": "timer-service-directive", "mutations": { "units.2.directives.Type": "simple", "units.2.directives.TimeoutStartSec": "30s" } },
+    { "id": "timer-calendar-monotonic-mixed", "mutations": { "units.2.directives.OnUnitActiveSec": "5m" } },
+    { "id": "timer-wrong-owner", "mutations": { "units.2.directives.Unit": "grimnir-api.service" } },
+    { "id": "timer-target-terminal", "mutations": { "units.4.directives.Unit": "workshop-failure.service" } },
+    { "id": "user-timer-wrong-scope", "mutations": { "units.4.directives.Unit": "grimnir-worker.service" } },
+    { "id": "timer-persistence", "mutations": { "units.2.directives.Persistent": false, "units.2.directives.AccuracySec": "0s", "units.2.directives.Unit": "workshop" } },
+    { "id": "invalid-burst", "mutations": { "units.0.directives.StartLimitBurst": "bogus" } },
+    { "id": "fractional-duration", "mutations": { "units.0.directives.RestartSec": "1.5s" } },
+    { "id": "compound-duration", "mutations": { "units.0.directives.RestartSec": "1min 30s" } },
+    { "id": "persistent-string", "mutations": { "units.2.directives.Persistent": "true" } },
+    { "id": "unsupported-failure-target-type", "mutations": { "units.3.directives.OnFailure": "workshop-failure.timer" } },
+    { "id": "failure-target-array-too-long", "mutations": { "units.3.directives.OnFailure": ["workshop-failure.service", "workshop-failure.service", "workshop-failure.service", "workshop-failure.service", "workshop-failure.service"] } },
+    { "id": "unsupported-content", "mutations": { "units.0.directives.Description": "private content must not be projected" } },
+    { "id": "record-extension", "mutations": { "extensions": [] } },
+    { "id": "rogue-unit", "mutations": { "units.0.name": "rogue.service" } }
   ]
 }

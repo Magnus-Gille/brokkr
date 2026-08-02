@@ -2,6 +2,7 @@
   "components": [
     {
       "name": "heimdall",
+      "target_node_id": "node-control",
       "systemd_units": [
         { "name": "heimdall", "type": "service" },
         { "name": "heimdall-collect", "type": "timer" },

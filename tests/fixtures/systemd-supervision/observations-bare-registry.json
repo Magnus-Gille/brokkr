@@ -5,43 +5,33 @@
   "notifier": { "status": "available" },
   "units": [
     {
-      "name": "heimdall.service",
+      "target_node_id": "node-control", "scope": "system", "name": "heimdall.service",
       "result": { "active_state": "active", "sub_state": "running", "result": "success" },
-      "restart": { "count": 0, "window_start": "2026-08-02T10:55:00Z", "window_end": "2026-08-02T11:55:00Z" },
-      "watchdog": { "result": "not-requested" },
-      "oom": { "result": "none" },
-      "timer": null
+      "restart": { "count": 0, "window_start": "2026-08-02T11:54:00Z", "window_end": "2026-08-02T11:55:00Z" },
+      "watchdog": { "result": "not-requested" }, "oom": { "result": "none" }, "timer": null
     },
     {
-      "name": "heimdall-collect.timer",
-      "result": { "active_state": "active", "sub_state": "waiting", "result": "success" },
-      "restart": { "count": 0, "window_start": "2026-08-02T10:55:00Z", "window_end": "2026-08-02T11:55:00Z" },
-      "watchdog": { "result": "not-requested" },
-      "oom": { "result": "not-applicable" },
-      "timer": { "last_run_at": "2026-08-02T11:50:00Z", "next_run_at": "2026-08-02T11:55:00Z", "last_result": "success", "missed_runs": 0, "persistent": true }
+      "target_node_id": "node-control", "scope": "system", "name": "heimdall-collect.timer",
+      "result": { "active_state": "active", "sub_state": "waiting", "result": "success" }, "restart": null,
+      "watchdog": { "result": "not-requested" }, "oom": { "result": "not-applicable" },
+      "timer": { "last_run_at": "2026-08-02T11:50:00Z", "next_run_at": "2026-08-02T12:05:00Z", "last_result": "success", "missed_runs": 0, "persistent": true }
     },
     {
-      "name": "heimdall-maintain.timer",
-      "result": { "active_state": "active", "sub_state": "waiting", "result": "success" },
-      "restart": { "count": 0, "window_start": "2026-08-02T10:55:00Z", "window_end": "2026-08-02T11:55:00Z" },
-      "watchdog": { "result": "not-requested" },
-      "oom": { "result": "not-applicable" },
-      "timer": { "last_run_at": "2026-08-02T11:45:00Z", "next_run_at": "2026-08-02T12:00:00Z", "last_result": "success", "missed_runs": 0, "persistent": true }
+      "target_node_id": "node-control", "scope": "system", "name": "heimdall-maintain.timer",
+      "result": { "active_state": "active", "sub_state": "waiting", "result": "success" }, "restart": null,
+      "watchdog": { "result": "not-requested" }, "oom": { "result": "not-applicable" },
+      "timer": { "last_run_at": "2026-08-02T11:45:00Z", "next_run_at": "2026-08-02T12:15:00Z", "last_result": "success", "missed_runs": null, "persistent": null }
     },
     {
-      "name": "nightly.service",
+      "target_node_id": "node-control", "scope": "system", "name": "nightly.service",
       "result": { "active_state": "inactive", "sub_state": "dead", "result": "success" },
-      "restart": { "count": 0, "window_start": "2026-08-02T10:55:00Z", "window_end": "2026-08-02T11:55:00Z" },
-      "watchdog": { "result": "not-requested" },
-      "oom": { "result": "not-applicable" },
-      "timer": null
+      "restart": { "count": 0, "window_start": "2026-08-02T11:54:00Z", "window_end": "2026-08-02T11:55:00Z" },
+      "watchdog": { "result": "not-requested" }, "oom": { "result": "not-applicable" }, "timer": null
     },
     {
-      "name": "nightly.timer",
-      "result": { "active_state": "active", "sub_state": "waiting", "result": "success" },
-      "restart": { "count": 0, "window_start": "2026-08-02T10:55:00Z", "window_end": "2026-08-02T11:55:00Z" },
-      "watchdog": { "result": "not-requested" },
-      "oom": { "result": "not-applicable" },
+      "target_node_id": "node-control", "scope": "system", "name": "nightly.timer",
+      "result": { "active_state": "active", "sub_state": "waiting", "result": "success" }, "restart": null,
+      "watchdog": { "result": "not-requested" }, "oom": { "result": "not-applicable" },
       "timer": { "last_run_at": "2026-08-02T11:50:00Z", "next_run_at": "2026-08-02T12:50:00Z", "last_result": "success", "missed_runs": 0, "persistent": true }
     }
   ]

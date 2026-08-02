@@ -1,36 +1,28 @@
 {
   "base": "observations-positive.json",
   "cases": [
-    {
-      "id": "restart-storm",
-      "mutations": {
-        "units.0.restart.count": 5
-      }
-    },
-    {
-      "id": "oom",
-      "mutations": {
-        "units.0.oom.result": "killed"
-      }
-    },
-    {
-      "id": "missed-timer",
-      "mutations": {
-        "units.2.timer.missed_runs": 2,
-        "units.2.timer.persistent": false
-      }
-    },
-    {
-      "id": "absent-notifier",
-      "mutations": {
-        "notifier": null
-      }
-    },
-    {
-      "id": "stale-audit",
-      "mutations": {
-        "observed_at": "2026-08-01T11:55:00Z"
-      }
-    }
+    { "id": "restart-storm", "mutations": { "units.0.restart.count": 5 } },
+    { "id": "oom", "mutations": { "units.0.oom.result": "killed" } },
+    { "id": "missed-timer", "mutations": { "units.2.timer.missed_runs": 2, "units.2.timer.persistent": false } },
+    { "id": "missed-timer-warning", "mutations": { "units.2.timer.missed_runs": 2 } },
+    { "id": "absent-notifier", "mutations": { "notifier": null } },
+    { "id": "stale-audit", "mutations": { "observed_at": "2026-08-01T11:55:00Z" } },
+    { "id": "future-audit", "mutations": { "observed_at": "2026-08-02T12:05:00Z" } },
+    { "id": "restart-window-mismatch", "mutations": { "units.0.restart.window_start": "2026-08-01T11:55:00Z" } },
+    { "id": "restart-window-end-mismatch", "mutations": { "units.0.restart.window_end": "2026-08-02T11:54:00Z" } },
+    { "id": "restart-window-contradictory", "mutations": { "units.0.restart.window_start": "2026-08-02T11:56:00Z" } },
+    { "id": "timer-last-run-future", "mutations": { "units.2.timer.last_run_at": "2026-08-02T12:05:00Z", "units.2.timer.next_run_at": "2026-08-02T12:10:00Z" } },
+    { "id": "timer-last-run-ancient", "mutations": { "units.2.timer.last_run_at": "2025-01-01T00:00:00Z" } },
+    { "id": "timer-timestamps-contradictory", "mutations": { "units.2.timer.next_run_at": "2026-08-02T11:40:00Z" } },
+    { "id": "timer-next-run-absurd-future", "mutations": { "units.2.timer.next_run_at": "2028-08-02T12:05:00Z" } },
+    { "id": "timer-next-run-ancient", "mutations": { "units.2.timer.next_run_at": "2025-01-01T00:00:00Z" } },
+    { "id": "timer-overdue", "mutations": { "units.2.timer.next_run_at": "2026-08-02T11:59:00Z" } },
+    { "id": "timer-restart-contradiction", "mutations": { "units.2.restart": { "count": 0, "window_start": "2026-08-02T11:54:00Z", "window_end": "2026-08-02T11:55:00Z" } } },
+    { "id": "watchdog-configured-not-requested", "mutations": { "units.0.watchdog.result": "not-requested" } },
+    { "id": "watchdog-configured-unknown", "mutations": { "units.0.watchdog.result": "unknown" } },
+    { "id": "watchdog-configured-timeout", "mutations": { "units.0.watchdog.result": "timeout" } },
+    { "id": "watchdog-without-request", "mutations": { "units.3.watchdog.result": "ok" } },
+    { "id": "watchdog-without-request-unknown", "mutations": { "units.3.watchdog.result": "unknown" } },
+    { "id": "watchdog-without-request-timeout", "mutations": { "units.3.watchdog.result": "timeout" } }
   ]
 }

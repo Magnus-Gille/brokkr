@@ -16,14 +16,20 @@
       "manager": "system",
       "failure_delivery": {
         "required": true,
-        "mode": "brokkr-systemd-failure"
+        "mode": "brokkr-systemd-failure",
+        "service_role": "none"
       }
     },
     "user": {
       "manager": "user",
       "failure_delivery": {
         "required": true,
-        "mode": "component-owner"
+        "mode": "component-owner",
+        "service_role": "none",
+        "terminal_handler_role": "terminal",
+        "terminal_handler_type": "oneshot",
+        "terminal_handler_restart": "no",
+        "terminal_handler_on_failure": "forbidden"
       }
     }
   },
@@ -45,7 +51,6 @@
         "runtime": { "required": true, "allow_infinity": true, "min_seconds": 60, "max_seconds": 86400 }
       },
       "oom": { "required": true, "allowed": ["stop", "kill"] },
-      "failure_delivery": { "required": true, "mode": "brokkr-systemd-failure" },
       "readiness": { "required": true }
     },
     "oneshot": {
@@ -65,18 +70,24 @@
         "runtime": { "required": true, "allow_infinity": true, "min_seconds": 60, "max_seconds": 86400 }
       },
       "oom": { "required": true, "allowed": ["stop", "kill"] },
-      "failure_delivery": { "required": true, "mode": "brokkr-systemd-failure" },
       "readiness": { "required": false }
     },
     "timer": {
       "unit_type": "timer",
-      "persistence": { "required": true, "allowed": [true] },
       "accuracy": { "required": true, "min_seconds": 1, "max_seconds": 3600 },
       "schedule": {
-        "required": true,
-        "directives": ["OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnUnitInactiveSec"]
+        "calendar_directive": "OnCalendar",
+        "monotonic_directives": ["OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnUnitInactiveSec"],
+        "classes_exclusive": true
       },
-      "missed_runs": true
+      "calendar": {
+        "persistence_required": true,
+        "missed_runs_evidence": "count"
+      },
+      "monotonic": {
+        "persistence_directive": "absent-or-false",
+        "missed_runs_evidence": "not-applicable"
+      }
     }
   },
   "watchdog": {
@@ -89,6 +100,9 @@
   },
   "observations": {
     "content_blind": true,
+    "restart_window_tolerance_seconds": 1,
+    "timer_timestamp_max_age_seconds": 31622400,
+    "timer_timestamp_max_future_seconds": 31622400,
     "fields": [
       "unit_result",
       "restart_count_window",
