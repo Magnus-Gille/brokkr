@@ -4,6 +4,8 @@
 // owner attestation, recovery keys, and the protected narrowing tail.
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
+import { performance } from "node:perf_hooks";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -61,6 +63,158 @@ const exactKeys = (value, keys) => (
   plain(value) && Object.keys(value).sort().join(",") === [...keys].sort().join(",")
 );
 const sha256 = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
+const LOCK_TICKET_FILE = /^(\d+)\.json$/;
+const LOCK_TICKET_DONE_FILE = /^(\d+)\.done$/;
+const LOCK_TICKET_IMMUTABLE_CHECKPOINT_FILE = /^checkpoint\.(\d+)\.json$/;
+const LOCK_TICKET_TMP_FILE =
+  /^((?:\d+\.json)|(?:\d+\.done)|(?:checkpoint(?:\.\d+)?\.json))\.(\d+)(?:\.([a-f0-9]{16}))?\.([0-9a-f-]{36})\.tmp$/;
+const LOCK_TICKET_CHECKPOINT = "checkpoint.json";
+const LOCK_TICKET_COMPACTION_THRESHOLD = 256;
+const LOCK_TICKET_ACQUIRE_RETRIES = 8;
+const LOCK_TICKET_LIVE_HARD_LIMIT = LOCK_TICKET_COMPACTION_THRESHOLD;
+const LOCK_TICKET_TMP_HARD_LIMIT = 64;
+const LOCK_TICKET_OWNER_STAMP_HEX = 16;
+const LOCK_OWNER_PROBE_ENV = "BROKKR_ENABLE_TEST_LOCK_OWNER_PROBE";
+const AUTHORITATIVE_BOOT_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const AUTHORITATIVE_PROCESS_START = /^linux-start:[1-9]\d*$/;
+const testLockOwnerProbe = () => (
+  process.env[LOCK_OWNER_PROBE_ENV] === "1" ?
+    globalThis.__BROKKR_TEST_LOCK_OWNER_PROBE__ ?? null :
+    null
+);
+const inferBootIdAuthoritative = value => AUTHORITATIVE_BOOT_ID.test(value);
+const inferProcessStartAuthoritative = value => AUTHORITATIVE_PROCESS_START.test(value);
+function normalizeLockOwnerEvidence(value, inferAuthoritative) {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value === "string" && value.length >= 1) {
+    return { value, authoritative: inferAuthoritative(value) };
+  }
+  if (plain(value) &&
+      typeof value.value === "string" &&
+      value.value.length >= 1 &&
+      typeof value.authoritative === "boolean") {
+    return {
+      value: value.value,
+      authoritative: value.authoritative && inferAuthoritative(value.value),
+    };
+  }
+  return undefined;
+}
+const parsePositiveInteger = value => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+};
+const readLinuxProcessStartTime = pid => {
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = raw.lastIndexOf(")");
+    if (close < 0) return null;
+    const fields = raw.slice(close + 2).trim().split(/\s+/);
+    const startTime = fields[19];
+    return /^[1-9]\d*$/.test(startTime) ? {
+      value: `linux-start:${startTime}`,
+      authoritative: true,
+    } : null;
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error?.code)) return null;
+    throw error;
+  }
+};
+const FALLBACK_BOOT_IDENTITY = (() => {
+  try {
+    // This stays an estimate, but bucket it at a host-wide second boundary so
+    // concurrent processes do not trivially diverge by millisecond jitter.
+    return {
+      value: `boot-estimate:${Math.max(0, Math.round(Date.now() / 1000 - os.uptime()))}`,
+      authoritative: false,
+    };
+  } catch {
+    try {
+      return { value: `boot-id-unavailable:${os.hostname()}`, authoritative: false };
+    } catch {
+      return { value: "boot-id-unavailable", authoritative: false };
+    }
+  }
+})();
+const SYSTEM_BOOT_IDENTITY = (() => {
+  try {
+    const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return inferBootIdAuthoritative(bootId) ? {
+      value: bootId,
+      authoritative: true,
+    } : FALLBACK_BOOT_IDENTITY;
+  } catch (error) {
+    if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error?.code)) throw error;
+    return FALLBACK_BOOT_IDENTITY;
+  }
+})();
+const SELF_PROCESS_START_IDENTITY =
+  readLinuxProcessStartTime(process.pid) ?? {
+    value: `time-origin:${Math.trunc(performance.timeOrigin)}`,
+    authoritative: false,
+  };
+const currentBootIdentity = () => {
+  const value = normalizeLockOwnerEvidence(
+    testLockOwnerProbe()?.currentBootId?.(),
+    inferBootIdAuthoritative,
+  );
+  return value ?? SYSTEM_BOOT_IDENTITY;
+};
+const currentProcessStartIdentity = () => {
+  const value = normalizeLockOwnerEvidence(
+    testLockOwnerProbe()?.processStartTime?.(process.pid),
+    inferProcessStartAuthoritative,
+  );
+  return value ?? SELF_PROCESS_START_IDENTITY;
+};
+const lockOwnerIdentityStamp = ({
+  boot_id,
+  boot_id_authoritative = false,
+  process_start_time,
+  process_start_time_authoritative = false,
+}) => sha256([
+  boot_id_authoritative ? "1" : "0",
+  boot_id ?? "",
+  process_start_time_authoritative ? "1" : "0",
+  process_start_time ?? "",
+].join("\n")).slice(0, LOCK_TICKET_OWNER_STAMP_HEX);
+const currentLockOwnerIdentity = () => {
+  const bootIdentity = currentBootIdentity();
+  const processStartIdentity = currentProcessStartIdentity();
+  return {
+    pid: process.pid,
+    boot_id: bootIdentity.value,
+    boot_id_authoritative: bootIdentity.authoritative,
+    process_start_time: processStartIdentity.value,
+    process_start_time_authoritative: processStartIdentity.authoritative,
+  };
+};
+const readProcessStartIdentity = pid => {
+  const testValue = normalizeLockOwnerEvidence(
+    testLockOwnerProbe()?.processStartTime?.(pid),
+    inferProcessStartAuthoritative,
+  );
+  if (testValue !== undefined) return testValue;
+  if (pid === process.pid) return currentProcessStartIdentity();
+  return readLinuxProcessStartTime(pid);
+};
+const readLiveOwnerStamp = pid => {
+  const bootIdentity = currentBootIdentity();
+  const processStartIdentity = readProcessStartIdentity(pid);
+  if (processStartIdentity === null ||
+      !bootIdentity.authoritative ||
+      !processStartIdentity.authoritative) {
+    return null;
+  }
+  return lockOwnerIdentityStamp({
+    boot_id: bootIdentity.value,
+    boot_id_authoritative: bootIdentity.authoritative,
+    process_start_time: processStartIdentity.value,
+    process_start_time_authoritative: processStartIdentity.authoritative,
+  });
+};
 const boundedJson = file => {
   const raw = fs.readFileSync(file, "utf8");
   assert(Buffer.byteLength(raw) <= MAX_BYTES, "journal_too_large");
@@ -71,68 +225,591 @@ const fsyncDirectory = directory => {
   const fd = fs.openSync(directory, "r");
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 };
-function writeAtomic(file, value) {
+const lockTicketFault = point => {
+  if (process.env.BROKKR_ENABLE_TEST_LOCK_TICKET_FAULTS === "1") {
+    globalThis.__BROKKR_TEST_LOCK_TICKET_FAULT__?.(point);
+  }
+};
+const publishFault = (tag, boundary) => {
+  if (tag) lockTicketFault(`after-${tag}-${boundary}`);
+};
+const unlinkIfExists = file => {
+  try { fs.unlinkSync(file); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+};
+function writeAtomic(file, value, options = {}) {
+  const { faultTag = null } = options;
   const encoded = `${canonicalJson(value)}\n`;
   assert(Buffer.byteLength(encoded) <= MAX_BYTES, "journal_too_large");
   const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
   const fd = fs.openSync(temporary, "wx", 0o600);
-  try { fs.writeFileSync(fd, encoded); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  publishFault(faultTag, "open");
+  try {
+    fs.writeFileSync(fd, encoded);
+    publishFault(faultTag, "write");
+    fs.fsyncSync(fd);
+    publishFault(faultTag, "fsync");
+  } finally { fs.closeSync(fd); }
   fs.renameSync(temporary, file);
+  publishFault(faultTag, "rename");
   fsyncDirectory(path.dirname(file));
 }
-function createExclusive(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+function createExclusive(file, value, options = {}) {
+  const { faultTag = null } = options;
+  const directory = path.dirname(file);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const encoded = `${canonicalJson(value)}\n`;
   assert(Buffer.byteLength(encoded) <= MAX_BYTES, "journal_too_large");
-  let fd;
-  try { fd = fs.openSync(file, "wx", 0o600); }
-  catch (error) { if (error.code === "EEXIST") return false; throw error; }
-  try { fs.writeFileSync(fd, encoded); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  fsyncDirectory(path.dirname(file));
+  const temporary = `${file}.${process.pid}.${lockOwnerIdentityStamp(
+    currentLockOwnerIdentity(),
+  )}.${crypto.randomUUID()}.tmp`;
+  const fd = fs.openSync(temporary, "wx", 0o600);
+  publishFault(faultTag, "open");
+  try {
+    fs.writeFileSync(fd, encoded);
+    publishFault(faultTag, "write");
+    fs.fsyncSync(fd);
+    publishFault(faultTag, "fsync");
+  } finally { fs.closeSync(fd); }
+  try { fs.linkSync(temporary, file); }
+  catch (error) {
+    unlinkIfExists(temporary);
+    if (error.code === "EEXIST") return false;
+    throw error;
+  }
+  publishFault(faultTag, "link");
+  fsyncDirectory(directory);
+  unlinkIfExists(temporary);
+  fsyncDirectory(directory);
   return true;
+}
+function readOptional(file) {
+  try { return boundedJson(file); }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
 }
 const stateRoot = journalDir => path.join(journalDir, ".autonomy-state");
 const targetKey = binding => binding.target_scope_digest.slice("sha256:".length);
 const domainStateFile = journalDir => path.join(stateRoot(journalDir), "domain-state.json");
 const domainLockDir = journalDir => path.join(stateRoot(journalDir), "domain-state.lock");
+const lockTicketPrefix = sequence => String(sequence).padStart(8, "0");
+const lockTicketCheckpointFile = sequence => `checkpoint.${lockTicketPrefix(sequence)}.json`;
+function readLockCheckpointRecord(file, sequence = null) {
+  const checkpoint = readOptional(file);
+  if (checkpoint === null) return null;
+  assert(exactKeys(checkpoint, [
+    "kind", "schema_version", "last_completed_sequence",
+    "last_completed_token", "next_sequence",
+  ]) && checkpoint.kind === "brokkr-lock-ticket-checkpoint" &&
+    checkpoint.schema_version === "v1" &&
+    Number.isSafeInteger(checkpoint.last_completed_sequence) &&
+    checkpoint.last_completed_sequence >= 0 &&
+    typeof checkpoint.last_completed_token === "string" &&
+    checkpoint.last_completed_token.length >= 1 &&
+    Number.isSafeInteger(checkpoint.next_sequence) &&
+    checkpoint.next_sequence === checkpoint.last_completed_sequence + 1,
+  "lock_checkpoint_invalid");
+  if (sequence !== null) {
+    assert(
+      checkpoint.last_completed_sequence === sequence &&
+      checkpoint.next_sequence === sequence + 1,
+      "lock_checkpoint_invalid",
+    );
+  }
+  return checkpoint;
+}
+function selectLockCheckpoint(current, candidate) {
+  if (candidate === null) return current;
+  if (current === null) return candidate;
+  if (candidate.record.last_completed_sequence > current.record.last_completed_sequence) {
+    return candidate;
+  }
+  if (candidate.record.last_completed_sequence < current.record.last_completed_sequence) {
+    return current;
+  }
+  assert(
+    candidate.record.last_completed_token === current.record.last_completed_token,
+    "lock_checkpoint_conflict",
+  );
+  if (current.name === LOCK_TICKET_CHECKPOINT && candidate.name !== LOCK_TICKET_CHECKPOINT) {
+    return candidate;
+  }
+  return current;
+}
+function selectedLockCheckpoint(tickets) {
+  let selected = null;
+  for (const name of fs.readdirSync(tickets)) {
+    if (name === LOCK_TICKET_CHECKPOINT) {
+      const record = readLockCheckpointRecord(path.join(tickets, name));
+      if (record !== null) {
+        selected = selectLockCheckpoint(selected, { name, record });
+      }
+      continue;
+    }
+    const sequence = parsePositiveInteger(LOCK_TICKET_IMMUTABLE_CHECKPOINT_FILE.exec(name)?.[1]);
+    if (sequence === null) continue;
+    const record = readLockCheckpointRecord(path.join(tickets, name), sequence);
+    if (record !== null) {
+      selected = selectLockCheckpoint(selected, { name, record });
+    }
+  }
+  return selected;
+}
+function readLockCheckpoint(tickets) {
+  return selectedLockCheckpoint(tickets)?.record ?? null;
+}
+function lockTicketTemp(name) {
+  if (!name.endsWith(".tmp")) return null;
+  const match = LOCK_TICKET_TMP_FILE.exec(name);
+  if (!match) return { name, pid: null, ownerStamp: null };
+  return {
+    name,
+    pid: parsePositiveInteger(match[2]),
+    ownerStamp: match[3] ?? null,
+  };
+}
+function reclaimInvalidLockTicketArtifacts(tickets) {
+  let reclaimed = false;
+  for (const name of fs.readdirSync(tickets)) {
+    const rawSequence = LOCK_TICKET_FILE.exec(name)?.[1] ??
+      LOCK_TICKET_DONE_FILE.exec(name)?.[1] ??
+      LOCK_TICKET_IMMUTABLE_CHECKPOINT_FILE.exec(name)?.[1];
+    if (rawSequence === undefined || parsePositiveInteger(rawSequence) !== null) continue;
+    try {
+      fs.unlinkSync(path.join(tickets, name));
+      reclaimed = true;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  if (reclaimed) fsyncDirectory(tickets);
+}
+function pruneCheckpointedLockTickets(tickets, floor) {
+  let pruned = false;
+  const selected = selectedLockCheckpoint(tickets);
+  for (const name of fs.readdirSync(tickets)) {
+    if (name === LOCK_TICKET_CHECKPOINT) {
+      if (selected?.name === name && selected.record.last_completed_sequence >= floor) continue;
+    } else {
+      const sequence = parsePositiveInteger(LOCK_TICKET_FILE.exec(name)?.[1]) ??
+        parsePositiveInteger(LOCK_TICKET_DONE_FILE.exec(name)?.[1]) ??
+        parsePositiveInteger(LOCK_TICKET_IMMUTABLE_CHECKPOINT_FILE.exec(name)?.[1]);
+      if (sequence === null || sequence > floor) continue;
+      if (selected?.name === name && sequence === floor) continue;
+    }
+    lockTicketFault("before-lock-prune-unlink");
+    try {
+      fs.unlinkSync(path.join(tickets, name));
+      pruned = true;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  if (pruned) fsyncDirectory(tickets);
+}
+function lockTicketEntries(tickets, floor) {
+  return fs.readdirSync(tickets).flatMap(name => {
+    const sequence = parsePositiveInteger(LOCK_TICKET_FILE.exec(name)?.[1]);
+    if (sequence === null || sequence <= floor) return [];
+    return [{ name, prefix: lockTicketPrefix(sequence), sequence }];
+  }).sort((left, right) => left.sequence - right.sequence);
+}
+function readLockTicketRecord(tickets, entry) {
+  let existing;
+  const ticketPath = path.join(tickets, entry.name);
+  try {
+    existing = boundedJson(ticketPath);
+  }
+  catch (error) { if (error.code === "ENOENT") return null; throw error; }
+  const legacyOwner = exactKeys(existing, [
+    "kind", "schema_version", "pid", "token", "sequence",
+  ]);
+  const stampedOwner = exactKeys(existing, [
+    "kind", "schema_version", "pid", "boot_id", "process_start_time", "token", "sequence",
+  ]);
+  const stampedOwnerWithAuthority = exactKeys(existing, [
+    "kind", "schema_version", "pid", "boot_id", "boot_id_authoritative",
+    "process_start_time", "process_start_time_authoritative", "token", "sequence",
+  ]);
+  assert((legacyOwner || stampedOwner || stampedOwnerWithAuthority) &&
+    existing.kind === "brokkr-lock-ticket" && existing.schema_version === "v1" &&
+    Number.isSafeInteger(existing.pid) && existing.pid > 0 &&
+    typeof existing.token === "string" && existing.token.length >= 1 &&
+    existing.sequence === entry.sequence &&
+    (!(stampedOwner || stampedOwnerWithAuthority) || (
+      typeof existing.boot_id === "string" && existing.boot_id.length >= 1 &&
+      typeof existing.process_start_time === "string" &&
+      existing.process_start_time.length >= 1
+    )) &&
+    (!stampedOwnerWithAuthority || (
+      typeof existing.boot_id_authoritative === "boolean" &&
+      typeof existing.process_start_time_authoritative === "boolean"
+    )),
+  "lock_owner_invalid");
+  return (stampedOwner || stampedOwnerWithAuthority) ? {
+    ...existing,
+    boot_id_authoritative: stampedOwnerWithAuthority ?
+      existing.boot_id_authoritative && inferBootIdAuthoritative(existing.boot_id) :
+      inferBootIdAuthoritative(existing.boot_id),
+    process_start_time_authoritative: stampedOwnerWithAuthority ?
+      existing.process_start_time_authoritative &&
+        inferProcessStartAuthoritative(existing.process_start_time) :
+      inferProcessStartAuthoritative(existing.process_start_time),
+  } : {
+    ...existing,
+    boot_id: null,
+    boot_id_authoritative: false,
+    process_start_time: null,
+    process_start_time_authoritative: false,
+  };
+}
+function checkpointCompletesLockTicket(checkpoint, ticket) {
+  if (checkpoint === null || checkpoint.last_completed_sequence < ticket.sequence) return false;
+  if (checkpoint.last_completed_sequence === ticket.sequence) {
+    assert(checkpoint.last_completed_token === ticket.token, "lock_checkpoint_conflict");
+  }
+  return true;
+}
+function hasValidLockResolution(tickets, entry, ticket, checkpoint) {
+  if (checkpointCompletesLockTicket(checkpoint, ticket)) return true;
+  try {
+    const completion = boundedJson(path.join(tickets, `${entry.prefix}.done`));
+    const completed = exactKeys(completion, [
+      "kind", "schema_version", "token", "sequence",
+    ]) && completion.kind === "brokkr-lock-ticket-completion";
+    const retired = exactKeys(completion, [
+      "kind", "schema_version", "token", "sequence", "reason",
+    ]) && completion.kind === "brokkr-lock-ticket-retirement" &&
+      typeof completion.reason === "string" &&
+      completion.reason.length >= 1;
+    assert((completed || retired) &&
+      completion.schema_version === "v1" &&
+      completion.token === ticket.token &&
+      completion.sequence === ticket.sequence,
+    "lock_completion_invalid");
+    return true;
+  } catch (error) {
+    if (["ENOENT", "journal_invalid_json", "journal_too_large", "lock_completion_invalid"]
+      .includes(error.code)) {
+      return false;
+    }
+    throw error;
+  }
+}
+function assertExistingLockResolutionAfterEexist(tickets, entry, ticket) {
+  let completion;
+  try {
+    completion = boundedJson(path.join(tickets, `${entry.prefix}.done`));
+  } catch (error) {
+    if (["ENOENT", "journal_invalid_json", "journal_too_large"].includes(error?.code)) {
+      fail("lock_completion_invalid", error);
+    }
+    throw error;
+  }
+  const completed = exactKeys(completion, [
+    "kind", "schema_version", "token", "sequence",
+  ]) && completion.kind === "brokkr-lock-ticket-completion";
+  const retired = exactKeys(completion, [
+    "kind", "schema_version", "token", "sequence", "reason",
+  ]) && completion.kind === "brokkr-lock-ticket-retirement" &&
+    typeof completion.reason === "string" &&
+    completion.reason.length >= 1;
+  assert((completed || retired) && completion.schema_version === "v1", "lock_completion_invalid");
+  assert(
+    completion.sequence === ticket.sequence &&
+    completion.token === ticket.token,
+    "lock_completion_conflict",
+  );
+}
+function lockOwnerProvablyDead(owner) {
+  assert(Number.isSafeInteger(owner.pid) && owner.pid > 0, "lock_owner_invalid");
+  if (owner.boot_id !== null) {
+    assert(typeof owner.boot_id === "string" && owner.boot_id.length >= 1 &&
+      typeof owner.boot_id_authoritative === "boolean" &&
+      typeof owner.process_start_time === "string" &&
+      owner.process_start_time.length >= 1 &&
+      typeof owner.process_start_time_authoritative === "boolean",
+    "lock_owner_invalid");
+  }
+  try {
+    process.kill(owner.pid, 0);
+  } catch (error) {
+    if (error.code === "ESRCH") return true;
+    if (error.code !== "EPERM") throw error;
+  }
+  if (owner.boot_id !== null) {
+    const bootIdentity = currentBootIdentity();
+    if (owner.boot_id_authoritative &&
+        bootIdentity.authoritative &&
+        owner.boot_id !== bootIdentity.value) {
+      return true;
+    }
+  }
+  if (owner.process_start_time === null) return false;
+  const processStartIdentity = readProcessStartIdentity(owner.pid);
+  if (processStartIdentity === null) return false;
+  return owner.process_start_time_authoritative &&
+    processStartIdentity.authoritative &&
+    owner.process_start_time !== processStartIdentity.value;
+}
+function lockOwnerAlive(owner) {
+  return !lockOwnerProvablyDead(owner);
+}
+function lockTicketTempAlive(temporary) {
+  if (temporary.pid === null) return false;
+  try {
+    process.kill(temporary.pid, 0);
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    if (error.code !== "EPERM") throw error;
+  }
+  if (temporary.ownerStamp === null) return true;
+  const liveStamp = readLiveOwnerStamp(temporary.pid);
+  if (liveStamp === null) return true;
+  return liveStamp === temporary.ownerStamp;
+}
+function writeLockTicketResolution(tickets, ticket, resolution, options = {}) {
+  return createExclusive(path.join(
+    tickets,
+    `${lockTicketPrefix(ticket.sequence)}.done`,
+  ), {
+    kind: resolution.kind,
+    schema_version: "v1",
+    token: ticket.token,
+    sequence: ticket.sequence,
+    ...resolution.fields,
+  }, options);
+}
+function retireLockTicketCandidate(tickets, entry, ticket) {
+  lockTicketFault("before-lock-ticket-retire-claim");
+  if (writeLockTicketResolution(tickets, ticket, {
+    kind: "brokkr-lock-ticket-retirement",
+    fields: { reason: "owner-dead" },
+  }, {
+    faultTag: "lock-retirement",
+  })) return;
+  assertExistingLockResolutionAfterEexist(tickets, entry, ticket);
+}
+function reclaimLockTicketTemps(tickets) {
+  let reclaimed = false;
+  for (const name of fs.readdirSync(tickets)) {
+    const temporary = lockTicketTemp(name);
+    if (!temporary || lockTicketTempAlive(temporary)) continue;
+    try {
+      fs.unlinkSync(path.join(tickets, temporary.name));
+      reclaimed = true;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  if (reclaimed) fsyncDirectory(tickets);
+  let remainingTemps = 0;
+  for (const name of fs.readdirSync(tickets)) {
+    if (lockTicketTemp(name)) remainingTemps += 1;
+  }
+  assert(remainingTemps <= LOCK_TICKET_TMP_HARD_LIMIT, "lock_ticket_tmp_limit");
+}
+function publishLockCheckpoint(tickets, ticket) {
+  const current = readLockCheckpoint(tickets);
+  if (checkpointCompletesLockTicket(current, ticket)) return current;
+  if (current !== null && current.last_completed_sequence > ticket.sequence) {
+    return current;
+  }
+  createExclusive(path.join(
+    tickets,
+    lockTicketCheckpointFile(ticket.sequence),
+  ), {
+    kind: "brokkr-lock-ticket-checkpoint",
+    schema_version: "v1",
+    last_completed_sequence: ticket.sequence,
+    last_completed_token: ticket.token,
+    next_sequence: ticket.sequence + 1,
+  }, { faultTag: "lock-checkpoint" });
+  const published = readLockCheckpoint(tickets);
+  assert(published !== null &&
+    published.last_completed_sequence >= ticket.sequence,
+  "lock_checkpoint_regressed");
+  if (published.last_completed_sequence === ticket.sequence) {
+    assert(published.last_completed_token === ticket.token, "lock_checkpoint_conflict");
+  }
+  return published;
+}
+function completedLockTicketPrefix(tickets, checkpoint = readLockCheckpoint(tickets)) {
+  const floor = checkpoint?.last_completed_sequence ?? 0;
+  let nextSequence = floor + 1;
+  let candidate = null;
+  let length = 0;
+  for (const entry of lockTicketEntries(tickets, floor)) {
+    if (entry.sequence !== nextSequence) break;
+    const ticket = readLockTicketRecord(tickets, entry);
+    if (ticket === null || !hasValidLockResolution(tickets, entry, ticket, checkpoint)) break;
+    candidate = ticket;
+    length += 1;
+    nextSequence += 1;
+  }
+  return { candidate, length };
+}
+function compactCompletedLockTicketPrefix(
+  tickets,
+  checkpoint = readLockCheckpoint(tickets),
+  options = {},
+) {
+  const { allowTailCompaction = true } = options;
+  const prefix = completedLockTicketPrefix(tickets, checkpoint);
+  const floor = checkpoint?.last_completed_sequence ?? 0;
+  const unresolvedTail = lockTicketEntries(tickets, floor).length - prefix.length;
+  if (prefix.candidate === null ||
+      (prefix.length < LOCK_TICKET_COMPACTION_THRESHOLD &&
+        (!allowTailCompaction || unresolvedTail === 0))) {
+    return checkpoint;
+  }
+  const current = publishLockCheckpoint(tickets, prefix.candidate);
+  pruneCheckpointedLockTickets(tickets, current.last_completed_sequence);
+  return current;
+}
+function completionFailure(error) {
+  if ([
+    "lock_completion_conflict",
+    "lock_checkpoint_conflict",
+    "lock_checkpoint_invalid",
+    "lock_checkpoint_regressed",
+    "lock_ticket_stale_below_floor",
+  ].includes(error?.code)) {
+    return error;
+  }
+  const wrapped = new Error("lock_completion_ambiguous", { cause: error });
+  wrapped.code = "lock_completion_ambiguous";
+  return wrapped;
+}
+function preserveReleaseFailure(operationError, releaseError) {
+  if (!operationError) return;
+  operationError.lock_release_error = completionFailure(releaseError);
+  if (operationError.cause === undefined) {
+    operationError.cause = operationError.lock_release_error;
+  }
+}
+function releaseLockTicket(tickets, ticket) {
+  const startingCheckpoint = readLockCheckpoint(tickets);
+  let checkpoint = compactCompletedLockTicketPrefix(tickets, startingCheckpoint, {
+    allowTailCompaction: false,
+  });
+  if (checkpoint !== null && checkpoint.last_completed_sequence >= ticket.sequence) {
+    if (checkpoint.last_completed_sequence === ticket.sequence) {
+      assert(checkpoint.last_completed_token === ticket.token, "lock_checkpoint_conflict");
+      try {
+        lockTicketFault("after-lock-release-visible-before-prune");
+        pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
+        return;
+      } catch (error) { return error; }
+    }
+    fail("lock_ticket_stale_below_floor");
+  }
+  const floor = checkpoint?.last_completed_sequence ?? 0;
+  const releasePrefix = completedLockTicketPrefix(tickets, checkpoint);
+  if (releasePrefix.length + 1 >= LOCK_TICKET_COMPACTION_THRESHOLD &&
+      ticket.sequence === floor + releasePrefix.length + 1) {
+    checkpoint = publishLockCheckpoint(tickets, ticket);
+    try {
+      lockTicketFault("after-lock-release-visible-before-prune");
+      pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
+      return;
+    } catch (error) { return error; }
+  }
+  assert(writeLockTicketResolution(tickets, ticket, {
+    kind: "brokkr-lock-ticket-completion",
+    fields: {},
+  }, {
+    faultTag: "lock-completion",
+  }), "lock_completion_conflict");
+  try {
+    lockTicketFault("after-lock-release-visible-before-prune");
+    return;
+  } catch (error) { return error; }
+}
 function withExclusiveDirectory(lockDir, code, operation) {
   const tickets = `${lockDir}.tickets`;
   fs.mkdirSync(tickets, { recursive: true, mode: 0o700 });
   const token = crypto.randomUUID();
-  const entries = fs.readdirSync(tickets).filter(name => /^\d{8}\.json$/.test(name)).sort();
-  assert(entries.length < 10_000, "lock_ticket_limit");
-  let sequence = 1;
-  if (entries.length) {
-    const latestName = entries.at(-1);
-    sequence = Number.parseInt(latestName.slice(0, 8), 10) + 1;
-    const existing = boundedJson(path.join(tickets, latestName));
-    assert(exactKeys(existing, ["kind", "schema_version", "pid", "token", "sequence"]) &&
-      existing.kind === "brokkr-lock-ticket" && existing.schema_version === "v1" &&
-      Number.isSafeInteger(existing.pid) && typeof existing.token === "string" &&
-      existing.sequence === sequence - 1, "lock_owner_invalid");
-    const completed = fs.existsSync(path.join(tickets, `${latestName.slice(0, 8)}.done`));
-    if (!completed) {
-    let alive = true;
-    try { process.kill(existing.pid, 0); }
-    catch (error) { if (error.code === "ESRCH") alive = false; else throw error; }
-    if (alive) fail(code);
+  let ticket = null;
+  for (let attempt = 0; attempt < LOCK_TICKET_ACQUIRE_RETRIES; attempt += 1) {
+    reclaimLockTicketTemps(tickets);
+    reclaimInvalidLockTicketArtifacts(tickets);
+    let checkpoint = readLockCheckpoint(tickets);
+    if (checkpoint !== null) pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
+    checkpoint = compactCompletedLockTicketPrefix(tickets, checkpoint);
+    const floor = checkpoint?.last_completed_sequence ?? 0;
+    const entries = lockTicketEntries(tickets, floor);
+    const unresolvedEntries = entries.length - completedLockTicketPrefix(tickets, checkpoint).length;
+    assert(unresolvedEntries < LOCK_TICKET_LIVE_HARD_LIMIT, "lock_ticket_live_limit");
+    let sequence = checkpoint?.next_sequence ?? 1;
+    if (entries.length) {
+      const latestEntry = entries.at(-1);
+      sequence = latestEntry.sequence + 1;
+      lockTicketFault("before-lock-ticket-read");
+      const existing = readLockTicketRecord(tickets, latestEntry);
+      if (existing === null) continue;
+      const refreshedCheckpoint = compactCompletedLockTicketPrefix(
+        tickets,
+        readLockCheckpoint(tickets),
+      );
+      if (refreshedCheckpoint?.last_completed_sequence >= latestEntry.sequence) {
+        if (refreshedCheckpoint.last_completed_sequence === latestEntry.sequence) {
+          assert(refreshedCheckpoint.last_completed_token === existing.token,
+            "lock_checkpoint_conflict");
+        }
+        continue;
+      }
+      if (!hasValidLockResolution(tickets, latestEntry, existing, refreshedCheckpoint)) {
+        if (lockOwnerAlive(existing)) fail(code);
+        retireLockTicketCandidate(tickets, latestEntry, existing);
+        attempt -= 1;
+        continue;
+      }
     }
+    const candidate = {
+      kind: "brokkr-lock-ticket",
+      schema_version: "v1",
+      ...currentLockOwnerIdentity(),
+      token,
+      sequence,
+    };
+    if (!createExclusive(path.join(
+      tickets,
+      `${lockTicketPrefix(sequence)}.json`,
+    ), candidate, {
+      faultTag: "lock-ticket",
+    })) {
+      continue;
+    }
+    checkpoint = readLockCheckpoint(tickets);
+    if (checkpoint !== null && checkpoint.last_completed_sequence >= candidate.sequence) {
+      pruneCheckpointedLockTickets(tickets, checkpoint.last_completed_sequence);
+      continue;
+    }
+    ticket = candidate;
+    break;
   }
-  const prefix = String(sequence).padStart(8, "0");
-  const ticket = {
-    kind: "brokkr-lock-ticket", schema_version: "v1", pid: process.pid, token, sequence,
-  };
-  assert(createExclusive(path.join(tickets, `${prefix}.json`), ticket), code);
-  try { return operation(); }
-  finally {
-    assert(createExclusive(path.join(tickets, `${prefix}.done`), {
-      kind: "brokkr-lock-ticket-completion", schema_version: "v1", token, sequence,
-    }), "lock_completion_conflict");
+  assert(ticket !== null, "lock_ticket_acquire_retry_exhausted");
+  let result = true;
+  let operationError = null;
+  try { result = operation(); }
+  catch (error) { operationError = error; }
+  try {
+    lockTicketFault("after-lock-owner-operation");
+    const compactionError = releaseLockTicket(tickets, ticket);
+    if (operationError) {
+      if (compactionError) preserveReleaseFailure(operationError, compactionError);
+      throw operationError;
+    }
+    // A successful owner operation remains committed even if best-effort
+    // post-release compaction or prune work later faults.
+    return result;
+  } catch (error) {
+    if (operationError) {
+      preserveReleaseFailure(operationError, error);
+      throw operationError;
+    }
+    throw completionFailure(error);
   }
-}
-function readOptional(file) {
-  try { return boundedJson(file); }
-  catch (error) { if (error.code === "ENOENT") return null; throw error; }
 }
 function claimTarget({
   journalDir, binding, bindingDigest, now, policy, resumeWatch = false,
@@ -2142,6 +2819,17 @@ const DEBIAN_API = (() => {
 })();
 
 export const { deriveDebianAutonomyExecution } = DEBIAN_API;
+export const __BROKKR_TEST_ONLY__LOCK_TICKET_LIMITS = Object.freeze({
+  compaction_threshold: LOCK_TICKET_COMPACTION_THRESHOLD,
+  live_hard_limit: LOCK_TICKET_LIVE_HARD_LIMIT,
+  tmp_hard_limit: LOCK_TICKET_TMP_HARD_LIMIT,
+});
+export function __BROKKR_TEST_ONLY__currentLockOwnerIdentity() {
+  return currentLockOwnerIdentity();
+}
+export function __BROKKR_TEST_ONLY__probeExclusiveDirectory(lockDir, operation = () => true) {
+  return withExclusiveDirectory(lockDir, "lock_probe_contended", operation);
+}
 
 // The raw W2a runner stays in DEBIAN_API's closure.  This is intentionally the
 // only exported production runner so every ambiguous effect must cross the

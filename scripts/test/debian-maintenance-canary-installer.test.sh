@@ -41,6 +41,56 @@ git -C "$SOURCE" add .
 git -C "$SOURCE" commit -qm "fixture"
 REVISION="$(git -C "$SOURCE" rev-parse HEAD)"
 
+wrong_revision() {
+  local revision="$1" alternate=0
+  if [[ "$revision" == *0 ]]; then
+    alternate=1
+  fi
+  printf '%s%s\n' "${revision%?}" "$alternate"
+}
+
+# A wrong revision must remain distinct when the valid revision ends in 0.
+COLLISION_REVISION=0000000000000000000000000000000000000000
+COLLISION_WRONG_REVISION="$(wrong_revision "$COLLISION_REVISION")"
+if [[ ! "$COLLISION_WRONG_REVISION" =~ ^[a-f0-9]{40}$ ]]; then
+  echo "wrong revision fixture is not a lowercase hexadecimal SHA" >&2
+  exit 1
+fi
+if [[ "$COLLISION_WRONG_REVISION" == "$COLLISION_REVISION" ]]; then
+  echo "wrong revision fixture collided with valid revision" >&2
+  exit 1
+fi
+if [[ "$COLLISION_WRONG_REVISION" != "${COLLISION_REVISION%?}1" ]]; then
+  echo "wrong revision fixture did not map a 0-ending SHA to suffix 1" >&2
+  exit 1
+fi
+
+# A non-zero-ending SHA must take the zero-suffix branch deterministically.
+NONZERO_ENDING_REVISION=000000000000000000000000000000000000000f
+NONZERO_ENDING_WRONG_REVISION="$(wrong_revision "$NONZERO_ENDING_REVISION")"
+if [[ ! "$NONZERO_ENDING_WRONG_REVISION" =~ ^[a-f0-9]{40}$ ]]; then
+  echo "wrong revision fixture is not a lowercase hexadecimal SHA for a non-zero-ending input" >&2
+  exit 1
+fi
+if [[ "$NONZERO_ENDING_WRONG_REVISION" == "$NONZERO_ENDING_REVISION" ]]; then
+  echo "wrong revision fixture collided for a non-zero-ending input" >&2
+  exit 1
+fi
+if [[ "$NONZERO_ENDING_WRONG_REVISION" != "${NONZERO_ENDING_REVISION%?}0" ]]; then
+  echo "wrong revision fixture did not map a non-zero-ending SHA to suffix 0" >&2
+  exit 1
+fi
+
+WRONG_REVISION="$(wrong_revision "$REVISION")"
+if [[ ! "$WRONG_REVISION" =~ ^[a-f0-9]{40}$ ]]; then
+  echo "wrong revision for generated revision is not a lowercase hexadecimal SHA" >&2
+  exit 1
+fi
+if [[ "$WRONG_REVISION" == "$REVISION" ]]; then
+  echo "wrong revision for generated revision collided with valid revision" >&2
+  exit 1
+fi
+
 cat >"$TMP/systemctl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail

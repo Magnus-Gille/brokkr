@@ -1,0 +1,15 @@
+{
+  "components": [
+    {
+      "name": "heimdall",
+      "target_node_id": "node-control",
+      "systemd_units": [
+        { "name": "heimdall", "type": "service" },
+        { "name": "heimdall-collect", "type": "timer" },
+        { "name": "heimdall-maintain", "type": "timer" },
+        { "name": "nightly", "type": "service" },
+        { "name": "nightly", "type": "timer" }
+      ]
+    }
+  ]
+}

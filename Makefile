@@ -2,7 +2,7 @@ BROKKR_SSH_TARGET ?= brokkr@control-node
 BROKKR_REMOTE_DIR ?= /opt/brokkr
 export OVERLAY COMMIT
 
-.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor test shellcheck
+.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight systemd-supervision-audit test shellcheck
 
 patching: ## Install/refresh unattended-upgrades on all Pi hosts (ARGS="--dry-run" or a host)
 	@./scripts/setup-host-patching.sh $(ARGS)
@@ -41,6 +41,12 @@ maintenance-controller: ## Inspect fail-closed maintenance-controller admission 
 
 maintenance-executor: ## Inspect the disarmed Debian host-adapter contract; no live host adapter is installed
 	@echo "Host adapter is disarmed; owner ceremony and exact root-owned registration are required."
+
+m5-fde-preflight: ## Run the read-only M5 FDE ceremony gate (ARGS="--copy-observed-at ...")
+	@./scripts/m5-fde-preflight.sh $(ARGS)
+
+systemd-supervision-audit: ## Audit systemd projection (real clock; replay --now requires BROKKR_SYSTEMD_AUDIT_ALLOW_REPLAY=1)
+	@node scripts/systemd-supervision-audit.mjs $(ARGS)
 
 maintenance-os: ## Run the OS maintenance report on the service host (ARGS="--dry-run --verbose")
 	@ssh $(BROKKR_SSH_TARGET) 'cd $(BROKKR_REMOTE_DIR) && bash scripts/maintenance-report.sh os $(ARGS)'
