@@ -36,7 +36,7 @@ export const canonicalJson = value => {
     `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
 };
 export const digest = value => `sha256:${crypto.createHash("sha256")
-  .update(typeof value === "string" ? value : canonicalJson(value))
+  .update(canonicalJson(value))
   .digest("hex")}`;
 const strictUtc = value => {
   if (typeof value !== "string" || !UTC.test(value)) return false;
@@ -46,6 +46,18 @@ const strictUtc = value => {
 };
 const exactKeys = (value, keys) => plain(value) &&
   Object.keys(value).sort().join(",") === [...keys].sort().join(",");
+export function validateFactoryDisarm(value, releaseSha) {
+  if (!/^[a-f0-9]{40}$/.test(releaseSha ?? "") || !exactKeys(value, [
+    "evidence_preserved", "kind", "recorded_at", "release_sha",
+    "schema_version", "state_preserved",
+  ]) || value.kind !== "brokkr-debian-maintenance-factory-disarm" ||
+      value.schema_version !== "v1" || value.release_sha !== releaseSha ||
+      value.evidence_preserved !== true || value.state_preserved !== true ||
+      !strictUtc(value.recorded_at)) {
+    fail("attempt_factory_disarm_invalid");
+  }
+  return true;
+}
 const id = (prefix, material) =>
   `${prefix}-${digest(material).slice("sha256:".length, "sha256:".length + 48)}`;
 const FACTORY_SCHEMA = JSON.parse(fs.readFileSync(fileURLToPath(new URL(
@@ -649,12 +661,17 @@ function proposalRequestForFence(proposal, fence) {
 
 export function buildFixedProductionRunOptions({
   proposal, stateRoot, authorityRoot, readFreshness, now,
-  hostApply = fixedHostApply,
+  hostApply = fixedHostApply, assertArmed = () => true,
 }) {
   if (!plain(proposal) || !path.isAbsolute(stateRoot) ||
       !path.isAbsolute(authorityRoot) ||
       typeof readFreshness !== "function" || typeof now !== "function" ||
-      typeof hostApply !== "function") fail("attempt_factory_runtime_invalid");
+      typeof hostApply !== "function" || typeof assertArmed !== "function") {
+    fail("attempt_factory_runtime_invalid");
+  }
+  const requireArmed = () => {
+    if (assertArmed() !== true) fail("attempt_factory_disarmed");
+  };
   const configTarget = proposal.request.execution_request.target;
   const fresh = () => validateFreshness(
     readFreshness(), now(), configTarget,
@@ -798,6 +815,7 @@ export function buildFixedProductionRunOptions({
     inventory: () => structuredClone(ensureFresh().inventory),
     activateFence: activation,
     applyFenced: invocation => {
+      requireArmed();
       const current = ensureFresh();
       if (digest(current.apt_source_evidence) !==
           proposal.request.apt_source_evidence_digest ||
@@ -823,6 +841,7 @@ export function buildFixedProductionRunOptions({
             canonicalJson(bound.registration)) {
         fail("attempt_factory_fixed_input_conflict");
       }
+      requireArmed();
       const effect = hostApply(adapterFile, proposal.binding.attempt_id);
       applied = true;
       const receipt = {
@@ -879,7 +898,17 @@ export function runDebianMaintenanceAttemptFactory({
   fault = () => {},
   authorityRoot = "/etc/brokkr/debian-maintenance-authority",
   hostApply = fixedHostApply,
+  readDisarm = () => false,
 }) {
+  if (typeof readDisarm !== "function") fail("attempt_factory_runtime_invalid");
+  const ensureArmed = () => {
+    const disarmed = readDisarm();
+    if (typeof disarmed !== "boolean") fail("attempt_factory_runtime_invalid");
+    return !disarmed;
+  };
+  if (!ensureArmed()) {
+    return { outcome: "no-attempt", reason: "attempt_factory_disarmed" };
+  }
   protectedStateRoot(stateRoot);
   if (typeof readConfiguration !== "function" ||
       typeof readFreshness !== "function" || typeof now !== "function" ||
@@ -901,6 +930,9 @@ export function runDebianMaintenanceAttemptFactory({
   if (fresh.kill_switch.identity !== config.actors.kill_switch) {
     return { outcome: "no-attempt", reason: "attempt_factory_identity_mismatch" };
   }
+  if (!ensureArmed()) {
+    return { outcome: "no-attempt", reason: "attempt_factory_disarmed" };
+  }
   const targetScopeDigest = digest({
     node_id: config.target.node_id, platform: config.target.platform,
   });
@@ -912,11 +944,17 @@ export function runDebianMaintenanceAttemptFactory({
     }),
     target_scope_digest: targetScopeDigest,
   };
+  if (!ensureArmed()) {
+    return { outcome: "no-attempt", reason: "attempt_factory_disarmed" };
+  }
   const occurrenceDir = path.join(stateRoot, "occurrences");
   fs.mkdirSync(occurrenceDir, { recursive: true, mode: 0o700 });
   const proposalFile = path.join(occurrenceDir,
     `${identities.occurrence_digest.slice("sha256:".length)}.json`);
   return withLock(`${proposalFile}.lock`, () => {
+    if (!ensureArmed()) {
+      return { outcome: "no-attempt", reason: "attempt_factory_disarmed" };
+    }
     let proposal;
     if (fs.existsSync(proposalFile)) {
       proposal = readJson(proposalFile);
@@ -953,15 +991,21 @@ export function runDebianMaintenanceAttemptFactory({
           (APPLY_VERIFY_BUDGET_SECONDS + config.watch_seconds) * 1000) {
       fail("attempt_factory_watch_unreachable");
     }
+    if (!ensureArmed()) {
+      return { outcome: "no-attempt", reason: "attempt_factory_disarmed" };
+    }
     fault("before-run-attempt");
     const options = buildRunOptions === null ?
       buildFixedProductionRunOptions({
         proposal: structuredClone(proposal), stateRoot, authorityRoot,
-        readFreshness, now, hostApply,
+        readFreshness, now, hostApply, assertArmed: ensureArmed,
       }) :
       buildRunOptions(
         structuredClone(proposal), structuredClone(beforeEffect),
       );
+    if (!ensureArmed()) {
+      return { outcome: "no-attempt", reason: "attempt_factory_disarmed" };
+    }
     const result = runAttempt(options);
     return {
       outcome: "attempt-dispatched",

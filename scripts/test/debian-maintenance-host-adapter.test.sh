@@ -20,6 +20,9 @@ import path from "node:path";
 const productionAdapter = await import(
   `${process.env.ROOT}/scripts/lib/fixed-debian-maintenance-host-operation.mjs`
 );
+const factoryDigest = (await import(
+  `${process.env.ROOT}/scripts/lib/debian-maintenance-attempt-factory.mjs`
+)).digest;
 const canonicalJson = value => value === null || typeof value !== "object" ? JSON.stringify(value) :
   Array.isArray(value) ? `[${value.map(canonicalJson).join(",")}]` :
     `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
@@ -156,6 +159,31 @@ assert.equal(result.outcome, "applied");
 assert.deepEqual(state.entries.map(entry => entry.phase), ["preflight", "inventory_before", "apply", "inventory_after", "verify"]);
 assert(calls.some(argv => argv[0] === "/usr/bin/apt-get" && argv.includes("--only-upgrade") && argv.includes("openssl=3.0.17-1~deb12u2")));
 assert(calls.every(argv => argv[0].startsWith("/")), "adapter invokes only absolute fixed binaries");
+
+// The factory's evidence digest is consumed by the real fixed host adapter;
+// string bytes must have identical semantics at both sides of that boundary,
+// while object canonicalization remains unchanged.
+assert.equal(factoryDigest({ evidence: "apt" }), digest({ evidence: "apt" }));
+assert.equal(factoryDigest(aptTrust), digest(aptTrust));
+const factoryEvidence = structuredClone(request.apt_source_evidence);
+factoryEvidence.trust_config_digest = factoryDigest(aptTrust);
+factoryEvidence.candidates[0].policy_output_digest = factoryDigest(aptPolicy);
+const factoryEvidenceRequest = {
+  ...structuredClone(request), apt_source_evidence: factoryEvidence,
+};
+factoryEvidenceRequest.apt_source_evidence_digest = factoryDigest(factoryEvidence);
+const factoryEvidenceRegistration = {
+  ...structuredClone(registration),
+  apt_source_evidence_digest: factoryEvidenceRequest.apt_source_evidence_digest,
+};
+applied = false;
+const factoryEvidenceResult = adapter.runHostAdapter({
+  action: "apply", request: factoryEvidenceRequest,
+  registration: factoryEvidenceRegistration,
+  env: isolatedEnvironment({ readJournal: () => null }).env,
+});
+assert.equal(factoryEvidenceResult.outcome, "applied",
+  "factory-produced apt evidence must pass the real host digest checks");
 
 // Production v2 has a mechanically composable digest graph: the recovery
 // descriptor is upstream of (and therefore cannot contain) binding_digest.

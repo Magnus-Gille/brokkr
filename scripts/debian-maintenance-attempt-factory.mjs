@@ -6,12 +6,16 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   runDebianMaintenanceAttemptFactory,
+  validateFactoryDisarm,
 } from "./lib/debian-maintenance-attempt-factory.mjs";
 
 const STATE_ROOT = "/var/lib/brokkr/debian-maintenance";
 const CONFIG_FILE = "/etc/brokkr/debian-maintenance-attempt-factory.json";
 const FRESHNESS_FILE =
   "/run/brokkr/debian-maintenance-window-freshness.json";
+const RELEASE_SHA = process.env.BROKKR_RELEASE_SHA;
+const DISARM_FILE = /^[a-f0-9]{40}$/.test(RELEASE_SHA ?? "") ?
+  `${STATE_ROOT}/disarmed/factory-${RELEASE_SHA}.json` : null;
 const CLI_FILE = fileURLToPath(import.meta.url);
 const OPERATION_FILE = fileURLToPath(new URL(
   "./lib/fixed-debian-maintenance-host-operation.mjs", import.meta.url,
@@ -33,6 +37,16 @@ const releaseDigest = () => `sha256:${crypto.createHash("sha256")
   .update(fs.readFileSync(OPERATION_FILE)).digest("hex")}`;
 const now = () => new Date(Math.floor(Date.now() / 1000) * 1000)
   .toISOString().replace(".000Z", "Z");
+const readFactoryDisarm = () => {
+  if (DISARM_FILE === null) throw Error("attempt_factory_release_identity_invalid");
+  let value;
+  try { value = read(DISARM_FILE); }
+  catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  return validateFactoryDisarm(value, RELEASE_SHA);
+};
 
 function cli() {
   if (process.argv.length !== 2) throw Error("attempt_factory_cli_arguments_invalid");
@@ -43,6 +57,7 @@ function cli() {
     readConfiguration: () => read(CONFIG_FILE),
     readFreshness: () => read(FRESHNESS_FILE),
     now,
+    readDisarm: readFactoryDisarm,
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

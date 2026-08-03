@@ -14,7 +14,7 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 const {
   canonicalJson, composeAttempt, digest, occurrenceIdentity,
-  runDebianMaintenanceAttemptFactory,
+  runDebianMaintenanceAttemptFactory, validateFactoryDisarm,
 } = await import(`${process.env.ROOT}/scripts/lib/debian-maintenance-attempt-factory.mjs`);
 const releaseDigest = digest("release");
 const policy = JSON.parse(fs.readFileSync(
@@ -149,6 +149,70 @@ assert.equal(first.mutation_id, retry.mutation_id);
 assert.equal(runs, 2, "timer retry resumes the same W2 proposal");
 assert.equal(fs.readdirSync(`${stateRoot}/occurrences`)
   .filter(name => name.endsWith(".json")).length, 1);
+
+// A scheduler retry after the installer writes the global disarm marker must
+// be a no-attempt result before it can create or resume an occurrence.
+const schedulerRoot = `${process.env.TMP}/scheduler-disarmed`;
+const schedulerGate = `${schedulerRoot}/disarmed/factory-current.json`;
+const schedulerRelease = "a".repeat(40);
+const schedulerGateValue = {
+  evidence_preserved: true,
+  kind: "brokkr-debian-maintenance-factory-disarm",
+  recorded_at: "2026-07-30T18:00:00Z",
+  release_sha: schedulerRelease,
+  schema_version: "v1",
+  state_preserved: true,
+};
+let schedulerRuns = 0;
+const schedulerBase = {
+  ...base,
+  stateRoot: schedulerRoot,
+  readDisarm: () => {
+    if (!fs.existsSync(schedulerGate)) return false;
+    return validateFactoryDisarm(
+      JSON.parse(fs.readFileSync(schedulerGate, "utf8")), schedulerRelease,
+    );
+  },
+  runAttempt: () => {
+    schedulerRuns += 1;
+    return { reason: "watching" };
+  },
+};
+const scheduled = runDebianMaintenanceAttemptFactory(schedulerBase);
+assert.equal(scheduled.outcome, "attempt-dispatched");
+fs.mkdirSync(`${schedulerRoot}/disarmed`, { recursive: true, mode: 0o700 });
+fs.writeFileSync(schedulerGate, `${JSON.stringify(schedulerGateValue)}\n`, {
+  mode: 0o600,
+});
+const afterGlobalDisarm = runDebianMaintenanceAttemptFactory(schedulerBase);
+assert.deepEqual(afterGlobalDisarm, {
+  outcome: "no-attempt", reason: "attempt_factory_disarmed",
+});
+assert.equal(schedulerRuns, 1,
+  "a disarmed scheduler retry must not resume or effect the attempt");
+assert.throws(
+  () => validateFactoryDisarm(schedulerGateValue, "b".repeat(40)),
+  /attempt_factory_disarm_invalid/,
+  "a gate for another release must not disarm this factory",
+);
+const freshDisarmedRoot = `${process.env.TMP}/fresh-scheduler-disarmed`;
+const freshDisarmedGate = `${freshDisarmedRoot}/disarmed/factory-${schedulerRelease}.json`;
+fs.mkdirSync(`${freshDisarmedRoot}/disarmed`, { recursive: true, mode: 0o700 });
+fs.writeFileSync(freshDisarmedGate, `${JSON.stringify(schedulerGateValue)}\n`, {
+  mode: 0o600,
+});
+const freshDisarmed = runDebianMaintenanceAttemptFactory({
+  ...schedulerBase,
+  stateRoot: freshDisarmedRoot,
+  readDisarm: () => validateFactoryDisarm(
+    JSON.parse(fs.readFileSync(freshDisarmedGate, "utf8")), schedulerRelease,
+  ),
+});
+assert.deepEqual(freshDisarmed, {
+  outcome: "no-attempt", reason: "attempt_factory_disarmed",
+});
+assert.equal(fs.existsSync(`${freshDisarmedRoot}/occurrences`), false,
+  "a pre-existing global gate prevents occurrence creation");
 
 let crash = true;
 assert.throws(() => runDebianMaintenanceAttemptFactory({
@@ -604,12 +668,13 @@ const fixedHostFor = stateRoot => {
     calls: () => calls,
   };
 };
-const runIntegration = ({ stateRoot, freshness, clock, host }) =>
+const runIntegration = ({ stateRoot, freshness, clock, host,
+  readDisarm = () => false }) =>
   runDebianMaintenanceAttemptFactory({
     stateRoot, authorityRoot, releaseDigest,
     readConfiguration: () => structuredClone(integrationConfig),
     readFreshness: () => structuredClone(freshness),
-    now: clock.now, hostApply: host.apply,
+    now: clock.now, hostApply: host.apply, readDisarm,
   });
 
 const successRoot = initializeIntegrationRoot("integration-success");
@@ -633,6 +698,36 @@ const committed = runIntegration({
 assert.equal(committed.result.reason, "committed");
 assert.equal(successHost.calls(), 1,
   "watch continuation never replays the fixed host effect");
+
+// A global disarm can arrive after the factory has built W2 options but before
+// the fixed host adapter's package effect. The production bridge must check
+// the gate at that final effect boundary, not only at scheduler dispatch.
+const effectDisarmRoot = initializeIntegrationRoot("integration-effect-disarm");
+const effectDisarmFresh = structuredClone(integrationFresh);
+const effectDisarmClock = advancingClock("2026-07-30T18:00:00Z");
+const effectDisarmHost = fixedHostFor(effectDisarmRoot);
+let effectDisarmReads = 0;
+globalThis.__BROKKR_TEST_FIXED_RECOVERY_HOST__ = {
+  persistActivation: activation => ({
+    activation_digest: digest(activation), idempotent: false,
+  }),
+  runFixedAdapter: ({ recovery_request: recoveryRequest }) => ({
+    idempotency_key: recoveryRequest.idempotency_key,
+    effect_lease_fence_digest: recoveryRequest.lease_fence_digest,
+    revalidated_lease_fence_digest:
+      recoveryRequest.revalidation_fence_digest,
+    revalidated_at: recoveryRequest.revalidation_fence.activated_at,
+    recovered: true, safe_state_verified: true,
+    quarantine_active: true, reason_code: null,
+  }),
+};
+runIntegration({
+  stateRoot: effectDisarmRoot, freshness: effectDisarmFresh,
+  clock: effectDisarmClock, host: effectDisarmHost,
+  readDisarm: () => ++effectDisarmReads > 6,
+});
+assert.equal(effectDisarmHost.calls(), 0,
+  "a gate observed at the fixed effect boundary must block hostApply");
 
 const recoveryActivations = new Map();
 globalThis.__BROKKR_TEST_FIXED_RECOVERY_HOST__ = {

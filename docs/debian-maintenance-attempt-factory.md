@@ -86,12 +86,49 @@ effect it persists the final lease-fenced request and registration and invokes
 only the release-local fixed host adapter. Configuration cannot supply code,
 callbacks, commands, paths, packages, or units.
 
-The factory service retains `ProtectSystem=strict`. Because the fixed apply
-adapter runs as its child and inherits that mount namespace, the only writable
-path exceptions are the maintenance state root plus `/var/lib/dpkg`,
-`/var/cache/apt`, and `/var/log/apt`. The installer rejects a factory template
-that weakens strict protection, omits those paths, adds another writable-path
-directive, or otherwise changes that exact exception line.
+The factory service intentionally uses `ProtectSystem=false`, matching the
+fixed apply and recovery units. It directly runs the real `apt-get` transaction
+through the fixed host adapter. Debian package payloads and maintainer scripts
+may write host paths such as `/usr`, `/etc`, `/boot`, and
+`/var/lib/apt/extended_states`; a strict systemd root would make valid upgrades
+fail with `EROFS`. The retained
+`ReadWritePaths=/var/lib/brokkr/debian-maintenance /var/lib/dpkg /var/cache/apt
+/var/log/apt` line is the exact state/dpkg/apt convention shared by the fixed
+units, but with `ProtectSystem=false` it is not an allowlist for all package
+writes. `ReadOnlyPaths=/etc/brokkr /run/brokkr` still protects the factory's
+configuration and freshness inputs.
+
+Factory evidence digests use the canonical JSON byte representation for every
+value, including strings; the fixed host adapter consumes those exact bytes,
+so string and object evidence have identical digest semantics across the
+factory-to-host boundary.
+
+This is an inherent host-filesystem write authority, not a sandbox that makes
+apt/dpkg harmless. The security boundary is the release-bound fixed adapter,
+the factory's zero-argument CLI, the exact persisted request/attempt/package
+set and root-owned inputs, plus the remaining systemd hardening controls:
+`NoNewPrivileges`, `PrivateTmp`, `ProtectHome`, the kernel/control-group/log
+protections, `PrivateDevices`, `RestrictSUIDSGID`, and the exact read-only input
+paths. The installer requires exactly one of each fixed service-hardening,
+identity, environment, and execution directive, including `NoNewPrivileges`,
+`PrivateTmp`, `ProtectHome`, the kernel/control-group/log protections,
+`PrivateDevices`, and `RestrictSUIDSGID`. It also requires exactly one
+`ProtectSystem=false`, the exact read-only and read-write path lines, the
+release-bound zero-argument `ExecStart`, and rejects extra path-authority
+directives or duplicate assignments.
+
+The installer also writes the legacy per-canary marker and the exact
+revision-bound global gate
+`/var/lib/brokkr/debian-maintenance/disarmed/factory-<release-sha>.json` before
+any systemd action. The factory validates that gate against its
+`BROKKR_RELEASE_SHA` and returns `no-attempt` before creating, resuming, or
+effecting an occurrence; the fixed production bridge checks it again at the
+effect boundary immediately before invoking the host adapter. Disable then
+disables/stops the shared timer and
+factory service, followed by the canary apply unit and its recovery instance;
+all actions are attempted even when one fails, and the gate/evidence remain
+available for recovery and audit. A later revision uses a different gate path,
+so an old disable cannot accidentally disarm the new release.
 
 Every attempt uses the one constrained release-bound
 `brokkr-debian-maintenance-recovery@.service` template. W2's authenticated
