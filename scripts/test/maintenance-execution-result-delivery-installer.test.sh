@@ -278,6 +278,30 @@ test -f \
   "$SAFE_CHAIN_UNIT_ROOT/brokkr-maintenance-execution-result-delivery.service"
 printf 'ok - installer accepts a safe unrelated dependency alias chain\n'
 
+CROSS_ROOT="$TMP/cross-root"
+CROSS_WANTS="$CROSS_ROOT/etc/systemd/system/multi-user.target.wants"
+CROSS_EXTERNAL_REAL="$TMP/cross-root-external-real"
+CROSS_EXTERNAL_PARENT="$TMP/cross-root-external-parent"
+mkdir -p "$CROSS_WANTS" "$CROSS_EXTERNAL_REAL"
+ln -s "$CROSS_EXTERNAL_REAL" "$CROSS_EXTERNAL_PARENT"
+ln -s \
+  "$CROSS_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service" \
+  "$CROSS_EXTERNAL_REAL/intermediate.service"
+ln -s "$CROSS_EXTERNAL_PARENT/intermediate.service" \
+  "$CROSS_WANTS/delivery-adapter-cross-root-alias.service"
+if env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$CROSS_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/cross-root-alias.out" 2>&1; then
+  echo "cross-root adapter dependency alias unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$CROSS_ROOT/usr"
+printf 'ok - installer resolves cross-root dependency aliases to a missing adapter unit\n'
+
 UNRELATED_ROOT="$TMP/unrelated-dependency-root"
 UNRELATED_WANTS="$UNRELATED_ROOT/etc/systemd/system/multi-user.target.wants"
 mkdir -p "$UNRELATED_WANTS"
