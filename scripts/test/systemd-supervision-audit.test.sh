@@ -27,8 +27,8 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1" >&2; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 run_audit() {
-  local output="$1" declarations="$2" observations="$3" registry="${4:-$REGISTRY}" baseline="${5:-$BASELINE}"
-  node "$AUDIT" --baseline "$baseline" --registry "$registry" --declarations "$declarations" --observations "$observations" --now "$NOW" >"$output" 2>"$output.stderr"
+  local output="$1" declarations="$2" observations="$3" registry="${4:-$REGISTRY}" baseline="${5:-$BASELINE}" now="${6:-$NOW}"
+  node "$AUDIT" --baseline "$baseline" --registry "$registry" --declarations "$declarations" --observations "$observations" --now "$now" >"$output" 2>"$output.stderr"
   RC=$?
 }
 
@@ -39,17 +39,31 @@ import fs from "node:fs";
 const [basePath, descriptorPath, outputPath, caseId] = process.argv.slice(2);
 const base = JSON.parse(fs.readFileSync(basePath, "utf8"));
 const descriptor = JSON.parse(fs.readFileSync(descriptorPath, "utf8"));
+if (descriptor.base !== basePath.split("/").at(-1)) throw new Error(`fixture base mismatch for ${caseId}`);
 const candidate = descriptor.cases.find(row => row.id === caseId);
 if (!candidate) throw new Error(`unknown fixture case ${caseId}`);
+if (!candidate.mutations || Object.keys(candidate.mutations).length === 0) throw new Error(`fixture case ${caseId} has no mutations`);
+const before = JSON.stringify(base);
 for (const [mutationPath, value] of Object.entries(candidate.mutations)) {
   const parts = mutationPath.split(".");
   let target = base;
-  for (const part of parts.slice(0, -1)) target = target[part];
-  if (value && typeof value === "object" && !Array.isArray(value) && value.$delete === true) delete target[parts.at(-1)];
+  for (const part of parts.slice(0, -1)) {
+    if (target === null || typeof target !== "object" || !Object.hasOwn(target, part)) throw new Error(`fixture path is missing for ${caseId}`);
+    target = target[part];
+  }
+  const leaf = parts.at(-1);
+  if (target === null || typeof target !== "object") throw new Error(`fixture target is invalid for ${caseId}`);
+  if (value && typeof value === "object" && !Array.isArray(value) && value.$delete === true) {
+    if (!Object.hasOwn(target, leaf)) throw new Error(`fixture delete path is missing for ${caseId}`);
+    delete target[leaf];
+  }
   else target[parts.at(-1)] = value;
 }
+if (JSON.stringify(base) === before) throw new Error(`fixture case ${caseId} did not change its base`);
 fs.writeFileSync(outputPath, `${JSON.stringify(base, null, 2)}\n`);
 NODE
+  local status=$?
+  [[ "$status" -eq 0 && -s "$output" ]] || return 1
 }
 
 make_registry_case() {
@@ -66,28 +80,50 @@ fs.writeFileSync(outputPath, `${JSON.stringify(candidate, null, 2)}\n`);
 NODE
 }
 
+assert_finding() {
+  local audit_file="$1" expected_unit="$2" code="$3" severity="$4" route="$5"
+  node --input-type=module - "$audit_file" "$expected_unit" "$code" "$severity" "$route" <<'NODE'
+import fs from "node:fs";
+const [auditPath, expectedUnit, code, severity, route] = process.argv.slice(2);
+const audit = JSON.parse(fs.readFileSync(auditPath, "utf8"));
+if (expectedUnit === "@global") {
+  if (!audit.findings.some(finding => finding.code === code && finding.severity === severity && finding.route === route && !Object.hasOwn(finding, "unit"))) process.exit(1);
+} else {
+  const unit = audit.units.find(candidate => candidate.unit === expectedUnit);
+  if (!unit) process.exit(1);
+  if (!audit.findings.some(finding => finding.code === code && finding.severity === severity && finding.route === route && finding.unit === unit.unit && finding.target_node_id === unit.target_node_id && finding.scope === unit.scope && finding.owner === unit.owner)) process.exit(1);
+}
+NODE
+}
+
 expect_observation_finding() {
-  local case_id="$1" code="$2"
-  make_case observations-positive.json observations-negative.json "$TMP/$case_id-observations.json" "$case_id"
-  run_audit "$TMP/$case_id.json" "$DECLARATIONS" "$TMP/$case_id-observations.json"
-  if [[ "$RC" -eq 1 && -s "$TMP/$case_id.json" ]] && grep -q "\"code\": \"$code\"" "$TMP/$case_id.json"; then ok "$case_id emits $code (exit 1)"; else bad "$case_id emits $code (exit 1)"; fi
+  local case_id="$1" expected_unit="$2" code="$3" severity="${4:-error}" route="${5:-substrate}" now="${6:-$NOW}"
+  if ! make_case observations-positive.json observations-negative.json "$TMP/$case_id-observations.json" "$case_id"; then bad "$case_id fixture mutation succeeds"; return; fi
+  run_audit "$TMP/$case_id.json" "$DECLARATIONS" "$TMP/$case_id-observations.json" "$REGISTRY" "$BASELINE" "$now"
+  if [[ "$RC" -eq 1 && -s "$TMP/$case_id.json" ]] && assert_finding "$TMP/$case_id.json" "$expected_unit" "$code" "$severity" "$route"; then ok "$case_id emits $expected_unit/$code/$severity/$route (exit 1)"; else bad "$case_id emits $expected_unit/$code/$severity/$route (exit 1)"; fi
 }
 
 expect_declaration_finding() {
-  local case_id="$1" code="$2" observations="${3:-$OBSERVATIONS}"
-  make_case declarations-positive.json declarations-negative.json "$TMP/$case_id-declarations.json" "$case_id"
+  local case_id="$1" expected_unit="$2" code="$3" severity="${4:-error}" route="${5:-substrate}" observations="${6:-$OBSERVATIONS}"
+  if ! make_case declarations-positive.json declarations-negative.json "$TMP/$case_id-declarations.json" "$case_id"; then bad "$case_id fixture mutation succeeds"; return; fi
   run_audit "$TMP/$case_id.json" "$TMP/$case_id-declarations.json" "$observations"
-  if [[ "$RC" -eq 1 && -s "$TMP/$case_id.json" ]] && grep -q "\"code\": \"$code\"" "$TMP/$case_id.json"; then ok "$case_id emits $code (exit 1)"; else bad "$case_id emits $code (exit 1)"; fi
+  if [[ "$RC" -eq 1 && -s "$TMP/$case_id.json" ]] && assert_finding "$TMP/$case_id.json" "$expected_unit" "$code" "$severity" "$route"; then ok "$case_id emits $expected_unit/$code/$severity/$route (exit 1)"; else bad "$case_id emits $expected_unit/$code/$severity/$route (exit 1)"; fi
 }
 
 expect_malformed_declaration() {
   local case_id="$1" marker="${2:-}"
-  make_case declarations-positive.json declarations-negative.json "$TMP/$case_id-declarations.json" "$case_id"
+  if ! make_case declarations-positive.json declarations-negative.json "$TMP/$case_id-declarations.json" "$case_id"; then bad "$case_id fixture mutation succeeds before malformed assertion"; return; fi
   run_audit "$TMP/$case_id.json" "$TMP/$case_id-declarations.json" "$OBSERVATIONS"
   if [[ "$RC" -eq 2 && ! -s "$TMP/$case_id.json" ]] && { [[ -z "$marker" ]] || ! grep -q "$marker" "$TMP/$case_id.json.stderr"; }; then ok "$case_id is malformed, content-blind, and emits no record (exit 2)"; else bad "$case_id is malformed, content-blind, and emits no record (exit 2)"; fi
 }
 
 echo "systemd-supervision-audit.test.sh"
+
+if make_case declarations-positive.json declarations-negative.json "$TMP/unexpected-case-output.json" case-does-not-exist >/dev/null 2>&1 || [[ -e "$TMP/unexpected-case-output.json" ]]; then
+  bad "fixture mutation helper rejects unknown cases without output"
+else
+  ok "fixture mutation helper rejects unknown cases without output"
+fi
 
 run_audit "$TMP/positive.json" "$DECLARATIONS" "$OBSERVATIONS"
 check "positive system/user services and calendar/monotonic timers pass" '[[ "$RC" -eq 0 ]]'
@@ -150,6 +186,13 @@ check "representative bare Grimnir names normalize to canonical effective names"
 check "explicit and implicit timer targets resolve after normalization" 'node -e '\''const x=require(process.argv[1]); if(x.summary.unit_count!==5||x.units.some(u=>u.status!=="pass")||x.units.some(u=>!u.unit.endsWith(".service")&&!u.unit.endsWith(".timer")))process.exit(1)'\'' "$TMP/bare-registry.json"'
 check "calendar and monotonic timer evidence remain distinct" 'node -e '\''const x=require(process.argv[1]); const c=x.units.find(u=>u.unit==="heimdall-collect.timer"),m=x.units.find(u=>u.unit==="heimdall-maintain.timer"); if(c.timer_class!=="calendar"||c.evidence.timer.persistent!==true||m.timer_class!=="monotonic"||m.evidence.timer.persistent!==null||m.evidence.timer.missed_runs!==null)process.exit(1)'\'' "$TMP/bare-registry.json"'
 
+if make_case declarations-bare-registry.json declarations-bare-cases.json "$TMP/bare-unit-shared-name-declarations.json" bare-unit-shared-service-timer-name; then
+  run_audit "$TMP/bare-unit-shared-name.json" "$TMP/bare-unit-shared-name-declarations.json" "$BARE_OBSERVATIONS" "$BARE_REGISTRY"
+  check "bare timer Unit=name resolves name.service even when name.timer exists" '[[ "$RC" -eq 0 ]] && node -e '\''const x=require(process.argv[1]); const u=x.units.find(v=>v.unit==="nightly.timer"); if(!u||u.status!=="pass"||u.findings.some(f=>f.code.startsWith("timer_target")))process.exit(1)'\'' "$TMP/bare-unit-shared-name.json"'
+else
+  bad "bare shared-name fixture mutation succeeds"
+fi
+
 run_audit "$TMP/repeated-name.json" "$REPEATED_DECLARATIONS" "$REPEATED_OBSERVATIONS" "$REPEATED_REGISTRY"
 check "same effective name across nodes and manager scopes is unambiguous" '[[ "$RC" -eq 0 ]] && node -e '\''const x=require(process.argv[1]); const s=x.units.filter(u=>u.unit==="shared.service"); if(s.length!==3||new Set(s.map(u=>`${u.target_node_id}:${u.scope}`)).size!==3)process.exit(1)'\'' "$TMP/repeated-name.json"'
 
@@ -159,32 +202,53 @@ for CASE_ID in duplicate-effective wrong-suffix duplicate-component; do
   check "$CASE_ID registry identity is hard-rejected without a record" '[[ "$RC" -eq 2 && ! -s "$TMP/'"$CASE_ID"'.json" ]]'
 done
 
-expect_observation_finding restart-storm restart_storm
-expect_observation_finding oom oom_kill_observed
-expect_observation_finding missed-timer timer_persistence_observation_mismatch
-expect_observation_finding missed-timer-warning timer_missed_runs
+expect_observation_finding restart-storm grimnir-api.service restart_storm
+if make_case observations-positive.json observations-negative.json "$TMP/restart-pre-lockout-below-observations.json" restart-pre-lockout-below; then
+  run_audit "$TMP/restart-pre-lockout-below.json" "$DECLARATIONS" "$TMP/restart-pre-lockout-below-observations.json"
+  check "burst minus one remains below the conservative pre-lockout threshold" '[[ "$RC" -eq 0 ]] && ! grep -q '"'"'restart_storm'"'"' "$TMP/restart-pre-lockout-below.json"'
+else
+  bad "restart-pre-lockout-below fixture mutation succeeds"
+fi
+expect_observation_finding oom grimnir-api.service oom_kill_observed
+expect_observation_finding missed-timer grimnir-worker.timer timer_persistence_observation_mismatch
+expect_observation_finding missed-timer-warning grimnir-worker.timer timer_missed_runs warning
 check "warning findings are nonzero and explicitly typed" 'node -e '\''const x=require(process.argv[1]); const f=x.findings.find(v=>v.code==="timer_missed_runs"); if(!f||f.severity!=="warning"||x.summary.status!=="fail")process.exit(1)'\'' "$TMP/missed-timer-warning.json"'
-expect_observation_finding absent-notifier failure_delivery_unavailable
-expect_observation_finding stale-audit evidence_stale
-expect_observation_finding future-audit evidence_future
+expect_observation_finding absent-notifier @global failure_delivery_unavailable
+check "null notifier evidence projects unknown" 'node -e '\''const x=require(process.argv[1]); if(x.notifier.status!=="unknown")process.exit(1)'\'' "$TMP/absent-notifier.json"'
+expect_observation_finding stale-audit grimnir-api.service evidence_stale
+expect_observation_finding future-audit grimnir-api.service evidence_future
 check "stale evidence fails every unit and compliant count" 'node -e '\''const x=require(process.argv[1]); if(x.summary.compliant_unit_count!==0||x.units.some(u=>u.status==="pass"))process.exit(1)'\'' "$TMP/stale-audit.json"'
 check "future evidence fails every unit and compliant count" 'node -e '\''const x=require(process.argv[1]); if(x.summary.compliant_unit_count!==0||x.units.some(u=>u.status==="pass"))process.exit(1)'\'' "$TMP/future-audit.json"'
-expect_observation_finding restart-window-mismatch restart_window_ancient
-expect_observation_finding restart-window-end-mismatch restart_window_ancient
-expect_observation_finding restart-window-contradictory restart_window_contradictory
-expect_observation_finding timer-last-run-future timer_last_run_future
-expect_observation_finding timer-last-run-ancient timer_last_run_ancient
-expect_observation_finding timer-timestamps-contradictory timer_timestamp_contradictory
-expect_observation_finding timer-next-run-absurd-future timer_next_run_future
-expect_observation_finding timer-next-run-ancient timer_next_run_ancient
-expect_observation_finding timer-overdue timer_overdue
-expect_observation_finding timer-restart-contradiction restart_evidence_contradiction
-expect_observation_finding watchdog-configured-not-requested watchdog_result_not_requested
-expect_observation_finding watchdog-configured-unknown watchdog_result_unknown
-expect_observation_finding watchdog-configured-timeout watchdog_timeout
-expect_observation_finding watchdog-without-request watchdog_observation_contradiction
-expect_observation_finding watchdog-without-request-unknown watchdog_observation_contradiction
-expect_observation_finding watchdog-without-request-timeout watchdog_observation_contradiction
+if make_case observations-positive.json observations-negative.json "$TMP/future-skew-inside-observations.json" future-skew-inside; then
+  run_audit "$TMP/future-skew-inside.json" "$DECLARATIONS" "$TMP/future-skew-inside-observations.json"
+  check "future skew just inside five seconds is fresh" '[[ "$RC" -eq 0 ]] && node -e '\''const x=require(process.argv[1]); if(x.freshness.status!=="fresh"||x.findings.some(f=>f.code==="audit_time_in_future"||f.code==="evidence_future"))process.exit(1)'\'' "$TMP/future-skew-inside.json"'
+else
+  bad "future-skew-inside fixture mutation succeeds"
+fi
+expect_observation_finding future-skew-outside grimnir-api.service evidence_future error substrate
+check "future skew just outside five seconds is future" 'node -e '\''const x=require(process.argv[1]); if(x.freshness.status!=="future")process.exit(1)'\'' "$TMP/future-skew-outside.json"'
+expect_observation_finding restart-window-mismatch grimnir-api.service restart_window_ancient
+expect_observation_finding restart-window-end-mismatch grimnir-api.service restart_window_ancient
+expect_observation_finding restart-window-contradictory grimnir-api.service restart_window_contradictory
+expect_observation_finding timer-last-run-future grimnir-worker.timer timer_last_run_future
+expect_observation_finding timer-last-run-ancient grimnir-worker.timer timer_last_run_ancient
+expect_observation_finding timer-timestamps-contradictory grimnir-worker.timer timer_timestamp_contradictory
+expect_observation_finding timer-next-run-absurd-future grimnir-worker.timer timer_next_run_future
+expect_observation_finding timer-next-run-ancient grimnir-worker.timer timer_next_run_ancient
+expect_observation_finding timer-overdue grimnir-worker.timer timer_overdue
+if make_case observations-positive.json observations-negative.json "$TMP/timer-fresh-lag-observations.json" timer-fresh-lag; then
+  run_audit "$TMP/timer-fresh-lag.json" "$DECLARATIONS" "$TMP/timer-fresh-lag-observations.json" "$REGISTRY" "$BASELINE" "2026-08-02T12:05:00Z"
+  check "fresh lag cannot turn a future-at-snapshot timer into overdue" '[[ "$RC" -eq 0 ]] && ! grep -q '"'"'timer_overdue'"'"' "$TMP/timer-fresh-lag.json"'
+else
+  bad "timer-fresh-lag fixture mutation succeeds"
+fi
+expect_observation_finding timer-restart-contradiction grimnir-worker.timer restart_evidence_contradiction
+expect_observation_finding watchdog-configured-not-requested grimnir-api.service watchdog_result_not_requested
+expect_observation_finding watchdog-configured-unknown grimnir-api.service watchdog_result_unknown
+expect_observation_finding watchdog-configured-timeout grimnir-api.service watchdog_timeout
+expect_observation_finding watchdog-without-request workshop.service watchdog_observation_contradiction
+expect_observation_finding watchdog-without-request-unknown workshop.service watchdog_observation_contradiction
+expect_observation_finding watchdog-without-request-timeout workshop.service watchdog_observation_contradiction
 
 node --input-type=module - "$BARE_OBSERVATIONS" "$TMP/monotonic-contradiction-observations.json" <<'NODE'
 import fs from "node:fs";
@@ -197,13 +261,19 @@ NODE
 run_audit "$TMP/monotonic-contradiction.json" "$BARE_DECLARATIONS" "$TMP/monotonic-contradiction-observations.json" "$BARE_REGISTRY"
 check "monotonic timers reject calendar catch-up evidence" '[[ "$RC" -eq 1 ]] && grep -q '"'"'timer_missed_runs_evidence_contradiction'"'"' "$TMP/monotonic-contradiction.json" && grep -q '"'"'timer_persistence_evidence_contradiction'"'"' "$TMP/monotonic-contradiction.json"'
 
-expect_declaration_finding unsafe-long-running restart_policy_unsafe
-expect_declaration_finding oom-continue oom_policy_unsafe
-expect_declaration_finding contradictory-oneshot restart_delay_forbidden
-expect_declaration_finding system-wrong-target failure_delivery_missing
-expect_declaration_finding user-system-delivery scope_delivery_contradiction
-expect_declaration_finding user-failure-delivery-missing failure_delivery_missing
-expect_declaration_finding user-failure-delivery-unregistered failure_delivery_target_missing
+expect_declaration_finding unsafe-long-running grimnir-api.service restart_policy_unsafe
+expect_declaration_finding watchdog-unsafe grimnir-api.service watchdog_unsafe
+expect_declaration_finding watchdog-requires-notify grimnir-api.service watchdog_requires_notify error component-owner
+expect_declaration_finding watchdog-heartbeat-unverified grimnir-api.service watchdog_heartbeat_unverified error component-owner
+expect_declaration_finding readiness-missing grimnir-api.service readiness_missing error component-owner
+expect_declaration_finding heartbeat-missing grimnir-api.service heartbeat_missing error component-owner
+expect_declaration_finding heartbeat-shape-contradiction grimnir-worker.service heartbeat_shape_contradiction error component-owner
+expect_declaration_finding oom-continue grimnir-api.service oom_policy_unsafe
+expect_declaration_finding contradictory-oneshot grimnir-worker.service restart_delay_forbidden
+expect_declaration_finding system-wrong-target grimnir-api.service failure_delivery_missing
+expect_declaration_finding user-system-delivery workshop.service scope_delivery_contradiction error component-owner
+expect_declaration_finding user-failure-delivery-missing workshop.service failure_delivery_missing error component-owner
+expect_declaration_finding user-failure-delivery-unregistered workshop.service failure_delivery_target_missing error component-owner
 
 node --input-type=module - "$REGISTRY" "$DECLARATIONS" "$TMP/failure-owner-registry.json" "$TMP/failure-owner-declarations.json" <<'NODE'
 import fs from "node:fs";
@@ -216,7 +286,7 @@ fs.writeFileSync(registryOutput, `${JSON.stringify(registry, null, 2)}\n`);
 fs.writeFileSync(declarationsOutput, `${JSON.stringify(declarations, null, 2)}\n`);
 NODE
 run_audit "$TMP/failure-owner.json" "$TMP/failure-owner-declarations.json" "$OBSERVATIONS" "$TMP/failure-owner-registry.json"
-check "user failure target must retain the owning component" '[[ "$RC" -eq 1 ]] && grep -q '"'"'failure_delivery_target_mismatch'"'"' "$TMP/failure-owner.json"'
+check "user failure target must retain the owning component" '[[ "$RC" -eq 1 ]] && assert_finding "$TMP/failure-owner.json" workshop.service failure_delivery_target_mismatch error component-owner'
 
 node --input-type=module - "$REGISTRY" "$DECLARATIONS" "$TMP/failure-scope-registry.json" "$TMP/failure-scope-declarations.json" <<'NODE'
 import fs from "node:fs";
@@ -229,7 +299,7 @@ fs.writeFileSync(registryOutput, `${JSON.stringify(registry, null, 2)}\n`);
 fs.writeFileSync(declarationsOutput, `${JSON.stringify(declarations, null, 2)}\n`);
 NODE
 run_audit "$TMP/failure-scope.json" "$TMP/failure-scope-declarations.json" "$OBSERVATIONS" "$TMP/failure-scope-registry.json"
-check "user failure target must retain the manager scope" '[[ "$RC" -eq 1 ]] && grep -q '"'"'failure_delivery_target_mismatch'"'"' "$TMP/failure-scope.json"'
+check "user failure target must retain the manager scope" '[[ "$RC" -eq 1 ]] && assert_finding "$TMP/failure-scope.json" workshop.service failure_delivery_target_mismatch error component-owner'
 
 node --input-type=module - "$DECLARATIONS" "$TMP/failure-undeclared-declarations.json" <<'NODE'
 import fs from "node:fs";
@@ -239,31 +309,46 @@ declarations.units = declarations.units.filter(unit => unit.name !== "workshop-f
 fs.writeFileSync(output, `${JSON.stringify(declarations, null, 2)}\n`);
 NODE
 run_audit "$TMP/failure-undeclared.json" "$TMP/failure-undeclared-declarations.json" "$OBSERVATIONS"
-check "registered target without a terminal declaration cannot gain trust" '[[ "$RC" -eq 1 ]] && grep -q '"'"'failure_delivery_target_undeclared'"'"' "$TMP/failure-undeclared.json"'
+check "registered target without a terminal declaration cannot gain trust" '[[ "$RC" -eq 1 ]] && assert_finding "$TMP/failure-undeclared.json" workshop.service failure_delivery_target_undeclared error component-owner'
 
-expect_declaration_finding system-failure-delivery-repeated failure_delivery_duplicate
-expect_declaration_finding duplicate-user-failure-target failure_delivery_duplicate
-expect_declaration_finding user-failure-self-target failure_delivery_self_target
-check "self-target also exposes the finite-graph cycle" 'grep -q '"'"'failure_delivery_cycle'"'"' "$TMP/user-failure-self-target.json"'
-expect_declaration_finding user-failure-nonterminal-target failure_delivery_target_nonterminal
-expect_declaration_finding user-failure-cycle failure_delivery_cycle
-expect_declaration_finding terminal-failure-delivery terminal_failure_handler_delivery_forbidden
-expect_declaration_finding terminal-failure-wrong-type terminal_failure_handler_type_unsafe
-check "normal user service also fails when its terminal target is invalid" 'grep -q '"'"'failure_delivery_target_terminal_invalid'"'"' "$TMP/terminal-failure-wrong-type.json"'
-expect_declaration_finding terminal-role-system-scope failure_handler_role_scope_contradiction
-expect_declaration_finding terminal-role-timer failure_handler_role_timer_contradiction
-expect_declaration_finding timer-calendar-false timer_schedule_value_unsafe
-expect_declaration_finding timer-calendar-blank timer_schedule_value_unsafe
-expect_declaration_finding timer-monotonic-false timer_schedule_value_unsafe
-expect_declaration_finding timer-service-directive timer_service_directive_forbidden
-expect_declaration_finding timer-calendar-monotonic-mixed timer_schedule_mixed
-expect_declaration_finding timer-wrong-owner timer_target_mismatch
-expect_declaration_finding timer-target-terminal timer_target_terminal_handler
-expect_declaration_finding user-timer-wrong-scope timer_target_mismatch
-expect_declaration_finding timer-persistence timer_not_persistent
+node --input-type=module - "$DECLARATIONS" "$TMP/missing-service-declaration.json" <<'NODE'
+import fs from "node:fs";
+const [source, output] = process.argv.slice(2);
+const declarations = JSON.parse(fs.readFileSync(source, "utf8"));
+declarations.units = declarations.units.filter(unit => unit.name !== "grimnir-api.service");
+fs.writeFileSync(output, `${JSON.stringify(declarations, null, 2)}\n`);
+NODE
+# shellcheck disable=SC2034 # consumed by the fixed check expression below.
+MISSING_DECLARATION_FIXTURE_RC=$?
+run_audit "$TMP/missing-service-declaration-audit.json" "$TMP/missing-service-declaration.json" "$OBSERVATIONS"
+check "missing service declaration keeps workload shape unknown without invented health failures" '[[ "$MISSING_DECLARATION_FIXTURE_RC" -eq 0 && "$RC" -eq 1 ]] && node -e '\''const x=require(process.argv[1]); const u=x.units.find(v=>v.unit==="grimnir-api.service"); if(!u||u.workload_shape!=="unknown"||u.findings.length!==1||u.findings[0].code!=="declaration_missing")process.exit(1)'\'' "$TMP/missing-service-declaration-audit.json"'
 
-make_case observations-positive.json observations-negative.json "$TMP/restart-storm-for-invalid-burst.json" restart-storm
-expect_declaration_finding invalid-burst start_limit_burst_unsafe "$TMP/restart-storm-for-invalid-burst.json"
+expect_declaration_finding system-failure-delivery-repeated grimnir-api.service failure_delivery_duplicate
+expect_declaration_finding duplicate-user-failure-target workshop.service failure_delivery_duplicate error component-owner
+expect_declaration_finding user-failure-self-target workshop.service failure_delivery_self_target error component-owner
+check "self-target also exposes the finite-graph cycle" 'assert_finding "$TMP/user-failure-self-target.json" workshop.service failure_delivery_cycle error component-owner'
+expect_declaration_finding user-failure-nonterminal-target workshop.service failure_delivery_target_nonterminal error component-owner
+expect_declaration_finding user-failure-cycle workshop.service failure_delivery_cycle error component-owner
+expect_declaration_finding terminal-failure-delivery workshop-failure.service terminal_failure_handler_delivery_forbidden error component-owner
+expect_declaration_finding terminal-failure-wrong-type workshop-failure.service terminal_failure_handler_type_unsafe error component-owner
+check "normal user service also fails when its terminal target is invalid" 'assert_finding "$TMP/terminal-failure-wrong-type.json" workshop.service failure_delivery_target_terminal_invalid error component-owner'
+expect_declaration_finding orphan-terminal workshop-failure.service terminal_handler_unreferenced error component-owner
+expect_declaration_finding all-services-terminal workshop.service terminal_handler_unreferenced error component-owner
+check "all-terminal fixture rejects the second orphan terminal too" 'assert_finding "$TMP/all-services-terminal.json" workshop-failure.service terminal_handler_unreferenced error component-owner'
+expect_declaration_finding terminal-role-system-scope grimnir-api.service failure_handler_role_scope_contradiction
+expect_declaration_finding terminal-role-timer grimnir-worker.timer failure_handler_role_timer_contradiction
+expect_declaration_finding timer-calendar-false grimnir-worker.timer timer_schedule_value_unsafe
+expect_declaration_finding timer-calendar-blank grimnir-worker.timer timer_schedule_value_unsafe
+expect_declaration_finding timer-monotonic-false workshop.timer timer_schedule_value_unsafe
+expect_declaration_finding timer-service-directive grimnir-worker.timer timer_service_directive_forbidden
+expect_declaration_finding timer-calendar-monotonic-mixed grimnir-worker.timer timer_schedule_mixed
+expect_declaration_finding timer-wrong-owner grimnir-worker.timer timer_target_mismatch
+expect_declaration_finding timer-target-terminal workshop.timer timer_target_terminal_handler
+expect_declaration_finding user-timer-wrong-scope workshop.timer timer_target_mismatch
+expect_declaration_finding timer-persistence grimnir-worker.timer timer_not_persistent
+
+if ! make_case observations-positive.json observations-negative.json "$TMP/restart-storm-for-invalid-burst.json" restart-storm; then bad "restart-storm fixture mutation succeeds"; fi
+expect_declaration_finding invalid-burst grimnir-api.service start_limit_burst_unsafe error substrate "$TMP/restart-storm-for-invalid-burst.json"
 check "invalid burst never coerces to zero or emits a false restart storm" '! grep -q '"'"'restart_storm'"'"' "$TMP/invalid-burst.json"'
 
 expect_malformed_declaration fractional-duration
@@ -306,7 +391,7 @@ check "byte bound rejects oversized declaration input with no record" '[[ "$RC" 
 node "$AUDIT" --baseline "$BASELINE" --registry "$REGISTRY" --declarations "$DECLARATIONS" --observations "$OBSERVATIONS" >"$TMP/clock.json" 2>"$TMP/clock.json.stderr"
 # shellcheck disable=SC2034 # consumed by the fixed check expression below.
 CLOCK_RC=$?
-check "production invocation defaults to the real clock and stamps its source" '[[ "$CLOCK_RC" -eq 1 && -s "$TMP/clock.json" ]] && node -e '\''const x=require(process.argv[1]); if(x.evaluated_at_source!=="clock"||x.evaluated_at==="2026-08-02T12:00:00Z")process.exit(1)'\'' "$TMP/clock.json"'
+check "production clock source is valid independently of fixture age" '[[ "$CLOCK_RC" -eq 0 || "$CLOCK_RC" -eq 1 ]] && [[ -s "$TMP/clock.json" ]] && node -e '\''const x=require(process.argv[1]); const d=new Date(x.evaluated_at); if(x.evaluated_at_source!=="clock"||Number.isNaN(d.getTime())||d.toISOString().replace(".000Z","Z")!==x.evaluated_at)process.exit(1)'\'' "$TMP/clock.json"'
 
 check "audit source has one unit status key and no external-command surface" 'SOURCE="$AUDIT" node --input-type=module <<'"'"'NODE'"'"'
 import fs from "node:fs";
@@ -315,7 +400,17 @@ const start=source.indexOf("const output = {");
 const end=source.indexOf("unitOutputs.push(output)",start);
 const body=source.slice(start,end);
 if((body.match(/\n\s+status:/g)??[]).length!==1)process.exit(1);
-if(/node:(?:child_process|http|https|net)|\b(?:fetch|spawn|execFile|writeFileSync)\b/.test(source))process.exit(1);
+const forbiddenModule=/"(?:node:)?(?:child_process|http|https|http2|net|tls|dgram|dns|undici|worker_threads)"/;
+const forbiddenBareChildApi=/(?<![.\w])(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork)\s*\(/;
+const forbiddenExternalApi=/\b(?:fetch|XMLHttpRequest|WebSocket|writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|truncate|truncateSync|rm|rmSync|unlink|unlinkSync|rename|renameSync|copyFile|copyFileSync|mkdir|mkdirSync)\s*\(/;
+if(forbiddenModule.test(source)||forbiddenBareChildApi.test(source)||forbiddenExternalApi.test(source))process.exit(1);
+NODE'
+
+check "shared schema helper enforces maxLength" 'ROOT="$ROOT" node --input-type=module <<'"'"'NODE'"'"'
+const {checkSchema,schemaErrors}=await import(`${process.env.ROOT}/scripts/lib/maintenance-policy-contract.mjs`);
+const schema={type:"string",maxLength:3};
+checkSchema(schema);
+if(schemaErrors(schema,"abc").length!==0||schemaErrors(schema,"abcd").length===0)process.exit(1);
 NODE'
 
 check "published schemas expose conservative input/output cardinality bounds" 'ROOT="$ROOT" node --input-type=module <<'"'"'NODE'"'"'

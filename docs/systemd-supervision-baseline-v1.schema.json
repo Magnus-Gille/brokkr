@@ -69,7 +69,7 @@
     "user-delivery": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["required", "mode", "service_role", "terminal_handler_role", "terminal_handler_type", "terminal_handler_restart", "terminal_handler_on_failure"],
+      "required": ["required", "mode", "service_role", "terminal_handler_role", "terminal_handler_type", "terminal_handler_restart", "terminal_handler_on_failure", "terminal_handler_min_incoming"],
       "properties": {
         "required": { "const": true },
         "mode": { "const": "component-owner" },
@@ -77,7 +77,8 @@
         "terminal_handler_role": { "const": "terminal" },
         "terminal_handler_type": { "const": "oneshot" },
         "terminal_handler_restart": { "const": "no" },
-        "terminal_handler_on_failure": { "const": "forbidden" }
+        "terminal_handler_on_failure": { "const": "forbidden" },
+        "terminal_handler_min_incoming": { "const": 1 }
       }
     },
     "system-scope": {

@@ -50,7 +50,6 @@ const die = message => {
 };
 const usage = () => die("usage: systemd-supervision-audit.mjs --baseline file --registry file --declarations file --observations file [--now UTC-fixture-override]");
 const unitKey = (targetNodeId, scope, unit) => `${targetNodeId}\u0000${scope}\u0000${unit}`;
-const bareKey = (targetNodeId, scope, bare) => `${targetNodeId}\u0000${scope}\u0000${bare}`;
 const clockNow = () => new Date(Math.floor(Date.now() / 1000) * 1000).toISOString().replace(".000Z", "Z");
 
 function parseArgs(argv) {
@@ -157,7 +156,6 @@ function normalizeRegistryUnitName(rawName, type) {
 
 function loadRegistry(registry) {
   const units = new Map();
-  const bareByContext = new Map();
   const unitsByEffective = new Map();
   const componentNames = new Set();
   let totalUnits = 0;
@@ -185,17 +183,13 @@ function loadRegistry(registry) {
         scope,
       };
       units.set(key, record);
-      const contextKey = bareKey(component.target_node_id, scope, normalized.base);
-      const contextCandidates = bareByContext.get(contextKey) ?? [];
-      contextCandidates.push(record);
-      bareByContext.set(contextKey, contextCandidates);
       const effectiveCandidates = unitsByEffective.get(normalized.effective) ?? [];
       effectiveCandidates.push(record);
       unitsByEffective.set(normalized.effective, effectiveCandidates);
     }
   }
   if (units.size === 0) die("registry contains no systemd units");
-  return { units, bareByContext, unitsByEffective };
+  return { units, unitsByEffective };
 }
 
 function loadDeclarations(declarations, registry) {
@@ -337,6 +331,20 @@ function terminalFailureHandlerValid(declaration, policy) {
     directiveValue(declaration.directives, "OnFailure") === undefined;
 }
 
+function terminalFailureHandlerIncomingCount(terminal, declarations, registry, policy) {
+  let incoming = 0;
+  for (const source of registry.units.values()) {
+    if (source.key === terminal.key || source.type !== "service" || source.scope !== "user" ||
+        source.target_node_id !== terminal.target_node_id || source.owner !== terminal.owner) continue;
+    const declaration = declarations.get(source.key);
+    if (!declaration || declaration.failure_handler_role !== policy.service_role) continue;
+    const configured = listValue(directiveValue(declaration.directives, "OnFailure"));
+    if (configured.length !== 1 || !USER_FAILURE_TARGET.test(configured[0])) continue;
+    if (registry.units.get(unitKey(source.target_node_id, source.scope, configured[0]))?.key === terminal.key) incoming += 1;
+  }
+  return incoming;
+}
+
 function checkFailureDelivery(state, declaration, registry, baseline, declarations) {
   const policy = baseline.scopes[state.unit.scope].failure_delivery;
   const configured = listValue(directiveValue(declaration.directives, "OnFailure"));
@@ -355,6 +363,7 @@ function checkFailureDelivery(state, declaration, registry, baseline, declaratio
     if (directiveValue(declaration.directives, "Type") !== policy.terminal_handler_type) addFinding(state, "terminal_failure_handler_type_unsafe", "error", "component-owner");
     if (directiveValue(declaration.directives, "Restart") !== policy.terminal_handler_restart) addFinding(state, "terminal_failure_handler_restart_unsafe", "error", "component-owner");
     if (policy.terminal_handler_on_failure === "forbidden" && configured.length !== 0) addFinding(state, "terminal_failure_handler_delivery_forbidden", "error", "component-owner");
+    if (terminalFailureHandlerIncomingCount(state.unit, declarations, registry, policy) < policy.terminal_handler_min_incoming) addFinding(state, "terminal_handler_unreferenced", "error", "component-owner");
     return;
   }
   if (declaration.failure_handler_role !== policy.service_role) {
@@ -444,8 +453,9 @@ function resolveTimerTarget(rawTarget, timer, registry) {
     const target = registry.units.get(unitKey(timer.target_node_id, timer.scope, rawTarget));
     return { target, effective: rawTarget, elsewhere: !target && findReferenceElsewhere(registry, rawTarget) };
   }
-  const candidates = registry.bareByContext.get(bareKey(timer.target_node_id, timer.scope, rawTarget)) ?? [];
-  return { target: candidates.length === 1 ? candidates[0] : null, effective: candidates.length === 1 ? candidates[0].unit : null, elsewhere: false };
+  const effective = `${rawTarget}.service`;
+  const target = registry.units.get(unitKey(timer.target_node_id, timer.scope, effective));
+  return { target, effective, elsewhere: !target && findReferenceElsewhere(registry, effective) };
 }
 
 function validCalendarValue(value) {
@@ -548,14 +558,13 @@ function checkWatchdogEvidence(state, observation, watchdogConfigured) {
   else addFinding(state, "watchdog_result_unknown");
 }
 
-function checkTimerEvidence(state, observation, declaration, timerClass, accuracy, observedAt, evaluatedAt, baseline) {
+function checkTimerEvidence(state, observation, declaration, timerClass, accuracy, observedAt, baseline) {
   if (observation.timer === null) {
     addFinding(state, "timer_evidence_missing");
     return;
   }
   const timer = observation.timer;
   const observed = Date.parse(observedAt);
-  const evaluated = Date.parse(evaluatedAt);
   const tolerance = baseline.observations.restart_window_tolerance_seconds * 1000;
   const maxAge = baseline.observations.timer_timestamp_max_age_seconds * 1000;
   const maxFuture = baseline.observations.timer_timestamp_max_future_seconds * 1000;
@@ -571,7 +580,7 @@ function checkTimerEvidence(state, observation, declaration, timerClass, accurac
   else {
     if (next > observed + maxFuture) addFinding(state, "timer_next_run_future");
     if (next < observed - maxAge) addFinding(state, "timer_next_run_ancient");
-    if (accuracy !== null && next + accuracy * 1000 < evaluated) addFinding(state, "timer_overdue");
+    if (accuracy !== null && next + accuracy * 1000 < observed) addFinding(state, "timer_overdue");
   }
   if (last !== null && next !== null && next < last) addFinding(state, "timer_timestamp_contradictory");
   if (timer.last_result !== "success" && timer.last_result !== "not-run") addFinding(state, "timer_last_result_unhealthy");
@@ -606,22 +615,25 @@ function projectEvidence(observation) {
   };
 }
 
-function checkObservedState(state, observation, shape, serviceState, timerState, declaration, observedAt, evaluatedAt, baseline) {
+function checkObservedState(state, observation, shape, serviceState, timerState, declaration, observedAt, baseline) {
   if (!observation) {
     addFinding(state, "observation_missing");
     return;
   }
   const healthyResult = observation.result.result === "success";
   const healthyState = shape === "long-running" ? observation.result.active_state === "active" :
-    shape === "oneshot" ? ["active", "inactive"].includes(observation.result.active_state) : observation.result.active_state === "active";
-  if (!healthyResult || !healthyState) addFinding(state, "unit_result_unhealthy");
+    shape === "oneshot" ? ["active", "inactive"].includes(observation.result.active_state) :
+      shape === "timer" ? observation.result.active_state === "active" : true;
+  if (!healthyResult || (shape !== "unknown" && !healthyState)) addFinding(state, "unit_result_unhealthy");
 
-  checkRestartEvidence(state, observation, shape, serviceState?.burst ?? null, serviceState?.interval ?? null, observedAt, baseline.observations.restart_window_tolerance_seconds);
-  checkWatchdogEvidence(state, observation, serviceState?.watchdogConfigured ?? false);
+  if (shape !== "unknown") {
+    checkRestartEvidence(state, observation, shape, serviceState?.burst ?? null, serviceState?.interval ?? null, observedAt, baseline.observations.restart_window_tolerance_seconds);
+    checkWatchdogEvidence(state, observation, serviceState?.watchdogConfigured ?? false);
+  }
   if (observation.oom.result === "killed") addFinding(state, "oom_kill_observed");
   if (observation.oom.result === "unknown") addFinding(state, "oom_result_unknown", "warning");
 
-  if (shape === "timer") checkTimerEvidence(state, observation, declaration, timerState?.timerClass ?? null, timerState?.accuracy ?? null, observedAt, evaluatedAt, baseline);
+  if (shape === "timer") checkTimerEvidence(state, observation, declaration, timerState?.timerClass ?? null, timerState?.accuracy ?? null, observedAt, baseline);
   else if (observation.timer !== null) addFinding(state, "timer_evidence_contradiction");
 }
 
@@ -641,7 +653,7 @@ function runAudit({ baseline, registry, declarations, observationsRecord, observ
   for (const unit of registry.units.values()) {
     const declaration = declarations.get(unit.key);
     const observation = observations.get(unit.key);
-    const shape = unit.type === "timer" ? "timer" : declaration?.directives?.Type === "oneshot" ? "oneshot" : "long-running";
+    const shape = unit.type === "timer" ? "timer" : !declaration ? "unknown" : declaration.directives.Type === "oneshot" ? "oneshot" : "long-running";
     const state = stateFor(unit);
     if (freshnessStatus === "stale") addFinding(state, "evidence_stale");
     if (freshnessStatus === "future") addFinding(state, "evidence_future");
@@ -650,7 +662,7 @@ function runAudit({ baseline, registry, declarations, observationsRecord, observ
     if (!declaration) addFinding(state, "declaration_missing");
     else if (shape === "timer") timerState = checkTimerDirectives(state, declaration, registry, baseline, declarations);
     else serviceState = checkServiceDirectives(state, declaration, baseline.workloads[shape], shape, registry, baseline, declarations);
-    checkObservedState(state, observation, shape, serviceState, timerState, declaration, observationsRecord.observed_at, evaluatedAt, baseline);
+    checkObservedState(state, observation, shape, serviceState, timerState, declaration, observationsRecord.observed_at, baseline);
     const output = {
       target_node_id: unit.target_node_id,
       unit: unit.unit,
@@ -682,7 +694,7 @@ function runAudit({ baseline, registry, declarations, observationsRecord, observ
       age_seconds: Math.max(0, Math.floor(observationAge / 1000)),
       max_age_seconds: baseline.freshness.max_age_seconds,
     },
-    notifier: { status: observationsRecord.notifier?.status ?? "absent" },
+    notifier: { status: observationsRecord.notifier?.status ?? "unknown" },
     summary: {
       status: findings.length === 0 ? "pass" : "fail",
       unit_count: unitOutputs.length,

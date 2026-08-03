@@ -9,7 +9,7 @@
   },
   "freshness": {
     "max_age_seconds": 900,
-    "future_skew_seconds": 0
+    "future_skew_seconds": 5
   },
   "scopes": {
     "system": {
@@ -29,7 +29,8 @@
         "terminal_handler_role": "terminal",
         "terminal_handler_type": "oneshot",
         "terminal_handler_restart": "no",
-        "terminal_handler_on_failure": "forbidden"
+        "terminal_handler_on_failure": "forbidden",
+        "terminal_handler_min_incoming": 1
       }
     }
   },

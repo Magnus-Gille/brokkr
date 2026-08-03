@@ -33,6 +33,9 @@ selects `oneshot` versus long-running policy; registry `type` only distinguishes
 services from timers. The declaration's finite `failure_handler_role` is an
 audit role, not topology: `none` is ordinary, while `terminal` is allowed only
 for the component-owned user-manager failure handler described below.
+If a service declaration is missing, the audit projects its workload shape as
+`unknown` and evaluates only shape-independent observed failures; it does not
+invent long-running restart, watchdog, readiness, or heartbeat semantics.
 
 ## Service policy and failure delivery
 
@@ -55,11 +58,13 @@ declared with `failure_handler_role: "terminal"`. The terminal handler is the
 finite end of the delivery graph: it must be a registered user service with
 `Type=oneshot`, `Restart=no`, and no `OnFailure`. It remains subject to normal
 start limits, timeouts, OOM policy, and observed result evidence; only recursive
-failure delivery is exempt. Self-targets, cycles, normal/nonterminal targets,
-undeclared targets, invalid terminal handlers, multiple targets, and terminal
-handlers that point onward are findings. System services and timers cannot use
-the terminal role. Target values and declaration roles are never projected to
-audit output.
+failure delivery is exempt. At least one valid ordinary service from the same
+component, node identity, and user manager must target it; an orphan terminal
+role is a finding, not a delivery bypass. Self-targets, cycles,
+normal/nonterminal targets, undeclared targets, invalid terminal handlers,
+multiple targets, and terminal handlers that point onward are findings. System
+services and timers cannot use the terminal role. Target values and declaration
+roles are never projected to audit output.
 
 ## Timer policy
 
@@ -82,10 +87,12 @@ fractional or compound systemd durations first—for example, `1.5s` to `1500ms`
 and `1min 30s` to `90s`—rather than pass them through.
 
 A timer target must be a declared ordinary service in the same registry owner,
-node identity, and manager scope. Explicit `Unit=` accepts a canonical name or
-a uniquely resolvable bare name. When it is omitted, the audit follows
-systemd's legitimate default (`<timer basename>.service`) and applies the same
-checks; explicit `Unit=` is not required merely for audit convenience.
+node identity, and manager scope. Explicit `Unit=` accepts a canonical service
+name or a bare name, which follows systemd semantics and deterministically gains
+the `.service` suffix even when the registry also contains a timer with that
+bare name. When `Unit=` is omitted, the audit follows systemd's legitimate
+default (`<timer basename>.service`) and applies the same checks; explicit
+`Unit=` is not required merely for audit convenience.
 
 ## Evidence binding and findings
 
@@ -99,17 +106,24 @@ For services, restart evidence is usable only when `window_end` equals
 StartLimitIntervalSec`, each within the versioned one-second tolerance. Future,
 reversed, old, or mismatched windows are findings. A restart storm is evaluated
 only after both the interval and burst parse and the window binds correctly;
-an invalid burst never coerces to zero.
+an invalid burst never coerces to zero. The v1 `restart_storm` threshold is
+deliberately conservative at `count >= StartLimitBurst`: it identifies the
+pre-lockout boundary where the next start inside the interval would be refused.
+`burst - 1` remains below that threshold.
 
-Top-level evidence is fresh for 900 seconds. If `observed_at` is stale or ahead
-of evaluation time, every registry unit receives a typed stale/future finding,
-no such unit is counted compliant, and the top-level status fails. Timer last
-runs ahead of observation time or older than the one-year evidence horizon are
-findings. A next run beyond the one-year planning horizon, older than the
-evidence horizon, before its last run, or overdue at evaluation time after
-adding `AccuracySec` is also a finding. Calendar missed runs are warning
-findings; warnings still make the affected unit and command nonzero. Monotonic
-missed-run/persistence values must remain not-applicable.
+Top-level evidence is fresh for 900 seconds, with a five-second future-clock
+skew tolerance. If `observed_at` is stale or farther ahead of evaluation time,
+every registry unit receives a typed stale/future finding, no such unit is
+counted compliant, and the top-level status fails. A null notifier projection
+means unknown evidence, not positive absence, and still fails required system
+delivery availability. Timer last runs ahead of observation time or older than
+the one-year evidence horizon are findings. A next run beyond the one-year
+planning horizon, older than the evidence horizon, before its last run, or
+already overdue at `observed_at` after adding `AccuracySec` is also a finding.
+Evaluation lag never retroactively proves a timer missed a run after the
+snapshot; freshness separately bounds that lag. Calendar missed runs are
+warning findings; warnings still make the affected unit and command nonzero.
+Monotonic missed-run/persistence values must remain not-applicable.
 
 Without `WatchdogSec`, the only consistent observation is `not-requested`.
 With `WatchdogSec`, only `ok` passes; `not-requested`, `unknown`, and `timeout`

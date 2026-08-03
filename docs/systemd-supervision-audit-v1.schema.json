@@ -132,7 +132,7 @@
         "unit": { "$ref": "#/$defs/unit-name" },
         "owner": { "$ref": "#/$defs/id" },
         "scope": { "enum": ["system", "user"] },
-        "workload_shape": { "enum": ["long-running", "oneshot", "timer"] },
+        "workload_shape": { "enum": ["long-running", "oneshot", "timer", "unknown"] },
         "timer_class": { "oneOf": [{ "type": "null" }, { "enum": ["calendar", "monotonic"] }] },
         "status": { "enum": ["pass", "fail"] },
         "findings": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/unit-finding" } },

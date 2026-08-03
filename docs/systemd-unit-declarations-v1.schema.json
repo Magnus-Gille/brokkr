@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://grimnir.gille.ai/contracts/systemd-unit-declarations/v1/schema.json",
   "title": "Brokkr systemd unit declaration projection v1",
-  "description": "Bounded sanitized audit projection. target_node_id, scope, and canonical effective name form a join key checked against the authoritative Grimnir registry; owner and service-vs-timer identity remain registry-owned. Sanitized Type distinguishes oneshot from long-running semantics. failure_handler_role is a finite audit role: terminal is valid only for a component-owned user oneshot with no OnFailure and never creates topology.",
+  "description": "Bounded sanitized audit projection. target_node_id, scope, and canonical effective name form a join key checked against the authoritative Grimnir registry; owner and service-vs-timer identity remain registry-owned. Sanitized Type distinguishes oneshot from long-running semantics. failure_handler_role is a finite audit role: terminal is valid only for a component-owned user oneshot with no OnFailure that is referenced by an ordinary same-owner/node/scope user service; it never creates topology.",
   "type": "object",
   "additionalProperties": false,
   "required": ["kind", "schema_version", "topology_authority", "units"],
