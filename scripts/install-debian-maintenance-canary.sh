@@ -95,6 +95,8 @@ APPLY_UNIT="brokkr-debian-maintenance-canary-$CANARY.service"
 RECOVERY_UNIT="brokkr-debian-maintenance-recovery-$CANARY.service"
 RELEASE_FILES=(
   scripts/debian-maintenance-host-adapter.mjs
+  scripts/maintenance-canary-watchdog.mjs
+  scripts/maintenance-owner-ceremony-transition.mjs
   scripts/lib/fixed-debian-maintenance-host-operation.mjs
   scripts/lib/bounded-recovery-dispatch.mjs
   systemd/brokkr-debian-maintenance-recovery.service.in
@@ -261,6 +263,8 @@ preflight_install_paths() {
     "$STATE_ROOT/recovery-activations" \
     "$STATE_ROOT/recovery-authorizations" \
     "$STATE_ROOT/disarmed" \
+    "$STATE_ROOT/armed" \
+    "$STATE_ROOT/ceremony" \
     "$STATE_ROOT/evidence" \
     "$STATE_ROOT/headroom"; do
     verify_secure_path "$directory" dir 1 0700
@@ -337,6 +341,9 @@ stage_exact_release() {
     "$staged_release/scripts/lib" \
     "$staged_release/systemd"
   chmod 0755 "$staged_release/scripts/debian-maintenance-host-adapter.mjs"
+  chmod 0755 "$staged_release/scripts/maintenance-canary-watchdog.mjs"
+  chmod 0755 \
+    "$staged_release/scripts/maintenance-owner-ceremony-transition.mjs"
   chmod 0644 \
     "$staged_release/scripts/lib/fixed-debian-maintenance-host-operation.mjs" \
     "$staged_release/scripts/lib/bounded-recovery-dispatch.mjs" \
@@ -355,6 +362,8 @@ install_directories() {
     "$STATE_ROOT/recovery-activations" \
     "$STATE_ROOT/recovery-authorizations" \
     "$STATE_ROOT/disarmed" \
+    "$STATE_ROOT/armed" \
+    "$STATE_ROOT/ceremony" \
     "$STATE_ROOT/evidence" \
     "$STATE_ROOT/headroom"
 }
@@ -509,6 +518,62 @@ try {
 NODE
 }
 
+ensure_initial_disarm() {
+  local disarmed="$STATE_ROOT/disarmed/$CANARY.json"
+  local armed="$STATE_ROOT/armed/$CANARY.json"
+  if [[ -e "$armed" || -L "$armed" ]]; then
+    die "installed canary is already armed; installer cannot alter lifecycle state"
+  fi
+  if [[ ! -e "$disarmed" && ! -L "$disarmed" ]]; then
+    write_disarm_marker
+    return
+  fi
+  verify_secure_path "$disarmed" file 1 0600
+  "$NODE" --input-type=module - \
+    "$disarmed" "$CANARY" "$REVISION" <<'NODE'
+import fs from "node:fs";
+const [file, canary, revision] = process.argv.slice(2);
+let marker;
+try {
+  marker = JSON.parse(fs.readFileSync(file, "utf8"));
+} catch {
+  throw new Error("install_disarm_marker_invalid");
+}
+if (marker?.kind !== "brokkr-debian-maintenance-canary-disarm" ||
+    marker?.schema_version !== "v1" ||
+    marker?.canary_id !== canary ||
+    marker?.release_sha !== revision ||
+    marker?.evidence_preserved !== true ||
+    marker?.state_preserved !== true) {
+  throw new Error("install_disarm_marker_invalid");
+}
+NODE
+}
+
+clear_armed_marker() {
+  local armed="$STATE_ROOT/armed/$CANARY.json"
+  [[ -e "$armed" || -L "$armed" ]] || return 0
+  verify_secure_path "$armed" file 1 0600
+  "$NODE" --input-type=module - "$armed" "$EXPECTED_UID" <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+const [file, uidInput] = process.argv.slice(2);
+const expectedUid = Number(uidInput);
+const stat = fs.lstatSync(file);
+if (!stat.isFile() || stat.isSymbolicLink() ||
+    stat.uid !== expectedUid || (stat.mode & 0o7777) !== 0o600) {
+  throw new Error("install_armed_marker_unsafe");
+}
+fs.unlinkSync(file);
+const directory = fs.openSync(path.dirname(file), "r");
+try {
+  fs.fsyncSync(directory);
+} finally {
+  fs.closeSync(directory);
+}
+NODE
+}
+
 case "$ACTION" in
   install)
     verify_install_source
@@ -543,6 +608,7 @@ case "$ACTION" in
     fi
     install_directories
     preallocate_headroom
+    ensure_initial_disarm
     verify_or_publish_release
     verify_or_publish_units
     printf 'installed disabled canary %s at release %s\n' "$CANARY" "$REVISION"
@@ -553,6 +619,7 @@ case "$ACTION" in
     [[ -f "$UNIT_ROOT/$APPLY_UNIT" ]] ||
       die "revision-bound canary unit is not installed"
     write_disarm_marker
+    clear_armed_marker
     set +e
     "$SYSTEMCTL" disable --now "$APPLY_UNIT"
     apply_status=$?

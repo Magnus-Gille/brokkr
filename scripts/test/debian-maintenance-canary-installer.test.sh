@@ -11,6 +11,9 @@ SYSTEMCTL_LOG="$TMP/systemctl.log"
 NODE_BIN="$(command -v node)"
 mkdir -p "$SOURCE/scripts/lib" "$SOURCE/systemd"
 cp "$ROOT/scripts/debian-maintenance-host-adapter.mjs" "$SOURCE/scripts/"
+cp "$ROOT/scripts/maintenance-canary-watchdog.mjs" "$SOURCE/scripts/"
+cp "$ROOT/scripts/maintenance-owner-ceremony-transition.mjs" \
+  "$SOURCE/scripts/"
 cp "$ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs" \
   "$ROOT/scripts/lib/bounded-recovery-dispatch.mjs" "$SOURCE/scripts/lib/"
 cp "$ROOT/systemd/brokkr-debian-maintenance-recovery.service.in" "$SOURCE/systemd/"
@@ -114,11 +117,15 @@ APPLY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-canary-ca
 RECOVERY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery-canary-fi.service"
 
 test -x "$RELEASE_ROOT/scripts/debian-maintenance-host-adapter.mjs"
+test -x "$RELEASE_ROOT/scripts/maintenance-owner-ceremony-transition.mjs"
+test -x "$RELEASE_ROOT/scripts/maintenance-canary-watchdog.mjs"
 test -r "$RELEASE_ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
 test -r "$RELEASE_ROOT/scripts/lib/bounded-recovery-dispatch.mjs"
 test -r "$RELEASE_ROOT/systemd/brokkr-debian-maintenance-recovery.service.in"
 for file in \
   scripts/debian-maintenance-host-adapter.mjs \
+  scripts/maintenance-owner-ceremony-transition.mjs \
+  scripts/maintenance-canary-watchdog.mjs \
   scripts/lib/fixed-debian-maintenance-host-operation.mjs \
   scripts/lib/bounded-recovery-dispatch.mjs \
   systemd/brokkr-debian-maintenance-recovery.service.in; do
@@ -147,6 +154,19 @@ grep -Fqx \
   "$APPLY_UNIT"
 ! grep -Eq '^(WantedBy=|OnFailure=)' "$APPLY_UNIT"
 test ! -e "$SYSTEMCTL_LOG"
+node --input-type=module - \
+  "$STATE_ROOT/disarmed/canary-fi.json" "$REVISION" <<'NODE'
+import assert from "node:assert/strict";
+import fs from "node:fs";
+const [file, revision] = process.argv.slice(2);
+const marker = JSON.parse(fs.readFileSync(file, "utf8"));
+assert.equal(marker.kind, "brokkr-debian-maintenance-canary-disarm");
+assert.equal(marker.schema_version, "v1");
+assert.equal(marker.canary_id, "canary-fi");
+assert.equal(marker.release_sha, revision);
+assert.equal(marker.evidence_preserved, true);
+assert.equal(marker.state_preserved, true);
+NODE
 
 # Exact replay is byte-idempotent: neither immutable release nor concrete units
 # are overwritten.
@@ -185,7 +205,8 @@ import path from "node:path";
 const root = process.argv[2];
 for (const directory of [
   root, "requests", "registrations", "fences", "journals", "terminals",
-  "recovery-activations", "recovery-authorizations", "disarmed", "evidence",
+  "recovery-activations", "recovery-authorizations", "disarmed", "armed",
+  "ceremony", "evidence",
 ].map(value => value === root ? value : path.join(root, value))) {
   assert.equal(fs.statSync(directory).mode & 0o777, 0o700, directory);
 }
@@ -232,6 +253,11 @@ git -C "$SOURCE" checkout -- scripts/debian-maintenance-host-adapter.mjs
 # or overwriting the conflicting bytes.
 printf '\n// retained-release-conflict\n' \
   >>"$RACE_RELEASE/scripts/debian-maintenance-host-adapter.mjs"
+if [[ "${REVISION: -1}" == "0" ]]; then
+  WRONG_REVISION="${REVISION%?}1"
+else
+  WRONG_REVISION="${REVISION%?}0"
+fi
 if env \
   BROKKR_CANARY_INSTALL_TEST_ROOT="$TOCTOU_ROOT" \
   BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
@@ -493,6 +519,11 @@ grep -Fqx \
 
 printf '%s\n' '{"redacted":"evidence-preserved"}' \
   >"$STATE_ROOT/evidence/canary-fi.json"
+rm "$STATE_ROOT/disarmed/canary-fi.json"
+printf '%s\n' \
+  "{\"kind\":\"brokkr-maintenance-owner-ceremony-state\",\"schema_version\":\"v1\",\"canary_id\":\"canary-fi\",\"release_sha\":\"$REVISION\",\"state\":\"armed-canary\"}" \
+  >"$STATE_ROOT/armed/canary-fi.json"
+chmod 0600 "$STATE_ROOT/armed/canary-fi.json"
 env \
   BROKKR_CANARY_INSTALL_TEST_ROOT="$INSTALL_ROOT" \
   BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
@@ -510,6 +541,7 @@ grep -Fqx "stop brokkr-debian-maintenance-recovery-canary-fi.service" \
   "$SYSTEMCTL_LOG"
 test -r "$STATE_ROOT/evidence/canary-fi.json"
 test -r "$STATE_ROOT/disarmed/canary-fi.json"
+test ! -e "$STATE_ROOT/armed/canary-fi.json"
 test -d "$RELEASE_ROOT"
 test -r "$STATE_ROOT/headroom/journal.reserve"
 test -r "$STATE_ROOT/headroom/evidence.reserve"
