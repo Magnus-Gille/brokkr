@@ -1,0 +1,121 @@
+{
+  "kind": "systemd-supervision-baseline",
+  "schema_version": "v1",
+  "baseline_id": "fleet-systemd-supervision",
+  "authority": {
+    "topology": "grimnir-service-registry",
+    "failure_delivery": "brokkr-systemd-failure-v1",
+    "audit": "brokkr-systemd-supervision-audit-v1"
+  },
+  "freshness": {
+    "max_age_seconds": 900,
+    "future_skew_seconds": 5
+  },
+  "scopes": {
+    "system": {
+      "manager": "system",
+      "failure_delivery": {
+        "required": true,
+        "mode": "brokkr-systemd-failure",
+        "service_role": "none"
+      }
+    },
+    "user": {
+      "manager": "user",
+      "failure_delivery": {
+        "required": true,
+        "mode": "component-owner",
+        "service_role": "none",
+        "terminal_handler_role": "terminal",
+        "terminal_handler_type": "oneshot",
+        "terminal_handler_restart": "no",
+        "terminal_handler_on_failure": "forbidden",
+        "terminal_handler_min_incoming": 1
+      }
+    }
+  },
+  "workloads": {
+    "long-running": {
+      "unit_type": "service",
+      "restart": {
+        "required": true,
+        "allowed": ["on-failure", "on-abnormal"],
+        "delay": { "required": true, "min_seconds": 1, "max_seconds": 60 }
+      },
+      "start_limits": {
+        "interval": { "required": true, "min_seconds": 60, "max_seconds": 3600 },
+        "burst": { "required": true, "min": 2, "max": 10 }
+      },
+      "timeouts": {
+        "start": { "required": true, "min_seconds": 1, "max_seconds": 120 },
+        "stop": { "required": true, "min_seconds": 1, "max_seconds": 120 },
+        "runtime": { "required": true, "allow_infinity": true, "min_seconds": 60, "max_seconds": 86400 }
+      },
+      "oom": { "required": true, "allowed": ["stop", "kill"] },
+      "readiness": { "required": true }
+    },
+    "oneshot": {
+      "unit_type": "service",
+      "restart": {
+        "required": true,
+        "allowed": ["no"],
+        "delay": { "required": false, "min_seconds": 0, "max_seconds": 0 }
+      },
+      "start_limits": {
+        "interval": { "required": true, "min_seconds": 60, "max_seconds": 3600 },
+        "burst": { "required": true, "min": 1, "max": 10 }
+      },
+      "timeouts": {
+        "start": { "required": true, "min_seconds": 1, "max_seconds": 3600 },
+        "stop": { "required": true, "min_seconds": 1, "max_seconds": 300 },
+        "runtime": { "required": true, "allow_infinity": true, "min_seconds": 60, "max_seconds": 86400 }
+      },
+      "oom": { "required": true, "allowed": ["stop", "kill"] },
+      "readiness": { "required": false }
+    },
+    "timer": {
+      "unit_type": "timer",
+      "start_limits": {
+        "interval": { "required": true, "min_seconds": 60, "max_seconds": 3600 },
+        "burst": { "required": true, "min": 1, "max": 10 }
+      },
+      "accuracy": { "required": true, "min_seconds": 1, "max_seconds": 3600 },
+      "schedule": {
+        "calendar_directive": "OnCalendar",
+        "monotonic_directives": ["OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnUnitInactiveSec"],
+        "classes_exclusive": true
+      },
+      "calendar": {
+        "persistence_required": true,
+        "missed_runs_evidence": "count"
+      },
+      "monotonic": {
+        "persistence_directive": "absent-or-false",
+        "missed_runs_evidence": "not-applicable"
+      }
+    }
+  },
+  "watchdog": {
+    "directive": "WatchdogSec",
+    "requires_types": ["notify", "notify-reload"],
+    "min_seconds": 5,
+    "max_seconds": 300,
+    "requires_app_heartbeat": true,
+    "requires_live_lock_fixture": true
+  },
+  "observations": {
+    "content_blind": true,
+    "restart_window_tolerance_seconds": 1,
+    "timer_timestamp_max_age_seconds": 31622400,
+    "timer_timestamp_max_future_seconds": 31622400,
+    "fields": [
+      "unit_result",
+      "restart_count_window",
+      "watchdog_result",
+      "oom_result",
+      "timer_last_next_run",
+      "audit_freshness"
+    ]
+  },
+  "extensions": []
+}

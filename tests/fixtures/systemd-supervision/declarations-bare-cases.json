@@ -1,0 +1,11 @@
+{
+  "base": "declarations-bare-registry.json",
+  "cases": [
+    {
+      "id": "bare-unit-shared-service-timer-name",
+      "mutations": {
+        "units.4.directives.Unit": "nightly"
+      }
+    }
+  ]
+}
