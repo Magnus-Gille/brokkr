@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=root
+DynamicUser=yes
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes

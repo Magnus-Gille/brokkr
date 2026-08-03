@@ -181,18 +181,76 @@ verify_source() {
 
 preflight_existing() {
   verify_path "$UNIT_ROOT" dir
-  "$NODE" --input-type=module - "$UNIT_ROOT" "$UNIT_NAME" <<'NODE'
+  "$NODE" --input-type=module - "$UNIT_ROOT" "$UNIT_NAME" "$UNIT" <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
-const [root, unitName] = process.argv.slice(2);
+const [root, unitName, unitPath] = process.argv.slice(2);
+const normalizedRoot = path.resolve(root);
+const normalizedUnitPath = path.resolve(unitPath);
+const maxLinkDepth = 64;
 if (!fs.existsSync(root)) process.exit(0);
+const isWithinRoot = candidate => {
+  const relative = path.relative(normalizedRoot, candidate);
+  return relative === "" ||
+    (!path.isAbsolute(relative) && relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`));
+};
+const assertSafeParent = candidate => {
+  const parent = path.dirname(candidate);
+  if (!isWithinRoot(parent)) {
+    throw new Error("delivery_unit_dependency_path_unsafe");
+  }
+  const relative = path.relative(normalizedRoot, parent);
+  let current = normalizedRoot;
+  for (const component of relative === "" ? [] : relative.split(path.sep)) {
+    current = path.join(current, component);
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error("delivery_unit_dependency_path_unsafe");
+    }
+  }
+};
+const checkDependencyLink = dependencyEntry => {
+  let current = path.resolve(dependencyEntry);
+  let followedLinks = 0;
+  const seen = new Set();
+  while (isWithinRoot(current)) {
+    if (current === normalizedUnitPath) {
+      throw new Error("delivery_unit_already_enabled");
+    }
+    if (seen.has(current)) {
+      throw new Error("delivery_unit_dependency_cycle");
+    }
+    seen.add(current);
+    assertSafeParent(current);
+    let stat;
+    try {
+      stat = fs.lstatSync(current);
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    if (!stat.isSymbolicLink()) return;
+    if (followedLinks >= maxLinkDepth) {
+      throw new Error("delivery_unit_dependency_depth");
+    }
+    followedLinks += 1;
+    const linkTarget = fs.readlinkSync(current);
+    current = path.resolve(path.dirname(current), linkTarget);
+  }
+};
 const visit = candidate => {
+  const dependencyDirectory =
+    /\.(?:wants|requires|upholds)$/.test(path.basename(candidate));
   for (const entry of fs.readdirSync(candidate)) {
     const child = path.join(candidate, entry);
     const stat = fs.lstatSync(child);
     if (stat.isSymbolicLink()) {
       if (entry === unitName) {
         throw new Error("delivery_unit_already_enabled");
+      }
+      if (dependencyDirectory) {
+        checkDependencyLink(child);
       }
       if (/\.(?:wants|requires|upholds)$/.test(entry)) {
         throw new Error("delivery_unit_dependency_directory_unsafe");

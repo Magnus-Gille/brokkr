@@ -147,6 +147,7 @@ function curlOnce(resultBytes, result, transport) {
   return new Promise(resolve => {
     const child = spawn("curl", [
       "--disable",
+      "--noproxy", "*",
       "--config", "/dev/fd/3",
       "--proto", "=https",
       "--proto-redir", "=https",
@@ -165,6 +166,11 @@ function curlOnce(resultBytes, result, transport) {
       "--silent",
       "--show-error",
     ], {
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        LANG: "C",
+        LC_ALL: "C",
+      },
       stdio: ["pipe", "pipe", "ignore", "pipe"],
     });
     let status = "";

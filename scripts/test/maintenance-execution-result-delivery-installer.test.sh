@@ -33,6 +33,28 @@ exit 99
 MOCK
 chmod 0755 "$TMP/bin/systemctl"
 
+assert_observation_only_unit() {
+  local unit="$1"
+  grep -Fqx 'DynamicUser=yes' "$unit"
+  ! grep -Eq '^User=' "$unit"
+  grep -Fqx 'NoNewPrivileges=yes' "$unit"
+  grep -Fqx 'ProtectSystem=strict' "$unit"
+  grep -Fqx 'CapabilityBoundingSet=' "$unit"
+  grep -Fqx 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' "$unit"
+  grep -Fqx 'Environment=PATH=/usr/bin:/bin' "$unit"
+  ! grep -Eq '^\[Install\]$' "$unit"
+  ! grep -Eq \
+    '^(ReadWritePaths|ReadWriteDirectories|BindPaths|StateDirectory|CacheDirectory|LogsDirectory|RuntimeDirectory|ConfigurationDirectory)=' \
+    "$unit"
+  ! grep -Eq '^Standard(Output|Error)=(file|append|truncate):' "$unit"
+  ! grep -Eq \
+    '^(ExecStartPre|ExecStartPost|ExecReload|ExecStop|ExecStopPost|Restart|SuccessAction|FailureAction)=' \
+    "$unit"
+}
+
+assert_observation_only_unit \
+  "$ROOT/systemd/brokkr-maintenance-execution-result-delivery.service.in"
+
 INSTALLER="$ROOT/scripts/install-maintenance-execution-result-delivery.sh"
 env \
   PATH="$TMP/bin:$PATH" \
@@ -73,6 +95,7 @@ grep -Fqx \
 grep -Fqx \
   "StandardInput=file:/var/lib/brokkr/debian-maintenance/evidence/maintenance-execution-result.json" \
   "$UNIT"
+assert_observation_only_unit "$UNIT"
 ! grep -Eq '^(WantedBy=|RequiredBy=|Alias=)' "$UNIT"
 ! grep -Fq 'LoadCredential=brokkr-maintenance-result-delivery-v1:' "$UNIT"
 test ! -e "$SYSTEMCTL_LOG"
@@ -159,6 +182,118 @@ test -L \
   "$ENABLED_WANTS/brokkr-maintenance-execution-result-delivery.service"
 test ! -e "$ENABLED_ROOT/usr"
 printf 'ok - installer refuses a pre-existing enablement link\n'
+
+ALIAS_FAILURES=0
+for dependency in wants requires upholds; do
+  ALIAS_ROOT="$TMP/alias-$dependency-root"
+  ALIAS_DIRECTORY="$ALIAS_ROOT/etc/systemd/system/multi-user.target.$dependency"
+  mkdir -p "$ALIAS_DIRECTORY"
+  case "$dependency" in
+    wants)
+      ALIAS_TARGET=../brokkr-maintenance-execution-result-delivery.service
+      ;;
+    requires)
+      ALIAS_TARGET="$ALIAS_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service"
+      ;;
+    upholds)
+      ALIAS_TARGET=.././ignored/../brokkr-maintenance-execution-result-delivery.service
+      ;;
+  esac
+  ln -s "$ALIAS_TARGET" "$ALIAS_DIRECTORY/delivery-adapter-alias.service"
+  if env \
+    PATH="$TMP/bin:$PATH" \
+    BROKKR_DELIVERY_INSTALL_TEST_ROOT="$ALIAS_ROOT" \
+    BROKKR_DELIVERY_NODE="$NODE_BIN" \
+    BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+    "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+    >"$TMP/alias-$dependency.out" 2>&1; then
+    echo "alias-named $dependency dependency unexpectedly accepted" >&2
+    ALIAS_FAILURES=$((ALIAS_FAILURES + 1))
+  fi
+done
+test "$ALIAS_FAILURES" -eq 0
+printf 'ok - installer resolves direct dependency aliases before accepting them\n'
+
+CHAIN_ROOT="$TMP/chained-alias-root"
+CHAIN_UNIT_ROOT="$CHAIN_ROOT/etc/systemd/system"
+CHAIN_WANTS="$CHAIN_UNIT_ROOT/multi-user.target.wants"
+mkdir -p "$CHAIN_WANTS"
+ln -s ../delivery-adapter-intermediate.service \
+  "$CHAIN_WANTS/delivery-adapter-chained-alias.service"
+ln -s brokkr-maintenance-execution-result-delivery.service \
+  "$CHAIN_UNIT_ROOT/delivery-adapter-intermediate.service"
+if env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$CHAIN_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/chained-alias.out" 2>&1; then
+  echo "chained adapter dependency alias unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$CHAIN_ROOT/usr"
+printf 'ok - installer resolves dependency alias chains to a missing adapter unit\n'
+
+CYCLE_ROOT="$TMP/cyclic-alias-root"
+CYCLE_UNIT_ROOT="$CYCLE_ROOT/etc/systemd/system"
+CYCLE_REQUIRES="$CYCLE_UNIT_ROOT/multi-user.target.requires"
+mkdir -p "$CYCLE_REQUIRES"
+ln -s ../delivery-cycle-intermediate.service \
+  "$CYCLE_REQUIRES/delivery-cycle-alias.service"
+ln -s multi-user.target.requires/delivery-cycle-alias.service \
+  "$CYCLE_UNIT_ROOT/delivery-cycle-intermediate.service"
+if env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$CYCLE_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/cyclic-alias.out" 2>&1; then
+  echo "cyclic dependency alias unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$CYCLE_ROOT/usr"
+printf 'ok - installer fails closed on dependency alias cycles\n'
+
+SAFE_CHAIN_ROOT="$TMP/unrelated-chain-root"
+SAFE_CHAIN_UNIT_ROOT="$SAFE_CHAIN_ROOT/etc/systemd/system"
+SAFE_CHAIN_UPHOLDS="$SAFE_CHAIN_UNIT_ROOT/multi-user.target.upholds"
+mkdir -p "$SAFE_CHAIN_UPHOLDS"
+ln -s ../unrelated-intermediate.service \
+  "$SAFE_CHAIN_UPHOLDS/unrelated-chain-alias.service"
+ln -s unrelated-target.service \
+  "$SAFE_CHAIN_UNIT_ROOT/unrelated-intermediate.service"
+printf '[Unit]\nDescription=Unrelated test unit\n' \
+  >"$SAFE_CHAIN_UNIT_ROOT/unrelated-target.service"
+env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$SAFE_CHAIN_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/unrelated-chain.out"
+test -L "$SAFE_CHAIN_UPHOLDS/unrelated-chain-alias.service"
+test -f \
+  "$SAFE_CHAIN_UNIT_ROOT/brokkr-maintenance-execution-result-delivery.service"
+printf 'ok - installer accepts a safe unrelated dependency alias chain\n'
+
+UNRELATED_ROOT="$TMP/unrelated-dependency-root"
+UNRELATED_WANTS="$UNRELATED_ROOT/etc/systemd/system/multi-user.target.wants"
+mkdir -p "$UNRELATED_WANTS"
+ln -s ../unrelated-normal.service \
+  "$UNRELATED_WANTS/unrelated-normal-alias.service"
+env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$UNRELATED_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/unrelated.out"
+test -L "$UNRELATED_WANTS/unrelated-normal-alias.service"
+test -f \
+  "$UNRELATED_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service"
+printf 'ok - installer accepts an unrelated normal dependency symlink\n'
 
 SYMLINKED_WANTS_ROOT="$TMP/symlinked-wants-root"
 SYMLINKED_WANTS_EXTERNAL="$TMP/symlinked-wants-external"
