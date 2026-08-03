@@ -3,7 +3,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-ROOT="$ROOT" TMP="$TMP" node \
+export ROOT TMP
+node \
   --experimental-loader \
   "$ROOT/scripts/test/fixtures/fixed-recovery-host/loader.mjs" \
   --input-type=module <<'NODE'
