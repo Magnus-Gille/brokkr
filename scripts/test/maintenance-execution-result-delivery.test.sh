@@ -53,7 +53,66 @@ printf '%s' "$status"
 MOCK
 chmod 0755 "$TMP/bin/curl"
 
+cat >"$TMP/preload-stat-shim.cjs" <<'SHIM'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const cloneWithUid = (stat, uid) => new Proxy(stat, {
+  get(target, property, receiver) {
+    if (property === "uid") return uid;
+    return Reflect.get(target, property, receiver);
+  },
+});
+
+const configuredDirectory = process.env.BROKKR_TEST_STAT_UID_DIRECTORY;
+const configuredDirectoryUid = process.env.BROKKR_TEST_STAT_UID_DIRECTORY_VALUE;
+const configuredFile = process.env.BROKKR_TEST_STAT_UID_FILE;
+const configuredFileUid = process.env.BROKKR_TEST_STAT_UID_FILE_VALUE;
+const directoryPath = configuredDirectory ? path.resolve(configuredDirectory) : "";
+const filePath = configuredFile ? path.resolve(configuredFile) : "";
+const directoryUid = configuredDirectoryUid === undefined ? null :
+  Number.parseInt(configuredDirectoryUid, 10);
+const fileUid = configuredFileUid === undefined ? null :
+  Number.parseInt(configuredFileUid, 10);
+const descriptorPaths = new Map();
+
+const originalOpenSync = fs.openSync;
+fs.openSync = function patchedOpenSync(candidate, ...args) {
+  const descriptor = originalOpenSync.call(this, candidate, ...args);
+  if (typeof candidate === "string") {
+    descriptorPaths.set(descriptor, path.resolve(candidate));
+  }
+  return descriptor;
+};
+
+const originalCloseSync = fs.closeSync;
+fs.closeSync = function patchedCloseSync(descriptor, ...args) {
+  descriptorPaths.delete(descriptor);
+  return originalCloseSync.call(this, descriptor, ...args);
+};
+
+const originalLstatSync = fs.lstatSync;
+fs.lstatSync = function patchedLstatSync(candidate, ...args) {
+  const stat = originalLstatSync.call(this, candidate, ...args);
+  if (typeof candidate === "string" && directoryUid !== null &&
+      path.resolve(candidate) === directoryPath) {
+    return cloneWithUid(stat, directoryUid);
+  }
+  return stat;
+};
+
+const originalFstatSync = fs.fstatSync;
+fs.fstatSync = function patchedFstatSync(descriptor, ...args) {
+  const stat = originalFstatSync.call(this, descriptor, ...args);
+  if (fileUid !== null && descriptorPaths.get(descriptor) === filePath) {
+    return cloneWithUid(stat, fileUid);
+  }
+  return stat;
+};
+SHIM
+
 write_enabled_config() {
+  rm -f "$CREDENTIALS/$CREDENTIAL_NAME"
   printf '%s\n' \
     "{\"kind\":\"brokkr-maintenance-result-delivery-config\",\"schema_version\":\"v1\",\"enabled\":true,\"endpoint\":\"$ENDPOINT\",\"bearer_token\":\"$TOKEN\",\"adapter_revision\":\"$REVISION\",\"adapter_digest\":\"$DIGEST\"}" \
     >"$CREDENTIALS/$CREDENTIAL_NAME"
@@ -61,6 +120,7 @@ write_enabled_config() {
 }
 
 write_disabled_config() {
+  rm -f "$CREDENTIALS/$CREDENTIAL_NAME"
   printf '%s\n' \
     "{\"kind\":\"brokkr-maintenance-result-delivery-config\",\"schema_version\":\"v1\",\"enabled\":false,\"adapter_revision\":\"$REVISION\",\"adapter_digest\":\"$DIGEST\"}" \
     >"$CREDENTIALS/$CREDENTIAL_NAME"
@@ -180,6 +240,54 @@ run_adapter 200 >"$TMP/disabled.out" 2>"$TMP/disabled.err"
 test ! -e "$CALLS"
 test ! -s "$TMP/disabled.err"
 printf 'ok - disabled gate is side-effect free\n'
+
+write_enabled_config
+chmod 0400 "$CREDENTIALS/$CREDENTIAL_NAME"
+reset_transport
+if ! run_adapter 200 \
+  NODE_OPTIONS="--require=$TMP/preload-stat-shim.cjs" \
+  BROKKR_TEST_STAT_UID_DIRECTORY="$CREDENTIALS" \
+  BROKKR_TEST_STAT_UID_DIRECTORY_VALUE=0 \
+  BROKKR_TEST_STAT_UID_FILE="$CREDENTIALS/$CREDENTIAL_NAME" \
+  BROKKR_TEST_STAT_UID_FILE_VALUE=0 \
+  >"$TMP/root-owned.out" 2>"$TMP/root-owned.err"; then
+  sed -n '1,20p' "$TMP/root-owned.err" >&2
+  exit 1
+fi
+"$NODE_BIN" -e '
+  const fs = require("node:fs");
+  const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  if (value.delivered !== true ||
+      value.result_id !== "result-33333333333333333333333333333333") {
+    process.exit(1);
+  }
+' "$TMP/root-owned.out"
+test ! -s "$TMP/root-owned.err"
+test "$(cat "$COUNT")" -eq 1
+printf 'ok - root-owned credential metadata is accepted under DynamicUser and LoadCredential\n'
+
+write_enabled_config
+INVALID_UID="$(id -u)"
+if [[ "$INVALID_UID" -eq 0 ]]; then
+  INVALID_UID=1
+else
+  INVALID_UID=$((INVALID_UID + 1))
+fi
+reset_transport
+if run_adapter 200 \
+  NODE_OPTIONS="--require=$TMP/preload-stat-shim.cjs" \
+  BROKKR_TEST_STAT_UID_DIRECTORY="$CREDENTIALS" \
+  BROKKR_TEST_STAT_UID_DIRECTORY_VALUE="$INVALID_UID" \
+  BROKKR_TEST_STAT_UID_FILE="$CREDENTIALS/$CREDENTIAL_NAME" \
+  BROKKR_TEST_STAT_UID_FILE_VALUE="$INVALID_UID" \
+  >"$TMP/arbitrary-owner.out" 2>&1; then
+  echo "arbitrary credential ownership unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$CALLS"
+! grep -Fq "$CREDENTIALS" "$TMP/arbitrary-owner.out"
+! grep -Fq "$TOKEN" "$TMP/arbitrary-owner.out"
+printf 'ok - arbitrary credential ownership remains rejected\n'
 
 write_enabled_config
 chmod 0644 "$CREDENTIALS/$CREDENTIAL_NAME"

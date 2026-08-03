@@ -48,11 +48,13 @@ bytes on standard input, re-runs the closed semantic validator, and accepts only
 the `brokkr-maintenance` v1 source. It accepts no arguments. The endpoint,
 dedicated Bearer token, enabled state, and exact adapter revision and SHA-256
 digest come from the protected systemd credential named
-`brokkr-maintenance-result-delivery-v1`. The credential must be a current-user
-owned, non-symlink regular file with mode `0400` or `0600`; its containing
-credential directory must also be current-user owned and not writable by group
-or other. The adapter never prints the endpoint, token, credential directory,
-curl stderr, or Heimdall response body.
+`brokkr-maintenance-result-delivery-v1`. Under `DynamicUser=yes` plus
+`LoadCredential=`, the credential directory and file may each be owned either
+by uid `0` or by the adapter's effective uid, but never by any other owner.
+The file must be a non-symlink regular file with mode `0400` or `0600`, and
+its containing credential directory must be an absolute, non-symlink directory
+that is not writable by group or other. The adapter never prints the endpoint,
+token, credential directory, curl stderr, or Heimdall response body.
 
 The closed configuration is version `v1`. A disabled configuration contains
 only its kind, version, `enabled: false`, and the adapter revision/digest
@@ -94,6 +96,38 @@ calls systemd, and no credential or enabled gate is installed. The unit's
 standard input is the fixed authoritative result projection at
 `/var/lib/brokkr/debian-maintenance/evidence/maintenance-execution-result.json`;
 no result or credential locator appears in its process arguments.
+
+Before writing anything, the installer scans the complete Debian system-unit
+load path in this exact precedence order:
+`/etc/systemd/system.control`,
+`/run/systemd/system.control`,
+`/run/systemd/transient`,
+`/run/systemd/generator.early`,
+`/etc/systemd/system`,
+`/etc/systemd/system.attached`,
+`/run/systemd/system`,
+`/run/systemd/system.attached`,
+`/run/systemd/generator`,
+`/usr/local/lib/systemd/system`,
+`/usr/lib/systemd/system`,
+`/run/systemd/generator.late`.
+For tests, these roots are mapped beneath `BROKKR_DELIVERY_INSTALL_TEST_ROOT`.
+It scans dependency directories in every existing root, rejects symlinked
+dependency directories, and follows individual dependency and top-level alias
+link chains read-only with bounded depth and cycle detection even when a
+terminal leaf is outside the static root set. Recursive enumeration itself
+never leaves the configured search roots: existing parent directories are
+canonicalized for matching, external directories are never recursively scanned,
+and unexpected filesystem errors other than a missing terminal parent or leaf
+fail closed. Dependency targets are matched against the normalized and
+available canonical adapter paths for every configured search root. Dependency
+entry basenames are also matched against the canonical adapter unit name and a
+bounded reverse alias closure derived from top-level unit symlinks in the
+configured search roots. A dependency entry is therefore rejected if its
+filename is the canonical adapter name or any alias resolving to it, even when
+the symlink target itself points somewhere else. This alias-basename rule is
+separate from the target-chain checks, so unrelated external terminals or
+normal masks do not block installation.
 
 Installation therefore remains inert. The separately authorized #69 owner
 ceremony must bind and provision the exact protected credential, atomically

@@ -214,6 +214,29 @@ done
 test "$ALIAS_FAILURES" -eq 0
 printf 'ok - installer resolves direct dependency aliases before accepting them\n'
 
+BASENAME_ALIAS_ROOT="$TMP/basename-alias-root"
+BASENAME_ALIAS_UNIT_ROOT="$BASENAME_ALIAS_ROOT/etc/systemd/system"
+BASENAME_ALIAS_WANTS="$BASENAME_ALIAS_UNIT_ROOT/multi-user.target.wants"
+mkdir -p "$BASENAME_ALIAS_WANTS"
+ln -s brokkr-maintenance-execution-result-delivery.service \
+  "$BASENAME_ALIAS_UNIT_ROOT/delivery-adapter-basename-alias.service"
+printf '[Unit]\nDescription=Unrelated basename alias target\n' \
+  >"$BASENAME_ALIAS_UNIT_ROOT/unrelated-target.service"
+ln -s ../unrelated-target.service \
+  "$BASENAME_ALIAS_WANTS/delivery-adapter-basename-alias.service"
+if env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$BASENAME_ALIAS_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/basename-alias.out" 2>&1; then
+  echo "adapter-alias dependency basename unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$BASENAME_ALIAS_ROOT/usr"
+printf 'ok - installer rejects an adapter-alias dependency basename even when its target is unrelated\n'
+
 CHAIN_ROOT="$TMP/chained-alias-root"
 CHAIN_UNIT_ROOT="$CHAIN_ROOT/etc/systemd/system"
 CHAIN_WANTS="$CHAIN_UNIT_ROOT/multi-user.target.wants"
@@ -278,6 +301,29 @@ test -f \
   "$SAFE_CHAIN_UNIT_ROOT/brokkr-maintenance-execution-result-delivery.service"
 printf 'ok - installer accepts a safe unrelated dependency alias chain\n'
 
+SAFE_EXTERNAL_ROOT="$TMP/safe-external-root"
+SAFE_EXTERNAL_UNIT_ROOT="$SAFE_EXTERNAL_ROOT/etc/systemd/system"
+SAFE_EXTERNAL_WANTS="$SAFE_EXTERNAL_UNIT_ROOT/multi-user.target.wants"
+SAFE_EXTERNAL_TERMINAL="$TMP/safe-external-terminal.service"
+mkdir -p "$SAFE_EXTERNAL_WANTS"
+printf 'external-sentinel\n' >"$SAFE_EXTERNAL_TERMINAL"
+ln -s "$SAFE_EXTERNAL_TERMINAL" \
+  "$SAFE_EXTERNAL_WANTS/unrelated-external-terminal.service"
+ln -s /dev/null \
+  "$SAFE_EXTERNAL_UNIT_ROOT/unrelated-top-level-mask.service"
+env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$SAFE_EXTERNAL_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/safe-external.out"
+test -L "$SAFE_EXTERNAL_WANTS/unrelated-external-terminal.service"
+test -L "$SAFE_EXTERNAL_UNIT_ROOT/unrelated-top-level-mask.service"
+test -f \
+  "$SAFE_EXTERNAL_UNIT_ROOT/brokkr-maintenance-execution-result-delivery.service"
+printf 'ok - installer accepts unrelated external dependency terminals and top-level masks\n'
+
 CROSS_ROOT="$TMP/cross-root"
 CROSS_WANTS="$CROSS_ROOT/etc/systemd/system/multi-user.target.wants"
 CROSS_EXTERNAL_REAL="$TMP/cross-root-external-real"
@@ -302,6 +348,49 @@ fi
 test ! -e "$CROSS_ROOT/usr"
 printf 'ok - installer resolves cross-root dependency aliases to a missing adapter unit\n'
 
+RUN_PATH_ROOT="$TMP/run-load-path-root"
+RUN_PATH_WANTS="$RUN_PATH_ROOT/run/systemd/system/multi-user.target.wants"
+mkdir -p "$RUN_PATH_WANTS"
+printf '[Unit]\nDescription=Run-path unrelated unit\n' \
+  >"$RUN_PATH_ROOT/run/systemd/system/unrelated-run-target.service"
+ln -s ../unrelated-run-target.service \
+  "$RUN_PATH_WANTS/brokkr-maintenance-execution-result-delivery.service"
+if env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$RUN_PATH_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/run-load-path.out" 2>&1; then
+  echo "latent /run adapter dependency unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$RUN_PATH_ROOT/usr"
+printf 'ok - installer scans /run for latent direct adapter dependencies before install\n'
+
+USR_LIB_ALIAS_ROOT="$TMP/usr-lib-alias-root"
+USR_LIB_UNIT_ROOT="$USR_LIB_ALIAS_ROOT/usr/lib/systemd/system"
+USR_LIB_WANTS="$USR_LIB_UNIT_ROOT/multi-user.target.wants"
+mkdir -p "$USR_LIB_WANTS"
+ln -s brokkr-maintenance-execution-result-delivery.service \
+  "$USR_LIB_UNIT_ROOT/distribution-delivery-alias.service"
+printf '[Unit]\nDescription=Usr-lib unrelated target\n' \
+  >"$USR_LIB_UNIT_ROOT/usr-lib-unrelated.service"
+ln -s ../usr-lib-unrelated.service \
+  "$USR_LIB_WANTS/distribution-delivery-alias.service"
+if env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$USR_LIB_ALIAS_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/usr-lib-alias.out" 2>&1; then
+  echo "adapter alias under /usr/lib unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$USR_LIB_ALIAS_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service"
+printf 'ok - installer scans /usr/lib alias dependencies before install\n'
+
 UNRELATED_ROOT="$TMP/unrelated-dependency-root"
 UNRELATED_WANTS="$UNRELATED_ROOT/etc/systemd/system/multi-user.target.wants"
 mkdir -p "$UNRELATED_WANTS"
@@ -318,6 +407,28 @@ test -L "$UNRELATED_WANTS/unrelated-normal-alias.service"
 test -f \
   "$UNRELATED_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service"
 printf 'ok - installer accepts an unrelated normal dependency symlink\n'
+
+USR_LIB_SAFE_ROOT="$TMP/usr-lib-unrelated-root"
+USR_LIB_SAFE_UNIT_ROOT="$USR_LIB_SAFE_ROOT/usr/lib/systemd/system"
+USR_LIB_SAFE_WANTS="$USR_LIB_SAFE_UNIT_ROOT/multi-user.target.wants"
+mkdir -p "$USR_LIB_SAFE_WANTS"
+ln -s usr-lib-safe-target.service \
+  "$USR_LIB_SAFE_UNIT_ROOT/usr-lib-safe-alias.service"
+printf '[Unit]\nDescription=Usr-lib safe target\n' \
+  >"$USR_LIB_SAFE_UNIT_ROOT/usr-lib-safe-target.service"
+ln -s ../usr-lib-safe-alias.service \
+  "$USR_LIB_SAFE_WANTS/usr-lib-safe-alias.service"
+env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$USR_LIB_SAFE_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/usr-lib-safe.out"
+test -L "$USR_LIB_SAFE_WANTS/usr-lib-safe-alias.service"
+test -f \
+  "$USR_LIB_SAFE_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service"
+printf 'ok - installer preserves unrelated normal distribution aliases while scanning /usr/lib\n'
 
 SYMLINKED_WANTS_ROOT="$TMP/symlinked-wants-root"
 SYMLINKED_WANTS_EXTERNAL="$TMP/symlinked-wants-external"

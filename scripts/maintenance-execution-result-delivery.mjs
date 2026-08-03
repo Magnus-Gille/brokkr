@@ -50,6 +50,7 @@ async function readBoundedStdin() {
 function readProtectedConfig() {
   const directory = process.env.CREDENTIALS_DIRECTORY;
   if (!directory || !path.isAbsolute(directory)) fail("config_missing");
+  const trustedOwners = new Set([0, process.geteuid()]);
   let directoryStat;
   try {
     directoryStat = fs.lstatSync(directory);
@@ -57,7 +58,7 @@ function readProtectedConfig() {
     fail("config_unsafe");
   }
   if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() ||
-      directoryStat.uid !== process.geteuid() ||
+      !trustedOwners.has(directoryStat.uid) ||
       (directoryStat.mode & 0o022) !== 0) {
     fail("config_unsafe");
   }
@@ -76,7 +77,7 @@ function readProtectedConfig() {
     fail("config_unsafe");
   }
   const mode = stat.mode & 0o7777;
-  if (!stat.isFile() || stat.uid !== process.geteuid() ||
+  if (!stat.isFile() || !trustedOwners.has(stat.uid) ||
       ![0o400, 0o600].includes(mode) ||
       stat.size < 2 || stat.size > MAX_CONFIG_BYTES) {
     fs.closeSync(descriptor);

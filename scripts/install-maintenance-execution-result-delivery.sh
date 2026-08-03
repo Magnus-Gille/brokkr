@@ -180,62 +180,162 @@ verify_source() {
 }
 
 preflight_existing() {
-  verify_path "$UNIT_ROOT" dir
-  "$NODE" --input-type=module - "$UNIT_ROOT" "$UNIT_NAME" "$UNIT" <<'NODE'
+  "$NODE" --input-type=module - "${ROOT_PREFIX:-}" "$UNIT_NAME" "$UNIT" <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
-const [root, unitName, unitPath] = process.argv.slice(2);
+const [rootPrefixInput, unitName, unitPath] = process.argv.slice(2);
+const rootPrefix = rootPrefixInput === "" ? "" : path.resolve(rootPrefixInput);
 const maxLinkDepth = 64;
-if (!fs.existsSync(root)) process.exit(0);
+const maxAliasClosureExpansions = 256;
+const dependencyDirectoryPattern = /\.(?:wants|requires|upholds)$/;
+const unitSearchRoots = [
+  "/etc/systemd/system.control",
+  "/run/systemd/system.control",
+  "/run/systemd/transient",
+  "/run/systemd/generator.early",
+  "/etc/systemd/system",
+  "/etc/systemd/system.attached",
+  "/run/systemd/system",
+  "/run/systemd/system.attached",
+  "/run/systemd/generator",
+  "/usr/local/lib/systemd/system",
+  "/usr/lib/systemd/system",
+  "/run/systemd/generator.late",
+];
+const mappedRoot = absoluteRoot => (
+  rootPrefix === "" ? absoluteRoot : path.join(rootPrefix, absoluteRoot.slice(1))
+);
+const mappedSearchRoots = unitSearchRoots.map(root => path.resolve(mappedRoot(root)));
+const isWithin = (base, candidate) => {
+  const relative = path.relative(base, candidate);
+  return relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative));
+};
 const canonicalLeaf = candidate => {
+  const normalized = path.resolve(candidate);
   let parent;
   try {
-    parent = fs.realpathSync(path.dirname(candidate));
+    parent = fs.realpathSync(path.dirname(normalized));
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
   }
-  return path.join(parent, path.basename(candidate));
+  return path.join(parent, path.basename(normalized));
 };
-const canonicalUnitPath = canonicalLeaf(unitPath);
-if (canonicalUnitPath === null) {
-  throw new Error("delivery_unit_path_unsafe");
+const existingSearchRoots = mappedSearchRoots.flatMap(root => {
+  if (!fs.existsSync(root)) return [];
+  const canonicalRoot = canonicalLeaf(root);
+  if (canonicalRoot === null) {
+    throw new Error("delivery_unit_dependency_directory_unsafe");
+  }
+  return [{ normalized: root, canonical: canonicalRoot }];
+});
+if (existingSearchRoots.length === 0) process.exit(0);
+const adapterTargetPaths = new Set();
+for (const root of mappedSearchRoots) {
+  const normalizedAdapterPath = path.join(root, unitName);
+  adapterTargetPaths.add(normalizedAdapterPath);
+  const canonicalAdapterPath = canonicalLeaf(normalizedAdapterPath);
+  if (canonicalAdapterPath !== null) {
+    adapterTargetPaths.add(canonicalAdapterPath);
+  }
 }
-const checkDependencyLink = dependencyEntry => {
-  let current = path.resolve(dependencyEntry);
+const resolveTerminalLeaf = start => {
+  let current = path.resolve(start);
   let followedLinks = 0;
   const seen = new Set();
   while (true) {
     const leaf = canonicalLeaf(current);
-    if (leaf === null) return;
-    if (leaf === canonicalUnitPath) {
-      throw new Error("delivery_unit_already_enabled");
-    }
-    if (seen.has(leaf)) {
+    const identity = leaf ?? path.resolve(current);
+    if (seen.has(identity)) {
       throw new Error("delivery_unit_dependency_cycle");
     }
-    seen.add(leaf);
+    seen.add(identity);
     let stat;
     try {
-      stat = fs.lstatSync(leaf);
+      stat = fs.lstatSync(identity);
     } catch (error) {
-      if (error?.code === "ENOENT") return;
+      if (error?.code === "ENOENT") {
+        return { leaf: identity, basename: path.basename(identity) };
+      }
       throw error;
     }
-    if (!stat.isSymbolicLink()) return;
+    if (!stat.isSymbolicLink()) {
+      return { leaf: identity, basename: path.basename(identity) };
+    }
     if (followedLinks >= maxLinkDepth) {
       throw new Error("delivery_unit_dependency_depth");
     }
     followedLinks += 1;
-    const linkTarget = fs.readlinkSync(leaf);
-    current = path.resolve(path.dirname(leaf), linkTarget);
+    const linkTarget = fs.readlinkSync(identity);
+    current = path.resolve(path.dirname(identity), linkTarget);
   }
 };
-const visit = candidate => {
-  const dependencyDirectory =
-    /\.(?:wants|requires|upholds)$/.test(path.basename(candidate));
+const reverseEdges = new Map();
+const addReverseEdge = (targetName, sourceName) => {
+  if (!targetName || sourceName === targetName) return;
+  if (!reverseEdges.has(targetName)) reverseEdges.set(targetName, new Set());
+  reverseEdges.get(targetName).add(sourceName);
+};
+for (const { normalized: root } of existingSearchRoots) {
+  const stat = fs.lstatSync(root);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error("delivery_unit_dependency_directory_unsafe");
+  }
+  for (const entry of fs.readdirSync(root)) {
+    const child = path.join(root, entry);
+    const childStat = fs.lstatSync(child);
+    if (!childStat.isSymbolicLink()) continue;
+    if (dependencyDirectoryPattern.test(entry)) {
+      throw new Error("delivery_unit_dependency_directory_unsafe");
+    }
+    const immediateTarget = path.resolve(
+      path.dirname(child),
+      fs.readlinkSync(child),
+    );
+    addReverseEdge(path.basename(immediateTarget), entry);
+    addReverseEdge(resolveTerminalLeaf(child).basename, entry);
+  }
+}
+const checkDependencyLink = dependencyEntry => {
+  const terminal = resolveTerminalLeaf(dependencyEntry);
+  if (adapterTargetPaths.has(terminal.leaf)) {
+    throw new Error("delivery_unit_already_enabled");
+  }
+};
+const adapterNames = new Set([unitName]);
+const queue = [unitName];
+let aliasClosureExpansions = 0;
+while (queue.length > 0) {
+  const current = queue.shift();
+  for (const alias of reverseEdges.get(current) ?? []) {
+    if (adapterNames.has(alias)) continue;
+    aliasClosureExpansions += 1;
+    if (aliasClosureExpansions > maxAliasClosureExpansions) {
+      throw new Error("delivery_unit_dependency_depth");
+    }
+    adapterNames.add(alias);
+    queue.push(alias);
+  }
+}
+const visitedDirectories = new Set();
+const visit = (root, candidate) => {
+  const candidateStat = fs.lstatSync(candidate);
+  if (candidateStat.isSymbolicLink() || !candidateStat.isDirectory()) {
+    throw new Error("delivery_unit_dependency_directory_unsafe");
+  }
+  const realCandidate = fs.realpathSync(candidate);
+  if (!isWithin(root.canonical, realCandidate)) {
+    throw new Error("delivery_unit_dependency_directory_unsafe");
+  }
+  if (visitedDirectories.has(realCandidate)) return;
+  visitedDirectories.add(realCandidate);
+  const dependencyDirectory = dependencyDirectoryPattern.test(path.basename(candidate));
   for (const entry of fs.readdirSync(candidate)) {
     const child = path.join(candidate, entry);
+    if (dependencyDirectory && adapterNames.has(entry)) {
+      throw new Error("delivery_unit_already_enabled");
+    }
     const stat = fs.lstatSync(child);
     if (stat.isSymbolicLink()) {
       if (entry === unitName) {
@@ -244,16 +344,19 @@ const visit = candidate => {
       if (dependencyDirectory) {
         checkDependencyLink(child);
       }
-      if (/\.(?:wants|requires|upholds)$/.test(entry)) {
+      if (dependencyDirectoryPattern.test(entry)) {
         throw new Error("delivery_unit_dependency_directory_unsafe");
       }
     } else if (stat.isDirectory()) {
-      visit(child);
+      visit(root, child);
     }
   }
 };
-visit(root);
+for (const root of existingSearchRoots) {
+  visit(root, root.normalized);
+}
 NODE
+  verify_path "$UNIT_ROOT" dir
   if [[ -e "$UNIT" || -L "$UNIT" ]]; then
     verify_path "$UNIT" file 0644
     grep -Fqx "Environment=BROKKR_ADAPTER_REVISION=$REVISION" "$UNIT" ||
