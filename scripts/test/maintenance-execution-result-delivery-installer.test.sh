@@ -159,3 +159,44 @@ test -L \
   "$ENABLED_WANTS/brokkr-maintenance-execution-result-delivery.service"
 test ! -e "$ENABLED_ROOT/usr"
 printf 'ok - installer refuses a pre-existing enablement link\n'
+
+SYMLINKED_WANTS_ROOT="$TMP/symlinked-wants-root"
+SYMLINKED_WANTS_EXTERNAL="$TMP/symlinked-wants-external"
+mkdir -p \
+  "$SYMLINKED_WANTS_ROOT/etc/systemd/system" \
+  "$SYMLINKED_WANTS_EXTERNAL"
+ln -s "$SYMLINKED_WANTS_EXTERNAL" \
+  "$SYMLINKED_WANTS_ROOT/etc/systemd/system/multi-user.target.wants"
+ln -s \
+  "$SYMLINKED_WANTS_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service" \
+  "$SYMLINKED_WANTS_EXTERNAL/brokkr-maintenance-execution-result-delivery.service"
+if env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$SYMLINKED_WANTS_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/symlinked-wants.out" 2>&1; then
+  echo "enablement hidden behind symlinked wants directory unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$SYMLINKED_WANTS_ROOT/usr"
+printf 'ok - installer refuses a symlinked systemd dependency directory\n'
+
+LOCKED_ROOT="$TMP/locked-root"
+LOCKED_UNIT_DIR="$LOCKED_ROOT/etc/systemd/system"
+LOCK_PATH="$LOCKED_UNIT_DIR/.brokkr-maintenance-result-delivery.install-lock"
+mkdir -p "$LOCK_PATH"
+if env \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_DELIVERY_INSTALL_TEST_ROOT="$LOCKED_ROOT" \
+  BROKKR_DELIVERY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  >"$TMP/locked.out" 2>&1; then
+  echo "concurrent installer lock unexpectedly accepted" >&2
+  exit 1
+fi
+test -d "$LOCK_PATH"
+test ! -e "$LOCKED_ROOT/usr"
+printf 'ok - failed lock acquisition preserves the concurrent installer lock\n'

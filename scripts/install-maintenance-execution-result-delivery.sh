@@ -76,12 +76,13 @@ RELEASE_FILES=(
 )
 STAGE_ROOT=""
 INSTALL_LOCK=""
+INSTALL_LOCK_HELD=false
 
 cleanup() {
   local status=$?
   [[ -z "$STAGE_ROOT" || ! -d "$STAGE_ROOT" ]] ||
     rm -rf "$STAGE_ROOT"
-  [[ -z "$INSTALL_LOCK" || ! -d "$INSTALL_LOCK" ]] ||
+  [[ "$INSTALL_LOCK_HELD" != true || ! -d "$INSTALL_LOCK" ]] ||
     rmdir "$INSTALL_LOCK"
   exit "$status"
 }
@@ -193,6 +194,9 @@ const visit = candidate => {
       if (entry === unitName) {
         throw new Error("delivery_unit_already_enabled");
       }
+      if (/\.(?:wants|requires|upholds)$/.test(entry)) {
+        throw new Error("delivery_unit_dependency_directory_unsafe");
+      }
     } else if (stat.isDirectory()) {
       visit(child);
     }
@@ -290,6 +294,7 @@ preflight_existing
 [[ -d "$UNIT_ROOT" ]] || install -d -m 0755 "$UNIT_ROOT"
 INSTALL_LOCK="$UNIT_ROOT/.brokkr-maintenance-result-delivery.install-lock"
 mkdir "$INSTALL_LOCK" || die "another delivery adapter install is in progress"
+INSTALL_LOCK_HELD=true
 preflight_existing
 stage_release
 render_unit "$(adapter_digest)"
