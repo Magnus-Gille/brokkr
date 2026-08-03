@@ -5,17 +5,18 @@
   "description": "Bounded read-only audit containing registry-derived identity/classification, content-blind state evidence, freshness, and deduplicated routed findings.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["kind", "schema_version", "baseline_id", "topology_authority", "observed_at", "evaluated_at", "evaluated_at_source", "freshness", "notifier", "summary", "units", "findings", "extensions"],
+  "required": ["kind", "schema_version", "baseline_id", "baseline_digest", "topology_authority", "observed_at", "evaluated_at", "evaluated_at_source", "freshness", "notifiers", "summary", "units", "findings", "extensions"],
   "properties": {
     "kind": { "const": "systemd-supervision-audit" },
     "schema_version": { "const": "v1" },
-    "baseline_id": { "$ref": "#/$defs/id" },
+    "baseline_id": { "const": "fleet-systemd-supervision" },
+    "baseline_digest": { "$ref": "#/$defs/sha256" },
     "topology_authority": { "const": "grimnir-service-registry" },
     "observed_at": { "$ref": "#/$defs/utc" },
     "evaluated_at": { "$ref": "#/$defs/utc" },
     "evaluated_at_source": { "enum": ["clock", "fixture-override"] },
     "freshness": { "$ref": "#/$defs/freshness" },
-    "notifier": { "$ref": "#/$defs/notifier" },
+    "notifiers": { "type": "array", "maxItems": 512, "items": { "$ref": "#/$defs/notifier" } },
     "summary": { "$ref": "#/$defs/summary" },
     "units": { "type": "array", "maxItems": 512, "items": { "$ref": "#/$defs/unit" } },
     "findings": { "type": "array", "maxItems": 4096, "uniqueItems": true, "items": { "$ref": "#/$defs/finding" } },
@@ -23,6 +24,7 @@
   },
   "$defs": {
     "id": { "type": "string", "minLength": 3, "maxLength": 63, "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+    "sha256": { "type": "string", "minLength": 71, "maxLength": 71, "pattern": "^sha256:[a-f0-9]{64}$" },
     "unit-name": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^(?!.*[\\r\\n])[A-Za-z0-9:_.@-]+\\.(?:service|timer)$" },
     "utc": { "type": "string", "minLength": 20, "maxLength": 20, "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ$", "format": "date-time" },
     "freshness": {
@@ -38,8 +40,11 @@
     "notifier": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status"],
-      "properties": { "status": { "enum": ["available", "absent", "unknown"] } }
+      "required": ["target_node_id", "status"],
+      "properties": {
+        "target_node_id": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["available", "absent", "unknown"] }
+      }
     },
     "summary": {
       "type": "object",
@@ -52,14 +57,17 @@
         "finding_count": { "type": "integer", "minimum": 0, "maximum": 4096 }
       }
     },
+    "finding-code": { "type": "string", "minLength": 3, "maxLength": 64, "pattern": "^[a-z][a-z0-9_]{2,63}$" },
+    "finding-severity": { "enum": ["error", "warning"] },
+    "finding-route": { "enum": ["substrate", "component-owner"] },
     "finding-core": {
       "type": "object",
       "additionalProperties": false,
       "required": ["code", "severity", "route"],
       "properties": {
-        "code": { "type": "string", "minLength": 3, "maxLength": 64, "pattern": "^[a-z][a-z0-9_]{2,63}$" },
-        "severity": { "enum": ["error", "warning"] },
-        "route": { "enum": ["substrate", "component-owner"] }
+        "code": { "$ref": "#/$defs/finding-code" },
+        "severity": { "$ref": "#/$defs/finding-severity" },
+        "route": { "$ref": "#/$defs/finding-route" }
       }
     },
     "finding": {
@@ -67,9 +75,9 @@
       "additionalProperties": false,
       "required": ["code", "severity", "route"],
       "properties": {
-        "code": { "type": "string", "minLength": 3, "maxLength": 64, "pattern": "^[a-z][a-z0-9_]{2,63}$" },
-        "severity": { "enum": ["error", "warning"] },
-        "route": { "enum": ["substrate", "component-owner"] },
+        "code": { "$ref": "#/$defs/finding-code" },
+        "severity": { "$ref": "#/$defs/finding-severity" },
+        "route": { "$ref": "#/$defs/finding-route" },
         "target_node_id": { "$ref": "#/$defs/id" },
         "scope": { "enum": ["system", "user"] },
         "unit": { "$ref": "#/$defs/unit-name" },

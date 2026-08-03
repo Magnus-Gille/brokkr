@@ -50,6 +50,9 @@
       "failure_handler_role": "none",
       "directives": {
         "Unit": "grimnir-worker.service",
+        "StartLimitIntervalSec": "60s",
+        "StartLimitBurst": "3",
+        "OnFailure": "brokkr-systemd-failure@%n.service",
         "OnCalendar": "*:0/5",
         "Persistent": true,
         "AccuracySec": "30s"
@@ -83,6 +86,9 @@
       "name": "workshop.timer",
       "failure_handler_role": "none",
       "directives": {
+        "StartLimitIntervalSec": "60s",
+        "StartLimitBurst": "3",
+        "OnFailure": "workshop-failure.service",
         "OnUnitActiveSec": "10m",
         "AccuracySec": "30s"
       },

@@ -75,6 +75,10 @@
     },
     "timer": {
       "unit_type": "timer",
+      "start_limits": {
+        "interval": { "required": true, "min_seconds": 60, "max_seconds": 3600 },
+        "burst": { "required": true, "min": 1, "max": 10 }
+      },
       "accuracy": { "required": true, "min_seconds": 1, "max_seconds": 3600 },
       "schedule": {
         "calendar_directive": "OnCalendar",
@@ -93,7 +97,7 @@
   },
   "watchdog": {
     "directive": "WatchdogSec",
-    "requires_type": "notify",
+    "requires_types": ["notify", "notify-reload"],
     "min_seconds": 5,
     "max_seconds": 300,
     "requires_app_heartbeat": true,

@@ -6,9 +6,10 @@
 // content-blind observations. This program never invokes systemctl, executes a
 // child process, writes a unit, enables a timer, or delivers a notification.
 import fs from "node:fs";
+import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkSchema, schemaErrors } from "./lib/maintenance-policy-contract.mjs";
+import { canonicalJson, checkSchema, schemaErrors } from "./lib/maintenance-policy-contract.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const UNIT_BASE_NAME = /^(?!.*[\r\n])[A-Za-z0-9:_.@-]+$/;
@@ -18,8 +19,11 @@ const ID = /^[a-z][a-z0-9-]{2,62}$/;
 const UTC = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/;
 const SCOPES = new Set(["system", "user"]);
 const CANONICAL_FAILURE_TARGET = "brokkr-systemd-failure@%n.service";
+const CANONICAL_BASELINE_ID = "fleet-systemd-supervision";
+const CANONICAL_BASELINE_PATH = path.join(ROOT, "docs/systemd-supervision-baseline-v1.json");
+const REPLAY_OPT_IN = "BROKKR_SYSTEMD_AUDIT_ALLOW_REPLAY";
 const TIMER_SCHEDULE_DIRECTIVES = ["OnCalendar", "OnBootSec", "OnStartupSec", "OnUnitActiveSec", "OnUnitInactiveSec"];
-const TIMER_SERVICE_DIRECTIVES = ["Type", "Restart", "RestartSec", "StartLimitIntervalSec", "StartLimitBurst", "TimeoutStartSec", "TimeoutStopSec", "RuntimeMaxSec", "OOMPolicy", "OnFailure", "WatchdogSec"];
+const TIMER_SERVICE_DIRECTIVES = ["Type", "Restart", "RestartSec", "TimeoutStartSec", "TimeoutStopSec", "RuntimeMaxSec", "OOMPolicy", "WatchdogSec"];
 const SERVICE_TIMER_DIRECTIVES = ["Unit", ...TIMER_SCHEDULE_DIRECTIVES, "Persistent", "AccuracySec"];
 const REQUIRED_OBSERVATION_FIELDS = ["unit_result", "restart_count_window", "watchdog_result", "oom_result", "timer_last_next_run", "audit_freshness"];
 const MAX_TOTAL_UNITS = 512;
@@ -44,11 +48,8 @@ const utc = value => {
   const instant = new Date(value);
   return !Number.isNaN(instant.getTime()) && instant.toISOString().replace(".000Z", "Z") === value;
 };
-const die = message => {
-  process.stderr.write(`systemd-supervision-audit: ${message}\n`);
-  process.exit(2);
-};
-const usage = () => die("usage: systemd-supervision-audit.mjs --baseline file --registry file --declarations file --observations file [--now UTC-fixture-override]");
+const die = () => { throw new Error("rejected"); };
+const usage = () => die();
 const unitKey = (targetNodeId, scope, unit) => `${targetNodeId}\u0000${scope}\u0000${unit}`;
 const clockNow = () => new Date(Math.floor(Date.now() / 1000) * 1000).toISOString().replace(".000Z", "Z");
 
@@ -65,7 +66,7 @@ function parseArgs(argv) {
   }
   for (const field of ["baseline", "registry", "declarations", "observations"]) if (!has(parsed, field)) usage();
   if (Object.keys(parsed).some(field => !["baseline", "registry", "declarations", "observations", "now"].includes(field))) usage();
-  if (has(parsed, "now") && !utc(parsed.now)) usage();
+  if (has(parsed, "now") && (process.env[REPLAY_OPT_IN] !== "1" || !utc(parsed.now))) usage();
   return {
     ...parsed,
     evaluatedAt: parsed.now ?? clockNow(),
@@ -124,6 +125,7 @@ function validateCountBound(policy, label) {
 }
 
 function validateBaseline(baseline) {
+  if (baseline.baseline_id !== CANONICAL_BASELINE_ID) die();
   for (const shape of ["long-running", "oneshot"]) {
     const policy = baseline.workloads[shape];
     if (policy.unit_type !== "service" || !Array.isArray(policy.restart.allowed) || policy.restart.allowed.length === 0 || new Set(policy.restart.allowed).size !== policy.restart.allowed.length) die(`invalid ${shape} policy`);
@@ -137,10 +139,14 @@ function validateBaseline(baseline) {
     if (!policy.oom.allowed.every(value => ["stop", "kill"].includes(value))) die(`invalid ${shape} OOM policy`);
   }
   const timer = baseline.workloads.timer;
+  validateBound(timer.start_limits.interval, "timer start-limit interval");
+  validateCountBound(timer.start_limits.burst, "timer start-limit burst");
   validateBound(timer.accuracy, "timer accuracy");
   if (timer.schedule.calendar_directive !== "OnCalendar" || timer.schedule.classes_exclusive !== true ||
       timer.schedule.monotonic_directives.length !== 4 || !timer.schedule.monotonic_directives.every(value => TIMER_SCHEDULE_DIRECTIVES.includes(value))) die("invalid timer schedule policy");
   if (baseline.watchdog.min_seconds > baseline.watchdog.max_seconds) die("invalid watchdog range");
+  if (!Array.isArray(baseline.watchdog.requires_types) || baseline.watchdog.requires_types.length !== 2 ||
+      !["notify", "notify-reload"].every(value => baseline.watchdog.requires_types.includes(value))) die();
   if (baseline.observations.fields.length !== REQUIRED_OBSERVATION_FIELDS.length || !REQUIRED_OBSERVATION_FIELDS.every(field => baseline.observations.fields.includes(field))) die("observation policy omits required evidence");
 }
 
@@ -206,15 +212,21 @@ function loadDeclarations(declarations, registry) {
 
 function loadObservations(observations, registry) {
   if (!utc(observations.observed_at)) die("observed timestamp is malformed");
-  const result = new Map();
+  const units = new Map();
   for (const unit of observations.units) {
     const key = unitKey(unit.target_node_id, unit.scope, unit.name);
-    if (!registry.units.has(key) || result.has(key)) die("observations contain an unknown or duplicate unit");
+    if (!registry.units.has(key) || units.has(key)) die("observations contain an unknown or duplicate unit");
     if (unit.restart !== null && (!utc(unit.restart.window_start) || !utc(unit.restart.window_end))) die("observed restart evidence is malformed");
     if (unit.timer !== null && ((unit.timer.last_run_at !== null && !utc(unit.timer.last_run_at)) || (unit.timer.next_run_at !== null && !utc(unit.timer.next_run_at)))) die("observed timer evidence is malformed");
-    result.set(key, unit);
+    units.set(key, unit);
   }
-  return result;
+  const systemNodeIds = new Set([...registry.units.values()].filter(unit => unit.scope === "system").map(unit => unit.target_node_id));
+  const notifiers = new Map();
+  for (const notifier of observations.notifiers ?? []) {
+    if (!systemNodeIds.has(notifier.target_node_id) || notifiers.has(notifier.target_node_id)) die();
+    notifiers.set(notifier.target_node_id, notifier.status ?? "unknown");
+  }
+  return { units, notifiers };
 }
 
 function parseNumber(value) {
@@ -334,7 +346,7 @@ function terminalFailureHandlerValid(declaration, policy) {
 function terminalFailureHandlerIncomingCount(terminal, declarations, registry, policy) {
   let incoming = 0;
   for (const source of registry.units.values()) {
-    if (source.key === terminal.key || source.type !== "service" || source.scope !== "user" ||
+    if (source.key === terminal.key || !["service", "timer"].includes(source.type) || source.scope !== "user" ||
         source.target_node_id !== terminal.target_node_id || source.owner !== terminal.owner) continue;
     const declaration = declarations.get(source.key);
     if (!declaration || declaration.failure_handler_role !== policy.service_role) continue;
@@ -352,7 +364,7 @@ function checkFailureDelivery(state, declaration, registry, baseline, declaratio
     if (declaration.failure_handler_role !== policy.service_role) addFinding(state, "failure_handler_role_scope_contradiction");
     if (configured.length === 0) addFinding(state, "failure_delivery_missing");
     if (configured.length > 1) addFinding(state, "failure_delivery_duplicate");
-    if (configured.length === 1 && configured[0] !== CANONICAL_FAILURE_TARGET) addFinding(state, "failure_delivery_missing");
+    if (configured.length === 1 && configured[0] !== CANONICAL_FAILURE_TARGET) addFinding(state, "failure_delivery_target_unexpected");
     return;
   }
   if (policy.mode !== "component-owner") {
@@ -379,7 +391,7 @@ function checkFailureDelivery(state, declaration, registry, baseline, declaratio
     return;
   }
   const targetName = configured[0];
-  if (targetName === CANONICAL_FAILURE_TARGET || targetName.includes("brokkr-systemd-failure")) {
+  if (targetName === CANONICAL_FAILURE_TARGET) {
     addFinding(state, "scope_delivery_contradiction", "error", "component-owner");
     return;
   }
@@ -408,7 +420,7 @@ function checkServiceDirectives(state, declaration, policy, shape, registry, bas
   const directives = declaration.directives;
   if (SERVICE_TIMER_DIRECTIVES.some(key => has(directives, key))) addFinding(state, "service_timer_directive_forbidden");
   const type = directiveValue(directives, "Type");
-  const allowedTypes = shape === "oneshot" ? ["oneshot"] : ["simple", "exec", "notify", "forking"];
+  const allowedTypes = shape === "oneshot" ? ["oneshot"] : ["simple", "exec", "notify", "notify-reload", "forking"];
   if (type === undefined) addFinding(state, "service_type_missing");
   else if (typeof type !== "string" || !allowedTypes.includes(type)) addFinding(state, "service_type_unsafe");
 
@@ -435,7 +447,7 @@ function checkServiceDirectives(state, declaration, policy, shape, registry, bas
   if (watchdogConfigured) {
     const seconds = parseNumber(watchdog);
     if (seconds === null || seconds === Infinity || seconds < baseline.watchdog.min_seconds || seconds > baseline.watchdog.max_seconds) addFinding(state, "watchdog_unsafe");
-    if (type !== baseline.watchdog.requires_type) addFinding(state, "watchdog_requires_notify", "error", "component-owner");
+    if (!baseline.watchdog.requires_types.includes(type)) addFinding(state, "watchdog_requires_notify", "error", "component-owner");
     if ((baseline.watchdog.requires_app_heartbeat && declaration.heartbeat.app_heartbeat !== "present") ||
         (baseline.watchdog.requires_live_lock_fixture && declaration.heartbeat.live_lock_fixture !== "passed")) addFinding(state, "watchdog_heartbeat_unverified", "error", "component-owner");
   }
@@ -469,7 +481,8 @@ function validMonotonicValue(value) {
 
 function checkTimerDirectives(state, declaration, registry, baseline, declarations) {
   const directives = declaration.directives;
-  if (declaration.failure_handler_role !== baseline.scopes[state.unit.scope].failure_delivery.service_role) addFinding(state, "failure_handler_role_timer_contradiction");
+  const failureRoleValid = declaration.failure_handler_role === baseline.scopes[state.unit.scope].failure_delivery.service_role;
+  if (!failureRoleValid) addFinding(state, "failure_handler_role_timer_contradiction");
   if (TIMER_SERVICE_DIRECTIVES.some(key => has(directives, key))) addFinding(state, "timer_service_directive_forbidden");
 
   const targetResolution = resolveTimerTarget(directiveValue(directives, "Unit"), state.unit, registry);
@@ -482,6 +495,9 @@ function checkTimerDirectives(state, declaration, registry, baseline, declaratio
   }
 
   const policy = baseline.workloads.timer;
+  checkCountDirective(state, directives, "StartLimitBurst", policy.start_limits.burst, "start_limit_burst_missing", "start_limit_burst_unsafe");
+  checkBoundDirective(state, directives, "StartLimitIntervalSec", policy.start_limits.interval, "start_limit_interval_missing", "start_limit_interval_unsafe");
+  if (failureRoleValid) checkFailureDelivery(state, declaration, registry, baseline, declarations);
   const calendarDirective = policy.schedule.calendar_directive;
   const calendarPresent = has(directives, calendarDirective);
   const calendarValid = calendarPresent && validCalendarValue(directiveValue(directives, calendarDirective));
@@ -637,7 +653,7 @@ function checkObservedState(state, observation, shape, serviceState, timerState,
   else if (observation.timer !== null) addFinding(state, "timer_evidence_contradiction");
 }
 
-function runAudit({ baseline, registry, declarations, observationsRecord, observations, evaluatedAt, evaluatedAtSource }) {
+function runAudit({ baseline, baselineDigest, registry, declarations, observationsRecord, observations, notifierEvidence, evaluatedAt, evaluatedAtSource }) {
   const findings = [];
   const globalFindingKeys = new Set();
   const unitOutputs = [];
@@ -647,14 +663,12 @@ function runAudit({ baseline, registry, declarations, observationsRecord, observ
   if (freshnessStatus === "future") addGlobalFinding(findings, globalFindingKeys, "audit_time_in_future");
   if (freshnessStatus === "stale") addGlobalFinding(findings, globalFindingKeys, "audit_stale");
 
-  const hasSystemService = [...registry.units.values()].some(unit => unit.scope === "system" && unit.type === "service");
-  if (hasSystemService && (!observationsRecord.notifier || observationsRecord.notifier.status !== "available")) addGlobalFinding(findings, globalFindingKeys, "failure_delivery_unavailable");
-
   for (const unit of registry.units.values()) {
     const declaration = declarations.get(unit.key);
     const observation = observations.get(unit.key);
     const shape = unit.type === "timer" ? "timer" : !declaration ? "unknown" : declaration.directives.Type === "oneshot" ? "oneshot" : "long-running";
     const state = stateFor(unit);
+    if (unit.scope === "system" && (notifierEvidence.get(unit.target_node_id) ?? "unknown") !== "available") addFinding(state, "failure_delivery_unavailable");
     if (freshnessStatus === "stale") addFinding(state, "evidence_stale");
     if (freshnessStatus === "future") addFinding(state, "evidence_future");
     let serviceState = null;
@@ -684,7 +698,8 @@ function runAudit({ baseline, registry, declarations, observationsRecord, observ
   return {
     kind: "systemd-supervision-audit",
     schema_version: "v1",
-    baseline_id: baseline.baseline_id,
+    baseline_id: CANONICAL_BASELINE_ID,
+    baseline_digest: baselineDigest,
     topology_authority: "grimnir-service-registry",
     observed_at: observationsRecord.observed_at,
     evaluated_at: evaluatedAt,
@@ -694,7 +709,9 @@ function runAudit({ baseline, registry, declarations, observationsRecord, observ
       age_seconds: Math.max(0, Math.floor(observationAge / 1000)),
       max_age_seconds: baseline.freshness.max_age_seconds,
     },
-    notifier: { status: observationsRecord.notifier?.status ?? "unknown" },
+    notifiers: [...new Set([...registry.units.values()].filter(unit => unit.scope === "system").map(unit => unit.target_node_id))]
+      .sort()
+      .map(target_node_id => ({ target_node_id, status: notifierEvidence.get(target_node_id) ?? "unknown" })),
     summary: {
       status: findings.length === 0 ? "pass" : "fail",
       unit_count: unitOutputs.length,
@@ -707,23 +724,46 @@ function runAudit({ baseline, registry, declarations, observationsRecord, observ
   };
 }
 
-const args = parseArgs(process.argv.slice(2));
-const schemas = loadSchemas();
-const baseline = readJsonBounded(args.baseline, "baseline");
-const registryRecord = readJsonBounded(args.registry, "registry");
-const declarationsRecord = readJsonBounded(args.declarations, "declarations");
-const observationsRecord = readJsonBounded(args.observations, "observations");
-validateAgainstSchema(schemas.baseline, baseline, "baseline");
-validateAgainstSchema(schemas.registry, registryRecord, "registry");
-validateAgainstSchema(schemas.declarations, declarationsRecord, "declarations");
-validateAgainstSchema(schemas.observations, observationsRecord, "observations");
-validateBaseline(baseline);
-const registry = loadRegistry(registryRecord);
-const declarations = loadDeclarations(declarationsRecord, registry);
-const observations = loadObservations(observationsRecord, registry);
-const audit = runAudit({ baseline, registry, declarations, observationsRecord, observations, evaluatedAt: args.evaluatedAt, evaluatedAtSource: args.evaluatedAtSource });
-validateAgainstSchema(schemas.audit, audit, "audit output");
-const serialized = `${JSON.stringify(audit, null, 2)}\n`;
-if (Buffer.byteLength(serialized, "utf8") > MAX_OUTPUT_BYTES) die("audit output size limit exceeded");
-process.stdout.write(serialized);
-if (audit.summary.finding_count > 0) process.exitCode = 1;
+function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const schemas = loadSchemas();
+  const baseline = readJsonBounded(args.baseline, "baseline");
+  const canonicalBaseline = readJsonBounded(CANONICAL_BASELINE_PATH, "baseline");
+  const registryRecord = readJsonBounded(args.registry, "registry");
+  const declarationsRecord = readJsonBounded(args.declarations, "declarations");
+  const observationsRecord = readJsonBounded(args.observations, "observations");
+  validateAgainstSchema(schemas.baseline, baseline, "baseline");
+  validateAgainstSchema(schemas.baseline, canonicalBaseline, "tracked baseline");
+  if (canonicalJson(baseline) !== canonicalJson(canonicalBaseline)) die();
+  validateAgainstSchema(schemas.registry, registryRecord, "registry");
+  validateAgainstSchema(schemas.declarations, declarationsRecord, "declarations");
+  validateAgainstSchema(schemas.observations, observationsRecord, "observations");
+  validateBaseline(canonicalBaseline);
+  const baselineDigest = `sha256:${crypto.createHash("sha256").update(canonicalJson(canonicalBaseline), "utf8").digest("hex")}`;
+  const registry = loadRegistry(registryRecord);
+  const declarations = loadDeclarations(declarationsRecord, registry);
+  const loadedObservations = loadObservations(observationsRecord, registry);
+  const audit = runAudit({
+    baseline: canonicalBaseline,
+    baselineDigest,
+    registry,
+    declarations,
+    observationsRecord,
+    observations: loadedObservations.units,
+    notifierEvidence: loadedObservations.notifiers,
+    evaluatedAt: args.evaluatedAt,
+    evaluatedAtSource: args.evaluatedAtSource,
+  });
+  validateAgainstSchema(schemas.audit, audit, "audit output");
+  const serialized = `${JSON.stringify(audit, null, 2)}\n`;
+  if (Buffer.byteLength(serialized, "utf8") > MAX_OUTPUT_BYTES) die();
+  process.stdout.write(serialized);
+  return audit.summary.finding_count > 0 ? 1 : 0;
+}
+
+try {
+  process.exitCode = main();
+} catch {
+  process.stderr.write("systemd-supervision-audit: rejected\n");
+  process.exitCode = 2;
+}

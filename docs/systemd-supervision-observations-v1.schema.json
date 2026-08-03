@@ -2,15 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://grimnir.gille.ai/contracts/systemd-supervision-observations/v1/schema.json",
   "title": "Brokkr systemd supervision observations v1",
-  "description": "Bounded, content-blind systemd state evidence. The stable target_node_id/scope/effective-name join key contains no host locator, unit content, command line, environment, journal text, or credential.",
+  "description": "Bounded, content-blind systemd state evidence. target_node_id is a Grimnir-owned public-safe opaque identifier used with scope and effective name as the stable join key; projections must not carry unit content, command lines, environment, journal text, credentials, or private locators.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["kind", "schema_version", "observed_at", "notifier", "units"],
+  "required": ["kind", "schema_version", "observed_at", "notifiers", "units"],
   "properties": {
     "kind": { "const": "systemd-supervision-observations" },
     "schema_version": { "const": "v1" },
     "observed_at": { "$ref": "#/$defs/utc" },
-    "notifier": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/notifier" }] },
+    "notifiers": { "oneOf": [{ "type": "null" }, { "type": "array", "maxItems": 512, "items": { "$ref": "#/$defs/notifier" } }] },
     "units": { "type": "array", "maxItems": 512, "items": { "$ref": "#/$defs/unit" } }
   },
   "$defs": {
@@ -20,8 +20,11 @@
     "notifier": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status"],
-      "properties": { "status": { "enum": ["available", "absent", "unknown"] } }
+      "required": ["target_node_id", "status"],
+      "properties": {
+        "target_node_id": { "$ref": "#/$defs/id" },
+        "status": { "oneOf": [{ "type": "null" }, { "enum": ["available", "absent", "unknown"] }] }
+      }
     },
     "result": {
       "type": "object",

@@ -37,7 +37,7 @@
         "OOMPolicy": { "$ref": "#/$defs/small-string" },
         "OnFailure": { "$ref": "#/$defs/failure-target-projection" },
         "WatchdogSec": { "$ref": "#/$defs/duration" },
-        "Unit": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "Unit": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^(?!.*[\\r\\n])[A-Za-z0-9:_.@-]+$" },
         "OnCalendar": { "$ref": "#/$defs/calendar-value" },
         "OnBootSec": { "$ref": "#/$defs/monotonic-value" },
         "OnStartupSec": { "$ref": "#/$defs/monotonic-value" },

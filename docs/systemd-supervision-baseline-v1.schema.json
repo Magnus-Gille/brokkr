@@ -9,7 +9,7 @@
   "properties": {
     "kind": { "const": "systemd-supervision-baseline" },
     "schema_version": { "const": "v1" },
-    "baseline_id": { "$ref": "#/$defs/id" },
+    "baseline_id": { "const": "fleet-systemd-supervision" },
     "authority": { "$ref": "#/$defs/authority" },
     "freshness": { "$ref": "#/$defs/freshness" },
     "scopes": {
@@ -183,9 +183,10 @@
     "timer-workload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["unit_type", "accuracy", "schedule", "calendar", "monotonic"],
+      "required": ["unit_type", "start_limits", "accuracy", "schedule", "calendar", "monotonic"],
       "properties": {
         "unit_type": { "const": "timer" },
+        "start_limits": { "$ref": "#/$defs/limits" },
         "accuracy": { "$ref": "#/$defs/bound" },
         "schedule": {
           "type": "object",
@@ -220,10 +221,10 @@
     "watchdog": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["directive", "requires_type", "min_seconds", "max_seconds", "requires_app_heartbeat", "requires_live_lock_fixture"],
+      "required": ["directive", "requires_types", "min_seconds", "max_seconds", "requires_app_heartbeat", "requires_live_lock_fixture"],
       "properties": {
         "directive": { "const": "WatchdogSec" },
-        "requires_type": { "const": "notify" },
+        "requires_types": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "enum": ["notify", "notify-reload"] } },
         "min_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
         "max_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
         "requires_app_heartbeat": { "const": true },

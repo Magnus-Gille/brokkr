@@ -45,7 +45,7 @@ maintenance-executor: ## Inspect the disarmed Debian host-adapter contract; no l
 m5-fde-preflight: ## Run the read-only M5 FDE ceremony gate (ARGS="--copy-observed-at ...")
 	@./scripts/m5-fde-preflight.sh $(ARGS)
 
-systemd-supervision-audit: ## Audit a registry-joined systemd projection (real clock; optional replay --now UTC)
+systemd-supervision-audit: ## Audit systemd projection (real clock; replay --now requires BROKKR_SYSTEMD_AUDIT_ALLOW_REPLAY=1)
 	@node scripts/systemd-supervision-audit.mjs $(ARGS)
 
 maintenance-os: ## Run the OS maintenance report on the service host (ARGS="--dry-run --verbose")

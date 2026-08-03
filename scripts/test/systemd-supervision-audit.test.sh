@@ -28,7 +28,7 @@ check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 run_audit() {
   local output="$1" declarations="$2" observations="$3" registry="${4:-$REGISTRY}" baseline="${5:-$BASELINE}" now="${6:-$NOW}"
-  node "$AUDIT" --baseline "$baseline" --registry "$registry" --declarations "$declarations" --observations "$observations" --now "$now" >"$output" 2>"$output.stderr"
+  BROKKR_SYSTEMD_AUDIT_ALLOW_REPLAY=1 node "$AUDIT" --baseline "$baseline" --registry "$registry" --declarations "$declarations" --observations "$observations" --now "$now" >"$output" 2>"$output.stderr"
   RC=$?
 }
 
@@ -57,7 +57,38 @@ for (const [mutationPath, value] of Object.entries(candidate.mutations)) {
     if (!Object.hasOwn(target, leaf)) throw new Error(`fixture delete path is missing for ${caseId}`);
     delete target[leaf];
   }
+  else if (value && typeof value === "object" && !Array.isArray(value) && value.$remove === true) {
+    if (!Array.isArray(target) || !/^\d+$/.test(leaf) || Number(leaf) >= target.length) throw new Error(`fixture remove path is invalid for ${caseId}`);
+    target.splice(Number(leaf), 1);
+  }
   else target[parts.at(-1)] = value;
+}
+if (JSON.stringify(base) === before) throw new Error(`fixture case ${caseId} did not change its base`);
+fs.writeFileSync(outputPath, `${JSON.stringify(base, null, 2)}\n`);
+NODE
+  local status=$?
+  [[ "$status" -eq 0 && -s "$output" ]] || return 1
+}
+
+make_baseline_case() {
+  local output="$1" case_id="$2"
+  node --input-type=module - "$BASELINE" "$FIXTURES/baseline-negative.json" "$output" "$case_id" <<'NODE'
+import fs from "node:fs";
+const [basePath, descriptorPath, outputPath, caseId] = process.argv.slice(2);
+const base = JSON.parse(fs.readFileSync(basePath, "utf8"));
+const descriptor = JSON.parse(fs.readFileSync(descriptorPath, "utf8"));
+if (descriptor.base !== basePath.split("/").at(-1)) throw new Error(`fixture base mismatch for ${caseId}`);
+const candidate = descriptor.cases.find(row => row.id === caseId);
+if (!candidate || !candidate.mutations || Object.keys(candidate.mutations).length === 0) throw new Error(`invalid fixture case ${caseId}`);
+const before = JSON.stringify(base);
+for (const [mutationPath, value] of Object.entries(candidate.mutations)) {
+  const parts = mutationPath.split(".");
+  let target = base;
+  for (const part of parts.slice(0, -1)) {
+    if (target === null || typeof target !== "object" || !Object.hasOwn(target, part)) throw new Error(`fixture path is missing for ${caseId}`);
+    target = target[part];
+  }
+  target[parts.at(-1)] = value;
 }
 if (JSON.stringify(base) === before) throw new Error(`fixture case ${caseId} did not change its base`);
 fs.writeFileSync(outputPath, `${JSON.stringify(base, null, 2)}\n`);
@@ -89,7 +120,10 @@ const audit = JSON.parse(fs.readFileSync(auditPath, "utf8"));
 if (expectedUnit === "@global") {
   if (!audit.findings.some(finding => finding.code === code && finding.severity === severity && finding.route === route && !Object.hasOwn(finding, "unit"))) process.exit(1);
 } else {
-  const unit = audit.units.find(candidate => candidate.unit === expectedUnit);
+  const identity = expectedUnit.split("/");
+  const unit = identity.length === 3
+    ? audit.units.find(candidate => candidate.target_node_id === identity[0] && candidate.scope === identity[1] && candidate.unit === identity[2])
+    : audit.units.find(candidate => candidate.unit === expectedUnit);
   if (!unit) process.exit(1);
   if (!audit.findings.some(finding => finding.code === code && finding.severity === severity && finding.route === route && finding.unit === unit.unit && finding.target_node_id === unit.target_node_id && finding.scope === unit.scope && finding.owner === unit.owner)) process.exit(1);
 }
@@ -127,9 +161,20 @@ fi
 
 run_audit "$TMP/positive.json" "$DECLARATIONS" "$OBSERVATIONS"
 check "positive system/user services and calendar/monotonic timers pass" '[[ "$RC" -eq 0 ]]'
+check "audit pins the canonical v1 baseline identity and digest" 'ROOT="$ROOT" node --input-type=module - "$TMP/positive.json" "$BASELINE" <<'"'"'NODE'"'"'
+import crypto from "node:crypto";
+import fs from "node:fs";
+const {canonicalJson}=await import(`${process.env.ROOT}/scripts/lib/maintenance-policy-contract.mjs`);
+const [auditPath,baselinePath]=process.argv.slice(2);
+const audit=JSON.parse(fs.readFileSync(auditPath,"utf8"));
+const baseline=JSON.parse(fs.readFileSync(baselinePath,"utf8"));
+const expected=`sha256:${crypto.createHash("sha256").update(canonicalJson(baseline)).digest("hex")}`;
+if(audit.baseline_id!=="fleet-systemd-supervision"||audit.baseline_digest!==expected)process.exit(1);
+NODE'
 check "registry shape and sanitized Type classify six units" 'node -e '\''const x=require(process.argv[1]); if(x.summary.status!=="pass"||x.summary.unit_count!==6||new Set(x.units.map(u=>u.workload_shape)).size!==3||!x.units.some(u=>u.scope==="user"&&u.workload_shape==="timer"))process.exit(1)'\'' "$TMP/positive.json"'
 check "fixture replay stamps its deterministic clock source" 'node -e '\''const x=require(process.argv[1]); if(x.evaluated_at_source!=="fixture-override"||x.evaluated_at!=="2026-08-02T12:00:00Z")process.exit(1)'\'' "$TMP/positive.json"'
 check "terminal user handler passes without recursive OnFailure" 'node -e '\''const x=require(process.argv[1]); const u=x.units.find(v=>v.unit==="workshop-failure.service"); if(!u||u.status!=="pass"||u.workload_shape!=="oneshot")process.exit(1)'\'' "$TMP/positive.json"'
+check "node-keyed notifier evidence is projected without a fleet scalar" 'node -e '\''const x=require(process.argv[1]); if(Object.hasOwn(x,"notifier")||x.notifiers.length!==1||x.notifiers[0].target_node_id!=="node-core"||x.notifiers[0].status!=="available")process.exit(1)'\'' "$TMP/positive.json"'
 check "audit projection is content-blind and carries only stable node identity" 'node -e '\''const x=require(process.argv[1]); const raw=JSON.stringify(x); if(raw.includes("OnFailure")||raw.includes("directives")||raw.includes("failure_handler_role")||raw.includes("host"))process.exit(1); if(x.units.some(u=>!u.target_node_id||Object.hasOwn(u,"failure_target")))process.exit(1)'\'' "$TMP/positive.json"'
 check "typed findings are deduplicated per unit" 'node -e '\''const x=require(process.argv[1]); for(const u of x.units)if(new Set(u.findings.map(JSON.stringify)).size!==u.findings.length)process.exit(1)'\'' "$TMP/positive.json"'
 
@@ -195,6 +240,32 @@ fi
 
 run_audit "$TMP/repeated-name.json" "$REPEATED_DECLARATIONS" "$REPEATED_OBSERVATIONS" "$REPEATED_REGISTRY"
 check "same effective name across nodes and manager scopes is unambiguous" '[[ "$RC" -eq 0 ]] && node -e '\''const x=require(process.argv[1]); const s=x.units.filter(u=>u.unit==="shared.service"); if(s.length!==3||new Set(s.map(u=>`${u.target_node_id}:${u.scope}`)).size!==3)process.exit(1)'\'' "$TMP/repeated-name.json"'
+check "multi-node notifier evidence remains node-specific" 'node -e '\''const x=require(process.argv[1]); if(x.notifiers.length!==2||x.notifiers.some(v=>v.status!=="available")||new Set(x.notifiers.map(v=>v.target_node_id)).size!==2)process.exit(1)'\'' "$TMP/repeated-name.json"'
+
+for CASE_ID in node-beta-absent node-beta-null node-beta-missing; do
+  if make_case observations-repeated-name.json observations-notifier-cases.json "$TMP/$CASE_ID-observations.json" "$CASE_ID"; then
+    run_audit "$TMP/$CASE_ID.json" "$REPEATED_DECLARATIONS" "$TMP/$CASE_ID-observations.json" "$REPEATED_REGISTRY"
+    check "$CASE_ID fails only the affected node's system unit" '[[ "$RC" -eq 1 ]] && assert_finding "$TMP/'"$CASE_ID"'.json" node-beta/system/shared.service failure_delivery_unavailable error substrate && node -e '\''const x=require(process.argv[1]); const alpha=x.units.find(v=>v.target_node_id==="node-alpha"&&v.scope==="system"),beta=x.units.find(v=>v.target_node_id==="node-beta"&&v.scope==="system"),n=x.notifiers.find(v=>v.target_node_id==="node-beta"); if(!alpha||!beta||alpha.status!=="pass"||beta.status!=="fail"||!n||n.status==="available"||x.summary.compliant_unit_count!==3)process.exit(1)'\'' "$TMP/'"$CASE_ID"'.json"'
+  else
+    bad "$CASE_ID fixture mutation succeeds"
+  fi
+done
+
+if make_case observations-repeated-name.json observations-notifier-cases.json "$TMP/all-notifiers-null-observations.json" all-notifiers-null; then
+  run_audit "$TMP/all-notifiers-null.json" "$REPEATED_DECLARATIONS" "$TMP/all-notifiers-null-observations.json" "$REPEATED_REGISTRY"
+  check "null notifier collection projects unknown and fails each system node" '[[ "$RC" -eq 1 ]] && node -e '\''const x=require(process.argv[1]); const system=x.units.filter(v=>v.scope==="system"); if(x.notifiers.length!==2||x.notifiers.some(v=>v.status!=="unknown")||system.length!==2||system.some(v=>v.status!=="fail"||!v.findings.some(f=>f.code==="failure_delivery_unavailable"))||x.summary.compliant_unit_count!==2)process.exit(1)'\'' "$TMP/all-notifiers-null.json"'
+else
+  bad "all-notifiers-null fixture mutation succeeds"
+fi
+
+for CASE_ID in notifier-duplicate notifier-unknown-node; do
+  if make_case observations-repeated-name.json observations-notifier-cases.json "$TMP/$CASE_ID-observations.json" "$CASE_ID"; then
+    run_audit "$TMP/$CASE_ID.json" "$REPEATED_DECLARATIONS" "$TMP/$CASE_ID-observations.json" "$REPEATED_REGISTRY"
+    check "$CASE_ID is hard-rejected without a record" '[[ "$RC" -eq 2 && ! -s "$TMP/'"$CASE_ID"'.json" ]]'
+  else
+    bad "$CASE_ID fixture mutation succeeds"
+  fi
+done
 
 for CASE_ID in duplicate-effective wrong-suffix duplicate-component; do
   make_registry_case "$TMP/$CASE_ID-registry.json" "$CASE_ID"
@@ -213,8 +284,11 @@ expect_observation_finding oom grimnir-api.service oom_kill_observed
 expect_observation_finding missed-timer grimnir-worker.timer timer_persistence_observation_mismatch
 expect_observation_finding missed-timer-warning grimnir-worker.timer timer_missed_runs warning
 check "warning findings are nonzero and explicitly typed" 'node -e '\''const x=require(process.argv[1]); const f=x.findings.find(v=>v.code==="timer_missed_runs"); if(!f||f.severity!=="warning"||x.summary.status!=="fail")process.exit(1)'\'' "$TMP/missed-timer-warning.json"'
-expect_observation_finding absent-notifier @global failure_delivery_unavailable
-check "null notifier evidence projects unknown" 'node -e '\''const x=require(process.argv[1]); if(x.notifier.status!=="unknown")process.exit(1)'\'' "$TMP/absent-notifier.json"'
+expect_observation_finding absent-notifier grimnir-api.service failure_delivery_unavailable
+check "null notifier evidence projects unknown and fails every affected system unit" 'node -e '\''const x=require(process.argv[1]); const n=x.notifiers.find(v=>v.target_node_id==="node-core"); const affected=x.units.filter(v=>v.target_node_id==="node-core"&&v.scope==="system"); if(!n||n.status!=="unknown"||affected.length!==3||affected.some(v=>v.status!=="fail"||!v.findings.some(f=>f.code==="failure_delivery_unavailable")))process.exit(1)'\'' "$TMP/absent-notifier.json"'
+expect_observation_finding missing-observation grimnir-api.service observation_missing
+expect_observation_finding missing-restart-evidence grimnir-api.service restart_evidence_missing
+expect_observation_finding missing-timer-evidence grimnir-worker.timer timer_evidence_missing
 expect_observation_finding stale-audit grimnir-api.service evidence_stale
 expect_observation_finding future-audit grimnir-api.service evidence_future
 check "stale evidence fails every unit and compliant count" 'node -e '\''const x=require(process.argv[1]); if(x.summary.compliant_unit_count!==0||x.units.some(u=>u.status==="pass"))process.exit(1)'\'' "$TMP/stale-audit.json"'
@@ -265,12 +339,19 @@ expect_declaration_finding unsafe-long-running grimnir-api.service restart_polic
 expect_declaration_finding watchdog-unsafe grimnir-api.service watchdog_unsafe
 expect_declaration_finding watchdog-requires-notify grimnir-api.service watchdog_requires_notify error component-owner
 expect_declaration_finding watchdog-heartbeat-unverified grimnir-api.service watchdog_heartbeat_unverified error component-owner
+if make_case declarations-positive.json declarations-negative.json "$TMP/watchdog-notify-reload-declarations.json" watchdog-notify-reload; then
+  run_audit "$TMP/watchdog-notify-reload.json" "$TMP/watchdog-notify-reload-declarations.json" "$OBSERVATIONS"
+  check "Type=notify-reload satisfies negotiated watchdog type semantics" '[[ "$RC" -eq 0 ]] && ! grep -q '"'"'watchdog_requires_notify'"'"' "$TMP/watchdog-notify-reload.json"'
+else
+  bad "watchdog-notify-reload fixture mutation succeeds"
+fi
 expect_declaration_finding readiness-missing grimnir-api.service readiness_missing error component-owner
 expect_declaration_finding heartbeat-missing grimnir-api.service heartbeat_missing error component-owner
 expect_declaration_finding heartbeat-shape-contradiction grimnir-worker.service heartbeat_shape_contradiction error component-owner
 expect_declaration_finding oom-continue grimnir-api.service oom_policy_unsafe
 expect_declaration_finding contradictory-oneshot grimnir-worker.service restart_delay_forbidden
-expect_declaration_finding system-wrong-target grimnir-api.service failure_delivery_missing
+expect_declaration_finding system-wrong-target grimnir-api.service failure_delivery_target_unexpected
+check "wrong system failure target is not misreported as missing" '! assert_finding "$TMP/system-wrong-target.json" grimnir-api.service failure_delivery_missing error substrate'
 expect_declaration_finding user-system-delivery workshop.service scope_delivery_contradiction error component-owner
 expect_declaration_finding user-failure-delivery-missing workshop.service failure_delivery_missing error component-owner
 expect_declaration_finding user-failure-delivery-unregistered workshop.service failure_delivery_target_missing error component-owner
@@ -300,6 +381,28 @@ fs.writeFileSync(declarationsOutput, `${JSON.stringify(declarations, null, 2)}\n
 NODE
 run_audit "$TMP/failure-scope.json" "$TMP/failure-scope-declarations.json" "$OBSERVATIONS" "$TMP/failure-scope-registry.json"
 check "user failure target must retain the manager scope" '[[ "$RC" -eq 1 ]] && assert_finding "$TMP/failure-scope.json" workshop.service failure_delivery_target_mismatch error component-owner'
+
+node --input-type=module - "$REGISTRY" "$DECLARATIONS" "$OBSERVATIONS" "$TMP/substr-registry.json" "$TMP/substr-declarations.json" "$TMP/substr-observations.json" <<'NODE'
+import fs from "node:fs";
+const [registryPath, declarationsPath, observationsPath, registryOutput, declarationsOutput, observationsOutput] = process.argv.slice(2);
+const registry = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+const component = registry.components.find(value => value.name === "workshop");
+component.systemd_units.find(unit => unit.name === "workshop-failure.service").name = "workshop-brokkr-systemd-failure-local.service";
+const declarations = JSON.parse(fs.readFileSync(declarationsPath, "utf8"));
+for (const unit of declarations.units) {
+  if (unit.directives.OnFailure === "workshop-failure.service") unit.directives.OnFailure = "workshop-brokkr-systemd-failure-local.service";
+}
+declarations.units.find(unit => unit.name === "workshop-failure.service").name = "workshop-brokkr-systemd-failure-local.service";
+const observations = JSON.parse(fs.readFileSync(observationsPath, "utf8"));
+observations.units.find(unit => unit.name === "workshop-failure.service").name = "workshop-brokkr-systemd-failure-local.service";
+fs.writeFileSync(registryOutput, `${JSON.stringify(registry, null, 2)}\n`);
+fs.writeFileSync(declarationsOutput, `${JSON.stringify(declarations, null, 2)}\n`);
+fs.writeFileSync(observationsOutput, `${JSON.stringify(observations, null, 2)}\n`);
+NODE
+# shellcheck disable=SC2034 # consumed by the fixed check expression below.
+SUBSTRING_FIXTURE_RC=$?
+run_audit "$TMP/substr.json" "$TMP/substr-declarations.json" "$TMP/substr-observations.json" "$TMP/substr-registry.json"
+check "canonical system target comparison does not reject a legitimate user component substring" '[[ "$SUBSTRING_FIXTURE_RC" -eq 0 && "$RC" -eq 0 ]] && ! grep -q '"'"'scope_delivery_contradiction'"'"' "$TMP/substr.json"'
 
 node --input-type=module - "$DECLARATIONS" "$TMP/failure-undeclared-declarations.json" <<'NODE'
 import fs from "node:fs";
@@ -332,11 +435,14 @@ expect_declaration_finding user-failure-cycle workshop.service failure_delivery_
 expect_declaration_finding terminal-failure-delivery workshop-failure.service terminal_failure_handler_delivery_forbidden error component-owner
 expect_declaration_finding terminal-failure-wrong-type workshop-failure.service terminal_failure_handler_type_unsafe error component-owner
 check "normal user service also fails when its terminal target is invalid" 'assert_finding "$TMP/terminal-failure-wrong-type.json" workshop.service failure_delivery_target_terminal_invalid error component-owner'
+expect_declaration_finding timer-only-terminal-reference workshop.service failure_delivery_missing error component-owner
+check "a valid timer-only inbound edge keeps the terminal handler referenced" 'node -e '\''const x=require(process.argv[1]); const u=x.units.find(v=>v.unit==="workshop-failure.service"); if(!u||u.status!=="pass"||u.findings.some(f=>f.code==="terminal_handler_unreferenced"))process.exit(1)'\'' "$TMP/timer-only-terminal-reference.json"'
 expect_declaration_finding orphan-terminal workshop-failure.service terminal_handler_unreferenced error component-owner
 expect_declaration_finding all-services-terminal workshop.service terminal_handler_unreferenced error component-owner
 check "all-terminal fixture rejects the second orphan terminal too" 'assert_finding "$TMP/all-services-terminal.json" workshop-failure.service terminal_handler_unreferenced error component-owner'
 expect_declaration_finding terminal-role-system-scope grimnir-api.service failure_handler_role_scope_contradiction
-expect_declaration_finding terminal-role-timer grimnir-worker.timer failure_handler_role_timer_contradiction
+expect_declaration_finding terminal-role-timer workshop.timer failure_handler_role_timer_contradiction
+check "timer role contradiction does not over-fire terminal-service findings" 'node -e '\''const x=require(process.argv[1]); const u=x.units.find(v=>v.unit==="workshop.timer"); if(!u||u.findings.length!==1||u.findings[0].code!=="failure_handler_role_timer_contradiction")process.exit(1)'\'' "$TMP/terminal-role-timer.json"'
 expect_declaration_finding timer-calendar-false grimnir-worker.timer timer_schedule_value_unsafe
 expect_declaration_finding timer-calendar-blank grimnir-worker.timer timer_schedule_value_unsafe
 expect_declaration_finding timer-monotonic-false workshop.timer timer_schedule_value_unsafe
@@ -346,6 +452,10 @@ expect_declaration_finding timer-wrong-owner grimnir-worker.timer timer_target_m
 expect_declaration_finding timer-target-terminal workshop.timer timer_target_terminal_handler
 expect_declaration_finding user-timer-wrong-scope workshop.timer timer_target_mismatch
 expect_declaration_finding timer-persistence grimnir-worker.timer timer_not_persistent
+expect_declaration_finding timer-start-limit-missing grimnir-worker.timer start_limit_burst_missing
+expect_declaration_finding timer-start-limit-unsafe grimnir-worker.timer start_limit_interval_unsafe
+expect_declaration_finding timer-wrong-failure-target grimnir-worker.timer failure_delivery_target_unexpected
+expect_declaration_finding user-timer-failure-missing workshop.timer failure_delivery_missing error component-owner
 
 if ! make_case observations-positive.json observations-negative.json "$TMP/restart-storm-for-invalid-burst.json" restart-storm; then bad "restart-storm fixture mutation succeeds"; fi
 expect_declaration_finding invalid-burst grimnir-api.service start_limit_burst_unsafe error substrate "$TMP/restart-storm-for-invalid-burst.json"
@@ -354,6 +464,7 @@ check "invalid burst never coerces to zero or emits a false restart storm" '! gr
 expect_malformed_declaration fractional-duration
 expect_malformed_declaration compound-duration
 expect_malformed_declaration persistent-string
+expect_malformed_declaration timer-unit-crlf "Injected=yes"
 expect_malformed_declaration user-failure-delivery-unsafe "private path"
 expect_malformed_declaration unsupported-failure-target-type
 expect_malformed_declaration failure-target-array-too-long
@@ -370,6 +481,23 @@ fs.writeFileSync(output, `${JSON.stringify(value, null, 2)}\n`);
 NODE
 run_audit "$TMP/baseline-extension-output.json" "$DECLARATIONS" "$OBSERVATIONS" "$REGISTRY" "$TMP/baseline-extension.json"
 check "nonempty baseline extensions are malformed and emit no record" '[[ "$RC" -eq 2 && ! -s "$TMP/baseline-extension-output.json" ]]'
+
+if make_baseline_case "$TMP/weakened-baseline.json" schema-valid-weakened-baseline; then
+  ROOT="$ROOT" node --input-type=module - "$TMP/weakened-baseline.json" <<'NODE'
+import fs from "node:fs";
+const {checkSchema,schemaErrors}=await import(`${process.env.ROOT}/scripts/lib/maintenance-policy-contract.mjs`);
+const schema=JSON.parse(fs.readFileSync(`${process.env.ROOT}/docs/systemd-supervision-baseline-v1.schema.json`,"utf8"));
+const candidate=JSON.parse(fs.readFileSync(process.argv[2],"utf8"));
+checkSchema(schema);
+if(schemaErrors(schema,candidate).length!==0)process.exit(1);
+NODE
+  # shellcheck disable=SC2034 # consumed by the fixed check expression below.
+  WEAKENED_SCHEMA_RC=$?
+  run_audit "$TMP/weakened-baseline-output.json" "$DECLARATIONS" "$OBSERVATIONS" "$REGISTRY" "$TMP/weakened-baseline.json"
+  check "schema-valid policy drift is rejected against tracked canonical content" '[[ "$WEAKENED_SCHEMA_RC" -eq 0 && "$RC" -eq 2 && ! -s "$TMP/weakened-baseline-output.json" && "$(<"$TMP/weakened-baseline-output.json.stderr")" == "systemd-supervision-audit: rejected" ]]'
+else
+  bad "schema-valid weakened-baseline fixture mutation succeeds"
+fi
 
 node --input-type=module - "$REGISTRY" "$TMP/too-many-components.json" <<'NODE'
 import fs from "node:fs";
@@ -393,16 +521,47 @@ node "$AUDIT" --baseline "$BASELINE" --registry "$REGISTRY" --declarations "$DEC
 CLOCK_RC=$?
 check "production clock source is valid independently of fixture age" '[[ "$CLOCK_RC" -eq 0 || "$CLOCK_RC" -eq 1 ]] && [[ -s "$TMP/clock.json" ]] && node -e '\''const x=require(process.argv[1]); const d=new Date(x.evaluated_at); if(x.evaluated_at_source!=="clock"||Number.isNaN(d.getTime())||d.toISOString().replace(".000Z","Z")!==x.evaluated_at)process.exit(1)'\'' "$TMP/clock.json"'
 
+node "$AUDIT" --baseline "$BASELINE" --registry "$REGISTRY" --declarations "$DECLARATIONS" --observations "$OBSERVATIONS" --now "$NOW" >"$TMP/replay-without-opt-in.json" 2>"$TMP/replay-without-opt-in.json.stderr"
+# shellcheck disable=SC2034 # consumed by the fixed check expression below.
+REPLAY_WITHOUT_OPT_IN_RC=$?
+check "--now is rejected without the explicit replay opt-in" '[[ "$REPLAY_WITHOUT_OPT_IN_RC" -eq 2 && ! -s "$TMP/replay-without-opt-in.json" && "$(<"$TMP/replay-without-opt-in.json.stderr")" == "systemd-supervision-audit: rejected" ]]'
+
+BROKKR_SYSTEMD_AUDIT_ALLOW_REPLAY=1 node "$AUDIT" --baseline "$BASELINE" --registry "$REGISTRY" --declarations "$DECLARATIONS" --observations "$OBSERVATIONS" --now malformed >"$TMP/malformed-now.json" 2>"$TMP/malformed-now.json.stderr"
+# shellcheck disable=SC2034 # consumed by the fixed check expression below.
+MALFORMED_NOW_RC=$?
+check "malformed replay time is a content-blind exit 2 with no record" '[[ "$MALFORMED_NOW_RC" -eq 2 && ! -s "$TMP/malformed-now.json" && "$(<"$TMP/malformed-now.json.stderr")" == "systemd-supervision-audit: rejected" ]]'
+
+ROOT="$ROOT" AUDIT="$AUDIT" node --input-type=module - "$TMP/throwing-audit.mjs" <<'NODE'
+import fs from "node:fs";
+const output = process.argv[2];
+let source = fs.readFileSync(process.env.AUDIT, "utf8");
+source = source.replace('"./lib/maintenance-policy-contract.mjs"', `"file://${process.env.ROOT}/scripts/lib/maintenance-policy-contract.mjs"`);
+const marker = "function main() {";
+if (!source.includes(marker)) throw new Error("top-level main boundary missing");
+source = source.replace(marker, `${marker}\n  throw new Error("private-exception-marker");`);
+fs.writeFileSync(output, source);
+NODE
+# shellcheck disable=SC2034 # consumed by the fixed check expression below.
+THROWING_FIXTURE_RC=$?
+BROKKR_SYSTEMD_AUDIT_ALLOW_REPLAY=1 node "$TMP/throwing-audit.mjs" --baseline "$BASELINE" --registry "$REGISTRY" --declarations "$DECLARATIONS" --observations "$OBSERVATIONS" --now "$NOW" >"$TMP/throwing-audit.json" 2>"$TMP/throwing-audit.json.stderr"
+# shellcheck disable=SC2034 # consumed by the fixed check expression below.
+THROWING_AUDIT_RC=$?
+check "unexpected exceptions cross one constant content-blind exit-2 boundary" '[[ "$THROWING_FIXTURE_RC" -eq 0 && "$THROWING_AUDIT_RC" -eq 2 && ! -s "$TMP/throwing-audit.json" && "$(<"$TMP/throwing-audit.json.stderr")" == "systemd-supervision-audit: rejected" ]] && ! grep -q '"'"'private-exception-marker\|Error:\| at '"'"' "$TMP/throwing-audit.json.stderr"'
+
 check "audit source has one unit status key and no external-command surface" 'SOURCE="$AUDIT" node --input-type=module <<'"'"'NODE'"'"'
 import fs from "node:fs";
 const source=fs.readFileSync(process.env.SOURCE,"utf8");
+const imports=[...source.matchAll(/from\s+"([^"]+)"/g)].map(match=>match[1]);
+const allowedImports=new Set(["node:crypto","node:fs","node:path","node:url","./lib/maintenance-policy-contract.mjs"]);
+if(imports.some(specifier=>!allowedImports.has(specifier))||new Set(imports).size!==allowedImports.size)process.exit(1);
 const start=source.indexOf("const output = {");
 const end=source.indexOf("unitOutputs.push(output)",start);
 const body=source.slice(start,end);
 if((body.match(/\n\s+status:/g)??[]).length!==1)process.exit(1);
-const forbiddenModule=/"(?:node:)?(?:child_process|http|https|http2|net|tls|dgram|dns|undici|worker_threads)"/;
+if((source.match(/"heartbeat_missing"/g)??[]).length!==1)process.exit(1);
+const forbiddenModule=/"(?:node:)?(?:child_process|http|https|http2|net|tls|dgram|dns|undici|worker_threads|cluster|quic)(?:\/[^" ]*)?"/;
 const forbiddenBareChildApi=/(?<![.\w])(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork)\s*\(/;
-const forbiddenExternalApi=/\b(?:fetch|XMLHttpRequest|WebSocket|writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|truncate|truncateSync|rm|rmSync|unlink|unlinkSync|rename|renameSync|copyFile|copyFileSync|mkdir|mkdirSync)\s*\(/;
+const forbiddenExternalApi=/\b(?:fetch|XMLHttpRequest|WebSocket|writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|truncate|truncateSync|rm|rmSync|unlink|unlinkSync|rename|renameSync|copyFile|copyFileSync|mkdir|mkdirSync|rmdir|rmdirSync|mkdtemp|mkdtempSync|chmod|chmodSync|chown|chownSync|link|linkSync|symlink|symlinkSync)\s*\(/;
 if(forbiddenModule.test(source)||forbiddenBareChildApi.test(source)||forbiddenExternalApi.test(source))process.exit(1);
 NODE'
 
