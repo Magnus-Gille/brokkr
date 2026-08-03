@@ -96,6 +96,12 @@ RECOVERY_UNIT="brokkr-debian-maintenance-recovery@.service"
 FACTORY_UNIT="brokkr-debian-maintenance-attempt-factory.service"
 FACTORY_TIMER="brokkr-debian-maintenance-attempt-factory.timer"
 RELEASE_FILES=(
+  docs/autonomy-constitution-v2.schema.json
+  docs/autonomy-coverage-registry-v2.schema.json
+  docs/autonomy-owner-attestation-registry-v1.schema.json
+  docs/autonomy-owner-authorization-v1.schema.json
+  docs/autonomy-recovery-worker-registry-v1.schema.json
+  docs/autonomy-runtime-narrowing-v1.schema.json
   docs/autonomous-mutation-journal-v2.schema.json
   docs/debian-maintenance-attempt-factory-config-v1.schema.json
   docs/debian-maintenance-window-freshness-v1.schema.json
@@ -373,6 +379,12 @@ stage_exact_release() {
     "$staged_release/scripts/debian-maintenance-attempt-factory.mjs" \
     "$staged_release/scripts/debian-maintenance-host-adapter.mjs"
   chmod 0644 \
+    "$staged_release/docs/autonomy-constitution-v2.schema.json" \
+    "$staged_release/docs/autonomy-coverage-registry-v2.schema.json" \
+    "$staged_release/docs/autonomy-owner-attestation-registry-v1.schema.json" \
+    "$staged_release/docs/autonomy-owner-authorization-v1.schema.json" \
+    "$staged_release/docs/autonomy-recovery-worker-registry-v1.schema.json" \
+    "$staged_release/docs/autonomy-runtime-narrowing-v1.schema.json" \
     "$staged_release/docs/autonomous-mutation-journal-v2.schema.json" \
     "$staged_release/docs/debian-maintenance-attempt-factory-config-v1.schema.json" \
     "$staged_release/docs/debian-maintenance-window-freshness-v1.schema.json" \

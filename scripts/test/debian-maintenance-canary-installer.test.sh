@@ -11,6 +11,12 @@ SYSTEMCTL_LOG="$TMP/systemctl.log"
 NODE_BIN="$(command -v node)"
 mkdir -p "$SOURCE/docs" "$SOURCE/scripts/lib" "$SOURCE/systemd"
 cp \
+  "$ROOT/docs/autonomy-constitution-v2.schema.json" \
+  "$ROOT/docs/autonomy-coverage-registry-v2.schema.json" \
+  "$ROOT/docs/autonomy-owner-attestation-registry-v1.schema.json" \
+  "$ROOT/docs/autonomy-owner-authorization-v1.schema.json" \
+  "$ROOT/docs/autonomy-recovery-worker-registry-v1.schema.json" \
+  "$ROOT/docs/autonomy-runtime-narrowing-v1.schema.json" \
   "$ROOT/docs/autonomous-mutation-journal-v2.schema.json" \
   "$ROOT/docs/debian-maintenance-attempt-factory-config-v1.schema.json" \
   "$ROOT/docs/debian-maintenance-window-freshness-v1.schema.json" \
@@ -139,6 +145,12 @@ test -r "$RELEASE_ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
 test -r "$RELEASE_ROOT/scripts/lib/bounded-recovery-dispatch.mjs"
 test -r "$RELEASE_ROOT/systemd/brokkr-debian-maintenance-recovery.service.in"
 for file in \
+  docs/autonomy-constitution-v2.schema.json \
+  docs/autonomy-coverage-registry-v2.schema.json \
+  docs/autonomy-owner-attestation-registry-v1.schema.json \
+  docs/autonomy-owner-authorization-v1.schema.json \
+  docs/autonomy-recovery-worker-registry-v1.schema.json \
+  docs/autonomy-runtime-narrowing-v1.schema.json \
   docs/autonomous-mutation-journal-v2.schema.json \
   docs/debian-maintenance-attempt-factory-config-v1.schema.json \
   docs/debian-maintenance-window-freshness-v1.schema.json \
