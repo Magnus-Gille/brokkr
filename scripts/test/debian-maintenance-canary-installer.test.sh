@@ -42,7 +42,26 @@ if [[ "$COLLISION_WRONG_REVISION" == "$COLLISION_REVISION" ]]; then
   echo "wrong revision fixture collided with valid revision" >&2
   exit 1
 fi
-test "$COLLISION_WRONG_REVISION" = "${COLLISION_REVISION%?}1"
+if [[ "$COLLISION_WRONG_REVISION" != "${COLLISION_REVISION%?}1" ]]; then
+  echo "wrong revision fixture did not map a 0-ending SHA to suffix 1" >&2
+  exit 1
+fi
+
+# A non-zero-ending SHA must take the zero-suffix branch deterministically.
+NONZERO_ENDING_REVISION=000000000000000000000000000000000000000f
+NONZERO_ENDING_WRONG_REVISION="$(wrong_revision "$NONZERO_ENDING_REVISION")"
+if [[ ! "$NONZERO_ENDING_WRONG_REVISION" =~ ^[a-f0-9]{40}$ ]]; then
+  echo "wrong revision fixture is not a lowercase hexadecimal SHA for a non-zero-ending input" >&2
+  exit 1
+fi
+if [[ "$NONZERO_ENDING_WRONG_REVISION" == "$NONZERO_ENDING_REVISION" ]]; then
+  echo "wrong revision fixture collided for a non-zero-ending input" >&2
+  exit 1
+fi
+if [[ "$NONZERO_ENDING_WRONG_REVISION" != "${NONZERO_ENDING_REVISION%?}0" ]]; then
+  echo "wrong revision fixture did not map a non-zero-ending SHA to suffix 0" >&2
+  exit 1
+fi
 
 WRONG_REVISION="$(wrong_revision "$REVISION")"
 if [[ ! "$WRONG_REVISION" =~ ^[a-f0-9]{40}$ ]]; then
