@@ -23,6 +23,37 @@ git -C "$SOURCE" add .
 git -C "$SOURCE" commit -qm "fixture"
 REVISION="$(git -C "$SOURCE" rev-parse HEAD)"
 
+wrong_revision() {
+  local revision="$1" alternate=0
+  if [[ "$revision" == *0 ]]; then
+    alternate=1
+  fi
+  printf '%s%s\n' "${revision%?}" "$alternate"
+}
+
+# A wrong revision must remain distinct when the valid revision ends in 0.
+COLLISION_REVISION=0000000000000000000000000000000000000000
+COLLISION_WRONG_REVISION="$(wrong_revision "$COLLISION_REVISION")"
+if [[ ! "$COLLISION_WRONG_REVISION" =~ ^[a-f0-9]{40}$ ]]; then
+  echo "wrong revision fixture is not a lowercase hexadecimal SHA" >&2
+  exit 1
+fi
+if [[ "$COLLISION_WRONG_REVISION" == "$COLLISION_REVISION" ]]; then
+  echo "wrong revision fixture collided with valid revision" >&2
+  exit 1
+fi
+test "$COLLISION_WRONG_REVISION" = "${COLLISION_REVISION%?}1"
+
+WRONG_REVISION="$(wrong_revision "$REVISION")"
+if [[ ! "$WRONG_REVISION" =~ ^[a-f0-9]{40}$ ]]; then
+  echo "wrong revision for generated revision is not a lowercase hexadecimal SHA" >&2
+  exit 1
+fi
+if [[ "$WRONG_REVISION" == "$REVISION" ]]; then
+  echo "wrong revision for generated revision collided with valid revision" >&2
+  exit 1
+fi
+
 cat >"$TMP/systemctl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -489,7 +520,7 @@ if env \
   BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
   "$INSTALLER" install \
     --source "$SOURCE" \
-    --revision "${REVISION%?}0" \
+    --revision "$WRONG_REVISION" \
     --canary canary-fi >"$TMP/wrong.out" 2>&1; then
   echo "wrong revision unexpectedly installed" >&2
   exit 1
