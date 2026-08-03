@@ -420,8 +420,8 @@ function withLock(directory, operation) {
     }
   }
 }
-function freshnessBinding(snapshot) {
-  return {
+function freshnessBinding(snapshot, { hostVerified = false } = {}) {
+  const binding = {
     policy_digest: snapshot.policy.policy_digest,
     target_scope_digest: digest({
       node_id: snapshot.target.node_id,
@@ -430,12 +430,22 @@ function freshnessBinding(snapshot) {
     window: structuredClone(snapshot.window),
     kill_switch_identity: snapshot.kill_switch.identity,
   };
+  if (!hostVerified) {
+    Object.assign(binding, {
+      plan_digest: digest(snapshot.plan),
+      inventory_baseline_digest: digest(snapshot.inventory),
+      postconditions_digest: digest(snapshot.postconditions),
+      apt_source_evidence_digest: digest(snapshot.apt_source_evidence),
+    });
+  }
+  return binding;
 }
 function hostEffectVerified(stateRoot, attemptId) {
   const journal = path.join(stateRoot, "journals", `${attemptId}.json`);
   if (!fs.existsSync(journal)) return false;
   const value = readJson(journal);
-  return Array.isArray(value.entries) &&
+  return exactKeys(value, ["entries", "terminal"]) &&
+    value.terminal === null && Array.isArray(value.entries) &&
     value.entries.at(-1)?.phase === "verify";
 }
 
@@ -665,11 +675,7 @@ export function buildFixedProductionRunOptions({
     fail("attempt_factory_recovery_key_mismatch");
   }
   let activeFence = null;
-  const fixedHostJournal = path.join(
-    stateRoot, "journals", `${proposal.binding.attempt_id}.json`,
-  );
-  let applied = fs.existsSync(fixedHostJournal) &&
-    readJson(fixedHostJournal).entries?.at(-1)?.phase === "verify";
+  let applied = hostEffectVerified(stateRoot, proposal.binding.attempt_id);
   const activation = fence => {
     if (fence.binding_digest !== proposal.binding_digest ||
         fence.attempt_id !== proposal.binding.attempt_id ||
@@ -736,8 +742,11 @@ export function buildFixedProductionRunOptions({
   };
   const ensureFresh = () => {
     const current = fresh();
-    if (canonicalJson(freshnessBinding(current)) !==
-        canonicalJson(freshnessBinding(proposal.evidence))) {
+    if (canonicalJson(freshnessBinding(current, {
+      hostVerified: applied,
+    })) !== canonicalJson(freshnessBinding(proposal.evidence, {
+      hostVerified: applied,
+    }))) {
       fail("attempt_factory_freshness_drifted");
     }
     return current;
@@ -767,6 +776,7 @@ export function buildFixedProductionRunOptions({
     },
     maintenance: () => {
       const current = ensureFresh();
+      const admissionPlan = applied ? proposal.plan : current.plan;
       return {
         window: {
           start: current.window.start, end: current.window.end,
@@ -776,7 +786,7 @@ export function buildFixedProductionRunOptions({
           non_pillar: current.target.non_pillar,
         },
         plan: {
-          classes: [...new Set(current.plan.candidates
+          classes: [...new Set(admissionPlan.candidates
             .map(item => item.class))].sort(),
           reboot_policy: "never", source: "distro_repository",
           workload_hooks: "not_applicable",
@@ -785,9 +795,7 @@ export function buildFixedProductionRunOptions({
     },
   };
   const adapters = {
-    inventory: () => structuredClone(
-      applied ? proposal.expected_postconditions : ensureFresh().inventory,
-    ),
+    inventory: () => structuredClone(ensureFresh().inventory),
     activateFence: activation,
     applyFenced: invocation => {
       const current = ensureFresh();
@@ -930,11 +938,17 @@ export function runDebianMaintenanceAttemptFactory({
     const beforeEffect = validateFreshness(
       readFreshness(), effectAt, config.target,
     );
-    if (canonicalJson(freshnessBinding(beforeEffect)) !==
-        canonicalJson(freshnessBinding(proposal.evidence))) {
+    const verifiedHostEffect = hostEffectVerified(
+      stateRoot, proposal.binding.attempt_id,
+    );
+    if (canonicalJson(freshnessBinding(beforeEffect, {
+      hostVerified: verifiedHostEffect,
+    })) !== canonicalJson(freshnessBinding(proposal.evidence, {
+      hostVerified: verifiedHostEffect,
+    }))) {
       fail("attempt_factory_freshness_drifted");
     }
-    if (!hostEffectVerified(stateRoot, proposal.binding.attempt_id) &&
+    if (!verifiedHostEffect &&
         Date.parse(proposal.binding.deadline) - Date.parse(effectAt) <
           (APPLY_VERIFY_BUDGET_SECONDS + config.watch_seconds) * 1000) {
       fail("attempt_factory_watch_unreachable");

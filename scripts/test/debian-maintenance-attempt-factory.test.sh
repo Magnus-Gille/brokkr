@@ -3,7 +3,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-ROOT="$ROOT" TMP="$TMP" node --input-type=module <<'NODE'
+ROOT="$ROOT" TMP="$TMP" node \
+  --experimental-loader \
+  "$ROOT/scripts/test/fixtures/fixed-recovery-host/loader.mjs" \
+  --input-type=module <<'NODE'
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -229,6 +232,65 @@ assert.throws(() => runDebianMaintenanceAttemptFactory({
   readFreshness: () => structuredClone(reads++ === 0 ? fresh : drifted),
 }), /attempt_factory_freshness_ineligible/);
 
+const assertPreEffectInputDriftBlocked = (name, mutate) => {
+  const changed = structuredClone(fresh);
+  mutate(changed);
+  let freshnessReads = 0;
+  let hostEffects = 0;
+  assert.throws(() => runDebianMaintenanceAttemptFactory({
+    ...base, stateRoot: `${process.env.TMP}/${name}`,
+    readFreshness: () => structuredClone(
+      freshnessReads++ === 0 ? fresh : changed,
+    ),
+    runAttempt: () => {
+      hostEffects += 1;
+      return { reason: "unexpected" };
+    },
+  }), /attempt_factory_freshness_drifted/);
+  assert.equal(hostEffects, 0,
+    `${name} must fail closed before any host effect`);
+};
+assertPreEffectInputDriftBlocked("plan-drift", snapshot => {
+  snapshot.plan.created_at = "2026-07-30T18:00:01Z";
+});
+assertPreEffectInputDriftBlocked("inventory-baseline-drift", snapshot => {
+  snapshot.inventory.packages = ["openssl=3.0.17-1~deb12u0"];
+});
+assertPreEffectInputDriftBlocked("postcondition-drift", snapshot => {
+  snapshot.postconditions.packages = ["openssl=3.0.17-1~deb12u3"];
+});
+assertPreEffectInputDriftBlocked("apt-evidence-drift", snapshot => {
+  snapshot.apt_source_evidence.trust_config_digest = digest("changed-trust");
+});
+
+const nonterminalVerifyRoot = `${process.env.TMP}/nonterminal-verify`;
+fs.mkdirSync(`${nonterminalVerifyRoot}/journals`, {
+  recursive: true, mode: 0o700,
+});
+fs.writeFileSync(
+  `${nonterminalVerifyRoot}/journals/${identities.attempt_id}.json`,
+  `${canonicalJson({
+    entries: [{ phase: "verify" }, { phase: "unknown" }], terminal: null,
+  })}\n`,
+  { mode: 0o600 },
+);
+const nonterminalChanged = structuredClone(fresh);
+nonterminalChanged.plan.created_at = "2026-07-30T18:00:01Z";
+let nonterminalReads = 0;
+let nonterminalEffects = 0;
+assert.throws(() => runDebianMaintenanceAttemptFactory({
+  ...base, stateRoot: nonterminalVerifyRoot,
+  readFreshness: () => structuredClone(
+    nonterminalReads++ === 0 ? fresh : nonterminalChanged,
+  ),
+  runAttempt: () => {
+    nonterminalEffects += 1;
+    return { reason: "unexpected" };
+  },
+}), /attempt_factory_freshness_drifted/);
+assert.equal(nonterminalEffects, 0,
+  "a nonterminal verify marker cannot relax pre-effect freshness");
+
 fs.mkdirSync(`${process.env.TMP}/contended`, { mode: 0o700 });
 fs.mkdirSync(`${process.env.TMP}/contended/occurrences`, { mode: 0o700 });
 const proposalName = identities.occurrence_digest.slice("sha256:".length);
@@ -421,9 +483,7 @@ authorization.signature = {
   value_base64: sign(authorization, ownerKeys.privateKey),
 };
 const authorizationDigest = digest(authorization);
-const integrationRoot = `${process.env.TMP}/integration`;
 const authorityRoot = `${process.env.TMP}/authority`;
-fs.mkdirSync(integrationRoot, { mode: 0o700 });
 fs.mkdirSync(authorityRoot, { mode: 0o700 });
 const protectedWrite = (file, value, raw = false) => {
   fs.writeFileSync(file, raw ? value : `${canonicalJson(value)}\n`,
@@ -449,17 +509,6 @@ protectedWrite(
   `${authorityRoot}/recovery-worker-private-key.pem`,
   recoveryKeys.privateKey.export({ type: "pkcs8", format: "pem" }), true,
 );
-protectedWrite(`${integrationRoot}/runtime-narrowing.json`, {
-  kind: "autonomy-runtime-narrowing", schema_version: "v1",
-  ledger_id: "maintenance-runtime-narrowing",
-  owner_authorization_digest: authorizationDigest,
-  entries: [], extensions: [],
-});
-protectedWrite(`${integrationRoot}/runtime-narrowing-checkpoint.json`, {
-  kind: "autonomy-runtime-narrowing-checkpoint", schema_version: "v1",
-  owner_authorization_digest: authorizationDigest,
-  ledger_tail_digest: null, minimum_entries: 0,
-});
 const integrationConfig = structuredClone(config);
 integrationConfig.actors = structuredClone(coverageBinding.identities);
 integrationConfig.authority = {
@@ -479,52 +528,189 @@ const integrationFresh = structuredClone(fresh);
 integrationFresh.kill_switch.identity =
   integrationConfig.actors.kill_switch;
 integrationFresh.valid_until = "2026-07-30T20:00:00Z";
-let clockMs = Date.parse("2026-07-30T18:00:00Z");
-const clock = () => new Date(clockMs += 1000)
-  .toISOString().replace(".000Z", "Z");
-let fixedHostCalls = 0;
-const fixedHostMock = (_adapter, attempt) => {
-  fixedHostCalls += 1;
-  const requestPath = `${integrationRoot}/requests/${attempt}.json`;
-  const registrationPath =
-    `${integrationRoot}/registrations/${attempt}.json`;
-  const fixedRequest = JSON.parse(fs.readFileSync(requestPath));
-  const fixedRegistration = JSON.parse(fs.readFileSync(registrationPath));
-  assert.equal(fixedRequest.schema_version, "v2");
-  assert.equal(fixedRequest.binding_digest, digest(fixedRequest.binding));
-  assert.equal(
-    fixedRequest.recovery_descriptor_digest,
-    digest(fixedRequest.recovery_descriptor),
-  );
-  assert.equal(
-    fixedRegistration.lease_fence_digest,
-    fixedRequest.lease_fence_digest,
-  );
-  fs.mkdirSync(`${integrationRoot}/journals`, { mode: 0o700 });
-  protectedWrite(`${integrationRoot}/journals/${attempt}.json`, {
-    entries: [{ phase: "verify" }],
-  });
-  return { elapsed_ms: 1 };
+const refreshPostEffectInputs = (snapshot, createdAt) => {
+  const currentPlan = structuredClone(snapshot.plan);
+  currentPlan.created_at = createdAt;
+  currentPlan.candidates = [];
+  delete currentPlan.plan_digest;
+  currentPlan.plan_digest = digest(currentPlan);
+  snapshot.plan = currentPlan;
+  snapshot.postconditions = {
+    ...structuredClone(after),
+    packages: ["openssl=3.0.17-1~deb12u3"],
+  };
+  snapshot.apt_source_evidence = {
+    kind: "brokkr-debian-apt-source-evidence", schema_version: "v1",
+    plan_digest: currentPlan.plan_digest,
+    policy_digest: policy.policy_digest,
+    trust_config_digest: digest("post-effect-trust"),
+    candidates: [],
+  };
 };
-const watching = runDebianMaintenanceAttemptFactory({
-  stateRoot: integrationRoot, authorityRoot, releaseDigest,
-  readConfiguration: () => structuredClone(integrationConfig),
-  readFreshness: () => structuredClone(integrationFresh),
-  now: clock, hostApply: fixedHostMock,
+const initializeIntegrationRoot = name => {
+  const root = `${process.env.TMP}/${name}`;
+  fs.mkdirSync(root, { mode: 0o700 });
+  protectedWrite(`${root}/runtime-narrowing.json`, {
+    kind: "autonomy-runtime-narrowing", schema_version: "v1",
+    ledger_id: "maintenance-runtime-narrowing",
+    owner_authorization_digest: authorizationDigest,
+    entries: [], extensions: [],
+  });
+  protectedWrite(`${root}/runtime-narrowing-checkpoint.json`, {
+    kind: "autonomy-runtime-narrowing-checkpoint", schema_version: "v1",
+    owner_authorization_digest: authorizationDigest,
+    ledger_tail_digest: null, minimum_entries: 0,
+  });
+  return root;
+};
+const advancingClock = initial => {
+  let milliseconds = Date.parse(initial);
+  return {
+    now: () => new Date(milliseconds += 1000)
+      .toISOString().replace(".000Z", "Z"),
+    set: value => { milliseconds = Date.parse(value); },
+  };
+};
+const fixedHostFor = stateRoot => {
+  let calls = 0;
+  return {
+    apply: (_adapter, attempt) => {
+      calls += 1;
+      const fixedRequest = JSON.parse(fs.readFileSync(
+        `${stateRoot}/requests/${attempt}.json`,
+      ));
+      const fixedRegistration = JSON.parse(fs.readFileSync(
+        `${stateRoot}/registrations/${attempt}.json`,
+      ));
+      assert.equal(fixedRequest.schema_version, "v2");
+      assert.equal(fixedRequest.binding_digest, digest(fixedRequest.binding));
+      assert.equal(
+        fixedRequest.recovery_descriptor_digest,
+        digest(fixedRequest.recovery_descriptor),
+      );
+      assert.equal(
+        fixedRegistration.lease_fence_digest,
+        fixedRequest.lease_fence_digest,
+      );
+      fs.mkdirSync(`${stateRoot}/journals`, {
+        recursive: true, mode: 0o700,
+      });
+      protectedWrite(`${stateRoot}/journals/${attempt}.json`, {
+        entries: [{ phase: "verify" }], terminal: null,
+      });
+      return { elapsed_ms: 1 };
+    },
+    calls: () => calls,
+  };
+};
+const runIntegration = ({ stateRoot, freshness, clock, host }) =>
+  runDebianMaintenanceAttemptFactory({
+    stateRoot, authorityRoot, releaseDigest,
+    readConfiguration: () => structuredClone(integrationConfig),
+    readFreshness: () => structuredClone(freshness),
+    now: clock.now, hostApply: host.apply,
+  });
+
+const successRoot = initializeIntegrationRoot("integration-success");
+const successFresh = structuredClone(integrationFresh);
+const successClock = advancingClock("2026-07-30T18:00:00Z");
+const successHost = fixedHostFor(successRoot);
+const watching = runIntegration({
+  stateRoot: successRoot, freshness: successFresh,
+  clock: successClock, host: successHost,
 });
 assert.equal(watching.result.reason, "watching");
-assert.equal(fixedHostCalls, 1);
-clockMs = Date.parse("2026-07-30T19:01:10Z");
-integrationFresh.observed_at = "2026-07-30T19:01:10Z";
-const committed = runDebianMaintenanceAttemptFactory({
-  stateRoot: integrationRoot, authorityRoot, releaseDigest,
-  readConfiguration: () => structuredClone(integrationConfig),
-  readFreshness: () => structuredClone(integrationFresh),
-  now: clock, hostApply: fixedHostMock,
+assert.equal(successHost.calls(), 1);
+successClock.set("2026-07-30T19:01:10Z");
+successFresh.observed_at = "2026-07-30T19:01:10Z";
+successFresh.inventory = structuredClone(after);
+refreshPostEffectInputs(successFresh, "2026-07-30T19:01:10Z");
+const committed = runIntegration({
+  stateRoot: successRoot, freshness: successFresh,
+  clock: successClock, host: successHost,
 });
 assert.equal(committed.result.reason, "committed");
-assert.equal(fixedHostCalls, 1,
+assert.equal(successHost.calls(), 1,
   "watch continuation never replays the fixed host effect");
+
+const recoveryActivations = new Map();
+globalThis.__BROKKR_TEST_FIXED_RECOVERY_HOST__ = {
+  persistActivation: activation => {
+    const activationDigest = digest(activation);
+    const existing = recoveryActivations.get(activation.attempt_id);
+    if (existing && digest(existing) !== activationDigest) {
+      throw Object.assign(new Error("activation-conflict"), {
+        code: "activation_conflict",
+      });
+    }
+    recoveryActivations.set(
+      activation.attempt_id, structuredClone(activation),
+    );
+    return {
+      activation_digest: activationDigest,
+      idempotent: existing !== undefined,
+    };
+  },
+  runFixedAdapter: ({ recovery_request: request }) => ({
+    idempotency_key: request.idempotency_key,
+    effect_lease_fence_digest: request.lease_fence_digest,
+    revalidated_lease_fence_digest: request.revalidation_fence_digest,
+    revalidated_at: request.revalidation_fence.activated_at,
+    recovered: true, safe_state_verified: true,
+    quarantine_active: true, reason_code: null,
+  }),
+};
+const driftRoot = initializeIntegrationRoot("integration-watch-drift");
+const driftFresh = structuredClone(integrationFresh);
+const driftClock = advancingClock("2026-07-30T18:00:00Z");
+const driftHost = fixedHostFor(driftRoot);
+const driftWatching = runIntegration({
+  stateRoot: driftRoot, freshness: driftFresh,
+  clock: driftClock, host: driftHost,
+});
+assert.equal(driftWatching.result.reason, "watching");
+driftClock.set("2026-07-30T18:10:00Z");
+driftFresh.observed_at = "2026-07-30T18:10:00Z";
+const timestampRefresh = runIntegration({
+  stateRoot: driftRoot, freshness: driftFresh,
+  clock: driftClock, host: driftHost,
+});
+assert.equal(timestampRefresh.result.reason, "watching",
+  "a timestamp-only refresh resumes the durable watch");
+driftClock.set("2026-07-30T18:20:00Z");
+driftFresh.observed_at = "2026-07-30T18:20:00Z";
+driftFresh.inventory = structuredClone(after);
+refreshPostEffectInputs(driftFresh, "2026-07-30T18:20:00Z");
+const inventoryTransition = runIntegration({
+  stateRoot: driftRoot, freshness: driftFresh,
+  clock: driftClock, host: driftHost,
+});
+assert.equal(inventoryTransition.result.reason, "watching",
+  "the verified inventory transition resumes the durable watch");
+driftClock.set("2026-07-30T19:01:10Z");
+driftFresh.observed_at = "2026-07-30T19:01:10Z";
+driftFresh.inventory.packages = ["openssl=3.0.17-1~deb12u3"];
+const driftRecovered = runIntegration({
+  stateRoot: driftRoot, freshness: driftFresh,
+  clock: driftClock, host: driftHost,
+});
+assert.equal(driftRecovered.result.reason, "recovered-disarmed",
+  "one-hour inventory drift enters fail-closed recovery");
+assert.equal(driftRecovered.result.journal.entries.some(
+  entry => entry.phase === "commit",
+), false, "one-hour inventory drift cannot commit");
+assert.equal(driftHost.calls(), 1,
+  "watch retries and drift recovery never replay the host effect");
+
+const terminalRetry = runDebianMaintenanceAttemptFactory({
+  stateRoot: driftRoot, authorityRoot, releaseDigest,
+  readConfiguration: () => structuredClone(integrationConfig),
+  readFreshness: () => structuredClone(driftFresh),
+  now: driftClock.now, hostApply: driftHost.apply,
+});
+assert.equal(terminalRetry.result.reason, "terminal-disarm",
+  "the recovered terminal remains idempotently replayable");
+assert.equal(driftHost.calls(), 1);
 
 console.log("debian maintenance attempt factory tests passed");
 NODE

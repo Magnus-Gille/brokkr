@@ -39,10 +39,26 @@ rename. Competing reclaimers cannot rename a winner's replacement lock; a
 crashed reclaimer is superseded through another atomically claimed generation.
 
 Immediately before W2 effect, the factory re-reads the protected freshness
-record. Policy, target, window, and kill-switch identity must still match and
-all liveness/eligibility/kill/hold/validity predicates must still be true. W2
-independently repeats authority, evidence, liveness, window, policy, inventory,
-fence, and kill-switch checks before effect.
+record. Until the fixed host journal ends in its valid `verify` phase, policy, target,
+window, kill-switch identity, plan, inventory baseline, expected
+postconditions, and apt-source evidence must exactly match the persisted
+proposal, and all liveness/eligibility/kill/hold/validity predicates must still
+be true. Apt evidence is checked again at the fixed adapter immediately before
+the package effect. W2 independently repeats authority, evidence, liveness,
+window, policy, inventory, fence, and kill-switch checks before effect.
+
+After that terminal host verification, the immutable proposal and W2 binding
+remain the effect authority. A refreshed record may legitimately contain a recomputed
+plan, inventory, projected postconditions, and apt evidence because installed
+state has changed; those values are no longer compared to the pre-effect
+proposal. The record must still be current, live, eligible, unheld, unkilled,
+in the same policy/target/window/kill-switch occurrence, and otherwise valid.
+During durable-watch continuation, W2 reads the current protected freshness
+inventory rather than synthesizing the proposal's expected state. The one-hour
+readback compares that current inventory with the immutable binding's
+postconditions digest; drift cannot commit and enters fail-closed recovery.
+The immediate post-apply inventory remains grounded in the fixed host adapter's
+verified `applied` outcome.
 
 ## Acyclic digest graph
 
@@ -69,6 +85,13 @@ files. It calls `runDebianMaintenance` directly. Immediately before the host
 effect it persists the final lease-fenced request and registration and invokes
 only the release-local fixed host adapter. Configuration cannot supply code,
 callbacks, commands, paths, packages, or units.
+
+The factory service retains `ProtectSystem=strict`. Because the fixed apply
+adapter runs as its child and inherits that mount namespace, the only writable
+path exceptions are the maintenance state root plus `/var/lib/dpkg`,
+`/var/cache/apt`, and `/var/log/apt`. The installer rejects a factory template
+that weakens strict protection, omits those paths, adds another writable-path
+directive, or otherwise changes that exact exception line.
 
 Every attempt uses the one constrained release-bound
 `brokkr-debian-maintenance-recovery@.service` template. W2's authenticated

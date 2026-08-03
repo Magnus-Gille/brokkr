@@ -180,6 +180,12 @@ grep -Fqx \
 grep -Fqx \
   "ExecStart=/usr/local/lib/brokkr/releases/$REVISION/scripts/debian-maintenance-attempt-factory.mjs" \
   "$FACTORY_UNIT"
+grep -Fqx "ProtectSystem=strict" "$FACTORY_UNIT"
+! grep -Fqx "ProtectSystem=false" "$FACTORY_UNIT"
+test "$(grep -c '^ReadWritePaths=' "$FACTORY_UNIT")" -eq 1
+grep -Fqx \
+  "ReadWritePaths=/var/lib/brokkr/debian-maintenance /var/lib/dpkg /var/cache/apt /var/log/apt" \
+  "$FACTORY_UNIT"
 cmp \
   "$SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
   "$FACTORY_TIMER"
@@ -471,6 +477,49 @@ fi
 grep -Fq "install_headroom_reserve_unsafe" "$TMP/sparse.out"
 test ! -e "$SPARSE_ROOT/etc"
 test ! -e "$SPARSE_ROOT/usr"
+
+# The installer rejects a tracked factory template that would either remove
+# strict filesystem protection or omit the exact apt/dpkg write exceptions
+# inherited by its fixed child adapter.
+UNSAFE_FACTORY_SOURCE="$TMP/unsafe-factory-source"
+git clone -q "$SOURCE" "$UNSAFE_FACTORY_SOURCE"
+git -C "$UNSAFE_FACTORY_SOURCE" config user.email test@example.invalid
+git -C "$UNSAFE_FACTORY_SOURCE" config user.name "Brokkr hermetic test"
+sed \
+  -e 's/^ProtectSystem=strict$/ProtectSystem=false/' \
+  -e 's#^ReadWritePaths=.*#ReadWritePaths=/var/lib/brokkr/debian-maintenance#' \
+  "$UNSAFE_FACTORY_SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.service.in" \
+  >"$UNSAFE_FACTORY_SOURCE/systemd/.unsafe-factory.service.in"
+mv \
+  "$UNSAFE_FACTORY_SOURCE/systemd/.unsafe-factory.service.in" \
+  "$UNSAFE_FACTORY_SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.service.in"
+git -C "$UNSAFE_FACTORY_SOURCE" add \
+  systemd/brokkr-debian-maintenance-attempt-factory.service.in
+git -C "$UNSAFE_FACTORY_SOURCE" commit -qm "unsafe factory sandbox"
+UNSAFE_FACTORY_REVISION="$(
+  git -C "$UNSAFE_FACTORY_SOURCE" rev-parse HEAD
+)"
+UNSAFE_FACTORY_ROOT="$TMP/unsafe-factory-root"
+if env \
+  BROKKR_CANARY_INSTALL_TEST_ROOT="$UNSAFE_FACTORY_ROOT" \
+  BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
+  BROKKR_CANARY_FALLOCATE="$TMP/fallocate" \
+  BROKKR_CANARY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$TMP/unsafe-factory-systemctl.log" \
+  "$INSTALLER" install \
+    --source "$UNSAFE_FACTORY_SOURCE" \
+    --revision "$UNSAFE_FACTORY_REVISION" \
+    --canary canary-unsafe-factory \
+    >"$TMP/unsafe-factory.out" 2>&1; then
+  echo "unsafe attempt factory unit unexpectedly installed" >&2
+  exit 1
+fi
+grep -Fq "attempt factory unit template sandbox invalid" \
+  "$TMP/unsafe-factory.out"
+test ! -e \
+  "$UNSAFE_FACTORY_ROOT/etc/systemd/system/brokkr-debian-maintenance-attempt-factory.service"
+test ! -e \
+  "$UNSAFE_FACTORY_ROOT/usr/local/lib/brokkr/releases/$UNSAFE_FACTORY_REVISION"
 
 # Invalid tracked template content fails during staging, before either concrete
 # unit or immutable release is published.

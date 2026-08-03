@@ -485,11 +485,26 @@ render_recovery_unit() {
 render_factory_unit() {
   local destination="$1"
   local template="$2"
+  local protect_system_count
+  local writable_paths_count
   grep -Fq '@RELEASE_SHA@' "$template" ||
     die "attempt factory unit template lacks release placeholder"
   sed -e "s/@RELEASE_SHA@/$REVISION/g" "$template" >"$destination"
   if grep -Eq '@[A-Za-z0-9_]+@' "$destination"; then
     die "attempt factory unit template has unresolved placeholders"
+  fi
+  protect_system_count="$(grep -Ec '^ProtectSystem=' "$destination" || true)"
+  writable_paths_count="$(grep -Ec '^ReadWritePaths=' "$destination" || true)"
+  if [[ "$protect_system_count" -ne 1 ||
+    "$writable_paths_count" -ne 1 ]] ||
+    ! grep -Fqx 'ProtectSystem=strict' "$destination" ||
+    ! grep -Fqx \
+      'ReadWritePaths=/var/lib/brokkr/debian-maintenance /var/lib/dpkg /var/cache/apt /var/log/apt' \
+      "$destination" ||
+    grep -Eq \
+      '^(ReadWriteDirectories|BindPaths|StateDirectory|CacheDirectory|LogsDirectory|RuntimeDirectory|ConfigurationDirectory)=' \
+      "$destination"; then
+    die "attempt factory unit template sandbox invalid"
   fi
   chmod 0644 "$destination"
 }
