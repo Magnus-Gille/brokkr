@@ -1,0 +1,47 @@
+{
+  "kind": "systemd-supervision-observations",
+  "schema_version": "v1",
+  "observed_at": "2026-08-02T11:55:00Z",
+  "notifiers": [
+    { "target_node_id": "node-core", "status": "available" }
+  ],
+  "units": [
+    {
+      "target_node_id": "node-core", "scope": "system", "name": "grimnir-api.service",
+      "result": { "active_state": "active", "sub_state": "running", "result": "success" },
+      "restart": { "count": 0, "window_start": "2026-08-02T11:54:00Z", "window_end": "2026-08-02T11:55:00Z" },
+      "watchdog": { "result": "ok" }, "oom": { "result": "none" }, "timer": null
+    },
+    {
+      "target_node_id": "node-core", "scope": "system", "name": "grimnir-worker.service",
+      "result": { "active_state": "inactive", "sub_state": "dead", "result": "success" },
+      "restart": { "count": 0, "window_start": "2026-08-02T11:54:00Z", "window_end": "2026-08-02T11:55:00Z" },
+      "watchdog": { "result": "not-requested" }, "oom": { "result": "not-applicable" }, "timer": null
+    },
+    {
+      "target_node_id": "node-core", "scope": "system", "name": "grimnir-worker.timer",
+      "result": { "active_state": "active", "sub_state": "waiting", "result": "success" },
+      "restart": null,
+      "watchdog": { "result": "not-requested" }, "oom": { "result": "not-applicable" },
+      "timer": { "last_run_at": "2026-08-02T11:50:00Z", "next_run_at": "2026-08-02T12:05:00Z", "last_result": "success", "missed_runs": 0, "persistent": true }
+    },
+    {
+      "target_node_id": "node-workshop", "scope": "user", "name": "workshop.service",
+      "result": { "active_state": "active", "sub_state": "running", "result": "success" },
+      "restart": { "count": 1, "window_start": "2026-08-02T11:53:00Z", "window_end": "2026-08-02T11:55:00Z" },
+      "watchdog": { "result": "not-requested" }, "oom": { "result": "none" }, "timer": null
+    },
+    {
+      "target_node_id": "node-workshop", "scope": "user", "name": "workshop.timer",
+      "result": { "active_state": "active", "sub_state": "waiting", "result": "success" }, "restart": null,
+      "watchdog": { "result": "not-requested" }, "oom": { "result": "not-applicable" },
+      "timer": { "last_run_at": "2026-08-02T11:50:00Z", "next_run_at": "2026-08-02T12:10:00Z", "last_result": "success", "missed_runs": null, "persistent": null }
+    },
+    {
+      "target_node_id": "node-workshop", "scope": "user", "name": "workshop-failure.service",
+      "result": { "active_state": "inactive", "sub_state": "dead", "result": "success" },
+      "restart": { "count": 0, "window_start": "2026-08-02T11:54:00Z", "window_end": "2026-08-02T11:55:00Z" },
+      "watchdog": { "result": "not-requested" }, "oom": { "result": "not-applicable" }, "timer": null
+    }
+  ]
+}

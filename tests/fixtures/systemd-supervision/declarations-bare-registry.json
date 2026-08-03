@@ -1,0 +1,32 @@
+{
+  "kind": "systemd-unit-declarations",
+  "schema_version": "v1",
+  "topology_authority": "grimnir-service-registry",
+  "units": [
+    {
+      "target_node_id": "node-control", "scope": "system", "name": "heimdall.service", "failure_handler_role": "none",
+      "directives": { "Type": "simple", "Restart": "on-failure", "RestartSec": "5s", "StartLimitIntervalSec": "60s", "StartLimitBurst": "5", "TimeoutStartSec": "30s", "TimeoutStopSec": "30s", "RuntimeMaxSec": "1h", "OOMPolicy": "stop", "OnFailure": "brokkr-systemd-failure@%n.service" },
+      "heartbeat": { "app_heartbeat": "present", "live_lock_fixture": "passed" }, "readiness": "present"
+    },
+    {
+      "target_node_id": "node-control", "scope": "system", "name": "heimdall-collect.timer", "failure_handler_role": "none",
+      "directives": { "Unit": "heimdall", "StartLimitIntervalSec": "60s", "StartLimitBurst": "3", "OnFailure": "brokkr-systemd-failure@%n.service", "OnCalendar": "*:0/5", "Persistent": true, "AccuracySec": "30s" },
+      "heartbeat": { "app_heartbeat": "not-applicable", "live_lock_fixture": "not-applicable" }, "readiness": "not-applicable"
+    },
+    {
+      "target_node_id": "node-control", "scope": "system", "name": "heimdall-maintain.timer", "failure_handler_role": "none",
+      "directives": { "Unit": "heimdall", "StartLimitIntervalSec": "60s", "StartLimitBurst": "3", "OnFailure": "brokkr-systemd-failure@%n.service", "OnUnitActiveSec": "15m", "AccuracySec": "30s" },
+      "heartbeat": { "app_heartbeat": "not-applicable", "live_lock_fixture": "not-applicable" }, "readiness": "not-applicable"
+    },
+    {
+      "target_node_id": "node-control", "scope": "system", "name": "nightly.service", "failure_handler_role": "none",
+      "directives": { "Type": "oneshot", "Restart": "no", "StartLimitIntervalSec": "60s", "StartLimitBurst": "3", "TimeoutStartSec": "120s", "TimeoutStopSec": "30s", "RuntimeMaxSec": "10m", "OOMPolicy": "stop", "OnFailure": "brokkr-systemd-failure@%n.service" },
+      "heartbeat": { "app_heartbeat": "not-applicable", "live_lock_fixture": "not-applicable" }, "readiness": "not-applicable"
+    },
+    {
+      "target_node_id": "node-control", "scope": "system", "name": "nightly.timer", "failure_handler_role": "none",
+      "directives": { "StartLimitIntervalSec": "60s", "StartLimitBurst": "3", "OnFailure": "brokkr-systemd-failure@%n.service", "OnCalendar": "*-*-* 03:00:00", "Persistent": true, "AccuracySec": "30s" },
+      "heartbeat": { "app_heartbeat": "not-applicable", "live_lock_fixture": "not-applicable" }, "readiness": "not-applicable"
+    }
+  ]
+}

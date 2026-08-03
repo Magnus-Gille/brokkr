@@ -1,0 +1,28 @@
+{
+  "components": [
+    {
+      "name": "api",
+      "target_node_id": "node-core",
+      "systemd_units": [
+        { "name": "grimnir-api.service", "type": "service", "scope": "system" }
+      ]
+    },
+    {
+      "name": "worker",
+      "target_node_id": "node-core",
+      "systemd_units": [
+        { "name": "grimnir-worker.service", "type": "service", "scope": "system" },
+        { "name": "grimnir-worker.timer", "type": "timer", "scope": "system" }
+      ]
+    },
+    {
+      "name": "workshop",
+      "target_node_id": "node-workshop",
+      "systemd_units": [
+        { "name": "workshop.service", "type": "service", "scope": "user" },
+        { "name": "workshop.timer", "type": "timer", "scope": "user" },
+        { "name": "workshop-failure.service", "type": "service", "scope": "user" }
+      ]
+    }
+  ]
+}

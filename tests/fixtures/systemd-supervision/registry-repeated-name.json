@@ -1,0 +1,7 @@
+{
+  "components": [
+    { "name": "alpha", "target_node_id": "node-alpha", "systemd_units": [{ "name": "shared", "type": "service" }] },
+    { "name": "beta", "target_node_id": "node-beta", "systemd_units": [{ "name": "shared", "type": "service" }] },
+    { "name": "gamma", "target_node_id": "node-alpha", "systemd_units": [{ "name": "shared", "type": "service", "scope": "user" }, { "name": "gamma-failure", "type": "service", "scope": "user" }] }
+  ]
+}

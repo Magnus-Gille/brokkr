@@ -168,10 +168,44 @@ The initial journal uses
 exclusive creation and all durable replacements are fsynced. Every append is a
 tail-digest compare-and-swap under a monotonic, exclusive-create lock ticket.
 A successor may advance past an incomplete ticket only after its owning
-process is proven dead; tickets are never unlinked or reused, eliminating
-read-then-delete takeover races. An exact
-terminal retry is read-only even after signed demotion; conflicting bindings
-cannot masquerade as that retry.
+process is proven dead inside the local single-host, single-PID-namespace lock
+scope; `kill(pid, 0)` `EPERM` is treated as still alive. Exact death proofs from
+authoritative stamps accept only the formats Brokkr generates itself: a Linux
+boot-id UUID and a positive `linux-start:<ticks>` process start. Malformed or
+future-unknown authority strings stay ambiguous and fail closed. Ticket
+publication is staged and fsynced before visibility, so a crash cannot publish
+a torn latest ticket. A dead incomplete tail is retired by an exclusive-create
+`NNNNNNNN.done` tombstone bound to that exact ticket sequence and token; no
+successor unlinks or reuses another actor's fresh `NNNNNNNN.json` path. When
+the live suffix reaches the compaction threshold, the owner publishes a
+monotonic checkpoint as the completion marker before pruning that completed
+prefix; a later writer may only advance that checkpoint, never regress it.
+Acquisition retries boundedly across prune-vs-read races, and dead staging
+files are reclaimed under a fail-closed local ceiling so crash-only growth
+stays bounded. Completed prefixes may therefore be durably
+checkpoint-compacted without deleting or reusing a live ticket. Legacy
+five-field tickets without an authoritative process-start stamp never use
+boot-time versus wall-clock PID-reuse inference; once `kill(pid, 0)` does not
+return `ESRCH`, they remain ambiguous and require owner action. The
+non-destructive remediation is to inspect the unresolved `NNNNNNNN.json` in the
+same `<lock>.tickets` directory, verify that its recorded `pid` is absent or is
+not the intended owner, then exclusive-create a matching `NNNNNNNN.done`
+record with:
+
+```json
+{
+  "kind": "brokkr-lock-ticket-retirement",
+  "schema_version": "v1",
+  "token": "<copied from NNNNNNNN.json>",
+  "sequence": N,
+  "reason": "legacy-owner-identity-ambiguous"
+}
+```
+
+Do not delete or rename the original ticket JSON; the next acquirer advances to
+`N + 1`, and normal checkpoint compaction later prunes the retired prefix. An
+exact terminal retry is read-only even after signed demotion; conflicting
+bindings cannot masquerade as that retry.
 
 One fsynced domain-state record is authoritative for the active target,
 per-target state, per-proposal attempt count, recent attempt window and global

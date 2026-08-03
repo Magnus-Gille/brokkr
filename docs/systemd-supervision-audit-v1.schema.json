@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grimnir.gille.ai/contracts/systemd-supervision-audit/v1/schema.json",
+  "title": "Brokkr systemd supervision audit v1",
+  "description": "Bounded read-only audit containing registry-derived identity/classification, content-blind state evidence, freshness, and deduplicated routed findings.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "baseline_id", "baseline_digest", "topology_authority", "observed_at", "evaluated_at", "evaluated_at_source", "freshness", "notifiers", "summary", "units", "findings", "extensions"],
+  "properties": {
+    "kind": { "const": "systemd-supervision-audit" },
+    "schema_version": { "const": "v1" },
+    "baseline_id": { "const": "fleet-systemd-supervision" },
+    "baseline_digest": { "$ref": "#/$defs/sha256" },
+    "topology_authority": { "const": "grimnir-service-registry" },
+    "observed_at": { "$ref": "#/$defs/utc" },
+    "evaluated_at": { "$ref": "#/$defs/utc" },
+    "evaluated_at_source": { "enum": ["clock", "fixture-override"] },
+    "freshness": { "$ref": "#/$defs/freshness" },
+    "notifiers": { "type": "array", "maxItems": 512, "items": { "$ref": "#/$defs/notifier" } },
+    "summary": { "$ref": "#/$defs/summary" },
+    "units": { "type": "array", "maxItems": 512, "items": { "$ref": "#/$defs/unit" } },
+    "findings": { "type": "array", "maxItems": 4096, "uniqueItems": true, "items": { "$ref": "#/$defs/finding" } },
+    "extensions": { "type": "array", "maxItems": 0, "items": {} }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 3, "maxLength": 63, "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+    "sha256": { "type": "string", "minLength": 71, "maxLength": 71, "pattern": "^sha256:[a-f0-9]{64}$" },
+    "unit-name": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^(?!.*[\\r\\n])[A-Za-z0-9:_.@-]+\\.(?:service|timer)$" },
+    "utc": { "type": "string", "minLength": 20, "maxLength": 20, "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ$", "format": "date-time" },
+    "freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "age_seconds", "max_age_seconds"],
+      "properties": {
+        "status": { "enum": ["fresh", "stale", "future"] },
+        "age_seconds": { "type": "integer", "minimum": 0 },
+        "max_age_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 }
+      }
+    },
+    "notifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_node_id", "status"],
+      "properties": {
+        "target_node_id": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["available", "absent", "unknown"] }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "unit_count", "compliant_unit_count", "finding_count"],
+      "properties": {
+        "status": { "enum": ["pass", "fail"] },
+        "unit_count": { "type": "integer", "minimum": 0, "maximum": 512 },
+        "compliant_unit_count": { "type": "integer", "minimum": 0, "maximum": 512 },
+        "finding_count": { "type": "integer", "minimum": 0, "maximum": 4096 }
+      }
+    },
+    "finding-code": { "type": "string", "minLength": 3, "maxLength": 64, "pattern": "^[a-z][a-z0-9_]{2,63}$" },
+    "finding-severity": { "enum": ["error", "warning"] },
+    "finding-route": { "enum": ["substrate", "component-owner"] },
+    "finding-core": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "route"],
+      "properties": {
+        "code": { "$ref": "#/$defs/finding-code" },
+        "severity": { "$ref": "#/$defs/finding-severity" },
+        "route": { "$ref": "#/$defs/finding-route" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "route"],
+      "properties": {
+        "code": { "$ref": "#/$defs/finding-code" },
+        "severity": { "$ref": "#/$defs/finding-severity" },
+        "route": { "$ref": "#/$defs/finding-route" },
+        "target_node_id": { "$ref": "#/$defs/id" },
+        "scope": { "enum": ["system", "user"] },
+        "unit": { "$ref": "#/$defs/unit-name" },
+        "owner": { "$ref": "#/$defs/id" }
+      }
+    },
+    "unit-finding": { "$ref": "#/$defs/finding-core" },
+    "unit-result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active_state", "sub_state", "result"],
+      "properties": {
+        "active_state": { "enum": ["active", "inactive", "failed", "activating", "deactivating", "unknown"] },
+        "sub_state": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[A-Za-z0-9_-]{1,32}$" },
+        "result": { "enum": ["success", "exit-code", "signal", "core-dump", "watchdog", "oom-kill", "timeout", "start-limit-hit", "resources", "protocol", "condition", "unknown"] }
+      }
+    },
+    "restart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "window_start", "window_end"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "window_start": { "$ref": "#/$defs/utc" },
+        "window_end": { "$ref": "#/$defs/utc" }
+      }
+    },
+    "watchdog": { "type": "object", "additionalProperties": false, "required": ["result"], "properties": { "result": { "enum": ["not-requested", "ok", "timeout", "unknown"] } } },
+    "oom": { "type": "object", "additionalProperties": false, "required": ["result"], "properties": { "result": { "enum": ["not-applicable", "none", "killed", "unknown"] } } },
+    "timer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["last_run_at", "next_run_at", "last_result", "missed_runs", "persistent"],
+      "properties": {
+        "last_run_at": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/utc" }] },
+        "next_run_at": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/utc" }] },
+        "last_result": { "enum": ["success", "failed", "not-run", "unknown"] },
+        "missed_runs": { "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 0, "maximum": 100000 }] },
+        "persistent": { "oneOf": [{ "type": "null" }, { "type": "boolean" }] }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit_result", "restart", "watchdog", "oom", "timer"],
+      "properties": {
+        "unit_result": { "$ref": "#/$defs/unit-result" },
+        "restart": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/restart" }] },
+        "watchdog": { "$ref": "#/$defs/watchdog" },
+        "oom": { "$ref": "#/$defs/oom" },
+        "timer": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/timer" }] }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_node_id", "unit", "owner", "scope", "workload_shape", "timer_class", "status", "findings", "evidence"],
+      "properties": {
+        "target_node_id": { "$ref": "#/$defs/id" },
+        "unit": { "$ref": "#/$defs/unit-name" },
+        "owner": { "$ref": "#/$defs/id" },
+        "scope": { "enum": ["system", "user"] },
+        "workload_shape": { "enum": ["long-running", "oneshot", "timer", "unknown"] },
+        "timer_class": { "oneOf": [{ "type": "null" }, { "enum": ["calendar", "monotonic"] }] },
+        "status": { "enum": ["pass", "fail"] },
+        "findings": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/unit-finding" } },
+        "evidence": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/evidence" }] }
+      }
+    }
+  }
+}
