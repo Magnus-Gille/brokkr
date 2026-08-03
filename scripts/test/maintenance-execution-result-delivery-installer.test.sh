@@ -33,6 +33,49 @@ exit 99
 MOCK
 chmod 0755 "$TMP/bin/systemctl"
 
+LSTAT_EACCES_PRELOAD="$TMP/lstat-eacces-preload.cjs"
+cat >"$LSTAT_EACCES_PRELOAD" <<'NODE'
+const fs = require("node:fs");
+
+const deniedPath = process.env.BROKKR_TEST_LSTAT_EACCES_PATH;
+if (!deniedPath) {
+  throw new Error("BROKKR_TEST_LSTAT_EACCES_PATH is required");
+}
+
+const originalLstatSync = fs.lstatSync;
+fs.lstatSync = function patchedLstatSync(candidate, ...rest) {
+  if (String(candidate) === deniedPath) {
+    const error = new Error(`EACCES: denied, lstat '${candidate}'`);
+    error.code = "EACCES";
+    throw error;
+  }
+  return originalLstatSync.call(this, candidate, ...rest);
+};
+NODE
+
+LSTAT_EACCES_NODE_WRAPPER="$TMP/lstat-eacces-node-wrapper"
+cat >"$LSTAT_EACCES_NODE_WRAPPER" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_NODE="${BROKKR_TEST_NODE_REAL:?BROKKR_TEST_NODE_REAL is required}"
+PRELOAD="${BROKKR_TEST_NODE_PRELOAD:?BROKKR_TEST_NODE_PRELOAD is required}"
+exec env NODE_OPTIONS="--require=$PRELOAD" "$REAL_NODE" "$@"
+WRAPPER
+chmod 0755 "$LSTAT_EACCES_NODE_WRAPPER"
+
+run_installer() {
+  local install_root="$1"
+  shift
+  env \
+    PATH="$TMP/bin:$PATH" \
+    BROKKR_DELIVERY_INSTALL_TEST_ROOT="$install_root" \
+    BROKKR_DELIVERY_NODE="$NODE_BIN" \
+    BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+    "$@" \
+    "$INSTALLER" install --source "$SOURCE" --revision "$REVISION"
+}
+
 assert_observation_only_unit() {
   local unit="$1"
   grep -Fqx 'DynamicUser=yes' "$unit"
@@ -470,3 +513,127 @@ fi
 test -d "$LOCK_PATH"
 test ! -e "$LOCKED_ROOT/usr"
 printf 'ok - failed lock acquisition preserves the concurrent installer lock\n'
+
+TRANSIENT_UNIT_ROOT="$TMP/transient-unit-root"
+mkdir -p "$TRANSIENT_UNIT_ROOT/run/systemd/transient"
+printf '[Unit]\nDescription=Transient conflicting canonical unit\n' \
+  >"$TRANSIENT_UNIT_ROOT/run/systemd/transient/brokkr-maintenance-execution-result-delivery.service"
+if run_installer "$TRANSIENT_UNIT_ROOT" >"$TMP/transient-unit.out" 2>&1; then
+  echo "canonical transient unit unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$TRANSIENT_UNIT_ROOT/usr"
+printf 'ok - installer rejects a canonical unit file in mapped /run/systemd/transient\n'
+
+CANONICAL_DROPIN_ROOT="$TMP/canonical-dropin-root"
+CANONICAL_DROPIN_DIR="$CANONICAL_DROPIN_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service.d"
+mkdir -p "$CANONICAL_DROPIN_DIR"
+printf '[Service]\nEnvironment=CANONICAL_OVERRIDE=1\n' \
+  >"$CANONICAL_DROPIN_DIR/override.conf"
+if run_installer "$CANONICAL_DROPIN_ROOT" >"$TMP/canonical-dropin.out" 2>&1; then
+  echo "canonical unit drop-in unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$CANONICAL_DROPIN_ROOT/usr"
+printf 'ok - installer rejects the canonical unit drop-in directory\n'
+
+DASH_PREFIX_DROPIN_ROOT="$TMP/dash-prefix-dropin-root"
+DASH_PREFIX_DROPIN_DIR="$DASH_PREFIX_DROPIN_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-.service.d"
+mkdir -p "$DASH_PREFIX_DROPIN_DIR"
+printf '[Service]\nEnvironment=DASH_PREFIX_OVERRIDE=1\n' \
+  >"$DASH_PREFIX_DROPIN_DIR/override.conf"
+if run_installer "$DASH_PREFIX_DROPIN_ROOT" >"$TMP/dash-prefix-dropin.out" 2>&1; then
+  echo "dash-prefix drop-in unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$DASH_PREFIX_DROPIN_ROOT/usr"
+printf 'ok - installer rejects dash-prefix unit drop-ins for the canonical name\n'
+
+TYPE_WIDE_DROPIN_ROOT="$TMP/type-wide-dropin-root"
+TYPE_WIDE_DROPIN_DIR="$TYPE_WIDE_DROPIN_ROOT/etc/systemd/system/service.d"
+mkdir -p "$TYPE_WIDE_DROPIN_DIR"
+printf '[Service]\nEnvironment=TYPE_WIDE_OVERRIDE=1\n' \
+  >"$TYPE_WIDE_DROPIN_DIR/override.conf"
+if run_installer "$TYPE_WIDE_DROPIN_ROOT" >"$TMP/type-wide-dropin.out" 2>&1; then
+  echo "type-wide service drop-in unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$TYPE_WIDE_DROPIN_ROOT/usr"
+printf 'ok - installer rejects type-wide service drop-ins\n'
+
+ALIAS_DROPIN_ROOT="$TMP/alias-dropin-root"
+ALIAS_DROPIN_ALIAS_ROOT="$ALIAS_DROPIN_ROOT/usr/lib/systemd/system"
+ALIAS_DROPIN_DIR="$ALIAS_DROPIN_ROOT/run/systemd/system/delivery-adapter-alias.service.d"
+mkdir -p "$ALIAS_DROPIN_ALIAS_ROOT" "$ALIAS_DROPIN_DIR"
+ln -s brokkr-maintenance-execution-result-delivery.service \
+  "$ALIAS_DROPIN_ALIAS_ROOT/delivery-adapter-alias.service"
+printf '[Service]\nEnvironment=ALIAS_OVERRIDE=1\n' \
+  >"$ALIAS_DROPIN_DIR/override.conf"
+if run_installer "$ALIAS_DROPIN_ROOT" >"$TMP/alias-dropin.out" 2>&1; then
+  echo "alias drop-in unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$ALIAS_DROPIN_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service"
+printf 'ok - installer rejects alias drop-ins discovered across configured roots\n'
+
+UNRELATED_DROPIN_ROOT="$TMP/unrelated-dropin-root"
+UNRELATED_DROPIN_DIR="$UNRELATED_DROPIN_ROOT/etc/systemd/system/unrelated-normal.service.d"
+mkdir -p "$UNRELATED_DROPIN_DIR"
+printf '[Service]\nEnvironment=UNRELATED_OVERRIDE=1\n' \
+  >"$UNRELATED_DROPIN_DIR/override.conf"
+run_installer "$UNRELATED_DROPIN_ROOT" >"$TMP/unrelated-dropin.out"
+test -f \
+  "$UNRELATED_DROPIN_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service"
+printf 'ok - installer does not overreach into unrelated unit drop-ins\n'
+
+DANGLING_ROOT_SYMLINK_ROOT="$TMP/dangling-root-symlink-root"
+mkdir -p "$DANGLING_ROOT_SYMLINK_ROOT/run/systemd"
+ln -s "$TMP/nonexistent-dangling-system-root" \
+  "$DANGLING_ROOT_SYMLINK_ROOT/run/systemd/system"
+if run_installer "$DANGLING_ROOT_SYMLINK_ROOT" >"$TMP/dangling-root-symlink.out" 2>&1; then
+  echo "dangling mapped search root symlink unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$DANGLING_ROOT_SYMLINK_ROOT/usr"
+printf 'ok - installer rejects a dangling mapped systemd search root symlink\n'
+
+FILE_MAPPED_ROOT="$TMP/file-mapped-root"
+mkdir -p "$FILE_MAPPED_ROOT/run/systemd"
+printf 'not-a-directory\n' >"$FILE_MAPPED_ROOT/run/systemd/system"
+if run_installer "$FILE_MAPPED_ROOT" >"$TMP/file-mapped-root.out" 2>&1; then
+  echo "regular-file mapped search root unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$FILE_MAPPED_ROOT/usr"
+printf 'ok - installer rejects a regular-file mapped systemd search root\n'
+
+LSTAT_EACCES_ROOT="$TMP/lstat-eacces-root"
+mkdir -p "$LSTAT_EACCES_ROOT/run/systemd/system"
+if run_installer \
+  "$LSTAT_EACCES_ROOT" \
+  "BROKKR_DELIVERY_NODE=$LSTAT_EACCES_NODE_WRAPPER" \
+  "BROKKR_TEST_NODE_REAL=$NODE_BIN" \
+  "BROKKR_TEST_NODE_PRELOAD=$LSTAT_EACCES_PRELOAD" \
+  "BROKKR_TEST_LSTAT_EACCES_PATH=$LSTAT_EACCES_ROOT/run/systemd/system" \
+  >"$TMP/lstat-eacces.out" 2>&1; then
+  echo "non-ENOENT lstat failure unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$LSTAT_EACCES_ROOT/usr"
+grep -Fq 'EACCES' "$TMP/lstat-eacces.out"
+printf 'ok - installer propagates non-ENOENT mapped search root lstat failures\n'
+
+ALIAS_DASH_PREFIX_DROPIN_ROOT="$TMP/alias-dash-prefix-dropin-root"
+ALIAS_DASH_PREFIX_ALIAS_ROOT="$ALIAS_DASH_PREFIX_DROPIN_ROOT/usr/lib/systemd/system"
+ALIAS_DASH_PREFIX_DROPIN_DIR="$ALIAS_DASH_PREFIX_DROPIN_ROOT/run/systemd/system/delivery-adapter-.service.d"
+mkdir -p "$ALIAS_DASH_PREFIX_ALIAS_ROOT" "$ALIAS_DASH_PREFIX_DROPIN_DIR"
+ln -s brokkr-maintenance-execution-result-delivery.service \
+  "$ALIAS_DASH_PREFIX_ALIAS_ROOT/delivery-adapter-alias.service"
+printf '[Service]\nEnvironment=ALIAS_DASH_PREFIX_OVERRIDE=1\n' \
+  >"$ALIAS_DASH_PREFIX_DROPIN_DIR/override.conf"
+if run_installer "$ALIAS_DASH_PREFIX_DROPIN_ROOT" >"$TMP/alias-dash-prefix-dropin.out" 2>&1; then
+  echo "alias dash-prefix drop-in unexpectedly accepted" >&2
+  exit 1
+fi
+test ! -e "$ALIAS_DASH_PREFIX_DROPIN_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service"
+printf 'ok - installer rejects alias dash-prefix unit drop-ins discovered across configured roots\n'

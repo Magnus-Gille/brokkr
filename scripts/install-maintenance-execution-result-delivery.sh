@@ -206,10 +206,26 @@ const mappedRoot = absoluteRoot => (
   rootPrefix === "" ? absoluteRoot : path.join(rootPrefix, absoluteRoot.slice(1))
 );
 const mappedSearchRoots = unitSearchRoots.map(root => path.resolve(mappedRoot(root)));
+const installedUnitPath = path.resolve(unitPath);
 const isWithin = (base, candidate) => {
   const relative = path.relative(base, candidate);
   return relative === "" ||
     (!relative.startsWith("..") && !path.isAbsolute(relative));
+};
+const dropInDirectoryNames = unitBasename => {
+  const directories = new Set([`${unitBasename}.d`]);
+  const suffixIndex = unitBasename.lastIndexOf(".");
+  if (suffixIndex === -1) return directories;
+  const prefix = unitBasename.slice(0, suffixIndex);
+  const suffix = unitBasename.slice(suffixIndex + 1);
+  directories.add(`${suffix}.d`);
+  let remainder = prefix;
+  while (remainder.includes("-")) {
+    const dashIndex = remainder.lastIndexOf("-");
+    directories.add(`${remainder.slice(0, dashIndex + 1)}.${suffix}.d`);
+    remainder = remainder.slice(0, dashIndex);
+  }
+  return directories;
 };
 const canonicalLeaf = candidate => {
   const normalized = path.resolve(candidate);
@@ -222,15 +238,35 @@ const canonicalLeaf = candidate => {
   }
   return path.join(parent, path.basename(normalized));
 };
-const existingSearchRoots = mappedSearchRoots.flatMap(root => {
-  if (!fs.existsSync(root)) return [];
-  const canonicalRoot = canonicalLeaf(root);
-  if (canonicalRoot === null) {
+const existingSearchRoots = [];
+for (const root of mappedSearchRoots) {
+  let stat;
+  try {
+    stat = fs.lstatSync(root);
+  } catch (error) {
+    if (error?.code === "ENOENT") continue;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error("delivery_unit_dependency_directory_unsafe");
   }
-  return [{ normalized: root, canonical: canonicalRoot }];
-});
+  existingSearchRoots.push({
+    normalized: root,
+    canonical: path.resolve(fs.realpathSync(root)),
+  });
+}
 if (existingSearchRoots.length === 0) process.exit(0);
+for (const { normalized: root } of existingSearchRoots) {
+  const candidate = path.join(root, unitName);
+  if (candidate === installedUnitPath) continue;
+  try {
+    fs.lstatSync(candidate);
+  } catch (error) {
+    if (error?.code === "ENOENT") continue;
+    throw error;
+  }
+  throw new Error("delivery_unit_already_enabled");
+}
 const adapterTargetPaths = new Set();
 for (const root of mappedSearchRoots) {
   const normalizedAdapterPath = path.join(root, unitName);
@@ -316,6 +352,24 @@ while (queue.length > 0) {
     }
     adapterNames.add(alias);
     queue.push(alias);
+  }
+}
+const applicableDropInDirectories = new Set();
+for (const adapterName of adapterNames) {
+  for (const directory of dropInDirectoryNames(adapterName)) {
+    applicableDropInDirectories.add(directory);
+  }
+}
+for (const { normalized: root } of existingSearchRoots) {
+  for (const directory of applicableDropInDirectories) {
+    const candidate = path.join(root, directory);
+    try {
+      fs.lstatSync(candidate);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    throw new Error("delivery_unit_already_enabled");
   }
 }
 const visitedDirectories = new Set();

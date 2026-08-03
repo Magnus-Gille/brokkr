@@ -112,22 +112,38 @@ load path in this exact precedence order:
 `/usr/lib/systemd/system`,
 `/run/systemd/generator.late`.
 For tests, these roots are mapped beneath `BROKKR_DELIVERY_INSTALL_TEST_ROOT`.
-It scans dependency directories in every existing root, rejects symlinked
+Enumeration is strict and fail-closed: every mapped root is probed with
+`lstat(2)`, only `ENOENT` is treated as absent, symlinks and non-directories
+are rejected, other filesystem errors propagate, and existing roots are
+canonicalized before recursive matching. A dangling mapped search-root symlink
+is therefore an installation blocker, not a skipped root.
+
+The effective-unit contract is exact and fail-closed. The canonical main unit
+name `brokkr-maintenance-execution-result-delivery.service` is rejected in
+every configured root except the intended `/etc/systemd/system` install path,
+which remains governed separately by the exact mode, revision, and byte-match
+checks for idempotent reinstallation. The installer also rejects any filesystem
+object at every applicable top-level drop-in path anywhere in the load path:
+the canonical `.service.d` directory, each dash-prefix truncation directory for
+that canonical name, the type-wide `service.d`, and the exact/prefix drop-in
+directories for aliases in the bounded reverse alias closure derived from
+top-level unit symlinks in the configured roots.
+
+It still scans dependency directories in every existing root, rejects symlinked
 dependency directories, and follows individual dependency and top-level alias
 link chains read-only with bounded depth and cycle detection even when a
 terminal leaf is outside the static root set. Recursive enumeration itself
-never leaves the configured search roots: existing parent directories are
-canonicalized for matching, external directories are never recursively scanned,
-and unexpected filesystem errors other than a missing terminal parent or leaf
-fail closed. Dependency targets are matched against the normalized and
-available canonical adapter paths for every configured search root. Dependency
-entry basenames are also matched against the canonical adapter unit name and a
-bounded reverse alias closure derived from top-level unit symlinks in the
-configured search roots. A dependency entry is therefore rejected if its
-filename is the canonical adapter name or any alias resolving to it, even when
-the symlink target itself points somewhere else. This alias-basename rule is
-separate from the target-chain checks, so unrelated external terminals or
-normal masks do not block installation.
+never leaves the configured search roots: external directories are never
+recursively scanned, and unexpected filesystem errors other than a missing
+terminal parent or leaf fail closed. Dependency targets are matched against the
+normalized and available canonical adapter paths for every configured search
+root. Dependency entry basenames are also matched against the canonical adapter
+unit name and a bounded reverse alias closure derived from top-level unit
+symlinks in the configured search roots. A dependency entry is therefore
+rejected if its filename is the canonical adapter name or any alias resolving
+to it, even when the symlink target itself points somewhere else. This
+alias-basename rule is separate from the target-chain checks, so unrelated
+external terminals or normal masks do not block installation.
 
 Installation therefore remains inert. The separately authorized #69 owner
 ceremony must bind and provision the exact protected credential, atomically
