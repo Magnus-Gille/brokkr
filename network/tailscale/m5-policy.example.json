@@ -1,0 +1,95 @@
+{
+  "hosts": {
+    "m5-operator-device": "__BROKKR_OPERATOR_ADDRESS__",
+    "m5-ordinary-deny-probe": "__BROKKR_ORDINARY_DENY_PROBE_ADDRESS__",
+    "m5-guest-deny-probe": "__BROKKR_GUEST_DENY_PROBE_ADDRESS__"
+  },
+  "tagOwners": {
+    "tag:m5-server": ["autogroup:owner"],
+    "tag:m5-inference": ["autogroup:owner"],
+    "tag:m5-gateway-client": ["autogroup:owner"],
+    "tag:m5-whisper-client": ["autogroup:owner"],
+    "tag:m5-runtime-client": ["autogroup:owner"]
+  },
+  "grants": [
+    {
+      "src": ["m5-operator-device"],
+      "dst": ["tag:m5-server"],
+      "ip": ["tcp:22", "tcp:445"]
+    },
+    {
+      "src": ["m5-operator-device"],
+      "dst": ["tag:m5-inference"],
+      "ip": ["tcp:8080"]
+    },
+    {
+      "src": ["tag:m5-gateway-client"],
+      "dst": ["tag:m5-inference"],
+      "ip": ["tcp:8080"]
+    },
+    {
+      "src": ["tag:m5-whisper-client"],
+      "dst": ["tag:m5-inference"],
+      "ip": ["tcp:8092"]
+    },
+    {
+      "src": ["tag:m5-runtime-client"],
+      "dst": ["tag:m5-inference"],
+      "ip": ["tcp:8091"]
+    }
+  ],
+  "ssh": [],
+  "tests": [
+    {
+      "src": "m5-operator-device",
+      "proto": "tcp",
+      "accept": ["tag:m5-server:22", "tag:m5-server:445", "tag:m5-inference:8080"],
+      "deny": ["tag:m5-inference:8092", "tag:m5-inference:8091"]
+    },
+    {
+      "src": "tag:m5-gateway-client",
+      "proto": "tcp",
+      "accept": ["tag:m5-inference:8080"],
+      "deny": ["tag:m5-server:22", "tag:m5-server:445", "tag:m5-inference:8092", "tag:m5-inference:8091"]
+    },
+    {
+      "src": "tag:m5-whisper-client",
+      "proto": "tcp",
+      "accept": ["tag:m5-inference:8092"],
+      "deny": ["tag:m5-server:22", "tag:m5-server:445", "tag:m5-inference:8080", "tag:m5-inference:8091"]
+    },
+    {
+      "src": "tag:m5-runtime-client",
+      "proto": "tcp",
+      "accept": ["tag:m5-inference:8091"],
+      "deny": ["tag:m5-server:22", "tag:m5-server:445", "tag:m5-inference:8080", "tag:m5-inference:8092"]
+    },
+    {
+      "src": "m5-ordinary-deny-probe",
+      "proto": "tcp",
+      "deny": ["tag:m5-server:22", "tag:m5-server:445", "tag:m5-inference:8080", "tag:m5-inference:8092", "tag:m5-inference:8091"]
+    },
+    {
+      "src": "m5-guest-deny-probe",
+      "proto": "tcp",
+      "deny": ["tag:m5-server:22", "tag:m5-server:445", "tag:m5-inference:8080", "tag:m5-inference:8092", "tag:m5-inference:8091"]
+    }
+  ],
+  "sshTests": [
+    {
+      "src": "m5-operator-device",
+      "dst": ["tag:m5-server"],
+      "deny": ["root", "operator"]
+    },
+    {
+      "src": "m5-ordinary-deny-probe",
+      "dst": ["tag:m5-server"],
+      "deny": ["root", "operator"]
+    },
+    {
+      "src": "m5-guest-deny-probe",
+      "dst": ["tag:m5-server"],
+      "deny": ["root", "operator"]
+    }
+  ]
+}
