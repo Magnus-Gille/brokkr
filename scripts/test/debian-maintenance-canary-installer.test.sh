@@ -9,11 +9,35 @@ SOURCE="$TMP/source"
 INSTALL_ROOT="$TMP/install-root"
 SYSTEMCTL_LOG="$TMP/systemctl.log"
 NODE_BIN="$(command -v node)"
-mkdir -p "$SOURCE/scripts/lib" "$SOURCE/systemd"
-cp "$ROOT/scripts/debian-maintenance-host-adapter.mjs" "$SOURCE/scripts/"
+mkdir -p "$SOURCE/docs" "$SOURCE/scripts/lib" "$SOURCE/systemd"
+cp \
+  "$ROOT/docs/autonomy-constitution-v2.schema.json" \
+  "$ROOT/docs/autonomy-coverage-registry-v2.schema.json" \
+  "$ROOT/docs/autonomy-owner-attestation-registry-v1.schema.json" \
+  "$ROOT/docs/autonomy-owner-authorization-v1.schema.json" \
+  "$ROOT/docs/autonomy-recovery-worker-registry-v1.schema.json" \
+  "$ROOT/docs/autonomy-runtime-narrowing-v1.schema.json" \
+  "$ROOT/docs/autonomous-mutation-journal-v2.schema.json" \
+  "$ROOT/docs/debian-maintenance-attempt-factory-config-v1.schema.json" \
+  "$ROOT/docs/debian-maintenance-window-freshness-v1.schema.json" \
+  "$SOURCE/docs/"
+cp \
+  "$ROOT/scripts/debian-maintenance-attempt-factory.mjs" \
+  "$ROOT/scripts/debian-maintenance-autonomy.mjs" \
+  "$ROOT/scripts/debian-maintenance-executor.mjs" \
+  "$ROOT/scripts/debian-maintenance-host-adapter.mjs" \
+  "$ROOT/scripts/maintenance-controller.mjs" \
+  "$SOURCE/scripts/"
 cp "$ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs" \
+  "$ROOT/scripts/lib/autonomy-authorization.mjs" \
+  "$ROOT/scripts/lib/debian-maintenance-attempt-factory.mjs" \
+  "$ROOT/scripts/lib/maintenance-policy-contract.mjs" \
   "$ROOT/scripts/lib/bounded-recovery-dispatch.mjs" "$SOURCE/scripts/lib/"
-cp "$ROOT/systemd/brokkr-debian-maintenance-recovery.service.in" "$SOURCE/systemd/"
+cp \
+  "$ROOT/systemd/brokkr-debian-maintenance-attempt-factory.service.in" \
+  "$ROOT/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+  "$ROOT/systemd/brokkr-debian-maintenance-recovery.service.in" \
+  "$SOURCE/systemd/"
 cp "$ROOT/scripts/install-debian-maintenance-canary.sh" "$SOURCE/scripts/"
 
 git -C "$SOURCE" init -q
@@ -111,16 +135,37 @@ env \
 RELEASE_ROOT="$INSTALL_ROOT/usr/local/lib/brokkr/releases/$REVISION"
 STATE_ROOT="$INSTALL_ROOT/var/lib/brokkr/debian-maintenance"
 APPLY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-canary-canary-fi.service"
-RECOVERY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery-canary-fi.service"
+RECOVERY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery@.service"
+FACTORY_UNIT="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-attempt-factory.service"
+FACTORY_TIMER="$INSTALL_ROOT/etc/systemd/system/brokkr-debian-maintenance-attempt-factory.timer"
 
 test -x "$RELEASE_ROOT/scripts/debian-maintenance-host-adapter.mjs"
+test -x "$RELEASE_ROOT/scripts/debian-maintenance-attempt-factory.mjs"
 test -r "$RELEASE_ROOT/scripts/lib/fixed-debian-maintenance-host-operation.mjs"
 test -r "$RELEASE_ROOT/scripts/lib/bounded-recovery-dispatch.mjs"
 test -r "$RELEASE_ROOT/systemd/brokkr-debian-maintenance-recovery.service.in"
 for file in \
+  docs/autonomy-constitution-v2.schema.json \
+  docs/autonomy-coverage-registry-v2.schema.json \
+  docs/autonomy-owner-attestation-registry-v1.schema.json \
+  docs/autonomy-owner-authorization-v1.schema.json \
+  docs/autonomy-recovery-worker-registry-v1.schema.json \
+  docs/autonomy-runtime-narrowing-v1.schema.json \
+  docs/autonomous-mutation-journal-v2.schema.json \
+  docs/debian-maintenance-attempt-factory-config-v1.schema.json \
+  docs/debian-maintenance-window-freshness-v1.schema.json \
+  scripts/debian-maintenance-attempt-factory.mjs \
+  scripts/debian-maintenance-autonomy.mjs \
+  scripts/debian-maintenance-executor.mjs \
   scripts/debian-maintenance-host-adapter.mjs \
+  scripts/maintenance-controller.mjs \
+  scripts/lib/autonomy-authorization.mjs \
+  scripts/lib/debian-maintenance-attempt-factory.mjs \
   scripts/lib/fixed-debian-maintenance-host-operation.mjs \
+  scripts/lib/maintenance-policy-contract.mjs \
   scripts/lib/bounded-recovery-dispatch.mjs \
+  systemd/brokkr-debian-maintenance-attempt-factory.service.in \
+  systemd/brokkr-debian-maintenance-attempt-factory.timer \
   systemd/brokkr-debian-maintenance-recovery.service.in; do
   git -C "$SOURCE" show "$REVISION:$file" >"$TMP/expected-commit-file"
   cmp "$TMP/expected-commit-file" "$RELEASE_ROOT/$file"
@@ -130,10 +175,44 @@ grep -Fqx \
   "ExecStart=/usr/local/lib/brokkr/releases/$REVISION/scripts/debian-maintenance-host-adapter.mjs --action apply --attempt canary-fi" \
   "$APPLY_UNIT"
 grep -Fqx \
-  "ExecStart=/usr/local/lib/brokkr/releases/$REVISION/scripts/debian-maintenance-host-adapter.mjs --action recover --attempt canary-fi" \
+  "ExecStart=/usr/local/lib/brokkr/releases/$REVISION/scripts/debian-maintenance-host-adapter.mjs --action recover --attempt %i" \
   "$RECOVERY_UNIT"
+grep -Fqx \
+  "ExecStart=/usr/local/lib/brokkr/releases/$REVISION/scripts/debian-maintenance-attempt-factory.mjs" \
+  "$FACTORY_UNIT"
+test "$(grep -c '^ProtectSystem=' "$FACTORY_UNIT")" -eq 1
+grep -Fqx "ProtectSystem=false" "$FACTORY_UNIT"
+! grep -Fqx "ProtectSystem=strict" "$FACTORY_UNIT"
+test "$(grep -c '^ReadOnlyPaths=' "$FACTORY_UNIT")" -eq 1
+grep -Fqx \
+  "ReadOnlyPaths=/etc/brokkr /run/brokkr" \
+  "$FACTORY_UNIT"
+test "$(grep -c '^ReadWritePaths=' "$FACTORY_UNIT")" -eq 1
+grep -Fqx \
+  "ReadWritePaths=/var/lib/brokkr/debian-maintenance /var/lib/dpkg /var/cache/apt /var/log/apt" \
+  "$FACTORY_UNIT"
+for factory_line in \
+  'Type=oneshot' \
+  'User=root' \
+  'NoNewPrivileges=yes' \
+  'PrivateTmp=yes' \
+  'ProtectHome=yes' \
+  'ProtectKernelTunables=yes' \
+  'ProtectControlGroups=yes' \
+  'ProtectKernelLogs=yes' \
+  'PrivateDevices=yes' \
+  'RestrictSUIDSGID=yes' \
+  "Environment=BROKKR_RELEASE_SHA=$REVISION" \
+  "ExecStart=/usr/local/lib/brokkr/releases/$REVISION/scripts/debian-maintenance-attempt-factory.mjs" \
+  'TimeoutStartSec=600'; do
+  test "$(grep -Fxc "$factory_line" "$FACTORY_UNIT")" -eq 1
+done
+cmp \
+  "$SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+  "$FACTORY_TIMER"
+! grep -Eq '^(WantedBy=)' "$FACTORY_UNIT"
+grep -Fqx "WantedBy=timers.target" "$FACTORY_TIMER"
 sed \
-  -e 's/@CANARY_ID@/canary-fi/g' \
   -e "s/@RELEASE_SHA@/$REVISION/g" \
   "$SOURCE/systemd/brokkr-debian-maintenance-recovery.service.in" \
   >"$TMP/expected-recovery.service"
@@ -147,6 +226,95 @@ grep -Fqx \
   "$APPLY_UNIT"
 ! grep -Eq '^(WantedBy=|OnFailure=)' "$APPLY_UNIT"
 test ! -e "$SYSTEMCTL_LOG"
+
+# Different canary IDs publish shared recovery/factory paths. Their source
+# revisions must serialize at one global lock; one wins and the other fails
+# without a mixed release or unit set.
+cat >"$TMP/race-after-source-verify" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+ready="$BROKKR_RACE_READY_DIR/$(basename "$1")"
+: >"$ready"
+while [[ ! -e "$BROKKR_RACE_READY_DIR/source" ||
+  ! -e "$BROKKR_RACE_READY_DIR/race-source-b" ]]; do
+  sleep 0.01
+done
+SH
+chmod 0755 "$TMP/race-after-source-verify"
+RACE_SOURCE_B="$TMP/race-source-b"
+git clone -q "$SOURCE" "$RACE_SOURCE_B"
+git -C "$RACE_SOURCE_B" config user.email test@example.invalid
+git -C "$RACE_SOURCE_B" config user.name "Brokkr hermetic test"
+printf '\n// concurrent release winner fixture\n' \
+  >>"$RACE_SOURCE_B/scripts/debian-maintenance-host-adapter.mjs"
+git -C "$RACE_SOURCE_B" add scripts/debian-maintenance-host-adapter.mjs
+git -C "$RACE_SOURCE_B" commit -qm "concurrent release fixture"
+RACE_REVISION_B="$(git -C "$RACE_SOURCE_B" rev-parse HEAD)"
+RACE_ROOT="$TMP/concurrent-install-root"
+RACE_READY_DIR="$TMP/concurrent-ready"
+mkdir -p "$RACE_READY_DIR"
+set +e
+env \
+  BROKKR_CANARY_INSTALL_TEST_ROOT="$RACE_ROOT" \
+  BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
+  BROKKR_CANARY_FALLOCATE="$TMP/fallocate" \
+  BROKKR_CANARY_NODE="$NODE_BIN" \
+  BROKKR_CANARY_AFTER_SOURCE_VERIFY_HOOK="$TMP/race-after-source-verify" \
+  BROKKR_RACE_READY_DIR="$RACE_READY_DIR" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$TMP/concurrent-systemctl.log" \
+  "$INSTALLER" install --source "$SOURCE" --revision "$REVISION" \
+  --canary race-a >"$TMP/concurrent-a.out" 2>&1 &
+RACE_A_PID=$!
+env \
+  BROKKR_CANARY_INSTALL_TEST_ROOT="$RACE_ROOT" \
+  BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
+  BROKKR_CANARY_FALLOCATE="$TMP/fallocate" \
+  BROKKR_CANARY_NODE="$NODE_BIN" \
+  BROKKR_CANARY_AFTER_SOURCE_VERIFY_HOOK="$TMP/race-after-source-verify" \
+  BROKKR_RACE_READY_DIR="$RACE_READY_DIR" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$TMP/concurrent-systemctl.log" \
+  "$INSTALLER" install --source "$RACE_SOURCE_B" --revision "$RACE_REVISION_B" \
+  --canary race-b >"$TMP/concurrent-b.out" 2>&1 &
+RACE_B_PID=$!
+wait "$RACE_A_PID"
+RACE_A_STATUS=$?
+wait "$RACE_B_PID"
+RACE_B_STATUS=$?
+set -e
+if [[ "$RACE_A_STATUS" -eq 0 && "$RACE_B_STATUS" -ne 0 ]]; then
+  RACE_WINNER_SOURCE="$SOURCE"
+  RACE_WINNER_REVISION="$REVISION"
+  RACE_WINNER_CANARY=race-a
+  RACE_LOSER_REVISION="$RACE_REVISION_B"
+  RACE_LOSER_CANARY=race-b
+elif [[ "$RACE_A_STATUS" -ne 0 && "$RACE_B_STATUS" -eq 0 ]]; then
+  RACE_WINNER_SOURCE="$RACE_SOURCE_B"
+  RACE_WINNER_REVISION="$RACE_REVISION_B"
+  RACE_WINNER_CANARY=race-b
+  RACE_LOSER_REVISION="$REVISION"
+  RACE_LOSER_CANARY=race-a
+else
+  echo "concurrent installs did not produce exactly one winner" >&2
+  exit 1
+fi
+RACE_RELEASE="$RACE_ROOT/usr/local/lib/brokkr/releases/$RACE_WINNER_REVISION"
+cmp \
+  "$RACE_WINNER_SOURCE/scripts/debian-maintenance-host-adapter.mjs" \
+  "$RACE_RELEASE/scripts/debian-maintenance-host-adapter.mjs"
+test ! -e "$RACE_ROOT/usr/local/lib/brokkr/releases/$RACE_LOSER_REVISION"
+test -e \
+  "$RACE_ROOT/etc/systemd/system/brokkr-debian-maintenance-canary-$RACE_WINNER_CANARY.service"
+test ! -e \
+  "$RACE_ROOT/etc/systemd/system/brokkr-debian-maintenance-canary-$RACE_LOSER_CANARY.service"
+for shared_unit in \
+  brokkr-debian-maintenance-attempt-factory.service \
+  brokkr-debian-maintenance-recovery@.service; do
+  grep -Fqx "Environment=BROKKR_RELEASE_SHA=$RACE_WINNER_REVISION" \
+    "$RACE_ROOT/etc/systemd/system/$shared_unit"
+done
+cmp \
+  "$RACE_WINNER_SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+  "$RACE_ROOT/etc/systemd/system/brokkr-debian-maintenance-attempt-factory.timer"
 
 # Exact replay is byte-idempotent: neither immutable release nor concrete units
 # are overwritten.
@@ -261,7 +429,11 @@ OTHER_REVISION="ffffffffffffffffffffffffffffffffffffffff"
 printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$OTHER_REVISION" \
   >"$UNIT_CONFLICT_DIR/brokkr-debian-maintenance-canary-canary-fi.service"
 printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$OTHER_REVISION" \
-  >"$UNIT_CONFLICT_DIR/brokkr-debian-maintenance-recovery-canary-fi.service"
+  >"$UNIT_CONFLICT_DIR/brokkr-debian-maintenance-recovery@.service"
+printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$OTHER_REVISION" \
+  >"$UNIT_CONFLICT_DIR/brokkr-debian-maintenance-attempt-factory.service"
+cp "$SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+  "$UNIT_CONFLICT_DIR/brokkr-debian-maintenance-attempt-factory.timer"
 if env \
   BROKKR_CANARY_INSTALL_TEST_ROOT="$UNIT_CONFLICT_ROOT" \
   BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
@@ -289,7 +461,11 @@ mkdir -p "$UNSAFE_UNIT_DIR"
 printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$REVISION" \
   >"$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-canary-canary-fi.service"
 printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$REVISION" \
-  >"$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-recovery-canary-fi.service"
+  >"$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-recovery@.service"
+printf 'Environment=BROKKR_RELEASE_SHA=%s\n' "$REVISION" \
+  >"$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-attempt-factory.service"
+cp "$SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+  "$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-attempt-factory.timer"
 chmod 0666 \
   "$UNSAFE_UNIT_DIR/brokkr-debian-maintenance-canary-canary-fi.service"
 if env \
@@ -412,6 +588,131 @@ grep -Fq "install_headroom_reserve_unsafe" "$TMP/sparse.out"
 test ! -e "$SPARSE_ROOT/etc"
 test ! -e "$SPARSE_ROOT/usr"
 
+# The package transaction may write host paths outside ReadWritePaths when
+# ProtectSystem=false; the installer therefore protects the exact unit shape,
+# not a false claim that apt/dpkg writes are path-allowlisted.
+prepare_factory_source() {
+  local factory_source="$1"
+  git clone -q "$SOURCE" "$factory_source"
+  git -C "$factory_source" config user.email test@example.invalid
+  git -C "$factory_source" config user.name "Brokkr hermetic test"
+}
+
+commit_factory_mutation() {
+  local factory_source="$1"
+  local message="$2"
+  git -C "$factory_source" add \
+    systemd/brokkr-debian-maintenance-attempt-factory.service.in
+  git -C "$factory_source" commit -qm "$message"
+  git -C "$factory_source" rev-parse HEAD
+}
+
+assert_factory_mutation_rejected() {
+  local label="$1"
+  local factory_source="$2"
+  local factory_revision="$3"
+  local factory_root="$TMP/$label-root"
+  local factory_output="$TMP/$label.out"
+  if env \
+    BROKKR_CANARY_INSTALL_TEST_ROOT="$factory_root" \
+    BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
+    BROKKR_CANARY_FALLOCATE="$TMP/fallocate" \
+    BROKKR_CANARY_NODE="$NODE_BIN" \
+    BROKKR_TEST_SYSTEMCTL_LOG="$TMP/$label-systemctl.log" \
+    "$INSTALLER" install \
+      --source "$factory_source" \
+      --revision "$factory_revision" \
+      --canary "canary-$label" \
+      >"$factory_output" 2>&1; then
+    echo "unsafe attempt factory unit unexpectedly installed: $label" >&2
+    exit 1
+  fi
+  grep -Fq "attempt factory unit template sandbox invalid" \
+    "$factory_output"
+  test ! -e \
+    "$factory_root/etc/systemd/system/brokkr-debian-maintenance-attempt-factory.service"
+  test ! -e \
+    "$factory_root/usr/local/lib/brokkr/releases/$factory_revision"
+}
+
+# The old strict configuration is rejected because real apt/dpkg payloads and
+# maintainer scripts need host filesystem writes such as /usr, /etc, and /boot.
+STRICT_FACTORY_SOURCE="$TMP/strict-factory-source"
+prepare_factory_source "$STRICT_FACTORY_SOURCE"
+sed \
+  -e 's/^ProtectSystem=false$/ProtectSystem=strict/' \
+  "$STRICT_FACTORY_SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.service.in" \
+  >"$STRICT_FACTORY_SOURCE/systemd/.strict-factory.service.in"
+mv \
+  "$STRICT_FACTORY_SOURCE/systemd/.strict-factory.service.in" \
+  "$STRICT_FACTORY_SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.service.in"
+STRICT_FACTORY_REVISION="$(
+  commit_factory_mutation "$STRICT_FACTORY_SOURCE" "strict factory sandbox"
+)"
+assert_factory_mutation_rejected \
+  strict-factory "$STRICT_FACTORY_SOURCE" "$STRICT_FACTORY_REVISION"
+
+# A duplicate ProtectSystem line is rejected instead of relying on systemd's
+# assignment ordering to choose an effective value.
+DUPLICATE_PROTECT_FACTORY_SOURCE="$TMP/duplicate-protect-factory-source"
+prepare_factory_source "$DUPLICATE_PROTECT_FACTORY_SOURCE"
+printf 'ProtectSystem=strict\n' \
+  >>"$DUPLICATE_PROTECT_FACTORY_SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.service.in"
+DUPLICATE_PROTECT_FACTORY_REVISION="$(
+  commit_factory_mutation \
+    "$DUPLICATE_PROTECT_FACTORY_SOURCE" "duplicate factory ProtectSystem"
+)"
+assert_factory_mutation_rejected \
+  duplicate-protect-factory \
+  "$DUPLICATE_PROTECT_FACTORY_SOURCE" \
+  "$DUPLICATE_PROTECT_FACTORY_REVISION"
+
+# Additional path-authority directives are rejected even though they could
+# otherwise change the factory's mount namespace semantics.
+EXTRA_PATH_FACTORY_SOURCE="$TMP/extra-path-factory-source"
+prepare_factory_source "$EXTRA_PATH_FACTORY_SOURCE"
+printf 'BindPaths=/usr\n' \
+  >>"$EXTRA_PATH_FACTORY_SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.service.in"
+EXTRA_PATH_FACTORY_REVISION="$(
+  commit_factory_mutation "$EXTRA_PATH_FACTORY_SOURCE" "extra factory path authority"
+)"
+assert_factory_mutation_rejected \
+  extra-path-factory "$EXTRA_PATH_FACTORY_SOURCE" "$EXTRA_PATH_FACTORY_REVISION"
+
+# The write-authority change does not permit dropping the factory's remaining
+# hardening contract.
+NO_NEW_PRIV_FACTORY_SOURCE="$TMP/no-new-priv-factory-source"
+prepare_factory_source "$NO_NEW_PRIV_FACTORY_SOURCE"
+sed \
+  -e '/^NoNewPrivileges=yes$/d' \
+  "$NO_NEW_PRIV_FACTORY_SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.service.in" \
+  >"$NO_NEW_PRIV_FACTORY_SOURCE/systemd/.no-new-priv-factory.service.in"
+mv \
+  "$NO_NEW_PRIV_FACTORY_SOURCE/systemd/.no-new-priv-factory.service.in" \
+  "$NO_NEW_PRIV_FACTORY_SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.service.in"
+NO_NEW_PRIV_FACTORY_REVISION="$(
+  commit_factory_mutation \
+    "$NO_NEW_PRIV_FACTORY_SOURCE" "remove factory no-new-privileges"
+)"
+assert_factory_mutation_rejected \
+  no-new-priv-factory \
+  "$NO_NEW_PRIV_FACTORY_SOURCE" \
+  "$NO_NEW_PRIV_FACTORY_REVISION"
+
+# The exact factory execution shape also rejects extra root command hooks.
+EXTRA_EXEC_FACTORY_SOURCE="$TMP/extra-exec-factory-source"
+prepare_factory_source "$EXTRA_EXEC_FACTORY_SOURCE"
+printf 'ExecStartPre=/usr/bin/true\n' \
+  >>"$EXTRA_EXEC_FACTORY_SOURCE/systemd/brokkr-debian-maintenance-attempt-factory.service.in"
+EXTRA_EXEC_FACTORY_REVISION="$(
+  commit_factory_mutation \
+    "$EXTRA_EXEC_FACTORY_SOURCE" "add factory exec hook"
+)"
+assert_factory_mutation_rejected \
+  extra-exec-factory \
+  "$EXTRA_EXEC_FACTORY_SOURCE" \
+  "$EXTRA_EXEC_FACTORY_REVISION"
+
 # Invalid tracked template content fails during staging, before either concrete
 # unit or immutable release is published.
 BROKEN_SOURCE="$TMP/broken-source"
@@ -443,12 +744,13 @@ grep -Fq "recovery unit template has unresolved placeholders" \
 test ! -e \
   "$BROKEN_ROOT/etc/systemd/system/brokkr-debian-maintenance-canary-canary-broken.service"
 test ! -e \
-  "$BROKEN_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery-canary-broken.service"
+  "$BROKEN_ROOT/etc/systemd/system/brokkr-debian-maintenance-recovery@.service"
 test ! -e \
   "$BROKEN_ROOT/usr/local/lib/brokkr/releases/$BROKEN_REVISION"
 
-# Disable persists the fail-closed marker before systemd. Even when disable
-# fails, both stop attempts occur and the marker/evidence remain durable.
+# Disable persists both the legacy canary marker and the revision-bound global
+# factory gate before systemd. Even when shutdown fails, every disable/stop
+# attempt occurs and the marker/evidence remain durable.
 STOP_FAILURE_ROOT="$TMP/stop-failure-root"
 STOP_FAILURE_LOG="$TMP/stop-failure-systemctl.log"
 env \
@@ -478,17 +780,25 @@ if env \
   echo "systemd disable failure unexpectedly reported success" >&2
   exit 1
 fi
-grep -Fq "disarm marker persisted but systemd stop failed" \
+grep -Fq "disarm gates persisted but systemd shutdown failed" \
   "$TMP/stop-failure.out"
 test -r \
   "$STOP_FAILURE_STATE/disarmed/canary-stop-failure.json"
 test -r \
+  "$STOP_FAILURE_STATE/disarmed/factory-$REVISION.json"
+test -r \
   "$STOP_FAILURE_STATE/evidence/canary-stop-failure.json"
+grep -Fqx \
+  "disable --now brokkr-debian-maintenance-attempt-factory.timer" \
+  "$STOP_FAILURE_LOG"
+grep -Fqx \
+  "stop brokkr-debian-maintenance-attempt-factory.service" \
+  "$STOP_FAILURE_LOG"
 grep -Fqx \
   "disable --now brokkr-debian-maintenance-canary-canary-stop-failure.service" \
   "$STOP_FAILURE_LOG"
 grep -Fqx \
-  "stop brokkr-debian-maintenance-recovery-canary-stop-failure.service" \
+  "stop brokkr-debian-maintenance-recovery@canary-stop-failure.service" \
   "$STOP_FAILURE_LOG"
 
 printf '%s\n' '{"redacted":"evidence-preserved"}' \
@@ -506,10 +816,21 @@ env \
 
 grep -Fqx "disable --now brokkr-debian-maintenance-canary-canary-fi.service" \
   "$SYSTEMCTL_LOG"
-grep -Fqx "stop brokkr-debian-maintenance-recovery-canary-fi.service" \
+grep -Fqx \
+  "disable --now brokkr-debian-maintenance-attempt-factory.timer" \
   "$SYSTEMCTL_LOG"
+grep -Fqx \
+  "stop brokkr-debian-maintenance-attempt-factory.service" \
+  "$SYSTEMCTL_LOG"
+grep -Fqx "stop brokkr-debian-maintenance-recovery@canary-fi.service" \
+  "$SYSTEMCTL_LOG"
+test "$(grep -c '^disable --now brokkr-debian-maintenance-attempt-factory.timer$' "$SYSTEMCTL_LOG")" -eq 1
+test "$(grep -c '^stop brokkr-debian-maintenance-attempt-factory.service$' "$SYSTEMCTL_LOG")" -eq 1
+test "$(grep -c '^disable --now brokkr-debian-maintenance-canary-canary-fi.service$' "$SYSTEMCTL_LOG")" -eq 1
+test "$(grep -c '^stop brokkr-debian-maintenance-recovery@canary-fi.service$' "$SYSTEMCTL_LOG")" -eq 1
 test -r "$STATE_ROOT/evidence/canary-fi.json"
 test -r "$STATE_ROOT/disarmed/canary-fi.json"
+test -r "$STATE_ROOT/disarmed/factory-$REVISION.json"
 test -d "$RELEASE_ROOT"
 test -r "$STATE_ROOT/headroom/journal.reserve"
 test -r "$STATE_ROOT/headroom/evidence.reserve"
@@ -517,6 +838,8 @@ grep -Fq "\"release_sha\":\"$REVISION\"" \
   "$STATE_ROOT/disarmed/canary-fi.json"
 grep -Fq '"evidence_preserved":true' \
   "$STATE_ROOT/disarmed/canary-fi.json"
+grep -Fq "\"release_sha\":\"$REVISION\"" \
+  "$STATE_ROOT/disarmed/factory-$REVISION.json"
 
 # Exact replay remains disable-only and preserves all evidence.
 env \
@@ -530,7 +853,15 @@ env \
     --revision "$REVISION" \
     --canary canary-fi
 test -r "$STATE_ROOT/evidence/canary-fi.json"
+test "$(grep -c '^disable --now brokkr-debian-maintenance-attempt-factory.timer$' "$SYSTEMCTL_LOG")" -eq 2
+test "$(grep -c '^stop brokkr-debian-maintenance-attempt-factory.service$' "$SYSTEMCTL_LOG")" -eq 2
+test "$(grep -c '^disable --now brokkr-debian-maintenance-canary-canary-fi.service$' "$SYSTEMCTL_LOG")" -eq 2
+test "$(grep -c '^stop brokkr-debian-maintenance-recovery@canary-fi.service$' "$SYSTEMCTL_LOG")" -eq 2
 
+case "$REVISION" in
+  *0) WRONG_REVISION="${REVISION%?}1" ;;
+  *) WRONG_REVISION="${REVISION%?}0" ;;
+esac
 if env \
   BROKKR_CANARY_INSTALL_TEST_ROOT="$TMP/wrong-revision-root" \
   BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \

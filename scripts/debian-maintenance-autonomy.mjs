@@ -20,7 +20,7 @@ import { windowStatus } from "./maintenance-controller.mjs";
 
 const DOMAIN = "no-reboot-security-bugfix-maintenance";
 const SCHEMA_ID = "https://grimnir.gille.ai/contracts/autonomous-mutation-journal/v2/schema.json";
-const SCHEMA_SHA256 = "fc0d87d815c6fda3b14116e0e8840e8ecbe8e3df77bbeaf74b2064184ad036f4";
+const SCHEMA_SHA256 = "fc6e4068bd1220b6c3d65d0791f1a2ae5dac36126170d9dd68703bcbe8af72fb";
 const LOCAL_SCHEMA_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../docs/autonomous-mutation-journal-v2.schema.json",

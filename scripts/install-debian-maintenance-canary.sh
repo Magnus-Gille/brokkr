@@ -92,17 +92,41 @@ RELEASE_PARENT="$(root_path "$RELEASE_PARENT_PATH")"
 STATE_ROOT="$(root_path "$STATE_PATH")"
 UNIT_ROOT="$(root_path "$UNIT_PATH")"
 APPLY_UNIT="brokkr-debian-maintenance-canary-$CANARY.service"
-RECOVERY_UNIT="brokkr-debian-maintenance-recovery-$CANARY.service"
+RECOVERY_UNIT="brokkr-debian-maintenance-recovery@.service"
+FACTORY_UNIT="brokkr-debian-maintenance-attempt-factory.service"
+FACTORY_TIMER="brokkr-debian-maintenance-attempt-factory.timer"
 RELEASE_FILES=(
+  docs/autonomy-constitution-v2.schema.json
+  docs/autonomy-coverage-registry-v2.schema.json
+  docs/autonomy-owner-attestation-registry-v1.schema.json
+  docs/autonomy-owner-authorization-v1.schema.json
+  docs/autonomy-recovery-worker-registry-v1.schema.json
+  docs/autonomy-runtime-narrowing-v1.schema.json
+  docs/autonomous-mutation-journal-v2.schema.json
+  docs/debian-maintenance-attempt-factory-config-v1.schema.json
+  docs/debian-maintenance-window-freshness-v1.schema.json
+  scripts/debian-maintenance-attempt-factory.mjs
+  scripts/debian-maintenance-autonomy.mjs
+  scripts/debian-maintenance-executor.mjs
   scripts/debian-maintenance-host-adapter.mjs
+  scripts/maintenance-controller.mjs
+  scripts/lib/autonomy-authorization.mjs
+  scripts/lib/debian-maintenance-attempt-factory.mjs
   scripts/lib/fixed-debian-maintenance-host-operation.mjs
+  scripts/lib/maintenance-policy-contract.mjs
   scripts/lib/bounded-recovery-dispatch.mjs
+  systemd/brokkr-debian-maintenance-attempt-factory.service.in
+  systemd/brokkr-debian-maintenance-attempt-factory.timer
   systemd/brokkr-debian-maintenance-recovery.service.in
 )
 STAGE_ROOT=""
+UNIT_STAGE_ROOT=""
 INSTALL_LOCK=""
+GLOBAL_INSTALL_LOCK=""
 PUBLISHED_APPLY=0
 PUBLISHED_RECOVERY=0
+PUBLISHED_FACTORY=0
+PUBLISHED_FACTORY_TIMER=0
 HEADROOM_TEMP=""
 
 cleanup() {
@@ -112,13 +136,21 @@ cleanup() {
       rm -f "$UNIT_ROOT/$APPLY_UNIT"
     [[ "$PUBLISHED_RECOVERY" -eq 0 ]] ||
       rm -f "$UNIT_ROOT/$RECOVERY_UNIT"
+    [[ "$PUBLISHED_FACTORY" -eq 0 ]] ||
+      rm -f "$UNIT_ROOT/$FACTORY_UNIT"
+    [[ "$PUBLISHED_FACTORY_TIMER" -eq 0 ]] ||
+      rm -f "$UNIT_ROOT/$FACTORY_TIMER"
   fi
   [[ -z "$STAGE_ROOT" || ! -d "$STAGE_ROOT" ]] ||
     rm -rf "$STAGE_ROOT"
+  [[ -z "$UNIT_STAGE_ROOT" || ! -d "$UNIT_STAGE_ROOT" ]] ||
+    rm -rf "$UNIT_STAGE_ROOT"
   [[ -z "$HEADROOM_TEMP" || ! -e "$HEADROOM_TEMP" ]] ||
     rm -f "$HEADROOM_TEMP"
   [[ -z "$INSTALL_LOCK" || ! -d "$INSTALL_LOCK" ]] ||
     rmdir "$INSTALL_LOCK"
+  [[ -z "$GLOBAL_INSTALL_LOCK" || ! -d "$GLOBAL_INSTALL_LOCK" ]] ||
+    rmdir "$GLOBAL_INSTALL_LOCK"
   exit "$status"
 }
 trap cleanup EXIT
@@ -296,17 +328,29 @@ verify_install_source() {
 preflight_installed_units() {
   local apply="$UNIT_ROOT/$APPLY_UNIT"
   local recovery="$UNIT_ROOT/$RECOVERY_UNIT"
+  local factory="$UNIT_ROOT/$FACTORY_UNIT"
+  local factory_timer="$UNIT_ROOT/$FACTORY_TIMER"
   local apply_exists=0
   local recovery_exists=0
+  local factory_exists=0
+  local factory_timer_exists=0
   [[ ! -e "$apply" && ! -L "$apply" ]] || apply_exists=1
   [[ ! -e "$recovery" && ! -L "$recovery" ]] || recovery_exists=1
-  [[ "$apply_exists" -eq "$recovery_exists" ]] ||
+  [[ ! -e "$factory" && ! -L "$factory" ]] || factory_exists=1
+  [[ ! -e "$factory_timer" && ! -L "$factory_timer" ]] ||
+    factory_timer_exists=1
+  [[ "$apply_exists" -eq "$recovery_exists" &&
+    "$apply_exists" -eq "$factory_exists" &&
+    "$apply_exists" -eq "$factory_timer_exists" ]] ||
     die "installed canary unit set is incomplete"
   if [[ "$apply_exists" -eq 1 ]]; then
     verify_secure_path "$apply" file 0 0644
     verify_secure_path "$recovery" file 0 0644
+    verify_secure_path "$factory" file 0 0644
+    verify_secure_path "$factory_timer" file 0 0644
     grep -Fqx "Environment=BROKKR_RELEASE_SHA=$REVISION" "$apply" &&
-      grep -Fqx "Environment=BROKKR_RELEASE_SHA=$REVISION" "$recovery" ||
+      grep -Fqx "Environment=BROKKR_RELEASE_SHA=$REVISION" "$recovery" &&
+      grep -Fqx "Environment=BROKKR_RELEASE_SHA=$REVISION" "$factory" ||
       die "installed canary revision does not match"
   fi
 }
@@ -333,13 +377,33 @@ stage_exact_release() {
   done
   chmod 0755 \
     "$staged_release" \
+    "$staged_release/docs" \
     "$staged_release/scripts" \
     "$staged_release/scripts/lib" \
     "$staged_release/systemd"
-  chmod 0755 "$staged_release/scripts/debian-maintenance-host-adapter.mjs"
+  chmod 0755 \
+    "$staged_release/scripts/debian-maintenance-attempt-factory.mjs" \
+    "$staged_release/scripts/debian-maintenance-host-adapter.mjs"
   chmod 0644 \
+    "$staged_release/docs/autonomy-constitution-v2.schema.json" \
+    "$staged_release/docs/autonomy-coverage-registry-v2.schema.json" \
+    "$staged_release/docs/autonomy-owner-attestation-registry-v1.schema.json" \
+    "$staged_release/docs/autonomy-owner-authorization-v1.schema.json" \
+    "$staged_release/docs/autonomy-recovery-worker-registry-v1.schema.json" \
+    "$staged_release/docs/autonomy-runtime-narrowing-v1.schema.json" \
+    "$staged_release/docs/autonomous-mutation-journal-v2.schema.json" \
+    "$staged_release/docs/debian-maintenance-attempt-factory-config-v1.schema.json" \
+    "$staged_release/docs/debian-maintenance-window-freshness-v1.schema.json" \
+    "$staged_release/scripts/debian-maintenance-autonomy.mjs" \
+    "$staged_release/scripts/debian-maintenance-executor.mjs" \
+    "$staged_release/scripts/maintenance-controller.mjs" \
+    "$staged_release/scripts/lib/autonomy-authorization.mjs" \
+    "$staged_release/scripts/lib/debian-maintenance-attempt-factory.mjs" \
     "$staged_release/scripts/lib/fixed-debian-maintenance-host-operation.mjs" \
+    "$staged_release/scripts/lib/maintenance-policy-contract.mjs" \
     "$staged_release/scripts/lib/bounded-recovery-dispatch.mjs" \
+    "$staged_release/systemd/brokkr-debian-maintenance-attempt-factory.service.in" \
+    "$staged_release/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
     "$staged_release/systemd/brokkr-debian-maintenance-recovery.service.in"
 }
 
@@ -413,16 +477,74 @@ render_apply_unit() {
 render_recovery_unit() {
   local destination="$1"
   local template="$2"
-  grep -Fq '@CANARY_ID@' "$template" ||
-    die "recovery unit template lacks canary placeholder"
   grep -Fq '@RELEASE_SHA@' "$template" ||
     die "recovery unit template lacks release placeholder"
   sed \
-    -e "s/@CANARY_ID@/$CANARY/g" \
     -e "s/@RELEASE_SHA@/$REVISION/g" \
     "$template" >"$destination"
   if grep -Eq '@[A-Za-z0-9_]+@' "$destination"; then
     die "recovery unit template has unresolved placeholders"
+  fi
+  chmod 0644 "$destination"
+}
+
+render_factory_unit() {
+  local destination="$1"
+  local template="$2"
+  local required_line
+  local environment_count
+  local exec_start_count
+  local protect_system_count
+  local read_only_paths_count
+  local writable_paths_count
+  grep -Fq '@RELEASE_SHA@' "$template" ||
+    die "attempt factory unit template lacks release placeholder"
+  sed -e "s/@RELEASE_SHA@/$REVISION/g" "$template" >"$destination"
+  if grep -Eq '@[A-Za-z0-9_]+@' "$destination"; then
+    die "attempt factory unit template has unresolved placeholders"
+  fi
+  for required_line in \
+    'Type=oneshot' \
+    'User=root' \
+    'NoNewPrivileges=yes' \
+    'PrivateTmp=yes' \
+    'ProtectHome=yes' \
+    'ProtectSystem=false' \
+    'ReadOnlyPaths=/etc/brokkr /run/brokkr' \
+    'ReadWritePaths=/var/lib/brokkr/debian-maintenance /var/lib/dpkg /var/cache/apt /var/log/apt' \
+    'ProtectKernelTunables=yes' \
+    'ProtectControlGroups=yes' \
+    'ProtectKernelLogs=yes' \
+    'PrivateDevices=yes' \
+    'RestrictSUIDSGID=yes' \
+    "Environment=BROKKR_RELEASE_SHA=$REVISION" \
+    "ExecStart=$RELEASE_PATH/scripts/debian-maintenance-attempt-factory.mjs" \
+    'TimeoutStartSec=600'; do
+    [[ "$(grep -Fxc "$required_line" "$destination" || true)" -eq 1 ]] ||
+      die "attempt factory unit template sandbox invalid"
+  done
+  environment_count="$(grep -Ec '^[[:space:]]*Environment[[:space:]]*=' "$destination" || true)"
+  exec_start_count="$(grep -Ec '^[[:space:]]*ExecStart[[:space:]]*=' "$destination" || true)"
+  protect_system_count="$(grep -Ec '^[[:space:]]*ProtectSystem[[:space:]]*=' "$destination" || true)"
+  read_only_paths_count="$(grep -Ec '^[[:space:]]*ReadOnlyPaths[[:space:]]*=' "$destination" || true)"
+  writable_paths_count="$(grep -Ec '^[[:space:]]*ReadWritePaths[[:space:]]*=' "$destination" || true)"
+  if [[ "$environment_count" -ne 1 ||
+    "$exec_start_count" -ne 1 ||
+    "$protect_system_count" -ne 1 ||
+    "$read_only_paths_count" -ne 1 ||
+    "$writable_paths_count" -ne 1 ]] ||
+    ! grep -Fqx 'ProtectSystem=false' "$destination" ||
+    ! grep -Fqx 'ReadOnlyPaths=/etc/brokkr /run/brokkr' "$destination" ||
+    ! grep -Fqx \
+      'ReadWritePaths=/var/lib/brokkr/debian-maintenance /var/lib/dpkg /var/cache/apt /var/log/apt' \
+      "$destination" ||
+    grep -Eq \
+      '^[[:space:]]*(ExecCondition|ExecStartPre|ExecStartPost|ExecStop|ExecStopPost|ExecReload|EnvironmentFile|PassEnvironment|UnsetEnvironment|LoadCredential|SetCredential|ImportCredential|SupplementaryGroups|Group|DynamicUser|CapabilityBoundingSet|AmbientCapabilities)[[:space:]]*=' \
+      "$destination" ||
+    grep -Eq \
+      '^[[:space:]]*(ReadWriteDirectories|ReadOnlyDirectories|InaccessiblePaths|ExecPaths|NoExecPaths|BindPaths|BindReadOnlyPaths|TemporaryFileSystem|RootDirectory|RootImage|StateDirectory|CacheDirectory|LogsDirectory|RuntimeDirectory|ConfigurationDirectory)[[:space:]]*=' \
+      "$destination"; then
+    die "attempt factory unit template sandbox invalid"
   fi
   chmod 0644 "$destination"
 }
@@ -437,45 +559,196 @@ verify_or_publish_release() {
       die "existing release differs from exact revision"
     return
   fi
-  mv "$staged" "$RELEASE_ROOT"
+  if ! "$NODE" --input-type=module - "$staged" "$RELEASE_ROOT" <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+const [source, destination] = process.argv.slice(2);
+const sourceStat = fs.lstatSync(source);
+if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) {
+  throw new Error("release_publication_source_invalid");
+}
+try {
+  fs.lstatSync(destination);
+  throw new Error("release_publication_target_appeared");
+} catch (error) {
+  if (error?.code !== "ENOENT") throw error;
+}
+try {
+  fs.mkdirSync(destination, { mode: sourceStat.mode & 0o7777 });
+} catch (error) {
+  if (error?.code === "EEXIST") {
+    throw new Error("release_publication_target_appeared");
+  }
+  throw error;
+}
+const destinationStat = fs.lstatSync(destination);
+if (!destinationStat.isDirectory() || destinationStat.isSymbolicLink()) {
+  throw new Error("release_publication_reservation_invalid");
+}
+fs.chmodSync(destination, sourceStat.mode & 0o7777);
+const sameInode = (left, right) =>
+  left.dev === right.dev && left.ino === right.ino;
+const assertAbsent = file => {
+  try {
+    fs.lstatSync(file);
+    throw new Error("release_publication_target_appeared");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+};
+const publishDirectory = (sourceDirectory, destinationDirectory) => {
+  const entries = fs.readdirSync(sourceDirectory).sort();
+  for (const entry of entries) {
+    const sourceEntry = path.join(sourceDirectory, entry);
+    const destinationEntry = path.join(destinationDirectory, entry);
+    const entryStat = fs.lstatSync(sourceEntry);
+    if (entryStat.isSymbolicLink() ||
+        (!entryStat.isDirectory() && !entryStat.isFile())) {
+      throw new Error("release_publication_entry_invalid");
+    }
+    assertAbsent(destinationEntry);
+    if (entryStat.isDirectory()) {
+      fs.mkdirSync(destinationEntry, { mode: entryStat.mode & 0o7777 });
+      fs.chmodSync(destinationEntry, entryStat.mode & 0o7777);
+      publishDirectory(sourceEntry, destinationEntry);
+    } else {
+      fs.linkSync(sourceEntry, destinationEntry);
+    }
+  }
+};
+publishDirectory(source, destination);
+if (!sameInode(destinationStat, fs.lstatSync(destination))) {
+  throw new Error("release_publication_reservation_lost");
+}
+NODE
+  then
+    die "release publication failed after no-replace reservation"
+  fi
+  verify_secure_release_tree "$RELEASE_ROOT"
+  verify_release_metadata_matches "$staged" "$RELEASE_ROOT"
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] ||
+    die "release publication failed after no-replace reservation"
+}
+
+publish_unit_no_replace() {
+  local staged="$1"
+  local destination="$2"
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    die "unit publication target appeared: $destination"
+  fi
+  "$NODE" --input-type=module - "$staged" "$destination" <<'NODE'
+import fs from "node:fs";
+const [source, destination] = process.argv.slice(2);
+const sourceStat = fs.lstatSync(source);
+if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+  throw new Error("unit_publication_source_invalid");
+}
+let linked = false;
+try {
+  fs.linkSync(source, destination);
+  linked = true;
+  const destinationStat = fs.lstatSync(destination);
+  if (!destinationStat.isFile() || destinationStat.isSymbolicLink() ||
+      destinationStat.dev !== sourceStat.dev ||
+      destinationStat.ino !== sourceStat.ino) {
+    throw new Error("unit_publication_postcondition_invalid");
+  }
+} catch (error) {
+  if (linked) {
+    try {
+      const destinationStat = fs.lstatSync(destination);
+      if (destinationStat.dev === sourceStat.dev &&
+          destinationStat.ino === sourceStat.ino) {
+        fs.unlinkSync(destination);
+      }
+    } catch (cleanupError) {
+      if (cleanupError?.code !== "ENOENT") throw cleanupError;
+    }
+  }
+  throw error;
+}
+NODE
+  [[ -f "$staged" && ! -L "$staged" &&
+    -f "$destination" && ! -L "$destination" ]] ||
+    die "unit publication refused to replace existing target: $destination"
 }
 
 verify_or_publish_units() {
-  local staged_apply="$STAGE_ROOT/$APPLY_UNIT"
-  local staged_recovery="$STAGE_ROOT/$RECOVERY_UNIT"
+  local staged_apply="$UNIT_STAGE_ROOT/$APPLY_UNIT"
+  local staged_recovery="$UNIT_STAGE_ROOT/$RECOVERY_UNIT"
   local apply="$UNIT_ROOT/$APPLY_UNIT"
   local recovery="$UNIT_ROOT/$RECOVERY_UNIT"
+  local staged_factory="$UNIT_STAGE_ROOT/$FACTORY_UNIT"
+  local staged_factory_timer="$UNIT_STAGE_ROOT/$FACTORY_TIMER"
+  local factory="$UNIT_ROOT/$FACTORY_UNIT"
+  local factory_timer="$UNIT_ROOT/$FACTORY_TIMER"
   if [[ -e "$apply" || -L "$apply" ]]; then
     preflight_installed_units
     cmp -s "$staged_apply" "$apply" &&
-      cmp -s "$staged_recovery" "$recovery" ||
+      cmp -s "$staged_recovery" "$recovery" &&
+      cmp -s "$staged_factory" "$factory" &&
+      cmp -s "$staged_factory_timer" "$factory_timer" ||
       die "installed canary units differ from exact revision"
     return
   fi
-  mv "$staged_recovery" "$recovery"
+  publish_unit_no_replace "$staged_factory_timer" "$factory_timer"
+  PUBLISHED_FACTORY_TIMER=1
+  publish_unit_no_replace "$staged_factory" "$factory"
+  PUBLISHED_FACTORY=1
+  publish_unit_no_replace "$staged_recovery" "$recovery"
   PUBLISHED_RECOVERY=1
-  mv "$staged_apply" "$apply"
+  publish_unit_no_replace "$staged_apply" "$apply"
   PUBLISHED_APPLY=1
   PUBLISHED_RECOVERY=0
+  PUBLISHED_FACTORY=0
+  PUBLISHED_FACTORY_TIMER=0
   PUBLISHED_APPLY=0
 }
 
 write_disarm_marker() {
   local destination="$STATE_ROOT/disarmed/$CANARY.json"
+  local factory_destination="$STATE_ROOT/disarmed/factory-$REVISION.json"
   local recorded_at
   recorded_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   "$NODE" --input-type=module - \
-    "$destination" "$CANARY" "$REVISION" "$recorded_at" <<'NODE'
+    "$destination" "$factory_destination" "$CANARY" "$REVISION" \
+    "$recorded_at" <<'NODE'
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-const [destination, canary, release, recordedAt] = process.argv.slice(2);
+const [destination, factoryDestination, canary, release, recordedAt] =
+  process.argv.slice(2);
 const directory = path.dirname(destination);
 fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 fs.chmodSync(directory, 0o700);
-const temporary =
-  `${destination}.${process.pid}.${crypto.randomUUID()}.tmp`;
-const value = {
+const write = (file, value) => {
+  const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  let descriptor;
+  try {
+    descriptor = fs.openSync(temporary, "wx", 0o600);
+    fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(temporary, file);
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+    try {
+      fs.unlinkSync(temporary);
+    } catch {
+      // Only the unique unpublished temporary is eligible for cleanup.
+    }
+  }
+};
+write(factoryDestination, {
+  evidence_preserved: true,
+  kind: "brokkr-debian-maintenance-factory-disarm",
+  recorded_at: recordedAt,
+  release_sha: release,
+  schema_version: "v1",
+  state_preserved: true,
+});
+write(destination, {
   canary_id: canary,
   evidence_preserved: true,
   kind: "brokkr-debian-maintenance-canary-disarm",
@@ -483,28 +756,12 @@ const value = {
   release_sha: release,
   schema_version: "v1",
   state_preserved: true,
-};
-let descriptor;
+});
+const directoryDescriptor = fs.openSync(directory, "r");
 try {
-  descriptor = fs.openSync(temporary, "wx", 0o600);
-  fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`);
-  fs.fsyncSync(descriptor);
-  fs.closeSync(descriptor);
-  descriptor = undefined;
-  fs.renameSync(temporary, destination);
-  const directoryDescriptor = fs.openSync(directory, "r");
-  try {
-    fs.fsyncSync(directoryDescriptor);
-  } finally {
-    fs.closeSync(directoryDescriptor);
-  }
+  fs.fsyncSync(directoryDescriptor);
 } finally {
-  if (descriptor !== undefined) fs.closeSync(descriptor);
-  try {
-    fs.unlinkSync(temporary);
-  } catch {
-    // Only the unique unpublished temporary is eligible for cleanup.
-  }
+  fs.closeSync(directoryDescriptor);
 }
 NODE
 }
@@ -515,6 +772,10 @@ case "$ACTION" in
     preflight_install_paths
     preflight_installed_units
     [[ -d "$UNIT_ROOT" ]] || install -d -m 0755 "$UNIT_ROOT"
+    global_install_lock_candidate="$UNIT_ROOT/.brokkr-debian-maintenance.install-lock"
+    mkdir "$global_install_lock_candidate" ||
+      die "another Debian maintenance install is in progress"
+    GLOBAL_INSTALL_LOCK="$global_install_lock_candidate"
     install_lock_candidate="$UNIT_ROOT/.brokkr-canary-$CANARY.install-lock"
     mkdir "$install_lock_candidate" ||
       die "another canary install is in progress"
@@ -522,10 +783,19 @@ case "$ACTION" in
     preflight_install_paths
     preflight_installed_units
     stage_exact_release
-    render_apply_unit "$STAGE_ROOT/$APPLY_UNIT"
+    UNIT_STAGE_ROOT="$(mktemp -d "$UNIT_ROOT/.brokkr-units-$REVISION.XXXXXX")"
+    chmod 0700 "$UNIT_STAGE_ROOT"
+    render_apply_unit "$UNIT_STAGE_ROOT/$APPLY_UNIT"
     render_recovery_unit \
-      "$STAGE_ROOT/$RECOVERY_UNIT" \
+      "$UNIT_STAGE_ROOT/$RECOVERY_UNIT" \
       "$STAGE_ROOT/release/systemd/brokkr-debian-maintenance-recovery.service.in"
+    render_factory_unit \
+      "$UNIT_STAGE_ROOT/$FACTORY_UNIT" \
+      "$STAGE_ROOT/release/systemd/brokkr-debian-maintenance-attempt-factory.service.in"
+    cp \
+      "$STAGE_ROOT/release/systemd/brokkr-debian-maintenance-attempt-factory.timer" \
+      "$UNIT_STAGE_ROOT/$FACTORY_TIMER"
+    chmod 0644 "$UNIT_STAGE_ROOT/$FACTORY_TIMER"
     if [[ -e "$RELEASE_ROOT" || -L "$RELEASE_ROOT" ]]; then
       verify_secure_path "$RELEASE_ROOT" dir
       verify_secure_release_tree "$RELEASE_ROOT"
@@ -537,8 +807,10 @@ case "$ACTION" in
     if [[ -e "$UNIT_ROOT/$APPLY_UNIT" ||
       -L "$UNIT_ROOT/$APPLY_UNIT" ]]; then
       preflight_installed_units
-      cmp -s "$STAGE_ROOT/$APPLY_UNIT" "$UNIT_ROOT/$APPLY_UNIT" &&
-        cmp -s "$STAGE_ROOT/$RECOVERY_UNIT" "$UNIT_ROOT/$RECOVERY_UNIT" ||
+      cmp -s "$UNIT_STAGE_ROOT/$APPLY_UNIT" "$UNIT_ROOT/$APPLY_UNIT" &&
+        cmp -s "$UNIT_STAGE_ROOT/$RECOVERY_UNIT" "$UNIT_ROOT/$RECOVERY_UNIT" &&
+        cmp -s "$UNIT_STAGE_ROOT/$FACTORY_UNIT" "$UNIT_ROOT/$FACTORY_UNIT" &&
+        cmp -s "$UNIT_STAGE_ROOT/$FACTORY_TIMER" "$UNIT_ROOT/$FACTORY_TIMER" ||
         die "installed canary units differ from exact revision"
     fi
     install_directories
@@ -554,13 +826,18 @@ case "$ACTION" in
       die "revision-bound canary unit is not installed"
     write_disarm_marker
     set +e
+    "$SYSTEMCTL" disable --now "$FACTORY_TIMER"
+    factory_timer_status=$?
+    "$SYSTEMCTL" stop "$FACTORY_UNIT"
+    factory_status=$?
     "$SYSTEMCTL" disable --now "$APPLY_UNIT"
     apply_status=$?
-    "$SYSTEMCTL" stop "$RECOVERY_UNIT"
+    "$SYSTEMCTL" stop "brokkr-debian-maintenance-recovery@$CANARY.service"
     recovery_status=$?
     set -e
-    [[ "$apply_status" -eq 0 && "$recovery_status" -eq 0 ]] ||
-      die "canary disarm marker persisted but systemd stop failed"
+    [[ "$factory_timer_status" -eq 0 && "$factory_status" -eq 0 &&
+      "$apply_status" -eq 0 && "$recovery_status" -eq 0 ]] ||
+      die "disarm gates persisted but systemd shutdown failed (timer=$factory_timer_status factory=$factory_status apply=$apply_status recovery=$recovery_status)"
     printf 'disabled and disarmed canary %s; evidence preserved\n' "$CANARY"
     ;;
 esac

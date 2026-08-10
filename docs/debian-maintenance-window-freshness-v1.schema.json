@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brokkr.gille.ai/contracts/debian-maintenance-window-freshness/v1/schema.json",
+  "title": "Brokkr Debian maintenance recurring freshness v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "schema_version", "observed_at", "valid_until", "liveness", "eligibility", "kill_switch", "hold", "policy", "window", "target", "plan", "inventory", "postconditions", "apt_source_evidence"],
+  "properties": {
+    "kind": { "const": "brokkr-debian-window-freshness" },
+    "schema_version": { "const": "v1" },
+    "observed_at": { "$ref": "#/$defs/utc" },
+    "valid_until": { "$ref": "#/$defs/utc" },
+    "liveness": { "$ref": "#/$defs/liveness" },
+    "eligibility": { "$ref": "#/$defs/eligibility" },
+    "kill_switch": { "$ref": "#/$defs/kill-switch" },
+    "hold": { "$ref": "#/$defs/hold" },
+    "policy": { "type": "object" },
+    "window": { "$ref": "#/$defs/window" },
+    "target": { "$ref": "#/$defs/target" },
+    "plan": { "type": "object" },
+    "inventory": { "type": "object" },
+    "postconditions": { "type": "object" },
+    "apt_source_evidence": { "type": "object" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+    "utc": { "type": "string", "format": "date-time" },
+    "liveness": { "type": "object", "additionalProperties": false, "required": ["healthy"], "properties": { "healthy": { "type": "boolean" } } },
+    "eligibility": { "type": "object", "additionalProperties": false, "required": ["eligible"], "properties": { "eligible": { "type": "boolean" } } },
+    "kill-switch": { "type": "object", "additionalProperties": false, "required": ["safe", "identity"], "properties": { "safe": { "type": "boolean" }, "identity": { "$ref": "#/$defs/id" } } },
+    "hold": { "type": "object", "additionalProperties": false, "required": ["active"], "properties": { "active": { "type": "boolean" } } },
+    "window": { "type": "object", "additionalProperties": false, "required": ["start", "end", "due"], "properties": { "start": { "$ref": "#/$defs/utc" }, "end": { "$ref": "#/$defs/utc" }, "due": { "type": "boolean" } } },
+    "target": { "type": "object", "additionalProperties": false, "required": ["node_id", "platform", "non_pillar"], "properties": { "node_id": { "$ref": "#/$defs/id" }, "platform": { "const": "debian" }, "non_pillar": { "const": true } } }
+  }
+}
