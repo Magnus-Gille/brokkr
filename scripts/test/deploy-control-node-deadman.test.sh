@@ -73,13 +73,25 @@ case "$*" in
   "--user stop brokkr-control-node-deadman.timer")
     printf '0\n' >"$MOCK_TIMER_ACTIVE_FILE"
     ;;
-  "--user is-enabled --quiet legacy-node-deadman.timer")
-    [[ "$(cat "$MOCK_LEGACY_TIMER_ENABLED_FILE")" == 1 ]]
-    exit
+  "--user is-enabled legacy-node-deadman.timer")
+    if [[ -n "${MOCK_LEGACY_TIMER_ENABLED_QUERY_ERROR:-}" ]]; then
+      printf '%s\n' "${MOCK_LEGACY_TIMER_ENABLED_QUERY_ERROR}"
+      exit 1
+    fi
+    if [[ "$(cat "$MOCK_LEGACY_TIMER_ENABLED_FILE")" == 1 ]]; then
+      printf 'enabled\n'
+      exit 0
+    fi
+    printf 'disabled\n'
+    exit 1
     ;;
-  "--user is-active --quiet legacy-node-deadman.timer")
-    [[ "$(cat "$MOCK_LEGACY_TIMER_ACTIVE_FILE")" == 1 ]]
-    exit
+  "--user is-active legacy-node-deadman.timer")
+    if [[ "$(cat "$MOCK_LEGACY_TIMER_ACTIVE_FILE")" == 1 ]]; then
+      printf 'active\n'
+      exit 0
+    fi
+    printf 'inactive\n'
+    exit 3
     ;;
   "--user enable legacy-node-deadman.timer")
     printf '1\n' >"$MOCK_LEGACY_TIMER_ENABLED_FILE"
@@ -278,6 +290,37 @@ run_deploy
 check "path-shaped legacy unit identity refuses" '[[ "$RC" -ne 0 && "$OUT" == *"invalid legacy service identity"* ]]'
 check "path-shaped identity refuses before unit mutation" '! grep -q "daemon-reload\|enable --now" "$CALLS"'
 unset BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
+
+: >"$CALLS"; write_env
+export BROKKR_DEADMAN_LEGACY_SERVICE=legacy-node-deadman.service
+export BROKKR_DEADMAN_LEGACY_TIMER=legacy-node-deadman.timer
+export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/control-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh
+run_deploy
+check "current dead-man state directory is not accepted as legacy source" '[[ "$RC" -ne 0 && "$OUT" == *"legacy state directory names the current dead-man state"* ]]'
+check "current-state collision refuses before unit mutation" '! grep -q "daemon-reload\|enable --now\|stop\|disable" "$CALLS"'
+unset BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
+
+: >"$CALLS"; write_env
+cat >"$UNIT_DIR/legacy-node-deadman.service" <<'EOF'
+[Service]
+ExecStart=%h/repos/brokkr/scripts/legacy-node-deadman.sh
+EOF
+cat >"$UNIT_DIR/legacy-node-deadman.timer" <<'EOF'
+[Timer]
+Unit=legacy-node-deadman.service
+EOF
+mkdir -p "$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SERVICE=legacy-node-deadman.service
+export BROKKR_DEADMAN_LEGACY_TIMER=legacy-node-deadman.timer
+export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh
+export MOCK_LEGACY_TIMER_ENABLED_QUERY_ERROR=failed
+run_deploy
+check "indeterminate legacy timer state refuses" '[[ "$RC" -ne 0 && "$OUT" == *"could not snapshot legacy timer enablement"* ]]'
+check "indeterminate timer state refuses before unit mutation" '! grep -q "stop legacy-node-deadman\|disable legacy-node-deadman\|daemon-reload\|enable --now" "$CALLS"'
+check "indeterminate timer state preserves legacy units" '[[ -f "$UNIT_DIR/legacy-node-deadman.service" && -f "$UNIT_DIR/legacy-node-deadman.timer" ]]'
+unset MOCK_LEGACY_TIMER_ENABLED_QUERY_ERROR BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
 
 : >"$CALLS"; write_env
 export BROKKR_DEADMAN_LEGACY_SERVICE=legacy-node-deadman.service

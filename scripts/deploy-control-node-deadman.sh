@@ -276,6 +276,7 @@ validate_legacy_identity() {
     *) die "legacy state directory must be one child of the configured state root" ;;
   esac
   [[ "$state_relative" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "invalid legacy state directory identity"
+  [[ "$LEGACY_STATE_DIR" != "$state_dir" ]] || die "legacy state directory names the current dead-man state"
   [[ -f "$UNIT_DIR/$LEGACY_SERVICE" && ! -L "$UNIT_DIR/$LEGACY_SERVICE" ]] || die "legacy service unit is missing or not regular"
   [[ -f "$UNIT_DIR/$LEGACY_TIMER" && ! -L "$UNIT_DIR/$LEGACY_TIMER" ]] || die "legacy timer unit is missing or not regular"
   [[ -d "$LEGACY_STATE_DIR" && ! -L "$LEGACY_STATE_DIR" ]] || die "legacy state directory is missing or not regular"
@@ -288,7 +289,7 @@ validate_legacy_identity() {
 }
 
 retire_legacy_install() {
-  local legacy_path legacy_name legacy_state_dir state_name source destination
+  local legacy_path legacy_name legacy_state_dir state_name source destination timer_enabled_state timer_active_state
   : >"$rollback_dir/legacy-units.manifest"
   : >"$rollback_dir/legacy-state.manifest"
   mkdir -p "$rollback_dir/legacy-units" "$rollback_dir/legacy-state"
@@ -298,15 +299,23 @@ retire_legacy_install() {
     legacy_path="$UNIT_DIR/$legacy_name"
     cp -a "$legacy_path" "$rollback_dir/legacy-units/$legacy_name" || \
       die "could not snapshot legacy unit $legacy_name"
+    if [[ "$legacy_name" == "$LEGACY_TIMER" ]]; then
+      timer_enabled_state="$(systemctl --user is-enabled "$legacy_name" 2>/dev/null || true)"
+      case "$timer_enabled_state" in
+        enabled) printf 'enabled\n' >"$rollback_dir/legacy-units/$legacy_name.enabled" || die "could not snapshot legacy timer enablement" ;;
+        disabled) ;;
+        *) die "could not snapshot legacy timer enablement" ;;
+      esac
+      timer_active_state="$(systemctl --user is-active "$legacy_name" 2>/dev/null || true)"
+      case "$timer_active_state" in
+        active) printf 'active\n' >"$rollback_dir/legacy-units/$legacy_name.active" || die "could not snapshot legacy timer activity" ;;
+        inactive) ;;
+        *) die "could not snapshot legacy timer activity" ;;
+      esac
+    fi
     printf '%s\n' "$legacy_path" >>"$rollback_dir/legacy-units.manifest" || \
       die "could not record legacy unit snapshot"
     if [[ "$legacy_name" == "$LEGACY_TIMER" ]]; then
-      if systemctl --user is-enabled --quiet "$legacy_name"; then
-        printf 'enabled\n' >"$rollback_dir/legacy-units/$legacy_name.enabled"
-      fi
-      if systemctl --user is-active --quiet "$legacy_name"; then
-        printf 'active\n' >"$rollback_dir/legacy-units/$legacy_name.active"
-      fi
       systemctl --user stop "$legacy_name" || die "could not stop legacy $legacy_name"
       systemctl --user disable "$legacy_name" || die "could not disable legacy $legacy_name"
     else
@@ -338,8 +347,8 @@ retire_legacy_install() {
 LEGACY_CONFIGURED=0
 LEGACY_STATE_NAME=""
 validate_legacy_identity
-transaction_mutated=1
 retire_legacy_install
+transaction_mutated=1
 
 install -d -m 0755 "$UNIT_DIR"
 if [[ "$prior_timer_active" == 1 ]]; then
