@@ -209,18 +209,20 @@ the exact legacy service unit, timer unit, state directory, and script path befo
 installer. The installer validates the finite unit/path grammar and exact service↔timer↔script
 correlation, then snapshots and disables that one unit/timer, removes those stale unit files, and
 installs the current control-node pair as one transaction. With no legacy identity supplied, no
-legacy files or state are discovered. Only the non-secret counters listed in the installer are
-migrated into `~/.local/state/brokkr/control-node-deadman`; credentials and unknown state files
-are never copied. If a later installation gate fails, the legacy units, timer state, and counters
-are restored from the local rollback snapshot. No compatibility aliases are tracked because they
-would preserve private deployment identity in the public repository.
+legacy files or state are discovered. Only `fail-count`, `state`, `last-alert`, `last-success`, and
+`last-external-success` are migrated into `~/.local/state/brokkr/control-node-deadman`; credentials
+and unknown state files are never copied. In particular, `last-error` is arbitrary diagnostic or
+private content: the installer does not migrate, copy, or delete it, so it remains byte-for-byte in
+the legacy state directory. If a later installation gate fails, the legacy units, timer state, and
+migrated operational state are restored from the local rollback snapshot. No compatibility aliases
+are tracked because they would preserve private deployment identity in the public repository.
 
-For example, an operator migrating a legacy `m5-deadman` install can run:
+For example, an operator migrating a `legacy-node-deadman` install can run:
 
 ```bash
-BROKKR_DEADMAN_LEGACY_SERVICE=m5-deadman.service \
-BROKKR_DEADMAN_LEGACY_TIMER=m5-deadman.timer \
-BROKKR_DEADMAN_LEGACY_STATE_DIR="$HOME/.local/state/brokkr/m5-deadman" \
-BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/m5-deadman.sh \
+BROKKR_DEADMAN_LEGACY_SERVICE=legacy-node-deadman.service \
+BROKKR_DEADMAN_LEGACY_TIMER=legacy-node-deadman.timer \
+BROKKR_DEADMAN_LEGACY_STATE_DIR="$HOME/.local/state/brokkr/legacy-node-deadman" \
+BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh \
 ./scripts/deploy-control-node-deadman.sh
 ```

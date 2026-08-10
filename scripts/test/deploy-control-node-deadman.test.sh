@@ -66,24 +66,24 @@ case "$*" in
   "--user stop brokkr-control-node-deadman.timer")
     printf '0\n' >"$MOCK_TIMER_ACTIVE_FILE"
     ;;
-  "--user is-enabled --quiet m5-deadman.timer")
+  "--user is-enabled --quiet legacy-node-deadman.timer")
     [[ "$(cat "$MOCK_LEGACY_TIMER_ENABLED_FILE")" == 1 ]]
     exit
     ;;
-  "--user is-active --quiet m5-deadman.timer")
+  "--user is-active --quiet legacy-node-deadman.timer")
     [[ "$(cat "$MOCK_LEGACY_TIMER_ACTIVE_FILE")" == 1 ]]
     exit
     ;;
-  "--user enable m5-deadman.timer")
+  "--user enable legacy-node-deadman.timer")
     printf '1\n' >"$MOCK_LEGACY_TIMER_ENABLED_FILE"
     ;;
-  "--user disable m5-deadman.timer")
+  "--user disable legacy-node-deadman.timer")
     printf '0\n' >"$MOCK_LEGACY_TIMER_ENABLED_FILE"
     ;;
-  "--user start m5-deadman.timer")
+  "--user start legacy-node-deadman.timer")
     printf '1\n' >"$MOCK_LEGACY_TIMER_ACTIVE_FILE"
     ;;
-  "--user stop m5-deadman.timer")
+  "--user stop legacy-node-deadman.timer")
     printf '0\n' >"$MOCK_LEGACY_TIMER_ACTIVE_FILE"
     ;;
   "--user start brokkr-control-node-deadman.service")
@@ -158,39 +158,42 @@ check "secret values are not printed" '[[ "$OUT" != *ratatoskr-secret-sentinel* 
 run_deploy
 check "second install is idempotent" '[[ "$RC" -eq 0 ]]'
 
-# A previous private deployment used m5-deadman.service and its matching
+# A previous private deployment used legacy-node-deadman.service and its matching
 # script.  The installer must retire that exact installation, preserve its
 # operational counters without copying credentials, and leave only the
 # current control-node unit/configuration behind.
 : >"$CALLS"; write_env; rm -f "$EXTERNAL_ENV"
 rm -rf "$STATE_ROOT/control-node-deadman"
-cat >"$UNIT_DIR/m5-deadman.service" <<'EOF'
+cat >"$UNIT_DIR/legacy-node-deadman.service" <<'EOF'
 [Service]
-ExecStart=%h/repos/brokkr/scripts/m5-deadman.sh
+ExecStart=%h/repos/brokkr/scripts/legacy-node-deadman.sh
 EOF
-cat >"$UNIT_DIR/m5-deadman.timer" <<'EOF'
+cat >"$UNIT_DIR/legacy-node-deadman.timer" <<'EOF'
 [Timer]
-Unit=m5-deadman.service
+Unit=legacy-node-deadman.service
 EOF
-mkdir -p "$STATE_ROOT/m5-deadman"
-export BROKKR_DEADMAN_LEGACY_SERVICE=m5-deadman.service
-export BROKKR_DEADMAN_LEGACY_TIMER=m5-deadman.timer
-export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/m5-deadman"
-export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/m5-deadman.sh
-printf '2\n' >"$STATE_ROOT/m5-deadman/fail-count"
-printf 'fail\n' >"$STATE_ROOT/m5-deadman/state"
-printf '500\n' >"$STATE_ROOT/m5-deadman/last-alert"
+mkdir -p "$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SERVICE=legacy-node-deadman.service
+export BROKKR_DEADMAN_LEGACY_TIMER=legacy-node-deadman.timer
+export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh
+printf '2\n' >"$STATE_ROOT/legacy-node-deadman/fail-count"
+printf 'fail\n' >"$STATE_ROOT/legacy-node-deadman/state"
+printf '500\n' >"$STATE_ROOT/legacy-node-deadman/last-alert"
+printf '\000\377legacy diagnostic\nprivate/path\000tail' >"$TMP/legacy-last-error.expected"
+cp "$TMP/legacy-last-error.expected" "$STATE_ROOT/legacy-node-deadman/last-error"
 printf '1\n' >"$MOCK_LEGACY_TIMER_ENABLED_FILE"
 printf '1\n' >"$MOCK_LEGACY_TIMER_ACTIVE_FILE"
 run_deploy
 check "legacy dead-man install migrates successfully" '[[ "$RC" -eq 0 ]]'
-check "legacy service is removed" '[[ ! -e "$UNIT_DIR/m5-deadman.service" ]]'
-check "legacy timer is removed" '[[ ! -e "$UNIT_DIR/m5-deadman.timer" ]]'
-check "legacy timer is stopped and disabled before replacement" 'grep -q "systemctl --user stop m5-deadman.timer" "$CALLS" && grep -q "systemctl --user disable m5-deadman.timer" "$CALLS"'
+check "legacy service is removed" '[[ ! -e "$UNIT_DIR/legacy-node-deadman.service" ]]'
+check "legacy timer is removed" '[[ ! -e "$UNIT_DIR/legacy-node-deadman.timer" ]]'
+check "legacy timer is stopped and disabled before replacement" 'grep -q "systemctl --user stop legacy-node-deadman.timer" "$CALLS" && grep -q "systemctl --user disable legacy-node-deadman.timer" "$CALLS"'
 check "legacy operational state is migrated" '[[ "$(cat "$STATE_ROOT/control-node-deadman/last-alert")" == 500 && "$(cat "$STATE_ROOT/control-node-deadman/fail-count")" == 2 ]]'
-check "legacy state directory is retired" '[[ ! -e "$STATE_ROOT/m5-deadman" ]]'
+check "legacy diagnostic remains byte-for-byte in legacy directory" 'cmp -s "$TMP/legacy-last-error.expected" "$STATE_ROOT/legacy-node-deadman/last-error"'
+check "legacy diagnostic is not migrated into current state" '[[ ! -e "$STATE_ROOT/control-node-deadman/last-error" ]]'
 check "current service points at current script" 'grep -Fxq "ExecStart=%h/repos/brokkr/scripts/control-node-deadman.sh" "$UNIT_DIR/brokkr-control-node-deadman.service"'
-check "current unit has no legacy script reference" '! grep -Fq "m5-deadman.sh" "$UNIT_DIR/brokkr-control-node-deadman.service"'
+check "current unit has no legacy script reference" '! grep -Fq "legacy-node-deadman.sh" "$UNIT_DIR/brokkr-control-node-deadman.service"'
 check "current timer targets current service" 'grep -Fxq "Unit=brokkr-control-node-deadman.service" "$UNIT_DIR/brokkr-control-node-deadman.timer"'
 unset BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
 
@@ -217,30 +220,30 @@ check "unrelated units receive no systemctl mutation" '! grep -q "unrelated-dead
 # A supplied identity is fail-closed when its service/script correlation is
 # corrupt; no unit mutation may happen before the operator fixes it.
 : >"$CALLS"; write_env
-cat >"$UNIT_DIR/m5-deadman.service" <<'EOF'
+cat >"$UNIT_DIR/legacy-node-deadman.service" <<'EOF'
 [Service]
 ExecStart=%h/repos/brokkr/scripts/not-the-declared-script.sh
 EOF
-cat >"$UNIT_DIR/m5-deadman.timer" <<'EOF'
+cat >"$UNIT_DIR/legacy-node-deadman.timer" <<'EOF'
 [Timer]
-Unit=m5-deadman.service
+Unit=legacy-node-deadman.service
 EOF
-mkdir -p "$STATE_ROOT/m5-deadman"
-export BROKKR_DEADMAN_LEGACY_SERVICE=m5-deadman.service
-export BROKKR_DEADMAN_LEGACY_TIMER=m5-deadman.timer
-export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/m5-deadman"
-export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/m5-deadman.sh
+mkdir -p "$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SERVICE=legacy-node-deadman.service
+export BROKKR_DEADMAN_LEGACY_TIMER=legacy-node-deadman.timer
+export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh
 run_deploy
 check "corrupt legacy script identity refuses" '[[ "$RC" -ne 0 && "$OUT" == *"script reference does not match identity"* ]]'
 check "corrupt legacy identity refuses before unit mutation" '! grep -q "daemon-reload\|enable --now" "$CALLS"'
-check "corrupt legacy service remains untouched" '[[ -f "$UNIT_DIR/m5-deadman.service" ]]'
+check "corrupt legacy service remains untouched" '[[ -f "$UNIT_DIR/legacy-node-deadman.service" ]]'
 unset BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
 
 : >"$CALLS"; write_env
-export BROKKR_DEADMAN_LEGACY_SERVICE='../m5-deadman.service'
-export BROKKR_DEADMAN_LEGACY_TIMER=m5-deadman.timer
-export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/m5-deadman"
-export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/m5-deadman.sh
+export BROKKR_DEADMAN_LEGACY_SERVICE='../legacy-node-deadman.service'
+export BROKKR_DEADMAN_LEGACY_TIMER=legacy-node-deadman.timer
+export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh
 run_deploy
 check "path-shaped legacy unit identity refuses" '[[ "$RC" -ne 0 && "$OUT" == *"invalid legacy service identity"* ]]'
 check "path-shaped identity refuses before unit mutation" '! grep -q "daemon-reload\|enable --now" "$CALLS"'
@@ -249,29 +252,29 @@ unset BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_L
 # If the replacement's runtime gate fails, the old install must come back with
 # its timer state and counters intact.
 : >"$CALLS"; write_env
-cat >"$UNIT_DIR/m5-deadman.service" <<'EOF'
+cat >"$UNIT_DIR/legacy-node-deadman.service" <<'EOF'
 [Service]
-ExecStart=%h/repos/brokkr/scripts/m5-deadman.sh
+ExecStart=%h/repos/brokkr/scripts/legacy-node-deadman.sh
 EOF
-cat >"$UNIT_DIR/m5-deadman.timer" <<'EOF'
+cat >"$UNIT_DIR/legacy-node-deadman.timer" <<'EOF'
 [Timer]
-Unit=m5-deadman.service
+Unit=legacy-node-deadman.service
 EOF
-mkdir -p "$STATE_ROOT/m5-deadman"
-export BROKKR_DEADMAN_LEGACY_SERVICE=m5-deadman.service
-export BROKKR_DEADMAN_LEGACY_TIMER=m5-deadman.timer
-export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/m5-deadman"
-export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/m5-deadman.sh
-printf '7\n' >"$STATE_ROOT/m5-deadman/last-alert"
+mkdir -p "$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SERVICE=legacy-node-deadman.service
+export BROKKR_DEADMAN_LEGACY_TIMER=legacy-node-deadman.timer
+export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh
+printf '7\n' >"$STATE_ROOT/legacy-node-deadman/last-alert"
 printf '1\n' >"$MOCK_LEGACY_TIMER_ENABLED_FILE"
 printf '1\n' >"$MOCK_LEGACY_TIMER_ACTIVE_FILE"
 export MOCK_SERVICE_RC=7
 run_deploy
 check "legacy migration runtime failure is visible" '[[ "$RC" -ne 0 && "$OUT" == *"runtime validation failed"* ]]'
-check "legacy service is restored after failed migration" '[[ -f "$UNIT_DIR/m5-deadman.service" ]]'
-check "legacy timer is restored after failed migration" '[[ -f "$UNIT_DIR/m5-deadman.timer" ]]'
+check "legacy service is restored after failed migration" '[[ -f "$UNIT_DIR/legacy-node-deadman.service" ]]'
+check "legacy timer is restored after failed migration" '[[ -f "$UNIT_DIR/legacy-node-deadman.timer" ]]'
 check "legacy timer state is restored after failed migration" '[[ "$(cat "$MOCK_LEGACY_TIMER_ENABLED_FILE")" == 1 && "$(cat "$MOCK_LEGACY_TIMER_ACTIVE_FILE")" == 1 ]]'
-check "legacy counter is restored after failed migration" '[[ "$(cat "$STATE_ROOT/m5-deadman/last-alert")" == 7 ]]'
+check "legacy counter is restored after failed migration" '[[ "$(cat "$STATE_ROOT/legacy-node-deadman/last-alert")" == 7 ]]'
 unset MOCK_SERVICE_RC BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
 
 # First-install failure after enable --now has already created enablement: the
