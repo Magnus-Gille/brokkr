@@ -270,7 +270,7 @@ validate_legacy_identity() {
   [[ "$LEGACY_SERVICE" =~ ^[A-Za-z0-9][A-Za-z0-9_.@:+-]*\.service$ ]] || die "invalid legacy service identity"
   [[ "$LEGACY_TIMER" =~ ^[A-Za-z0-9][A-Za-z0-9_.@:+-]*\.timer$ ]] || die "invalid legacy timer identity"
   [[ "$LEGACY_SERVICE" != "$SERVICE" && "$LEGACY_TIMER" != "$TIMER" ]] || die "legacy identity names the current unit"
-  [[ "$LEGACY_SCRIPT" =~ ^[A-Za-z0-9][A-Za-z0-9_.@:+/-]*\.sh$ ]] || die "invalid legacy script identity"
+  [[ "$LEGACY_SCRIPT" =~ ^scripts/[A-Za-z0-9][A-Za-z0-9_.@:+-]*\.sh$ ]] || die "invalid legacy script identity"
   case "$LEGACY_STATE_DIR" in
     "$STATE_ROOT"/*) state_relative="${LEGACY_STATE_DIR#"$STATE_ROOT"/}" ;;
     *) die "legacy state directory must be one child of the configured state root" ;;

@@ -249,6 +249,16 @@ check "path-shaped legacy unit identity refuses" '[[ "$RC" -ne 0 && "$OUT" == *"
 check "path-shaped identity refuses before unit mutation" '! grep -q "daemon-reload\|enable --now" "$CALLS"'
 unset BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
 
+: >"$CALLS"; write_env
+export BROKKR_DEADMAN_LEGACY_SERVICE=legacy-node-deadman.service
+export BROKKR_DEADMAN_LEGACY_TIMER=legacy-node-deadman.timer
+export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/../legacy-node-deadman.sh
+run_deploy
+check "traversal-shaped legacy script identity refuses" '[[ "$RC" -ne 0 && "$OUT" == *"invalid legacy script identity"* ]]'
+check "traversal-shaped script refuses before unit mutation" '! grep -q "daemon-reload\|enable --now\|stop\|disable" "$CALLS"'
+unset BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
+
 # If the replacement's runtime gate fails, the old install must come back with
 # its timer state and counters intact.
 : >"$CALLS"; write_env

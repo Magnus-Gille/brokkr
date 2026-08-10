@@ -207,7 +207,8 @@ This public interface replaces earlier site-specific script, unit, environment-v
 names. A migration is deliberately explicit: set all four `BROKKR_DEADMAN_LEGACY_*` variables for
 the exact legacy service unit, timer unit, state directory, and script path before running the
 installer. The installer validates the finite unit/path grammar and exact service↔timer↔script
-correlation, then snapshots and disables that one unit/timer, removes those stale unit files, and
+correlation; the script identity must be one direct `scripts/*.sh` child with no traversal or
+additional path segment. It then snapshots and disables that one unit/timer, removes those stale unit files, and
 installs the current control-node pair as one transaction. With no legacy identity supplied, no
 legacy files or state are discovered. Only `fail-count`, `state`, `last-alert`, `last-success`, and
 `last-external-success` are migrated into `~/.local/state/brokkr/control-node-deadman`; credentials
