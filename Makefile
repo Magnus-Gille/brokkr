@@ -2,7 +2,7 @@ BROKKR_SSH_TARGET ?= brokkr@control-node
 BROKKR_REMOTE_DIR ?= /opt/brokkr
 export OVERLAY COMMIT
 
-.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight systemd-supervision-audit test shellcheck
+.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight systemd-supervision-audit m5-network-render m5-network-preflight test shellcheck
 
 patching: ## Install/refresh unattended-upgrades on all Pi hosts (ARGS="--dry-run" or a host)
 	@./scripts/setup-host-patching.sh $(ARGS)
@@ -47,6 +47,14 @@ m5-fde-preflight: ## Run the read-only M5 FDE ceremony gate (ARGS="--copy-observ
 
 systemd-supervision-audit: ## Audit systemd projection (real clock; replay --now requires BROKKR_SYSTEMD_AUDIT_ALLOW_REPLAY=1)
 	@node scripts/systemd-supervision-audit.mjs $(ARGS)
+
+m5-network-render: ## Render the M5 default-deny plan (CONFIG=/root-owned/profile)
+	@test -n "$(CONFIG)" || { echo "CONFIG=/root-owned/profile is required" >&2; exit 64; }
+	@./scripts/m5-network-profile.py render --config "$(CONFIG)"
+
+m5-network-preflight: ## Run the non-mutating M5 network-profile gate (CONFIG=...)
+	@test -n "$(CONFIG)" || { echo "CONFIG=/root-owned/profile is required" >&2; exit 64; }
+	@./scripts/m5-network-profile.py preflight --config "$(CONFIG)"
 
 maintenance-os: ## Run the OS maintenance report on the service host (ARGS="--dry-run --verbose")
 	@ssh $(BROKKR_SSH_TARGET) 'cd $(BROKKR_REMOTE_DIR) && bash scripts/maintenance-report.sh os $(ARGS)'
