@@ -52,6 +52,7 @@ required to run or understand Brokkr.
 | `disk/`, `timemachine/`, `samba/` | Storage, capacity, Time Machine, and share checks |
 | `scripts/offsite-photos-backup.sh` | Fail-closed `rclone crypt` backup with deletion gates |
 | `scripts/m5-fde-preflight.sh` | Read-only M5 LUKS/Secure Boot/TPM and backup-evidence ceremony gate |
+| `scripts/m5-network-profile.py` | Default-deny M5 UFW plus pre-INPUT tailnet/SSH/Samba/inference transaction with timed rollback and independent confirmation |
 | `heimdall/` | Compose and push hardware-health snapshots |
 | `systemd/brokkr-systemd-failure*` | Fail-loud reporting for failed system services and timer-driven oneshots |
 | `journald/`, `scripts/setup-persistent-journal.sh` | Bounded persistent-journal policy for post-reboot evidence |
@@ -122,6 +123,7 @@ Feature-specific setup and acceptance checks live in:
 - [`docs/maintenance-plan.md`](docs/maintenance-plan.md)
 - [`runbooks/restore.md`](runbooks/restore.md)
 - [`runbooks/m5-root-fde-migration.md`](runbooks/m5-root-fde-migration.md)
+- [`runbooks/m5-network-hardening.md`](runbooks/m5-network-hardening.md)
 
 ## Security model and limitations
 
