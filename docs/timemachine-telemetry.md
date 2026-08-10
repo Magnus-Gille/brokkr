@@ -34,6 +34,13 @@ The snapshot is atomically replaced before the existing authenticated Heimdall
 delivery, so an older snapshot cannot be replayed as current. The probe never
 starts, modifies, mounts, or deletes a backup.
 
+The systemd unit treats the observed state and the telemetry run outcome as
+separate signals. A `warn` or `fail` probe result is valid health evidence; if
+its snapshot is delivered successfully, the unit exits successfully so the
+warning remains visible without becoming a delivery failure. Probe execution,
+snapshot publication, or Heimdall transport failures exit non-zero and remain
+retryable/observable to systemd.
+
 ## Install, readback, and reversal
 
 Nothing is installed automatically. On M5, create the protected probe file and

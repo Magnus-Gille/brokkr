@@ -35,7 +35,6 @@ export BROKKR_TM_BANDS_DIR
 mkdir -p "$STATE_DIR" || fail "cannot create state directory"
 [ -n "${HEIMDALL_HUB_URL:-}" ] && [ -n "${HEIMDALL_FLEET_TOKEN:-}" ] || fail "Heimdall delivery is not configured"
 probe="$(python3 "$HERE/destination-probe.py")"
-probe_rc=$?
 [ -n "$probe" ] || fail "probe produced no result"
 snapshot="$STATE_DIR/timemachine-health.json"
 tmp="$STATE_DIR/.timemachine-health.json.$$"
@@ -72,4 +71,11 @@ BROKKR_HEIMDALL_LABEL="Time Machine Freshness" \
 BROKKR_HEIMDALL_STAMP_PREFIX="timemachine-" \
 BROKKR_STATE_DIR="$STATE_DIR" \
   "$HERE/../heimdall/push.sh" "$snapshot"
-exit "$probe_rc"
+delivery_rc=$?
+if [ "$delivery_rc" -ne 0 ]; then
+  # A warning/failure in the observed backup state is valid telemetry once it
+  # has been delivered. Transport/execution failures are different: the unit
+  # must remain failed so systemd can retry and operators can see the outage.
+  exit "$delivery_rc"
+fi
+exit 0
