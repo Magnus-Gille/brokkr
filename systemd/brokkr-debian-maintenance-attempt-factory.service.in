@@ -1,0 +1,23 @@
+[Unit]
+Description=Brokkr Debian maintenance per-window attempt factory
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/debian-maintenance-attempt-factory.md
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=false
+ReadOnlyPaths=/etc/brokkr /run/brokkr
+ReadWritePaths=/var/lib/brokkr/debian-maintenance /var/lib/dpkg /var/cache/apt /var/log/apt
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+PrivateDevices=yes
+RestrictSUIDSGID=yes
+Environment=BROKKR_RELEASE_SHA=@RELEASE_SHA@
+ExecStart=/usr/local/lib/brokkr/releases/@RELEASE_SHA@/scripts/debian-maintenance-attempt-factory.mjs
+TimeoutStartSec=600

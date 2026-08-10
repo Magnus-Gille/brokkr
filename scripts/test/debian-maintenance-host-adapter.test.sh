@@ -20,6 +20,9 @@ import path from "node:path";
 const productionAdapter = await import(
   `${process.env.ROOT}/scripts/lib/fixed-debian-maintenance-host-operation.mjs`
 );
+const factoryDigest = (await import(
+  `${process.env.ROOT}/scripts/lib/debian-maintenance-attempt-factory.mjs`
+)).digest;
 const canonicalJson = value => value === null || typeof value !== "object" ? JSON.stringify(value) :
   Array.isArray(value) ? `[${value.map(canonicalJson).join(",")}]` :
     `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
@@ -156,6 +159,149 @@ assert.equal(result.outcome, "applied");
 assert.deepEqual(state.entries.map(entry => entry.phase), ["preflight", "inventory_before", "apply", "inventory_after", "verify"]);
 assert(calls.some(argv => argv[0] === "/usr/bin/apt-get" && argv.includes("--only-upgrade") && argv.includes("openssl=3.0.17-1~deb12u2")));
 assert(calls.every(argv => argv[0].startsWith("/")), "adapter invokes only absolute fixed binaries");
+
+// The factory's evidence digest is consumed by the real fixed host adapter;
+// string bytes must have identical semantics at both sides of that boundary,
+// while object canonicalization remains unchanged.
+assert.equal(factoryDigest({ evidence: "apt" }), digest({ evidence: "apt" }));
+assert.equal(factoryDigest(aptTrust), digest(aptTrust));
+const factoryEvidence = structuredClone(request.apt_source_evidence);
+factoryEvidence.trust_config_digest = factoryDigest(aptTrust);
+factoryEvidence.candidates[0].policy_output_digest = factoryDigest(aptPolicy);
+const factoryEvidenceRequest = {
+  ...structuredClone(request), apt_source_evidence: factoryEvidence,
+};
+factoryEvidenceRequest.apt_source_evidence_digest = factoryDigest(factoryEvidence);
+const factoryEvidenceRegistration = {
+  ...structuredClone(registration),
+  apt_source_evidence_digest: factoryEvidenceRequest.apt_source_evidence_digest,
+};
+applied = false;
+const factoryEvidenceResult = adapter.runHostAdapter({
+  action: "apply", request: factoryEvidenceRequest,
+  registration: factoryEvidenceRegistration,
+  env: isolatedEnvironment({ readJournal: () => null }).env,
+});
+assert.equal(factoryEvidenceResult.outcome, "applied",
+  "factory-produced apt evidence must pass the real host digest checks");
+
+// Production v2 has a mechanically composable digest graph: the recovery
+// descriptor is upstream of (and therefore cannot contain) binding_digest.
+// The request carries the full binding so the host boundary can recompute and
+// verify every edge immediately before effect.
+applied = false;
+const v2 = structuredClone(request);
+v2.schema_version = "v2";
+v2.actors = {
+  owner: "maintenance-owner", controller: "maintenance-controller",
+  watchdog: "maintenance-watchdog", kill_switch: "maintenance-kill-switch",
+  recovery_worker: "maintenance-recovery-worker",
+};
+v2.recovery_descriptor = {
+  kind: "brokkr-debian-recovery-descriptor", schema_version: "v2",
+  descriptor_id: "recovery-67", attempt_id: request.attempt_id,
+  mutation_id: "mutation-67", recovery_disarm_id: "disarm-67",
+  target_scope_digest: request.lease_fence.target_scope_digest,
+  candidate_digest: request.plan_digest,
+  postconditions_digest: digest(request.execution_request.expected_postconditions),
+  worker_identity: v2.actors.recovery_worker, packages: ["openssl"],
+  restart_units: ["brokkr-maintenance-safe.service"], budget_seconds: 240,
+};
+v2.recovery_descriptor_digest = digest(v2.recovery_descriptor);
+v2.binding = {
+  attempt_id: request.attempt_id, mutation_id: "mutation-67",
+  recovery_disarm_id: "disarm-67", idempotency_key: "idem-67",
+  writer_owner: "brokkr",
+  owner_authority_ref: "ref:brokkr-owner-authority",
+  owner_authority_digest: digest("owner"),
+  configuration_owner: "brokkr",
+  configuration_owner_authority_ref: "ref:brokkr-config-authority",
+  configuration_owner_authority_digest: digest("config-authority"),
+  target_scope_digest: request.lease_fence.target_scope_digest,
+  admission_coverage_digest: digest("coverage"),
+  admission_binding_state: "armed-canary",
+  candidate_digest: request.plan_digest,
+  config_digest: digest({
+    adapter_revision_digest: request.release_digest,
+    node_id: request.execution_request.target.node_id,
+    target_scope_digest: request.lease_fence.target_scope_digest,
+  }),
+  baseline_digest: digest({
+    inventory: request.execution_request.pre_state,
+    node_id: request.execution_request.target.node_id,
+    target_scope_digest: request.lease_fence.target_scope_digest,
+  }),
+  policy_digest: request.execution_request.config.policy_digest,
+  postconditions_digest: v2.recovery_descriptor.postconditions_digest,
+  deadline: "2026-07-27T13:10:00Z",
+  owner_identity: v2.actors.owner,
+  controller_identity: v2.actors.controller,
+  watchdog_identity: v2.actors.watchdog,
+  kill_switch_identity: v2.actors.kill_switch,
+  recovery_worker_identity: v2.actors.recovery_worker,
+  risk_scope: "no-reboot-security-bugfix-maintenance",
+  canary: {
+    scope_digest: request.lease_fence.target_scope_digest, target_count: 1,
+  },
+  recovery: {
+    class: "R-forward", worker_identity: v2.actors.recovery_worker,
+    descriptor_digest: v2.recovery_descriptor_digest,
+    disarms_after_action: true,
+  },
+};
+v2.binding.evidence_digest = digest({
+  baseline_digest: v2.binding.baseline_digest,
+  candidate_digest: v2.binding.candidate_digest,
+  config_digest: v2.binding.config_digest,
+  policy_digest: v2.binding.policy_digest,
+});
+v2.binding_digest = digest(v2.binding);
+v2.lease_fence.binding_digest = v2.binding_digest;
+v2.lease_fence_digest = digest(v2.lease_fence);
+v2.freshness_digest = digest({ eligible: true });
+const v2Registration = {
+  ...structuredClone(registration), schema_version: "v2",
+  mutation_id: v2.binding.mutation_id,
+  idempotency_key: v2.binding.idempotency_key,
+  recovery_disarm_id: v2.binding.recovery_disarm_id,
+  binding_digest: v2.binding_digest,
+  recovery_descriptor_digest: v2.recovery_descriptor_digest,
+  lease_fence_digest: v2.lease_fence_digest,
+  freshness_digest: v2.freshness_digest,
+  actors: structuredClone(v2.actors),
+};
+const v2Scenario = isolatedEnvironment({ readJournal: () => null });
+const v2Result = adapter.runHostAdapter({
+  action: "apply", request: v2, registration: v2Registration,
+  env: v2Scenario.env,
+});
+assert.equal(v2Result.outcome, "applied");
+const v2FenceMutationMismatch = structuredClone(v2);
+v2FenceMutationMismatch.lease_fence.mutation_id = "mutation-elsewhere";
+v2FenceMutationMismatch.lease_fence_digest =
+  digest(v2FenceMutationMismatch.lease_fence);
+const v2FenceMutationRegistration = {
+  ...structuredClone(v2Registration),
+  lease_fence_digest: v2FenceMutationMismatch.lease_fence_digest,
+};
+assert.throws(() => adapter.runHostAdapter({
+  action: "apply", request: v2FenceMutationMismatch,
+  registration: v2FenceMutationRegistration,
+  env: isolatedEnvironment({ readJournal: () => null }).env,
+}), /host_fence_invalid/,
+  "a recomputed fence digest cannot hide a mutation identity mismatch");
+const v2Cycle = structuredClone(v2);
+v2Cycle.recovery_descriptor.binding_digest = v2Cycle.binding_digest;
+v2Cycle.recovery_descriptor_digest = digest(v2Cycle.recovery_descriptor);
+v2Cycle.binding.recovery.descriptor_digest = v2Cycle.recovery_descriptor_digest;
+v2Cycle.binding_digest = digest(v2Cycle.binding);
+assert.throws(() => adapter.runHostAdapter({
+  action: "apply", request: v2Cycle, registration: v2Registration,
+  env: isolatedEnvironment({ readJournal: () => null }).env,
+}), /host_request_invalid|host_recovery_descriptor_invalid|host_registration_mismatch/,
+  "a cyclic descriptor shape fails closed");
+globalThis.__BROKKR_TEST_HOST_ADAPTER_ENV__ = env;
+
 let injectedCallbackCalled = false;
 const injectedResult = productionAdapter.runFixedDebianMaintenanceHostOperation({
   action: "apply", request, registration,
@@ -886,7 +1032,7 @@ globalThis.__BROKKR_TEST_SPAWN_SYNC__ = (binary, argv) => {
   assert.equal(binary, "/usr/bin/systemctl");
   assert.deepEqual(argv, [
     "start",
-    `brokkr-debian-maintenance-recovery-${activeProductionAttempt}.service`,
+    `brokkr-debian-maintenance-recovery@${activeProductionAttempt}.service`,
   ]);
   productionStarts += 1;
   const activation = JSON.parse(fs.readFileSync(path.join(
@@ -1293,16 +1439,15 @@ grep -Eq '"--nonblock", "--no-fork"' "$ROOT/scripts/debian-maintenance-host-adap
   "$ROOT/scripts/debian-maintenance-host-adapter.mjs" \
   "$ROOT/scripts/lib/bounded-recovery-dispatch.mjs"
 UNIT="$ROOT/systemd/brokkr-debian-maintenance-recovery.service.in"
-grep -Eq '^ExecStart=/usr/local/lib/brokkr/releases/@RELEASE_SHA@/scripts/debian-maintenance-host-adapter.mjs --action recover --attempt @CANARY_ID@$' "$UNIT"
+grep -Eq '^ExecStart=/usr/local/lib/brokkr/releases/@RELEASE_SHA@/scripts/debian-maintenance-host-adapter.mjs --action recover --attempt %i$' "$UNIT"
 if command -v systemd-analyze >/dev/null 2>&1; then
   UNIT_ROOT="$TMP/systemd-root"
   RELEASE_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  RENDERED_UNIT="brokkr-debian-maintenance-recovery-attempt-67.service"
+  RENDERED_UNIT="brokkr-debian-maintenance-recovery@attempt-67.service"
   mkdir -p "$UNIT_ROOT/etc/systemd/system" \
     "$UNIT_ROOT/usr/local/lib/brokkr/releases/$RELEASE_SHA/scripts"
   sed \
     -e "s/@RELEASE_SHA@/$RELEASE_SHA/g" \
-    -e 's/@CANARY_ID@/attempt-67/g' \
     "$UNIT" >"$UNIT_ROOT/etc/systemd/system/$RENDERED_UNIT"
   for target in \
     basic.target local-fs.target network-online.target shutdown.target \
