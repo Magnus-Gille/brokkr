@@ -7,7 +7,7 @@ Type=oneshot
 WorkingDirectory=%h/repos/brokkr
 EnvironmentFile=%h/.config/grimnir/notify.env
 EnvironmentFile=-%h/.config/grimnir/deadman-external.env
-Environment=CONTROL_NODE_DEADMAN_URL=http://control-node:3033/api/health
+Environment=CONTROL_NODE_DEADMAN_URL=@CONTROL_NODE_DEADMAN_URL@
 Environment=CONTROL_NODE_DEADMAN_FAIL_AFTER=3
 Environment=CONTROL_NODE_DEADMAN_ALERT_COOLDOWN_SECS=1800
 ExecStart=%h/repos/brokkr/scripts/control-node-deadman.sh

@@ -47,6 +47,10 @@ valid_external_url() {
   [[ "${1:-}" =~ ^https://[^/?#[:space:]\"\\]+([/?#][^[:space:]\"\\]*)?$ ]]
 }
 
+valid_target_url() {
+  [[ "${1:-}" =~ ^https?://[^/?#[:space:]\"\\]+([/?#][^[:space:]\"\\]*)?$ ]]
+}
+
 external_ping_url() {
   local url="$1" status
   # --disable must be curl's first argument: otherwise ~/.curlrc can enable
@@ -106,6 +110,7 @@ else
   echo "preflight: external heartbeat is not configured"
 fi
 
+valid_target_url "$TARGET_URL" || die "production probe URL is invalid"
 curl -fsS -m 8 -o /dev/null "$TARGET_URL" || die "production probe failed: $TARGET_URL"
 echo "preflight: production probe passes"
 
@@ -354,7 +359,17 @@ install -d -m 0755 "$UNIT_DIR"
 if [[ "$prior_timer_active" == 1 ]]; then
   systemctl --user stop "$TIMER" || die "could not stop prior $TIMER for atomic upgrade"
 fi
-install -m 0644 "$HERE/systemd/m5/$SERVICE" "$UNIT_DIR/$SERVICE"
+rendered_service="$rollback_dir/$SERVICE.rendered"
+awk -v target_url="$TARGET_URL" '
+  $0 == "Environment=CONTROL_NODE_DEADMAN_URL=@CONTROL_NODE_DEADMAN_URL@" {
+    print "Environment=CONTROL_NODE_DEADMAN_URL=" target_url
+    rendered = 1
+    next
+  }
+  { print }
+  END { exit(rendered ? 0 : 1) }
+' "$HERE/systemd/m5/$SERVICE" >"$rendered_service" || die "could not render $SERVICE target URL"
+install -m 0644 "$rendered_service" "$UNIT_DIR/$SERVICE"
 install -m 0644 "$HERE/systemd/m5/$TIMER" "$UNIT_DIR/$TIMER"
 systemctl --user daemon-reload || die "user systemd daemon-reload failed"
 probe_started_at="$(date +%s)"
