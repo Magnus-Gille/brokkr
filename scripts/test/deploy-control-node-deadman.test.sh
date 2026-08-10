@@ -34,6 +34,13 @@ cat >"$TMP/bin/loginctl" <<'EOF'
 printf 'loginctl %s\n' "$*" >>"$MOCK_CALLS"
 printf '%s\n' "${MOCK_LINGER:-yes}"
 EOF
+cat >"$TMP/bin/cp" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${MOCK_CP_FAIL_PATTERN:-}" && "$*" == *"$MOCK_CP_FAIL_PATTERN"* ]]; then
+  exit 93
+fi
+exec /bin/cp "$@"
+EOF
 cat >"$TMP/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >>"$MOCK_CALLS"
@@ -100,7 +107,7 @@ case "$*" in
 esac
 exit 0
 EOF
-chmod +x "$TMP/bin/hostname" "$TMP/bin/curl" "$TMP/bin/loginctl" "$TMP/bin/systemctl"
+chmod +x "$TMP/bin/hostname" "$TMP/bin/curl" "$TMP/bin/loginctl" "$TMP/bin/cp" "$TMP/bin/systemctl"
 
 NOTIFY_ENV="$TMP/home/.config/grimnir/notify.env"
 EXTERNAL_ENV="$TMP/home/.config/grimnir/deadman-external.env"
@@ -157,6 +164,29 @@ check "secret values are not printed" '[[ "$OUT" != *ratatoskr-secret-sentinel* 
 
 run_deploy
 check "second install is idempotent" '[[ "$RC" -eq 0 ]]'
+
+# A rollback snapshot failure must not turn a read-only pre-mutation error into
+# deletion of the live legacy unit named in the pending migration.
+: >"$CALLS"; write_env; rm -f "$EXTERNAL_ENV"
+cat >"$UNIT_DIR/legacy-node-deadman.service" <<'EOF'
+[Service]
+ExecStart=%h/repos/brokkr/scripts/legacy-node-deadman.sh
+EOF
+cat >"$UNIT_DIR/legacy-node-deadman.timer" <<'EOF'
+[Timer]
+Unit=legacy-node-deadman.service
+EOF
+mkdir -p "$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SERVICE=legacy-node-deadman.service
+export BROKKR_DEADMAN_LEGACY_TIMER=legacy-node-deadman.timer
+export BROKKR_DEADMAN_LEGACY_STATE_DIR="$STATE_ROOT/legacy-node-deadman"
+export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh
+export MOCK_CP_FAIL_PATTERN=legacy-units/legacy-node-deadman.timer
+run_deploy
+check "legacy snapshot failure is visible" '[[ "$RC" -ne 0 && "$OUT" == *"could not snapshot legacy unit"* ]]'
+check "legacy timer survives snapshot failure" '[[ -f "$UNIT_DIR/legacy-node-deadman.timer" ]]'
+check "legacy service survives snapshot failure" '[[ -f "$UNIT_DIR/legacy-node-deadman.service" ]]'
+unset MOCK_CP_FAIL_PATTERN BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
 
 # A previous private deployment used legacy-node-deadman.service and its matching
 # script.  The installer must retire that exact installation, preserve its

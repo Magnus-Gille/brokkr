@@ -296,9 +296,10 @@ retire_legacy_install() {
   [[ "$LEGACY_CONFIGURED" == 1 ]] || return 0
   for legacy_name in "$LEGACY_TIMER" "$LEGACY_SERVICE"; do
     legacy_path="$UNIT_DIR/$legacy_name"
-    printf '%s\n' "$legacy_path" >>"$rollback_dir/legacy-units.manifest"
     cp -a "$legacy_path" "$rollback_dir/legacy-units/$legacy_name" || \
       die "could not snapshot legacy unit $legacy_name"
+    printf '%s\n' "$legacy_path" >>"$rollback_dir/legacy-units.manifest" || \
+      die "could not record legacy unit snapshot"
     if [[ "$legacy_name" == "$LEGACY_TIMER" ]]; then
       if systemctl --user is-enabled --quiet "$legacy_name"; then
         printf 'enabled\n' >"$rollback_dir/legacy-units/$legacy_name.enabled"
@@ -320,9 +321,10 @@ retire_legacy_install() {
   for state_name in $LEGACY_STATE_FILE_NAMES; do
     source="$legacy_state_dir/$state_name"
     [[ -f "$source" && ! -L "$source" ]] || continue
-    printf '%s|%s\n' "$legacy_name" "$state_name" >>"$rollback_dir/legacy-state.manifest"
     cp -p "$source" "$rollback_dir/legacy-state/$legacy_name/$state_name" || \
       die "could not snapshot legacy dead-man state"
+    printf '%s|%s\n' "$legacy_name" "$state_name" >>"$rollback_dir/legacy-state.manifest" || \
+      die "could not record legacy dead-man state snapshot"
     destination="$state_dir/$state_name"
     if [[ ! -e "$destination" ]]; then
       mkdir -p "$state_dir" || die "could not create current dead-man state directory"
