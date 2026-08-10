@@ -1,0 +1,11 @@
+{
+  "base": "observations-repeated-name.json",
+  "cases": [
+    { "id": "node-beta-absent", "mutations": { "notifiers.1.status": "absent" } },
+    { "id": "node-beta-null", "mutations": { "notifiers.1.status": null } },
+    { "id": "node-beta-missing", "mutations": { "notifiers.1": { "$remove": true } } },
+    { "id": "all-notifiers-null", "mutations": { "notifiers": null } },
+    { "id": "notifier-duplicate", "mutations": { "notifiers.2": { "target_node_id": "node-beta", "status": "unknown" } } },
+    { "id": "notifier-unknown-node", "mutations": { "notifiers.2": { "target_node_id": "node-workshop", "status": "available" } } }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "base": "systemd-supervision-baseline-v1.json",
+  "cases": [
+    {
+      "id": "schema-valid-weakened-baseline",
+      "mutations": {
+        "workloads.long-running.restart.delay.min_seconds": 0
+      }
+    }
+  ]
+}

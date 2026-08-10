@@ -2,7 +2,7 @@ BROKKR_SSH_TARGET ?= brokkr@control-node
 BROKKR_REMOTE_DIR ?= /opt/brokkr
 export OVERLAY COMMIT
 
-.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight m5-network-render m5-network-preflight test shellcheck
+.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight systemd-supervision-audit m5-network-render m5-network-preflight test shellcheck
 
 patching: ## Install/refresh unattended-upgrades on all Pi hosts (ARGS="--dry-run" or a host)
 	@./scripts/setup-host-patching.sh $(ARGS)
@@ -44,6 +44,9 @@ maintenance-executor: ## Inspect the disarmed Debian host-adapter contract; no l
 
 m5-fde-preflight: ## Run the read-only M5 FDE ceremony gate (ARGS="--copy-observed-at ...")
 	@./scripts/m5-fde-preflight.sh $(ARGS)
+
+systemd-supervision-audit: ## Audit systemd projection (real clock; replay --now requires BROKKR_SYSTEMD_AUDIT_ALLOW_REPLAY=1)
+	@node scripts/systemd-supervision-audit.mjs $(ARGS)
 
 m5-network-render: ## Render the M5 default-deny plan (CONFIG=/root-owned/profile)
 	@test -n "$(CONFIG)" || { echo "CONFIG=/root-owned/profile is required" >&2; exit 64; }

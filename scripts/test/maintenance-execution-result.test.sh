@@ -7,6 +7,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 ROOT="$ROOT" TMP="$TMP" node --input-type=module <<'NODE'
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 const root = process.env.ROOT;
 const { autonomyDigest } = await import(`${root}/scripts/lib/autonomy-authorization.mjs`);
@@ -17,6 +18,14 @@ const { projectMaintenanceExecutionResult, validateMaintenanceExecutionResult } 
 const resultSchema = JSON.parse(fs.readFileSync(
   `${root}/docs/maintenance-execution-result-v1.schema.json`, "utf8",
 ));
+const schemaBytes = fs.readFileSync(
+  `${root}/docs/maintenance-execution-result-v1.schema.json`,
+);
+assert.equal(
+  crypto.createHash("sha256").update(schemaBytes).digest("hex"),
+  "7dc0510e413ae6634b1eaa9738f30668727b9e5d4bc210b89c857934ba06b312",
+  "Heimdall #16 pins the exact producer schema bytes",
+);
 const digest = char => `sha256:${char.repeat(64)}`;
 const binding = { mutation_id: "mutation-one", attempt_id: "attempt-one", recovery_disarm_id: "disarm-one", idempotency_key: "idem-one", writer_owner: "brokkr", owner_authority_ref: "ref:owner-authority", owner_authority_digest: digest("a"), configuration_owner: "brokkr", configuration_owner_authority_ref: "ref:config-authority", configuration_owner_authority_digest: digest("b"), target_scope_digest: digest("c"), admission_coverage_digest: digest("d"), admission_binding_state: "armed-canary", owner_identity: "owner-one", controller_identity: "controller-one", watchdog_identity: "watchdog-one", kill_switch_identity: "switch-one", recovery_worker_identity: "recovery-worker", risk_scope: "risk-one", candidate_digest: digest("e"), config_digest: digest("2"), evidence_digest: digest("f"), policy_digest: digest("0"), baseline_digest: digest("1"), postconditions_digest: digest("3"), deadline: "2026-07-28T11:08:00Z", canary: { scope_digest: digest("4"), target_count: 1 }, recovery: { class: "R-forward", worker_identity: "recovery-worker", descriptor_digest: digest("5"), disarms_after_action: true } };
 function entry(phase, sequence, reason, actor, bindingDigest, previous) {
@@ -475,6 +484,20 @@ for (const fixture of negative.cases) {
 console.log("ok - result fixtures, pure projection, and adversarial combinations fail closed");
 NODE
 
-node "$ROOT/scripts/maintenance-execution-result-delivery.mjs" --result "$ROOT/tests/fixtures/maintenance-execution-result/clean.json" >"$TMP/delivery.json"
-node -e 'const x=require(process.argv[1]); if(x.delivered!==false||x.reason!=="delivery_disabled")process.exit(1)' "$TMP/delivery.json"
+mkdir -m 0700 "$TMP/delivery-credentials"
+DELIVERY_REVISION="1111111111111111111111111111111111111111"
+DELIVERY_DIGEST="sha256:$(printf '2%.0s' {1..64})"
+printf '%s\n' \
+  "{\"kind\":\"brokkr-maintenance-result-delivery-config\",\"schema_version\":\"v1\",\"enabled\":false,\"adapter_revision\":\"$DELIVERY_REVISION\",\"adapter_digest\":\"$DELIVERY_DIGEST\"}" \
+  >"$TMP/delivery-credentials/brokkr-maintenance-result-delivery-v1"
+chmod 0600 \
+  "$TMP/delivery-credentials/brokkr-maintenance-result-delivery-v1"
+env \
+  CREDENTIALS_DIRECTORY="$TMP/delivery-credentials" \
+  BROKKR_ADAPTER_REVISION="$DELIVERY_REVISION" \
+  BROKKR_ADAPTER_DIGEST="$DELIVERY_DIGEST" \
+  node "$ROOT/scripts/maintenance-execution-result-delivery.mjs" \
+  <"$ROOT/tests/fixtures/maintenance-execution-result/clean.json" \
+  >"$TMP/delivery.json"
+node -e 'const x=JSON.parse(require("node:fs").readFileSync(process.argv[1])); if(x.delivered!==false||x.reason!=="delivery_disabled")process.exit(1)' "$TMP/delivery.json"
 printf 'ok - delivery adapter is disabled and side-effect free\n'
