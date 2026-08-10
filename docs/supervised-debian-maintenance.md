@@ -6,6 +6,11 @@ arm, dispatch, or mutate a live canary. No private locator, target registration,
 package log, credential, or signed owner authority belongs in this repository
 or its generated dossier.
 
+For the separate owner-controlled #69/#70 live ceremony, use the
+[public-safe owner ceremony packet](maintenance-owner-ceremony.md). It binds
+the required public evidence without authorizing an installation or exposing
+private target or trust material.
+
 ## Produce a revision-bound dossier
 
 Start from a clean worktree at the exact revision to certify. Choose an

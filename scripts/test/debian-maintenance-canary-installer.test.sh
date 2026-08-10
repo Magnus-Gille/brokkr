@@ -531,6 +531,10 @@ env \
     --canary canary-fi
 test -r "$STATE_ROOT/evidence/canary-fi.json"
 
+WRONG_REVISION="${REVISION%?}0"
+if [[ "$WRONG_REVISION" == "$REVISION" ]]; then
+  WRONG_REVISION="${REVISION%?}1"
+fi
 if env \
   BROKKR_CANARY_INSTALL_TEST_ROOT="$TMP/wrong-revision-root" \
   BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
