@@ -166,7 +166,7 @@ echo "deploy-control-node-deadman.test.sh"
 write_env
 run_deploy
 check "valid preflight installs successfully" '[[ "$RC" -eq 0 ]]'
-check "service installed" 'cmp -s "$HERE/../../systemd/m5/brokkr-control-node-deadman.service" "$UNIT_DIR/brokkr-control-node-deadman.service"'
+check "service installed with default target URL" 'grep -Fxq "Environment=CONTROL_NODE_DEADMAN_URL=http://control-node:3033/api/health" "$UNIT_DIR/brokkr-control-node-deadman.service" && ! grep -Fq "@CONTROL_NODE_DEADMAN_URL@" "$UNIT_DIR/brokkr-control-node-deadman.service"'
 check "timer installed" 'cmp -s "$HERE/../../systemd/m5/brokkr-control-node-deadman.timer" "$UNIT_DIR/brokkr-control-node-deadman.timer"'
 check "credential file is mandatory at runtime" 'grep -q "^EnvironmentFile=%h/.config/grimnir/notify.env$" "$UNIT_DIR/brokkr-control-node-deadman.service"'
 check "external credential file is optional at runtime" 'grep -q "^EnvironmentFile=-%h/.config/grimnir/deadman-external.env$" "$UNIT_DIR/brokkr-control-node-deadman.service"'
@@ -176,6 +176,13 @@ check "secret values are not printed" '[[ "$OUT" != *ratatoskr-secret-sentinel* 
 
 run_deploy
 check "second install is idempotent" '[[ "$RC" -eq 0 ]]'
+
+: >"$CALLS"; write_env
+export BROKKR_DEADMAN_TARGET_URL=http://control-node.tailnet.example:3033/api/health
+run_deploy
+check "explicit target URL installs successfully" '[[ "$RC" -eq 0 ]]'
+check "installed service binds the explicit target URL" 'grep -Fxq "Environment=CONTROL_NODE_DEADMAN_URL=http://control-node.tailnet.example:3033/api/health" "$UNIT_DIR/brokkr-control-node-deadman.service"'
+unset BROKKR_DEADMAN_TARGET_URL
 
 # A rollback snapshot failure must not turn a read-only pre-mutation error into
 # deletion of the live legacy unit named in the pending migration.
