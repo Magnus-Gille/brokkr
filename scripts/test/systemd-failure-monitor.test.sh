@@ -12,18 +12,40 @@ mkdir -p "$TMP/bin" "$TMP/state" "$TMP/python"
 CALLS="$TMP/calls"
 REQUEST="$TMP/request.json"
 UNEXPECTED="$TMP/unexpected-systemctl"
-: >"$CALLS"; : >"$UNEXPECTED"
+SYSTEMCTL_CALLS="$TMP/systemctl-calls"
+ORDER_LOG="$TMP/order"
+: >"$CALLS"; : >"$UNEXPECTED"; : >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"
 
 cat >"$TMP/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
   *"list-units"*"--type=service"*"--state=failed"*)
+    printf 'list\n' >>"$MOCK_SYSTEMCTL_CALLS"
+    printf 'list\n' >>"$MOCK_ORDER_LOG"
     while IFS= read -r unit; do
       [ -n "$unit" ] && printf '%s loaded failed failed synthetic failure\n' "$unit"
     done <"$MOCK_FAILED_UNITS"
     ;;
+  *"reset-failed"*)
+    unit="${@: -1}"
+    printf 'reset-failed:%s\n' "$unit" >>"$MOCK_SYSTEMCTL_CALLS"
+    printf 'reset-failed:%s\n' "$unit" >>"$MOCK_ORDER_LOG"
+    if [[ "${MOCK_RESET_RC:-0}" -eq 0 ]]; then
+      filtered="${MOCK_FAILED_UNITS}.filtered"
+      grep -Fvx "$unit" "$MOCK_FAILED_UNITS" >"$filtered" || :
+      mv "$filtered" "$MOCK_FAILED_UNITS"
+    fi
+    exit "${MOCK_RESET_RC:-0}"
+    ;;
   *"show"*)
-    printf 'failed\nexit-code\n1\n'
+    unit="${@: -1}"
+    printf 'show:%s\n' "$unit" >>"$MOCK_SYSTEMCTL_CALLS"
+    printf 'show:%s\n' "$unit" >>"$MOCK_ORDER_LOG"
+    case "$unit" in
+      brokkr-systemd-failure@*) state="${MOCK_REPORTER_STATE:-failed}" ;;
+      *) state="${MOCK_UNIT_STATE:-failed}" ;;
+    esac
+    printf '%s\n' "$state"
     ;;
   *) printf '%s\n' "$*" >>"$MOCK_UNEXPECTED_SYSTEMCTL"; exit 64 ;;
 esac
@@ -57,7 +79,19 @@ class Opener:
     def open(self, request, timeout):
         with open(os.environ['MOCK_REQUEST_FILE'], 'w', encoding='utf-8') as fh:
             json.dump({'body': json.loads(request.data.decode()), 'timeout': timeout}, fh)
+        with open(os.environ['MOCK_ORDER_LOG'], 'a', encoding='utf-8') as fh:
+            fh.write('delivery\n')
         status = int(os.environ.get('MOCK_HTTP_STATUS', '200'))
+        count_file = os.environ.get('MOCK_HTTP_COUNT_FILE')
+        if os.environ.get('MOCK_FAIL_SECOND_PUSH') == '1' and count_file:
+            try:
+                count = int(open(count_file, encoding='utf-8').read())
+            except (FileNotFoundError, ValueError):
+                count = 0
+            with open(count_file, 'w', encoding='utf-8') as fh:
+                fh.write(str(count + 1))
+            if count == 1:
+                status = 500
         if 200 <= status < 300:
             return Response(status)
         raise urllib.error.HTTPError(request.full_url, status, 'mock', {}, None)
@@ -71,11 +105,14 @@ FAILED_UNITS="$TMP/failed-units"
 export PATH="$TMP/bin:$PATH" PYTHONPATH="$TMP/python"
 export MOCK_FAILED_UNITS="$FAILED_UNITS" MOCK_UNEXPECTED_SYSTEMCTL="$UNEXPECTED"
 export MOCK_NOTIFY_CALLS="$CALLS" MOCK_REQUEST_FILE="$REQUEST"
+export MOCK_SYSTEMCTL_CALLS="$SYSTEMCTL_CALLS" MOCK_ORDER_LOG="$ORDER_LOG"
+export MOCK_HTTP_COUNT_FILE="$TMP/http-count"
 export BROKKR_STATE_DIR="$TMP/state"
 export HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=test-token
 export RATATOSKR_URL=http://ratatoskr.invalid/api/send RATATOSKR_SEND_API_KEY=test-key
 export TELEGRAM_ALLOWED_USERS=123456789
 export MOCK_HTTP_STATUS=200
+export MOCK_UNIT_STATE=failed
 
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
@@ -117,6 +154,84 @@ check "clearing every failed unit emits recoveries" '[[ "$RC" -eq 0 && "$OUT" ==
 check "recovery clears durable failed-unit state" '[[ ! -s "$TMP/state/systemd-failures/failed-units" ]]'
 check "recovery updates Heimdall to pass" 'python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "pass"'\'' "$REQUEST"'
 check "recovery sends one notification per recovered unit" '[[ "$(wc -l < "$CALLS" | tr -d " ")" -eq 4 ]]'
+
+# The immediate OnFailure path must reconcile the explicitly reported unit even
+# when a concurrent list-units snapshot omits it. A positive failed-state
+# readback preserves a genuine failure; a positive inactive-state readback
+# permits a recovered unit to leave durable reporter state.
+printf 'alpha.service\nbeta.service\n' >"$FAILED_UNITS"
+run --sweep
+check "mixed failure baseline is durable before immediate reconciliation" '[[ "$RC" -eq 0 ]] && grep -qx "alpha.service" "$TMP/state/systemd-failures/failed-units" && grep -qx "beta.service" "$TMP/state/systemd-failures/failed-units"'
+
+: >"$FAILED_UNITS"
+export MOCK_UNIT_STATE=failed
+run --unit beta.service
+check "still-failing OnFailure unit survives a list snapshot race" '[[ "$RC" -eq 0 ]] && grep -qx "beta.service" "$TMP/state/systemd-failures/failed-units"'
+check "still-failing unit is not reported as recovered" '[[ "$OUT" != *"recovered: beta.service"* ]]'
+
+export MOCK_UNIT_STATE=inactive
+run --unit beta.service
+check "recovered OnFailure unit is removed from durable reporter state" '[[ "$RC" -eq 0 ]] && [[ ! -s "$TMP/state/systemd-failures/failed-units" ]] && [[ "$OUT" == *"recovered: beta.service"* ]]'
+
+# A previously failed immediate reporter can outlive its recovered producer.
+# The monitor must clear only that exact reporter instance, after delivery and
+# after a direct producer recovery readback.
+REPORTER="brokkr-systemd-failure@alpha.service.service"
+printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-units"
+printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"
+export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0
+run --sweep
+check "recovered producer with stale reporter succeeds" '[[ "$RC" -eq 0 && "$OUT" == *"cleared failed reporter: $REPORTER"* ]]'
+check "reset-failed clears only the exact Brokkr reporter instance" 'grep -Fxq "reset-failed:$REPORTER" "$SYSTEMCTL_CALLS" && ! grep -Fqx "$REPORTER" "$FAILED_UNITS" && ! grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
+check "reporter reset follows delivery and producer recovery verification" '[[ "$(tr "\n" " " < "$ORDER_LOG")" == "list show:alpha.service delivery show:alpha.service show:$REPORTER reset-failed:$REPORTER delivery " ]]'
+check "final panel omits the reset reporter" 'python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "pass"'\'' "$REQUEST" && ! grep -Fq "$REPORTER" "$REQUEST"'
+
+export MOCK_UNIT_STATE=inactive
+run --sweep
+check "next sweep does not emit a misleading reporter recovery" '[[ "$RC" -eq 0 && "$OUT" != *"recovered: $REPORTER"* ]]'
+
+# If the converged second delivery fails, keep the reset marker and durable
+# pre-reset state so the next retry suppresses only the already-cleared
+# reporter, while still publishing the producer recovery.
+printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-units"
+printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"; : >"$TMP/http-count"
+export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0 MOCK_FAIL_SECOND_PUSH=1
+run --sweep
+check "failed converged panel push is visible" '[[ "$RC" -ne 0 && "$OUT" == *"final Heimdall push failed"* ]]'
+check "failed converged push leaves reset marker and retryable state" 'grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/reset-reporters" && grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
+
+export MOCK_FAIL_SECOND_PUSH=0
+run --sweep
+check "retry after failed converged push clears stale reporter without recovery noise" '[[ "$RC" -eq 0 && "$OUT" != *"recovered: $REPORTER"* ]] && [[ ! -s "$TMP/state/systemd-failures/reset-reporters" ]] && [[ ! -s "$TMP/state/systemd-failures/failed-units" ]]'
+
+# A producer that is still failed must keep both the producer and reporter
+# failures visible; no reset-failed command is permitted.
+printf 'alpha.service\n%s\n' "$REPORTER" >"$FAILED_UNITS"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"
+export MOCK_UNIT_STATE=failed
+run --sweep
+check "still-failing producer preserves reporter failure" '[[ "$RC" -eq 0 ]] && grep -Fqx "$REPORTER" "$FAILED_UNITS" && ! grep -Fq "reset-failed:" "$SYSTEMCTL_CALLS"'
+
+# Unknown producer state and reset failure both fail closed before durable state
+# publication; the failed reporter remains observable for a later retry.
+printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-units"
+printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"
+export MOCK_UNIT_STATE=unknown MOCK_RESET_RC=0
+run --sweep
+check "ambiguous producer recovery refuses before delivery" '[[ "$RC" -ne 0 && "$OUT" == *"unknown state"* ]] && ! grep -Fq "delivery" "$ORDER_LOG"'
+check "ambiguous producer recovery preserves durable state" 'grep -Fqx "alpha.service" "$TMP/state/systemd-failures/failed-units" && grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
+
+export MOCK_UNIT_STATE=inactive MOCK_RESET_RC=1
+run --sweep
+check "failed reporter reset is non-zero and attributable" '[[ "$RC" -ne 0 && "$OUT" == *"could not clear failed reporter"* ]]'
+check "failed reporter reset preserves durable state" 'grep -Fqx "alpha.service" "$TMP/state/systemd-failures/failed-units" && grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
+
+export MOCK_RESET_RC=0
+
+export MOCK_UNIT_STATE=failed
 
 printf 'brokkr-health.service\n' >"$FAILED_UNITS"
 run --unit brokkr-health.service
