@@ -193,10 +193,21 @@ export MOCK_UNIT_STATE=inactive
 run --unit beta.service
 check "recovered OnFailure unit is removed from durable reporter state" '[[ "$RC" -eq 0 ]] && [[ ! -s "$TMP/state/systemd-failures/failed-units" ]] && [[ "$OUT" == *"recovered: beta.service"* ]]'
 
+# A reporter can be the only current failure before the first durable snapshot
+# when its producer has already recovered. Discover and clear it even though
+# PREVIOUS is empty, without emitting a false new-failure notification.
+REPORTER="brokkr-systemd-failure@alpha.service.service"
+: >"$TMP/state/systemd-failures/failed-units"
+printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"
+export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0
+run --sweep
+check "reporter-only current state with empty previous is reconciled" '[[ "$RC" -eq 0 && "$OUT" == *"cleared failed reporter: $REPORTER"* ]] && [[ ! -s "$TMP/state/systemd-failures/failed-units" ]]'
+check "reporter-only current state emits no false new-failure notification" '[[ "$OUT" != *"new failure: $REPORTER"* ]] && ! grep -Fq "$REPORTER" "$CALLS"'
+
 # A previously failed immediate reporter can outlive its recovered producer.
 # The monitor must clear only that exact reporter instance, after delivery and
 # after a direct producer recovery readback.
-REPORTER="brokkr-systemd-failure@alpha.service.service"
 printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-units"
 printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
 : >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"

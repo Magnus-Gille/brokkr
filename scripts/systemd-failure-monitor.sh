@@ -139,6 +139,47 @@ fi
 # a failed or transitional/unknown state fails closed without changing durable
 # state.
 : >"$STALE_REPORTERS"
+# A reporter can be the only unit in CURRENT when its producer recovered before
+# the first durable snapshot. Discover those reporter instances directly and
+# verify their producers before treating them as stale. A producer that is
+# genuinely failed is retained in CURRENT; an unreadable or transitional state
+# fails closed without changing durable state.
+if [ -s "$CURRENT" ]; then
+  while IFS= read -r current_unit; do
+    case "$current_unit" in
+      brokkr-systemd-failure@*.service)
+        producer="${current_unit#brokkr-systemd-failure@}"
+        producer="${producer%.service}"
+        # A producer already in RECOVERED will be verified by the existing
+        # producer-recovery loop below; avoid doing that readback twice.
+        if grep -Fqx "$producer" "$RECOVERED"; then
+          continue
+        fi
+        if ! producer_state="$(systemctl show --property=ActiveState --value "$producer")"; then
+          echo "brokkr systemd failure monitor: could not verify reporter producer '$producer'" >&2
+          exit 1
+        fi
+        case "$producer_state" in
+          failed)
+            printf '%s\n' "$producer" >>"$CURRENT"
+            ;;
+          active|inactive)
+            printf '%s\n' "$current_unit" >>"$STALE_REPORTERS"
+            ;;
+          unknown)
+            echo "brokkr systemd failure monitor: unknown state '$producer_state' for '$producer'" >&2
+            exit 1
+            ;;
+          *)
+            echo "brokkr systemd failure monitor: ambiguous producer state '$producer_state' for '$producer'" >&2
+            exit 1
+            ;;
+        esac
+      ;;
+    esac
+  done < <(grep -E '^brokkr-systemd-failure@[A-Za-z0-9:_.@\\-]+\.service$' "$CURRENT" || :)
+fi
+
 if [ -s "$RECOVERED" ]; then
   while IFS= read -r recovered; do
     if [[ ! "$recovered" =~ ^[A-Za-z0-9:_.@\\-]+\.service$ ]]; then
@@ -172,16 +213,18 @@ if [ -s "$RECOVERED" ]; then
         ;;
     esac
   done <"$RECOVERED"
-  LC_ALL=C sort -u "$CURRENT" -o "$CURRENT"
-  LC_ALL=C sort -u "$STALE_REPORTERS" -o "$STALE_REPORTERS"
-  # Recompute transitions after correcting a list snapshot that omitted a
-  # producer which is still genuinely failed.
-  comm -13 "$SORTED_PREVIOUS" "$CURRENT" >"$NEW"
-  comm -23 "$SORTED_PREVIOUS" "$CURRENT" >"$RECOVERED"
-  if [ -f "$PENDING_RESETS" ]; then
-    grep -Fvx -f "$PENDING_RESETS" "$RECOVERED" >"$TMP_FILTER" || :
-    mv "$TMP_FILTER" "$RECOVERED"
-  fi
+fi
+
+LC_ALL=C sort -u "$CURRENT" -o "$CURRENT"
+LC_ALL=C sort -u "$STALE_REPORTERS" -o "$STALE_REPORTERS"
+# Recompute transitions after correcting a list snapshot that omitted a
+# producer which is still genuinely failed, or after discovering a reporter
+# directly from CURRENT.
+comm -13 "$SORTED_PREVIOUS" "$CURRENT" >"$NEW"
+comm -23 "$SORTED_PREVIOUS" "$CURRENT" >"$RECOVERED"
+if [ -f "$PENDING_RESETS" ]; then
+  grep -Fvx -f "$PENDING_RESETS" "$RECOVERED" >"$TMP_FILTER" || :
+  mv "$TMP_FILTER" "$RECOVERED"
 fi
 
 compose_snapshot() {
