@@ -416,6 +416,34 @@ if [ -s "$STALE_REPORTERS" ]; then
     $1 ~ /^[A-Za-z0-9:_.@\\-]+\.service$/ { print $1 }
   ' | LC_ALL=C sort -u >"$FINAL_CURRENT"
   if ! cmp -s "$CURRENT" "$FINAL_CURRENT"; then
+    # The aggregate list can omit a unit during a concurrent transition. Directly
+    # verify every expected omission before replacing CURRENT so a still-failed
+    # unit cannot be turned into a false recovery by the snapshot race.
+    while IFS= read -r expected; do
+      if grep -Fqx "$expected" "$FINAL_CURRENT"; then
+        continue
+      fi
+      if ! expected_state="$(systemctl show --property=ActiveState --value "$expected")"; then
+        echo "brokkr systemd failure monitor: could not verify omitted unit '$expected'" >&2
+        exit 1
+      fi
+      case "$expected_state" in
+        failed)
+          printf '%s\n' "$expected" >>"$FINAL_CURRENT"
+          ;;
+        active|inactive)
+          ;;
+        unknown)
+          echo "brokkr systemd failure monitor: unknown state '$expected_state' for omitted unit '$expected'" >&2
+          exit 1
+          ;;
+        *)
+          echo "brokkr systemd failure monitor: ambiguous state '$expected_state' for omitted unit '$expected'" >&2
+          exit 1
+          ;;
+      esac
+    done <"$CURRENT"
+    LC_ALL=C sort -u "$FINAL_CURRENT" -o "$FINAL_CURRENT"
     cp "$FINAL_CURRENT" "$CURRENT"
     echo "brokkr systemd failure monitor: failed-unit state changed during reporter recovery; reconciled fresh aggregate"
   fi
@@ -426,6 +454,8 @@ if [ -s "$STALE_REPORTERS" ]; then
     grep -Fvx -f "$PENDING_RESETS" "$RECOVERED" >"$TMP_FILTER" || :
     mv "$TMP_FILTER" "$RECOVERED"
   fi
+  grep -Ev '^brokkr-systemd-failure@[A-Za-z0-9:_.@\\-]+\.service$' "$RECOVERED" >"$TMP_FILTER" || :
+  mv "$TMP_FILTER" "$RECOVERED"
   if ! compose_snapshot; then
     echo "brokkr systemd failure monitor: could not compose final Heimdall snapshot" >&2
     exit 1
@@ -446,6 +476,11 @@ if [ -s "$NEW" ]; then
   done <"$NEW"
 fi
 if [ -s "$RECOVERED" ]; then
+  # Reporter units are internal alert-path implementation details. Their
+  # recovery must never become an operator recovery notification, regardless
+  # of whether systemd self-cleared the unit or this monitor reset it.
+  grep -Ev '^brokkr-systemd-failure@[A-Za-z0-9:_.@\\-]+\.service$' "$RECOVERED" >"$TMP_FILTER" || :
+  mv "$TMP_FILTER" "$RECOVERED"
   while IFS= read -r recovered; do
     echo "brokkr systemd failure monitor: recovered: $recovered"
     notify_telegram "Brokkr systemd recovery on $(hostname): $recovered" || true

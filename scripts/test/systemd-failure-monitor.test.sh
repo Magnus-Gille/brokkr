@@ -22,8 +22,20 @@ case "$*" in
   *"list-units"*"--type=service"*"--state=failed"*)
     printf 'list\n' >>"$MOCK_SYSTEMCTL_CALLS"
     printf 'list\n' >>"$MOCK_ORDER_LOG"
+    list_count=1
+    if [[ -n "${MOCK_LIST_COUNT_FILE:-}" ]]; then
+      list_count=0
+      if [[ -f "$MOCK_LIST_COUNT_FILE" ]]; then
+        list_count="$(cat "$MOCK_LIST_COUNT_FILE")"
+      fi
+      list_count=$((list_count + 1))
+      printf '%s\n' "$list_count" >"$MOCK_LIST_COUNT_FILE"
+    fi
     while IFS= read -r unit; do
       if [[ "$unit" == brokkr-systemd-failure@* && "${MOCK_FINAL_LIST_SELF_CLEARED:-0}" -eq 1 ]]; then
+        continue
+      fi
+      if [[ -n "${MOCK_OMIT_FROM_FINAL_LIST:-}" && "$unit" == "$MOCK_OMIT_FROM_FINAL_LIST" && "$list_count" -gt 1 ]]; then
         continue
       fi
       [ -n "$unit" ] && printf '%s loaded failed failed synthetic failure\n' "$unit"
@@ -145,6 +157,7 @@ export MOCK_FAILED_UNITS="$FAILED_UNITS" MOCK_UNEXPECTED_SYSTEMCTL="$UNEXPECTED"
 export MOCK_NOTIFY_CALLS="$CALLS" MOCK_REQUEST_FILE="$REQUEST"
 export MOCK_SYSTEMCTL_CALLS="$SYSTEMCTL_CALLS" MOCK_ORDER_LOG="$ORDER_LOG"
 export MOCK_HTTP_COUNT_FILE="$TMP/http-count"
+export MOCK_LIST_COUNT_FILE="$TMP/list-count"
 export MOCK_PENDING_RESETS="$TMP/state/systemd-failures/reset-reporters"
 export BROKKR_STATE_DIR="$TMP/state"
 export HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=test-token
@@ -272,6 +285,18 @@ check "late aggregate producer refailure publishes no false clean panel" '[[ "$(
 unset MOCK_PRODUCER_REFAIL_ON_REPORTER MOCK_PRODUCER_REFAIL_PRODUCER
 rm -f "$TMP/state/systemd-failures/reset-reporters"
 
+# A fresh aggregate can omit a still-failed producer during a list race. The
+# direct ActiveState reconciliation must preserve it before CURRENT is replaced
+# so the final panel cannot publish a false recovery.
+printf 'alpha.service\nbeta.service\n%s\n%s\n' "$REPORTER" "$REPORTER_BETA" >"$TMP/state/systemd-failures/failed-units"
+printf 'alpha.service\n%s\n' "$REPORTER_BETA" >"$FAILED_UNITS"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"; : >"$TMP/http-count"; : >"$TMP/list-count"
+export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0 MOCK_OMIT_FROM_FINAL_LIST=alpha.service
+run --sweep
+check "aggregate omission preserves a directly verified failed producer" '[[ "$RC" -eq 0 && "$OUT" == *"reconciled fresh aggregate"* ]] && grep -Fqx "alpha.service" "$TMP/state/systemd-failures/failed-units"'
+check "aggregate omission never publishes a false producer recovery" '[[ "$OUT" != *"recovered: alpha.service"* ]] && python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "fail" and "alpha.service" in d["body"]["message"]'\'' "$REQUEST"'
+unset MOCK_OMIT_FROM_FINAL_LIST
+
 # If the converged second delivery fails, keep the reset marker and durable
 # pre-reset state so the next retry suppresses only the already-cleared
 # reporter, while still publishing the producer recovery.
@@ -354,7 +379,7 @@ printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
 export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=inactive MOCK_RESET_RC=0
 export MOCK_FINAL_LIST_SELF_CLEARED=1
 run --sweep
-check "self-cleared reporter recovery succeeds without reset" '[[ "$RC" -eq 0 && "$OUT" == *"recovered: alpha.service"* ]] && ! grep -Fq "reset-failed:" "$SYSTEMCTL_CALLS"'
+check "self-cleared reporter recovery succeeds without reset" '[[ "$RC" -eq 0 && "$OUT" == *"recovered: alpha.service"* && "$OUT" != *"recovered: $REPORTER"* ]] && ! grep -Fq "reset-failed:" "$SYSTEMCTL_CALLS"'
 check "self-cleared reporter recovery publishes pass" '[[ ! -s "$TMP/state/systemd-failures/failed-units" ]] && python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "pass"'\'' "$REQUEST"'
 unset MOCK_FINAL_LIST_SELF_CLEARED
 
