@@ -23,6 +23,9 @@ case "$*" in
     printf 'list\n' >>"$MOCK_SYSTEMCTL_CALLS"
     printf 'list\n' >>"$MOCK_ORDER_LOG"
     while IFS= read -r unit; do
+      if [[ "$unit" == brokkr-systemd-failure@* && "${MOCK_FINAL_LIST_SELF_CLEARED:-0}" -eq 1 ]]; then
+        continue
+      fi
       [ -n "$unit" ] && printf '%s loaded failed failed synthetic failure\n' "$unit"
     done <"$MOCK_FAILED_UNITS"
     ;;
@@ -30,6 +33,10 @@ case "$*" in
     unit="${@: -1}"
     printf 'reset-failed:%s\n' "$unit" >>"$MOCK_SYSTEMCTL_CALLS"
     printf 'reset-failed:%s\n' "$unit" >>"$MOCK_ORDER_LOG"
+    if [[ "${MOCK_CRASH_BEFORE_RESET:-0}" -eq 1 ]]; then
+      grep -Fqx "$unit" "$MOCK_PENDING_RESETS" || exit 97
+      kill -TERM "$PPID"
+    fi
     if [[ "${MOCK_RESET_RC:-0}" -eq 0 ]]; then
       filtered="${MOCK_FAILED_UNITS}.filtered"
       grep -Fvx "$unit" "$MOCK_FAILED_UNITS" >"$filtered" || :
@@ -138,6 +145,7 @@ export MOCK_FAILED_UNITS="$FAILED_UNITS" MOCK_UNEXPECTED_SYSTEMCTL="$UNEXPECTED"
 export MOCK_NOTIFY_CALLS="$CALLS" MOCK_REQUEST_FILE="$REQUEST"
 export MOCK_SYSTEMCTL_CALLS="$SYSTEMCTL_CALLS" MOCK_ORDER_LOG="$ORDER_LOG"
 export MOCK_HTTP_COUNT_FILE="$TMP/http-count"
+export MOCK_PENDING_RESETS="$TMP/state/systemd-failures/reset-reporters"
 export BROKKR_STATE_DIR="$TMP/state"
 export HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=test-token
 export RATATOSKR_URL=http://ratatoskr.invalid/api/send RATATOSKR_SEND_API_KEY=test-key
@@ -227,12 +235,26 @@ export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0
 run --sweep
 check "recovered producer with stale reporter succeeds" '[[ "$RC" -eq 0 && "$OUT" == *"cleared failed reporter: $REPORTER"* ]]'
 check "reset-failed clears only the exact Brokkr reporter instance" 'grep -Fxq "reset-failed:$REPORTER" "$SYSTEMCTL_CALLS" && ! grep -Fqx "$REPORTER" "$FAILED_UNITS" && ! grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
-check "reporter reset and convergence are enclosed by producer and reporter readbacks" '[[ "$(tr "\n" " " < "$ORDER_LOG")" == "list show:alpha.service delivery show:alpha.service show:$REPORTER reset-failed:$REPORTER show:alpha.service show:$REPORTER show:alpha.service delivery " ]]'
+check "reporter reset and convergence are enclosed by producer and reporter readbacks" '[[ "$(tr "\n" " " < "$ORDER_LOG")" == "list show:alpha.service delivery show:alpha.service show:$REPORTER reset-failed:$REPORTER show:alpha.service show:$REPORTER list delivery " ]]'
 check "final panel omits the reset reporter" 'python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "pass"'\'' "$REQUEST" && ! grep -Fq "$REPORTER" "$REQUEST"'
 
 export MOCK_UNIT_STATE=inactive
 run --sweep
 check "next sweep does not emit a misleading reporter recovery" '[[ "$RC" -eq 0 && "$OUT" != *"recovered: $REPORTER"* ]]'
+
+# Reset suppression is write-ahead durable. A crash immediately before the
+# reset command must leave the marker so a later run cannot invent a reporter
+# recovery from the still-old PREVIOUS state.
+printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-units"
+printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
+rm -f "$TMP/state/systemd-failures/reset-reporters"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"; : >"$TMP/http-count"
+export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0 MOCK_CRASH_BEFORE_RESET=1
+run --sweep
+check "crash before reset retains write-ahead suppression" '[[ "$RC" -ne 0 ]] && grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/reset-reporters" && grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
+unset MOCK_CRASH_BEFORE_RESET
+run --sweep
+check "retry after pre-reset crash suppresses misleading reporter recovery" '[[ "$RC" -eq 0 && "$OUT" != *"recovered: $REPORTER"* ]] && [[ ! -s "$TMP/state/systemd-failures/reset-reporters" ]] && [[ ! -s "$TMP/state/systemd-failures/failed-units" ]]'
 
 # Every recovered producer must pass one final aggregate readback after all
 # stale reporters have been processed. If alpha fails while beta is being
@@ -245,8 +267,8 @@ printf '%s\n%s\n' "$REPORTER" "$REPORTER_BETA" >"$FAILED_UNITS"
 export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0
 export MOCK_PRODUCER_REFAIL_ON_REPORTER="$REPORTER_BETA" MOCK_PRODUCER_REFAIL_PRODUCER=alpha.service
 run --sweep
-check "final aggregate producer readback catches a late refailure" '[[ "$RC" -ne 0 && "$OUT" == *"failed during final recovery verification"* ]]'
-check "late aggregate producer refailure never publishes a clean panel" '[[ "$(grep -cFx delivery "$ORDER_LOG")" -eq 1 ]] && grep -Fqx "alpha.service" "$FAILED_UNITS" && grep -Fqx "alpha.service" "$TMP/state/systemd-failures/failed-units" && grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units" && grep -Fqx "$REPORTER_BETA" "$TMP/state/systemd-failures/failed-units"'
+check "final aggregate snapshot catches a late refailure" '[[ "$RC" -eq 0 && "$OUT" == *"reconciled fresh aggregate"* ]]'
+check "late aggregate producer refailure publishes no false clean panel" '[[ "$(grep -cFx delivery "$ORDER_LOG")" -eq 2 ]] && grep -Fqx "alpha.service" "$FAILED_UNITS" && grep -Fqx "alpha.service" "$TMP/state/systemd-failures/failed-units" && python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "fail" and "alpha.service" in d["body"]["message"]'\'' "$REQUEST"'
 unset MOCK_PRODUCER_REFAIL_ON_REPORTER MOCK_PRODUCER_REFAIL_PRODUCER
 rm -f "$TMP/state/systemd-failures/reset-reporters"
 
@@ -330,9 +352,11 @@ printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-un
 printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
 : >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"; : >"$TMP/http-count"
 export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=inactive MOCK_RESET_RC=0
+export MOCK_FINAL_LIST_SELF_CLEARED=1
 run --sweep
 check "self-cleared reporter recovery succeeds without reset" '[[ "$RC" -eq 0 && "$OUT" == *"recovered: alpha.service"* ]] && ! grep -Fq "reset-failed:" "$SYSTEMCTL_CALLS"'
 check "self-cleared reporter recovery publishes pass" '[[ ! -s "$TMP/state/systemd-failures/failed-units" ]] && python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "pass"'\'' "$REQUEST"'
+unset MOCK_FINAL_LIST_SELF_CLEARED
 
 # Recovery is only clearable for a stable producer state. Transitional states
 # must fail closed before delivery or reset-failed, preserving both states for

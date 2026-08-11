@@ -76,7 +76,8 @@ STALE_REPORTERS="$STATE_DIR/.stale-reporters.$$"
 PENDING_RESETS="$STATE_DIR/reset-reporters"
 TMP_PENDING_RESETS="$STATE_DIR/.reset-reporters.$$"
 TMP_FILTER="$STATE_DIR/.filter.$$"
-trap 'rm -f "$CURRENT" "$NEW" "$RECOVERED" "$SORTED_PREVIOUS" "$TMP_SNAPSHOT" "$TMP_PREVIOUS" "$STALE_REPORTERS" "$TMP_PENDING_RESETS" "$TMP_FILTER"' EXIT
+FINAL_CURRENT="$STATE_DIR/.final-current.$$"
+trap 'rm -f "$CURRENT" "$NEW" "$RECOVERED" "$SORTED_PREVIOUS" "$TMP_SNAPSHOT" "$TMP_PREVIOUS" "$STALE_REPORTERS" "$TMP_PENDING_RESETS" "$TMP_FILTER" "$FINAL_CURRENT"' EXIT
 
 # `systemctl list-units` is column-oriented. Only accept legal service names so
 # malformed output can never become a panel/notification injection primitive.
@@ -318,11 +319,14 @@ if [ -s "$STALE_REPORTERS" ]; then
     fi
     case "$reporter_state" in
       failed)
+        if ! mark_pending_reset "$reporter"; then
+          echo "brokkr systemd failure monitor: could not persist reporter reset suppression for '$reporter'" >&2
+          exit 1
+        fi
         if ! systemctl reset-failed "$reporter"; then
           echo "brokkr systemd failure monitor: could not clear failed reporter '$reporter'" >&2
           exit 1
         fi
-        mark_pending_reset "$reporter"
         reporter_reset=1
         ;;
       active|inactive) ;;
@@ -393,43 +397,29 @@ if [ -s "$STALE_REPORTERS" ]; then
     fi
   done <"$STALE_REPORTERS"
 
-  # Every producer must still be stable after all individual reporter checks
-  # have completed. A producer can fail while another reporter is being
-  # processed; do not publish a clean aggregate from the earlier readbacks.
-  while IFS= read -r reporter; do
-    producer="${reporter#brokkr-systemd-failure@}"
-    producer="${producer%.service}"
-    if ! producer_state="$(systemctl show --property=ActiveState --value "$producer")"; then
-      echo "brokkr systemd failure monitor: could not verify final recovery for '$producer'" >&2
-      exit 1
-    fi
-    case "$producer_state" in
-      active|inactive) ;;
-      failed)
-        echo "brokkr systemd failure monitor: producer '$producer' failed during final recovery verification" >&2
-        exit 1
-        ;;
-      unknown)
-        echo "brokkr systemd failure monitor: unknown final producer state '$producer_state' for '$producer'" >&2
-        exit 1
-        ;;
-      *)
-        echo "brokkr systemd failure monitor: ambiguous final producer state '$producer_state' for '$producer'" >&2
-        exit 1
-        ;;
-    esac
-  done <"$STALE_REPORTERS"
-
   # The first authenticated delivery was the gate for reset-failed. Rebuild
-  # the final panel and transitions after removing only reporters that were
-  # actually reset, then require a second authenticated delivery before state
-  # publication. A failed final push leaves pending reset markers for a clean
-  # retry without a misleading reporter-recovery notification.
+  # the expected final panel after removing only reporters that were actually
+  # reset, then reconcile it against one fresh aggregate systemd snapshot.
+  # A failed final push leaves pending reset markers for a clean retry without
+  # a misleading reporter-recovery notification.
   while IFS= read -r reporter; do
     grep -Fvx "$reporter" "$CURRENT" >"$TMP_FILTER" || :
     mv "$TMP_FILTER" "$CURRENT"
   done <"$STALE_REPORTERS"
   LC_ALL=C sort -u "$CURRENT" -o "$CURRENT"
+
+  if ! final_listed="$(systemctl list-units --all --type=service --state=failed --no-legend --plain)"; then
+    echo "brokkr systemd failure monitor: could not verify final failed system services" >&2
+    exit 1
+  fi
+  printf '%s\n' "$final_listed" | awk '
+    $1 ~ /^[A-Za-z0-9:_.@\\-]+\.service$/ { print $1 }
+  ' | LC_ALL=C sort -u >"$FINAL_CURRENT"
+  if ! cmp -s "$CURRENT" "$FINAL_CURRENT"; then
+    cp "$FINAL_CURRENT" "$CURRENT"
+    echo "brokkr systemd failure monitor: failed-unit state changed during reporter recovery; reconciled fresh aggregate"
+  fi
+
   comm -13 "$SORTED_PREVIOUS" "$CURRENT" >"$NEW"
   comm -23 "$SORTED_PREVIOUS" "$CURRENT" >"$RECOVERED"
   if [ -s "$PENDING_RESETS" ]; then
