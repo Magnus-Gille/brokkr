@@ -393,6 +393,33 @@ if [ -s "$STALE_REPORTERS" ]; then
     fi
   done <"$STALE_REPORTERS"
 
+  # Every producer must still be stable after all individual reporter checks
+  # have completed. A producer can fail while another reporter is being
+  # processed; do not publish a clean aggregate from the earlier readbacks.
+  while IFS= read -r reporter; do
+    producer="${reporter#brokkr-systemd-failure@}"
+    producer="${producer%.service}"
+    if ! producer_state="$(systemctl show --property=ActiveState --value "$producer")"; then
+      echo "brokkr systemd failure monitor: could not verify final recovery for '$producer'" >&2
+      exit 1
+    fi
+    case "$producer_state" in
+      active|inactive) ;;
+      failed)
+        echo "brokkr systemd failure monitor: producer '$producer' failed during final recovery verification" >&2
+        exit 1
+        ;;
+      unknown)
+        echo "brokkr systemd failure monitor: unknown final producer state '$producer_state' for '$producer'" >&2
+        exit 1
+        ;;
+      *)
+        echo "brokkr systemd failure monitor: ambiguous final producer state '$producer_state' for '$producer'" >&2
+        exit 1
+        ;;
+    esac
+  done <"$STALE_REPORTERS"
+
   # The first authenticated delivery was the gate for reset-failed. Rebuild
   # the final panel and transitions after removing only reporters that were
   # actually reset, then require a second authenticated delivery before state
@@ -418,13 +445,6 @@ if [ -s "$STALE_REPORTERS" ]; then
     echo "brokkr systemd failure monitor: final Heimdall push failed; reset reporter state retained for retry" >&2
     exit 1
   fi
-  : >"$TMP_PENDING_RESETS"
-  mv "$TMP_PENDING_RESETS" "$PENDING_RESETS"
-elif [ -f "$PENDING_RESETS" ]; then
-  # A retry after a successful reset but failed final push has now delivered
-  # the converged panel; the marker has served its suppression purpose.
-  : >"$TMP_PENDING_RESETS"
-  mv "$TMP_PENDING_RESETS" "$PENDING_RESETS"
 fi
 
 if [ -s "$NEW" ]; then
@@ -446,6 +466,13 @@ fi
 # snapshot, so a delivery failure remains a retryable transition.
 cp "$CURRENT" "$TMP_PREVIOUS"
 mv "$TMP_PREVIOUS" "$PREVIOUS"
+# Retire reset suppression only after the converged state is durably published.
+# If publication fails or the process crashes before this point, the marker
+# keeps the next reconciliation from emitting a misleading reporter recovery.
+if [ -f "$PENDING_RESETS" ]; then
+  : >"$TMP_PENDING_RESETS"
+  mv "$TMP_PENDING_RESETS" "$PENDING_RESETS"
+fi
 if [ ! -s "$NEW" ] && [ ! -s "$RECOVERED" ]; then
   echo "brokkr systemd failure monitor: no state change"
 fi
