@@ -32,13 +32,18 @@ next run retries rather than claiming the incident was delivered.
 
 The immediate `--unit` path also reads the named unit's `ActiveState` when a
 concurrent failed-unit listing omits it. A direct `failed` readback keeps that
-unit in durable state; a known non-failed state permits a recovery transition.
-An unreadable or unknown state fails closed and leaves the previous durable
-state untouched, so a transient systemd race cannot hide another failure.
+unit in durable state; only a stable `active` or `inactive` state permits a
+recovery transition. Reloading, activating, deactivating, maintenance,
+unknown, or any other transitional/ambiguous state fails closed and leaves the
+previous durable state untouched, so a transient systemd race cannot hide
+another failure.
 If the producer's exact `brokkr-systemd-failure@...service` instance is still
 failed, the monitor clears that instance with `systemctl reset-failed` only
-after the panel delivery succeeds and the producer recovery is verified. A
-reporter readback or reset error remains visible and retryable.
+after the panel delivery succeeds and the producer recovery is verified. It
+then reads both producer and reporter state again before removing the reporter
+from the failure view or publishing recovery. A fresh failure, transitional or
+ambiguous state, reporter readback error, or reset error leaves the prior state
+visible and retryable.
 
 The handler and sweep deliberately have no `OnFailure=` themselves: recursively
 alerting a broken alert path would create a failure storm. Their non-zero status

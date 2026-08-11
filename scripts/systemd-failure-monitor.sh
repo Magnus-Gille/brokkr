@@ -99,12 +99,16 @@ if [ "$MODE" = "--unit" ] && ! grep -Fqx "$UNIT" "$CURRENT"; then
       printf '%s\n' "$UNIT" >>"$CURRENT"
       LC_ALL=C sort -u "$CURRENT" -o "$CURRENT"
       ;;
-    active|reloading|inactive|activating|deactivating|maintenance)
+    active|inactive)
       # The OnFailure unit has recovered or is no longer failed. Leave it out
       # so the normal previous-state diff emits one recovery transition.
       ;;
-    *)
+    unknown)
       echo "brokkr systemd failure monitor: unknown state '$active_state' for '$UNIT'" >&2
+      exit 1
+      ;;
+    *)
+      echo "brokkr systemd failure monitor: ambiguous state '$active_state' for '$UNIT'" >&2
       exit 1
       ;;
   esac
@@ -130,9 +134,10 @@ fi
 
 # A failed immediate handler can remain as a failed systemd instance after its
 # producer has recovered. Only consider the exact Brokkr reporter instance for
-# a recovered producer, and verify the producer directly before any reset. If
-# the list snapshot races and the producer is still failed, retain it; if its
-# state is unreadable or unknown, fail closed without changing durable state.
+# a recovered producer, and verify every producer directly before any reset or
+# recovery publication. Only stable active/inactive states qualify as recovery;
+# a failed or transitional/unknown state fails closed without changing durable
+# state.
 : >"$STALE_REPORTERS"
 if [ -s "$RECOVERED" ]; then
   while IFS= read -r recovered; do
@@ -143,10 +148,6 @@ if [ -s "$RECOVERED" ]; then
     case "$recovered" in
       brokkr-systemd-failure@*.service) continue ;;
     esac
-    reporter="brokkr-systemd-failure@${recovered}.service"
-    if ! grep -Fqx "$reporter" "$CURRENT"; then
-      continue
-    fi
     if ! producer_state="$(systemctl show --property=ActiveState --value "$recovered")"; then
       echo "brokkr systemd failure monitor: could not verify recovery for '$recovered'" >&2
       exit 1
@@ -155,11 +156,18 @@ if [ -s "$RECOVERED" ]; then
       failed)
         printf '%s\n' "$recovered" >>"$CURRENT"
         ;;
-      active|reloading|inactive|activating|deactivating|maintenance)
-        printf '%s\n' "$reporter" >>"$STALE_REPORTERS"
+      active|inactive)
+        reporter="brokkr-systemd-failure@${recovered}.service"
+        if grep -Fqx "$reporter" "$CURRENT"; then
+          printf '%s\n' "$reporter" >>"$STALE_REPORTERS"
+        fi
+        ;;
+      unknown)
+        echo "brokkr systemd failure monitor: unknown state '$producer_state' for '$recovered'" >&2
+        exit 1
         ;;
       *)
-        echo "brokkr systemd failure monitor: unknown state '$producer_state' for '$recovered'" >&2
+        echo "brokkr systemd failure monitor: ambiguous producer state '$producer_state' for '$recovered'" >&2
         exit 1
         ;;
     esac
@@ -241,6 +249,7 @@ if [ -s "$STALE_REPORTERS" ]; then
   while IFS= read -r reporter; do
     producer="${reporter#brokkr-systemd-failure@}"
     producer="${producer%.service}"
+    reporter_reset=0
     if ! producer_state="$(systemctl show --property=ActiveState --value "$producer")"; then
       echo "brokkr systemd failure monitor: could not reverify recovery for '$producer'" >&2
       exit 1
@@ -250,9 +259,13 @@ if [ -s "$STALE_REPORTERS" ]; then
         echo "brokkr systemd failure monitor: producer '$producer' failed again; reporter reset skipped" >&2
         exit 1
         ;;
-      active|reloading|inactive|activating|deactivating|maintenance) ;;
+      active|inactive) ;;
+      unknown)
+        echo "brokkr systemd failure monitor: unknown post-reset state '$producer_state' for '$producer'" >&2
+        exit 1
+        ;;
       *)
-        echo "brokkr systemd failure monitor: unknown state '$producer_state' for '$producer'" >&2
+        echo "brokkr systemd failure monitor: ambiguous post-reset producer state '$producer_state' for '$producer'" >&2
         exit 1
         ;;
     esac
@@ -261,19 +274,80 @@ if [ -s "$STALE_REPORTERS" ]; then
       exit 1
     fi
     case "$reporter_state" in
-      failed) ;;
-      active|reloading|inactive|activating|deactivating|maintenance) continue ;;
+      failed)
+        if ! systemctl reset-failed "$reporter"; then
+          echo "brokkr systemd failure monitor: could not clear failed reporter '$reporter'" >&2
+          exit 1
+        fi
+        mark_pending_reset "$reporter"
+        reporter_reset=1
+        ;;
+      active|inactive) ;;
+      unknown)
+        echo "brokkr systemd failure monitor: unknown post-reset reporter state '$reporter_state' for '$reporter'" >&2
+        exit 1
+        ;;
       *)
-        echo "brokkr systemd failure monitor: unknown reporter state '$reporter_state' for '$reporter'" >&2
+        echo "brokkr systemd failure monitor: ambiguous post-reset reporter state '$reporter_state' for '$reporter'" >&2
         exit 1
         ;;
     esac
-    if ! systemctl reset-failed "$reporter"; then
-      echo "brokkr systemd failure monitor: could not clear failed reporter '$reporter'" >&2
+
+    # The reporter may already have self-cleared, but every stale reporter
+    # still needs a fresh producer readback before it can be removed from
+    # CURRENT or published as recovered. reset-failed is not a synchronization
+    # barrier for either unit, so the producer may also fail after the
+    # pre-reset readback. The pending marker and prior durable state make
+    # either race visible and retryable.
+    if ! producer_state="$(systemctl show --property=ActiveState --value "$producer")"; then
+      echo "brokkr systemd failure monitor: could not verify post-reset state for '$producer'" >&2
       exit 1
     fi
-    mark_pending_reset "$reporter"
-    echo "brokkr systemd failure monitor: cleared failed reporter: $reporter"
+    case "$producer_state" in
+      failed)
+        if [ "$reporter_reset" -eq 1 ]; then
+          echo "brokkr systemd failure monitor: producer '$producer' failed again after reporter reset" >&2
+        else
+          echo "brokkr systemd failure monitor: producer '$producer' failed again before reporter recovery commit" >&2
+        fi
+        exit 1
+        ;;
+      active|inactive) ;;
+      unknown)
+        echo "brokkr systemd failure monitor: unknown post-reset state '$producer_state' for '$producer'" >&2
+        exit 1
+        ;;
+      *)
+        echo "brokkr systemd failure monitor: ambiguous post-reset producer state '$producer_state' for '$producer'" >&2
+        exit 1
+        ;;
+    esac
+    if ! reporter_state="$(systemctl show --property=ActiveState --value "$reporter")"; then
+      echo "brokkr systemd failure monitor: could not verify post-reset reporter state for '$reporter'" >&2
+      exit 1
+    fi
+    case "$reporter_state" in
+      failed)
+        if [ "$reporter_reset" -eq 1 ]; then
+          echo "brokkr systemd failure monitor: reporter '$reporter' failed again after reset" >&2
+        else
+          echo "brokkr systemd failure monitor: reporter '$reporter' failed again before recovery commit" >&2
+        fi
+        exit 1
+        ;;
+      active|inactive) ;;
+      unknown)
+        echo "brokkr systemd failure monitor: unknown post-reset reporter state '$reporter_state' for '$reporter'" >&2
+        exit 1
+        ;;
+      *)
+        echo "brokkr systemd failure monitor: ambiguous post-reset reporter state '$reporter_state' for '$reporter'" >&2
+        exit 1
+        ;;
+    esac
+    if [ "$reporter_reset" -eq 1 ]; then
+      echo "brokkr systemd failure monitor: cleared failed reporter: $reporter"
+    fi
   done <"$STALE_REPORTERS"
 
   # The first authenticated delivery was the gate for reset-failed. Rebuild
@@ -288,8 +362,10 @@ if [ -s "$STALE_REPORTERS" ]; then
   LC_ALL=C sort -u "$CURRENT" -o "$CURRENT"
   comm -13 "$SORTED_PREVIOUS" "$CURRENT" >"$NEW"
   comm -23 "$SORTED_PREVIOUS" "$CURRENT" >"$RECOVERED"
-  grep -Fvx -f "$PENDING_RESETS" "$RECOVERED" >"$TMP_FILTER" || :
-  mv "$TMP_FILTER" "$RECOVERED"
+  if [ -s "$PENDING_RESETS" ]; then
+    grep -Fvx -f "$PENDING_RESETS" "$RECOVERED" >"$TMP_FILTER" || :
+    mv "$TMP_FILTER" "$RECOVERED"
+  fi
   if ! compose_snapshot; then
     echo "brokkr systemd failure monitor: could not compose final Heimdall snapshot" >&2
     exit 1

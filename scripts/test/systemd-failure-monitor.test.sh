@@ -34,6 +34,15 @@ case "$*" in
       filtered="${MOCK_FAILED_UNITS}.filtered"
       grep -Fvx "$unit" "$MOCK_FAILED_UNITS" >"$filtered" || :
       mv "$filtered" "$MOCK_FAILED_UNITS"
+      producer="${unit#brokkr-systemd-failure@}"
+      producer="${producer%.service}"
+      if [[ "${MOCK_PRODUCER_REFAIL_AFTER_RESET:-0}" -eq 1 ]]; then
+        printf '%s\n' "$producer" >>"$MOCK_FAILED_UNITS"
+      fi
+      if [[ "${MOCK_REPORTER_REFAIL_AFTER_RESET:-0}" -eq 1 ]]; then
+        printf '%s\n' "$unit" >>"$MOCK_FAILED_UNITS"
+      fi
+      LC_ALL=C sort -u "$MOCK_FAILED_UNITS" -o "$MOCK_FAILED_UNITS"
     fi
     exit "${MOCK_RESET_RC:-0}"
     ;;
@@ -41,10 +50,20 @@ case "$*" in
     unit="${@: -1}"
     printf 'show:%s\n' "$unit" >>"$MOCK_SYSTEMCTL_CALLS"
     printf 'show:%s\n' "$unit" >>"$MOCK_ORDER_LOG"
-    case "$unit" in
-      brokkr-systemd-failure@*) state="${MOCK_REPORTER_STATE:-failed}" ;;
-      *) state="${MOCK_UNIT_STATE:-failed}" ;;
-    esac
+    if [[ "$unit" == brokkr-systemd-failure@* && "${MOCK_PRODUCER_REFAIL_BEFORE_REPORTER_READBACK:-0}" -eq 1 ]]; then
+      producer="${unit#brokkr-systemd-failure@}"
+      producer="${producer%.service}"
+      printf '%s\n' "$producer" >>"$MOCK_FAILED_UNITS"
+      LC_ALL=C sort -u "$MOCK_FAILED_UNITS" -o "$MOCK_FAILED_UNITS"
+    fi
+    if grep -Fqx "$unit" "$MOCK_FAILED_UNITS"; then
+      case "$unit" in
+        brokkr-systemd-failure@*) state="${MOCK_REPORTER_STATE:-failed}" ;;
+        *) state=failed ;;
+      esac
+    else
+      state="${MOCK_UNIT_STATE:-inactive}"
+    fi
     printf '%s\n' "$state"
     ;;
   *) printf '%s\n' "$*" >>"$MOCK_UNEXPECTED_SYSTEMCTL"; exit 64 ;;
@@ -149,6 +168,7 @@ check "successful retry publishes the new state atomically" 'grep -qx "alpha.ser
 check "successful retry sends beta's exact operator notification" 'grep -Fq "Brokkr systemd failure on" "$CALLS" && grep -Fq "beta.service" "$CALLS"'
 
 : >"$FAILED_UNITS"
+export MOCK_UNIT_STATE=inactive
 run --sweep
 check "clearing every failed unit emits recoveries" '[[ "$RC" -eq 0 && "$OUT" == *"recovered: alpha.service"* && "$OUT" == *"recovered: beta.service"* ]]'
 check "recovery clears durable failed-unit state" '[[ ! -s "$TMP/state/systemd-failures/failed-units" ]]'
@@ -184,7 +204,7 @@ export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0
 run --sweep
 check "recovered producer with stale reporter succeeds" '[[ "$RC" -eq 0 && "$OUT" == *"cleared failed reporter: $REPORTER"* ]]'
 check "reset-failed clears only the exact Brokkr reporter instance" 'grep -Fxq "reset-failed:$REPORTER" "$SYSTEMCTL_CALLS" && ! grep -Fqx "$REPORTER" "$FAILED_UNITS" && ! grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
-check "reporter reset follows delivery and producer recovery verification" '[[ "$(tr "\n" " " < "$ORDER_LOG")" == "list show:alpha.service delivery show:alpha.service show:$REPORTER reset-failed:$REPORTER delivery " ]]'
+check "reporter reset and convergence are enclosed by producer and reporter readbacks" '[[ "$(tr "\n" " " < "$ORDER_LOG")" == "list show:alpha.service delivery show:alpha.service show:$REPORTER reset-failed:$REPORTER show:alpha.service show:$REPORTER delivery " ]]'
 check "final panel omits the reset reporter" 'python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "pass"'\'' "$REQUEST" && ! grep -Fq "$REPORTER" "$REQUEST"'
 
 export MOCK_UNIT_STATE=inactive
@@ -205,6 +225,74 @@ check "failed converged push leaves reset marker and retryable state" 'grep -Fqx
 export MOCK_FAIL_SECOND_PUSH=0
 run --sweep
 check "retry after failed converged push clears stale reporter without recovery noise" '[[ "$RC" -eq 0 && "$OUT" != *"recovered: $REPORTER"* ]] && [[ ! -s "$TMP/state/systemd-failures/reset-reporters" ]] && [[ ! -s "$TMP/state/systemd-failures/failed-units" ]]'
+
+# reset-failed is not a synchronization barrier. If the producer fails again
+# before the converged recovery publication, retain the durable pre-reset
+# state, keep the pending marker, and leave the fresh producer failure in the
+# mocked current systemd state. No clean second delivery is permitted.
+printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-units"
+printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"; : >"$TMP/http-count"
+export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0
+export MOCK_PRODUCER_REFAIL_AFTER_RESET=1
+run --sweep
+check "producer refailure after reporter reset fails closed" '[[ "$RC" -ne 0 && "$OUT" == *"failed again after reporter reset"* ]]'
+check "post-reset producer failure remains current and durable" 'grep -Fqx "alpha.service" "$FAILED_UNITS" && grep -Fqx "alpha.service" "$TMP/state/systemd-failures/failed-units" && grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
+check "post-reset producer failure retains pending reset" 'grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/reset-reporters"'
+check "post-reset producer failure never publishes a clean panel" '[[ "$(grep -cFx delivery "$ORDER_LOG")" -eq 1 ]] && python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "fail"'\'' "$REQUEST" && grep -Fq "$REPORTER" "$REQUEST"'
+unset MOCK_PRODUCER_REFAIL_AFTER_RESET
+
+# A reporter that fails again after reset is equally ambiguous and must not be
+# removed from CURRENT or durable state before a later retry.
+printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-units"
+printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"; : >"$TMP/http-count"
+export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0
+export MOCK_REPORTER_REFAIL_AFTER_RESET=1
+run --sweep
+check "reporter refailure after reset fails closed" '[[ "$RC" -ne 0 && "$OUT" == *"failed again after reset"* ]]'
+check "post-reset reporter failure retains durable state" 'grep -Fqx "alpha.service" "$TMP/state/systemd-failures/failed-units" && grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
+check "post-reset reporter failure does not publish a clean panel" '[[ "$(grep -cFx delivery "$ORDER_LOG")" -eq 1 ]]'
+unset MOCK_REPORTER_REFAIL_AFTER_RESET
+
+# A reporter can self-clear before reset-failed, but the producer can fail
+# again before the reporter readback completes. The common post-readback gate
+# must retain both durable failures and the already-delivered failure panel.
+printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-units"
+printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
+rm -f "$TMP/state/systemd-failures/reset-reporters"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"; : >"$TMP/http-count"
+export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=inactive MOCK_RESET_RC=0
+export MOCK_PRODUCER_REFAIL_BEFORE_REPORTER_READBACK=1
+run --sweep
+check "producer refailure before self-cleared reporter readback fails closed" '[[ "$RC" -ne 0 && "$OUT" == *"failed again before reporter recovery commit"* ]]'
+check "pre-readback producer failure remains current and durable" 'grep -Fqx "alpha.service" "$FAILED_UNITS" && grep -Fqx "alpha.service" "$TMP/state/systemd-failures/failed-units" && grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
+check "pre-readback producer failure does not reset reporter" '! grep -Fq "reset-failed:" "$SYSTEMCTL_CALLS" && [[ ! -s "$TMP/state/systemd-failures/reset-reporters" ]]'
+check "pre-readback producer failure never publishes a clean panel" '[[ "$(grep -cFx delivery "$ORDER_LOG")" -eq 1 ]] && python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "fail"'\'' "$REQUEST" && grep -Fq "$REPORTER" "$REQUEST"'
+unset MOCK_PRODUCER_REFAIL_BEFORE_REPORTER_READBACK
+
+# The non-racing self-cleared reporter path still publishes the producer
+# recovery, even though no pending reset marker exists.
+printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-units"
+printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
+: >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"; : >"$TMP/http-count"
+export MOCK_UNIT_STATE=inactive MOCK_REPORTER_STATE=inactive MOCK_RESET_RC=0
+run --sweep
+check "self-cleared reporter recovery succeeds without reset" '[[ "$RC" -eq 0 && "$OUT" == *"recovered: alpha.service"* ]] && ! grep -Fq "reset-failed:" "$SYSTEMCTL_CALLS"'
+check "self-cleared reporter recovery publishes pass" '[[ ! -s "$TMP/state/systemd-failures/failed-units" ]] && python3 -c '\''import json,sys; d=json.load(open(sys.argv[1])); assert d["body"]["state"] == "pass"'\'' "$REQUEST"'
+
+# Recovery is only clearable for a stable producer state. Transitional states
+# must fail closed before delivery or reset-failed, preserving both states for
+# a later sweep.
+for transitional in reloading activating deactivating maintenance; do
+  printf 'alpha.service\n%s\n' "$REPORTER" >"$TMP/state/systemd-failures/failed-units"
+  printf '%s\n' "$REPORTER" >"$FAILED_UNITS"
+  : >"$SYSTEMCTL_CALLS"; : >"$ORDER_LOG"
+  export MOCK_UNIT_STATE="$transitional" MOCK_REPORTER_STATE=failed MOCK_RESET_RC=0
+  run --sweep
+  check "producer $transitional state remains ambiguous" '[[ "$RC" -ne 0 && "$OUT" == *"ambiguous producer state"* ]] && ! grep -Fq "reset-failed:" "$SYSTEMCTL_CALLS" && ! grep -Fq "delivery" "$ORDER_LOG"'
+  check "producer $transitional state preserves durable failure" 'grep -Fqx "alpha.service" "$TMP/state/systemd-failures/failed-units" && grep -Fqx "$REPORTER" "$TMP/state/systemd-failures/failed-units"'
+done
 
 # A producer that is still failed must keep both the producer and reporter
 # failures visible; no reset-failed command is permitted.
