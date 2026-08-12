@@ -38,6 +38,10 @@ distinguish "not installed" from "installed but broken":
   `Self.Online == true`. Stopped, offline, malformed, and unavailable states
   are distinct explicit fail-closed probe observations and never advertise
   `tailnet`.
+- Linux `uname -m` values `aarch64`/`arm64`, `armv7l`, and `x86_64` are preserved
+  as their corresponding v1 architecture values. `armv7l` is not widened to
+  `arm64`; workload placement remains fail-closed unless the workload contract
+  explicitly supports `armv7l`.
 - Storage classes are never guessed from `df`. The owner overlay declares
   logical stores (class + mount); `df -Pm` only confirms the mount and measures
   available MiB. A declared but unmounted store is reported with
