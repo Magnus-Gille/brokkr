@@ -227,3 +227,18 @@ BROKKR_DEADMAN_LEGACY_STATE_DIR="$HOME/.local/state/brokkr/legacy-node-deadman" 
 BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh \
 ./scripts/deploy-control-node-deadman.sh
 ```
+
+The verified historical M5 installation has a dedicated opt-in
+`historic-control-node-v1` profile. It binds the exact retired service/timer pair,
+state directory, and script identity; it is never inferred from filenames. Run it
+only after confirming those four artifacts belong to the host:
+
+```bash
+./scripts/deploy-control-node-deadman.sh --legacy-profile historic-control-node-v1
+```
+
+The profile refuses any `BROKKR_DEADMAN_LEGACY_*` overrides, validates the service↔timer↔script
+correlation, snapshots timer state and operational counters, and uses the same transactional
+rollback as generic migration. The hermetic deployment test proves successful retirement,
+counter migration, timer disablement, and refusal before systemd mutation when the profile is
+mixed with an explicit identity.

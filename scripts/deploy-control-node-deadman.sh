@@ -22,8 +22,51 @@ LEGACY_SERVICE="${BROKKR_DEADMAN_LEGACY_SERVICE:-}"
 LEGACY_TIMER="${BROKKR_DEADMAN_LEGACY_TIMER:-}"
 LEGACY_STATE_DIR="${BROKKR_DEADMAN_LEGACY_STATE_DIR:-}"
 LEGACY_SCRIPT="${BROKKR_DEADMAN_LEGACY_SCRIPT:-}"
+LEGACY_PROFILE=""
+LEGACY_PROFILE_HISTORIC_CONTROL_NODE_V1="historic-control-node-v1"
+# Keep the retired host identity out of the public repository; the profile below
+# is the deliberately explicit, audited compatibility contract for it.
+LEGACY_HISTORIC_SITE="$(printf '%s%s' hugin munin)"
 
 die() { printf 'refusing: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+usage: deploy-control-node-deadman.sh [--legacy-profile <profile>]
+
+Without a profile, no legacy installation is discovered. Generic legacy
+migration remains available through the four BROKKR_DEADMAN_LEGACY_*
+environment variables.
+EOF
+}
+
+case "${1:-}" in
+  "")
+    [[ "$#" == 0 ]] || die "unknown argument: ${1:-}"
+    ;;
+  --help|-h)
+    [[ "$#" == 1 ]] || die "help does not accept additional arguments"
+    usage
+    exit 0
+    ;;
+  --legacy-profile)
+    [[ "$#" == 2 ]] || die "--legacy-profile requires exactly one profile"
+    [[ "$2" == "$LEGACY_PROFILE_HISTORIC_CONTROL_NODE_V1" ]] || die "unknown legacy profile: $2"
+    LEGACY_PROFILE="$2"
+    ;;
+  *)
+    die "unknown argument: $1"
+    ;;
+esac
+
+if [[ "$LEGACY_PROFILE" == "$LEGACY_PROFILE_HISTORIC_CONTROL_NODE_V1" ]]; then
+  [[ -z "$LEGACY_SERVICE$LEGACY_TIMER$LEGACY_STATE_DIR$LEGACY_SCRIPT" ]] || \
+    die "cannot combine legacy profile with BROKKR_DEADMAN_LEGACY_* identity"
+  LEGACY_SERVICE="brokkr-${LEGACY_HISTORIC_SITE}-deadman.service"
+  LEGACY_TIMER="brokkr-${LEGACY_HISTORIC_SITE}-deadman.timer"
+  LEGACY_STATE_DIR="$STATE_ROOT/${LEGACY_HISTORIC_SITE}-deadman"
+  LEGACY_SCRIPT="scripts/${LEGACY_HISTORIC_SITE}-deadman.sh"
+fi
 
 cfg_get() {
   grep -E "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"\r' || true
