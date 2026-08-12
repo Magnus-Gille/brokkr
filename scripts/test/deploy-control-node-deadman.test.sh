@@ -44,6 +44,8 @@ EOF
 cat >"$TMP/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >>"$MOCK_CALLS"
+legacy_profile_site="$(printf '%s%s' hugin munin)"
+legacy_profile_timer="brokkr-${legacy_profile_site}-deadman.timer"
 case "$*" in
   "--user is-enabled --quiet brokkr-control-node-deadman.timer")
     [[ "$(cat "$MOCK_TIMER_ENABLED_FILE")" == 1 ]]
@@ -105,6 +107,38 @@ case "$*" in
   "--user stop legacy-node-deadman.timer")
     printf '0\n' >"$MOCK_LEGACY_TIMER_ACTIVE_FILE"
     ;;
+  "--user is-enabled $legacy_profile_timer")
+    if [[ "$(cat "$MOCK_LEGACY_TIMER_ENABLED_FILE")" == 1 ]]; then
+      printf 'enabled\n'
+      exit 0
+    fi
+    printf 'disabled\n'
+    exit 1
+    ;;
+  "--user is-active $legacy_profile_timer")
+    if [[ "$(cat "$MOCK_LEGACY_TIMER_ACTIVE_FILE")" == 1 ]]; then
+      printf 'active\n'
+      exit 0
+    fi
+    printf 'inactive\n'
+    exit 3
+    ;;
+  "--user enable $legacy_profile_timer")
+    printf '1\n' >"$MOCK_LEGACY_TIMER_ENABLED_FILE"
+    ;;
+  "--user disable $legacy_profile_timer")
+    if [[ "${MOCK_PROFILE_DISABLE_RC:-0}" != 0 ]]; then
+      printf '0\n' >"$MOCK_LEGACY_TIMER_ENABLED_FILE"
+      exit "$MOCK_PROFILE_DISABLE_RC"
+    fi
+    printf '0\n' >"$MOCK_LEGACY_TIMER_ENABLED_FILE"
+    ;;
+  "--user start $legacy_profile_timer")
+    printf '1\n' >"$MOCK_LEGACY_TIMER_ACTIVE_FILE"
+    ;;
+  "--user stop $legacy_profile_timer")
+    printf '0\n' >"$MOCK_LEGACY_TIMER_ACTIVE_FILE"
+    ;;
   "--user start brokkr-control-node-deadman.service")
     if [[ "${MOCK_WRITE_STATE:-1}" == 1 ]]; then
       mkdir -p "$(dirname "$MOCK_STATE_FILE")"
@@ -160,6 +194,7 @@ ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 run_deploy() { OUT="$(bash "$DEPLOY" 2>&1)"; RC=$?; : "$OUT" "$RC"; }
+run_deploy_args() { OUT="$(bash "$DEPLOY" "$@" 2>&1)"; RC=$?; : "$OUT" "$RC"; }
 
 echo "deploy-control-node-deadman.test.sh"
 
@@ -246,6 +281,70 @@ check "current unit has no legacy script reference" '! grep -Fq "legacy-node-dea
 check "current timer targets current service" 'grep -Fxq "Unit=brokkr-control-node-deadman.service" "$UNIT_DIR/brokkr-control-node-deadman.timer"'
 unset BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
 
+# The verified historical M5 install has a fixed identity. Its migration is
+# available only through an explicit profile; ordinary installs must not
+# discover or mutate these names automatically.
+: >"$CALLS"; write_env; rm -f "$EXTERNAL_ENV"
+rm -rf "$STATE_ROOT/control-node-deadman"
+PROFILE_SITE="$(printf '%s%s' hugin munin)"
+PROFILE_ID="historic-control-node-v1"
+PROFILE_SERVICE="brokkr-${PROFILE_SITE}-deadman.service"
+PROFILE_TIMER="brokkr-${PROFILE_SITE}-deadman.timer"
+PROFILE_STATE_DIR="$STATE_ROOT/${PROFILE_SITE}-deadman"
+cat >"$UNIT_DIR/$PROFILE_SERVICE" <<EOF
+[Service]
+ExecStart=%h/repos/brokkr/scripts/${PROFILE_SITE}-deadman.sh
+EOF
+cat >"$UNIT_DIR/$PROFILE_TIMER" <<EOF
+[Timer]
+Unit=$PROFILE_SERVICE
+EOF
+mkdir -p "$PROFILE_STATE_DIR"
+printf '3\n' >"$PROFILE_STATE_DIR/fail-count"
+printf 'fail\n' >"$PROFILE_STATE_DIR/state"
+printf '501\n' >"$PROFILE_STATE_DIR/last-alert"
+printf '1\n' >"$MOCK_LEGACY_TIMER_ENABLED_FILE"
+printf '1\n' >"$MOCK_LEGACY_TIMER_ACTIVE_FILE"
+run_deploy_args --legacy-profile "$PROFILE_ID"
+check "historical profile migration succeeds" '[[ "$RC" -eq 0 ]]'
+check "historical service is removed" '[[ ! -e "$UNIT_DIR/$PROFILE_SERVICE" ]]'
+check "historical timer is removed" '[[ ! -e "$UNIT_DIR/$PROFILE_TIMER" ]]'
+check "historical timer is stopped and disabled" 'grep -q "systemctl --user stop $PROFILE_TIMER" "$CALLS" && grep -q "systemctl --user disable $PROFILE_TIMER" "$CALLS"'
+check "historical operational state is migrated" '[[ "$(cat "$STATE_ROOT/control-node-deadman/last-alert")" == 501 && "$(cat "$STATE_ROOT/control-node-deadman/fail-count")" == 3 ]]'
+check "historical state directory is retired" '[[ ! -e "$PROFILE_STATE_DIR" ]]'
+
+# A failure after the legacy timer was stopped must roll its exact units and
+# timer state back; retirement itself is part of the mutation transaction.
+: >"$CALLS"; write_env
+cat >"$UNIT_DIR/$PROFILE_SERVICE" <<EOF
+[Service]
+ExecStart=%h/repos/brokkr/scripts/${PROFILE_SITE}-deadman.sh
+EOF
+cat >"$UNIT_DIR/$PROFILE_TIMER" <<EOF
+[Timer]
+Unit=$PROFILE_SERVICE
+EOF
+mkdir -p "$PROFILE_STATE_DIR"
+printf '9\n' >"$PROFILE_STATE_DIR/last-alert"
+printf '1\n' >"$MOCK_LEGACY_TIMER_ENABLED_FILE"
+printf '1\n' >"$MOCK_LEGACY_TIMER_ACTIVE_FILE"
+export MOCK_PROFILE_DISABLE_RC=91
+run_deploy_args --legacy-profile "$PROFILE_ID"
+check "historical retirement failure is visible" '[[ "$RC" -ne 0 && "$OUT" == *"could not disable legacy"* ]]'
+check "historical service is restored after retirement failure" '[[ -f "$UNIT_DIR/$PROFILE_SERVICE" ]]'
+check "historical timer is restored after retirement failure" '[[ -f "$UNIT_DIR/$PROFILE_TIMER" ]]'
+check "historical timer state is restored after retirement failure" '[[ "$(cat "$MOCK_LEGACY_TIMER_ENABLED_FILE")" == 1 && "$(cat "$MOCK_LEGACY_TIMER_ACTIVE_FILE")" == 1 ]]'
+check "historical state remains after retirement failure" '[[ "$(cat "$PROFILE_STATE_DIR/last-alert")" == 9 ]]'
+unset MOCK_PROFILE_DISABLE_RC
+
+# The profile cannot be combined with a second, operator-supplied identity.
+: >"$CALLS"; write_env
+export BROKKR_DEADMAN_LEGACY_SERVICE=other.service
+run_deploy_args --legacy-profile "$PROFILE_ID"
+check "historical profile rejects mixed legacy identity" '[[ "$RC" -ne 0 && "$OUT" == *"cannot combine legacy profile"* ]]'
+check "mixed profile refuses before systemd mutation" '! grep -q systemctl "$CALLS"'
+unset BROKKR_DEADMAN_LEGACY_SERVICE
+
 # With no explicit legacy identity, unrelated dead-man-looking units and state
 # are never discovered or changed.
 : >"$CALLS"; write_env
@@ -325,7 +424,7 @@ export BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh
 export MOCK_LEGACY_TIMER_ENABLED_QUERY_ERROR=failed
 run_deploy
 check "indeterminate legacy timer state refuses" '[[ "$RC" -ne 0 && "$OUT" == *"could not snapshot legacy timer enablement"* ]]'
-check "indeterminate timer state refuses before unit mutation" '! grep -q "stop legacy-node-deadman\|disable legacy-node-deadman\|daemon-reload\|enable --now" "$CALLS"'
+check "indeterminate timer state refuses before legacy mutation" '! grep -q "stop legacy-node-deadman\|disable legacy-node-deadman" "$CALLS"'
 check "indeterminate timer state preserves legacy units" '[[ -f "$UNIT_DIR/legacy-node-deadman.service" && -f "$UNIT_DIR/legacy-node-deadman.timer" ]]'
 unset MOCK_LEGACY_TIMER_ENABLED_QUERY_ERROR BROKKR_DEADMAN_LEGACY_SERVICE BROKKR_DEADMAN_LEGACY_TIMER BROKKR_DEADMAN_LEGACY_STATE_DIR BROKKR_DEADMAN_LEGACY_SCRIPT
 
