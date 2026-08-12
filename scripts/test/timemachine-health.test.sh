@@ -54,6 +54,7 @@ check "successful empty query proves no backups" '[[ "$RC" -eq 2 && "$OUT" == *"
 export MOCK_TM_MODE=fail
 run_check
 check "tmutil failure is unknown, not a false no-backup claim" '[[ "$RC" -eq 1 && "$OUT" == WARN:*"state unknown"* ]]'
+check "tmutil diagnostic is not exposed" '[[ "$OUT" != *"destination unavailable"* ]]'
 
 export MOCK_TM_MODE=malformed
 run_check

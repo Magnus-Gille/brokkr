@@ -21,7 +21,7 @@ while IFS= read -r unit; do
     else
       printf 'ok - direct ExecStart script is executable: %s\n' "$script"
     fi
-  done < <(sed -nE 's@^ExecStart=(/opt/brokkr|%h/repos/brokkr)/(scripts/[A-Za-z0-9._/-]+\.sh)([[:space:]].*)?$@\2@p' "$unit")
+  done < <(sed -nE 's@^ExecStart=(/opt/brokkr|%h/repos/brokkr)/((scripts|timemachine)/[A-Za-z0-9._/-]+\.sh)([[:space:]].*)?$@\2@p' "$unit")
 done < <(find "$ROOT/systemd" -type f -name '*.service' -print | sort)
 
 if [ "$FOUND" -eq 0 ]; then
