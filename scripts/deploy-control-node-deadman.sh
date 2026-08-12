@@ -395,8 +395,11 @@ retire_legacy_install() {
 LEGACY_CONFIGURED=0
 LEGACY_STATE_NAME=""
 validate_legacy_identity
-retire_legacy_install
+# Legacy retirement stops and removes a previously healthy monitor. Arm the
+# rollback trap before entering it, so every failure within that transaction
+# restores the legacy units, timer state, and copied counters.
 transaction_mutated=1
+retire_legacy_install
 
 install -d -m 0755 "$UNIT_DIR"
 if [[ "$prior_timer_active" == 1 ]]; then
