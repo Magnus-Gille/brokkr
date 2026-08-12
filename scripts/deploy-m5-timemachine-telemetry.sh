@@ -33,12 +33,16 @@ release="$release_root/releases/$expected_revision"
 unit_dir="$config_home/systemd/user"
 unit="$unit_dir/brokkr-timemachine-telemetry.service"
 timer="$unit_dir/brokkr-timemachine-telemetry.timer"
+# This is intentionally the exact path allowed by the unit's ReadWritePaths.
+# It must exist before the service namespace is constructed; telemetry.sh cannot
+# create it after systemd has rejected the namespace setup.
+state_dir="$HOME/.local/state/brokkr"
 if [ -z "$apply" ]; then
   echo "DRY-RUN: verified source $expected_revision; release target $release"
   exit 0
 fi
 
-install -d -m 700 "$release_root"
+install -d -m 700 "$release_root" "$state_dir"
 stage="$(mktemp -d "$release_root/.stage.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT
 install -d -m 700 "$stage/timemachine" "$stage/heimdall" "$unit_dir" "$release_root/releases"
@@ -53,5 +57,11 @@ sed "s/@REVISION@/$expected_revision/g" "$HERE/systemd/m5/user/brokkr-timemachin
 install -m 644 "$rendered" "$unit"
 install -m 644 "$HERE/systemd/m5/user/brokkr-timemachine-telemetry.timer" "$timer"
 systemctl --user daemon-reload
-systemctl --user enable brokkr-timemachine-telemetry.timer
-echo "installed revision-bound release; rollback: restore $unit.previous-$expected_revision (if present), disable timer, daemon-reload"
+# A source warning is valid telemetry and telemetry.sh exits zero after a
+# successful delivery.  Validate the actual installed unit before its timer is
+# activated, so a bad source/credential/transport does not look installed.
+systemctl --user start brokkr-timemachine-telemetry.service
+systemctl --user enable --now brokkr-timemachine-telemetry.timer
+systemctl --user is-enabled --quiet brokkr-timemachine-telemetry.timer
+systemctl --user is-active --quiet brokkr-timemachine-telemetry.timer
+echo "installed revision-bound release; timer is enabled and active; rollback: restore $unit.previous-$expected_revision (if present), disable timer, daemon-reload"

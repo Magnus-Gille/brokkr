@@ -14,4 +14,6 @@ ProtectSystem=full
 ProtectHome=read-only
 # The producer may write only its own cached snapshot and delivery stamps.
 ReadWritePaths=%h/.local/state/brokkr
-TimeoutStartSec=30
+# The probe allows 20 seconds and the authenticated delivery allows 10.  Keep
+# a 15-second margin for startup, snapshot generation, and state stamping.
+TimeoutStartSec=45

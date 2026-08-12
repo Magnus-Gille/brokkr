@@ -10,11 +10,12 @@ printf 'BROKKR_TM_BANDS_DIR=/private/bands\n' > "$HOME_DIR/.config/brokkr/timema
 printf 'HEIMDALL_HUB_URL=https://example.invalid/api\nHEIMDALL_FLEET_TOKEN=test\n' > "$HOME_DIR/.config/brokkr/heimdall.env"; chmod 600 "$HOME_DIR/.config/brokkr"/*.env
 cat > "$TMP/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SYSTEMCTL_LOG:?}"
 exit 0
 EOF
 chmod +x "$TMP/bin/systemctl"
 SCRIPT="$REPO/scripts/deploy-m5-timemachine-telemetry.sh"
-HOST_NAME="$(hostname)"; export HOME="$HOME_DIR" PATH="$TMP/bin:$PATH" BROKKR_M5_HOSTNAME="$HOST_NAME"
+HOST_NAME="$(hostname)"; export HOME="$HOME_DIR" PATH="$TMP/bin:$PATH" BROKKR_M5_HOSTNAME="$HOST_NAME" SYSTEMCTL_LOG="$TMP/systemctl.log"
 # CI may export XDG_CONFIG_HOME for the runner; this fixture intentionally
 # exercises the HOME-default install layout it created above.
 unset XDG_CONFIG_HOME
@@ -29,4 +30,8 @@ RC=0; run "$SCRIPT" "$REPO" "$SHA" --apply
 UNIT="$HOME_DIR/.config/systemd/user/brokkr-timemachine-telemetry.service"
 if [[ "$RC" -eq 0 && -f "$UNIT" ]]; then ok "exact clean source installs release"; else bad "exact clean source installs release"; printf '  fixture apply output: %s\n' "$OUT"; fi
 check "installed unit avoids canonical checkout" '! grep -q "$REPO" "$UNIT" && grep -q "/releases/$SHA/" "$UNIT"'
+check "installer creates unit state directory before first start" '[[ -d "$HOME_DIR/.local/state/brokkr" && "$(stat -f %Lp "$HOME_DIR/.local/state/brokkr" 2>/dev/null || stat -c %a "$HOME_DIR/.local/state/brokkr")" == 700 ]]'
+check "runtime service validation precedes timer activation" '[[ "$(grep -nFx -- "--user start brokkr-timemachine-telemetry.service" "$TMP/systemctl.log" | cut -d: -f1)" -lt "$(grep -nFx -- "--user enable --now brokkr-timemachine-telemetry.timer" "$TMP/systemctl.log" | cut -d: -f1)" ]]'
+check "timer is enabled and active after install" 'grep -qFx -- "--user is-enabled --quiet brokkr-timemachine-telemetry.timer" "$TMP/systemctl.log" && grep -qFx -- "--user is-active --quiet brokkr-timemachine-telemetry.timer" "$TMP/systemctl.log"'
+check "unit timeout exceeds sequential probe and delivery budgets" '[[ "$(sed -nE "s/^TimeoutStartSec=([0-9]+)$/\\1/p" "$ROOT/systemd/m5/user/brokkr-timemachine-telemetry.service")" -gt 30 ]]'
 echo "PASS=$PASS FAIL=$FAIL"; [[ "$FAIL" -eq 0 ]]

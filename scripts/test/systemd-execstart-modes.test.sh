@@ -7,11 +7,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FAIL=0
 FOUND=0
+TELEMETRY_FOUND=0
 
 while IFS= read -r unit; do
   while IFS= read -r script; do
     [ -n "$script" ] || continue
     FOUND=$((FOUND + 1))
+    if [ "$script" = "timemachine/telemetry.sh" ]; then
+      TELEMETRY_FOUND=1
+    fi
     if [ ! -f "$ROOT/$script" ]; then
       printf 'not ok - ExecStart references missing repository script: %s\n' "$script" >&2
       FAIL=$((FAIL + 1))
@@ -21,7 +25,7 @@ while IFS= read -r unit; do
     else
       printf 'ok - direct ExecStart script is executable: %s\n' "$script"
     fi
-  done < <(sed -nE 's@^ExecStart=(/opt/brokkr|%h/repos/brokkr)/((scripts|timemachine)/[A-Za-z0-9._/-]+\.sh)([[:space:]].*)?$@\2@p' "$unit")
+  done < <(sed -nE 's;^ExecStart=(/opt/brokkr|%h/repos/brokkr|%h/.local/lib/brokkr/timemachine-telemetry/releases/@REVISION@)/((scripts|timemachine)/[A-Za-z0-9._/-]+\.sh)([[:space:]].*)?$;\2;p' "$unit")
 done < <(find "$ROOT/systemd" -type f -name '*.service' -print | sort)
 
 if [ "$FOUND" -eq 0 ]; then
@@ -30,3 +34,4 @@ if [ "$FOUND" -eq 0 ]; then
 fi
 
 [ "$FAIL" -eq 0 ]
+[ "$TELEMETRY_FOUND" -eq 1 ] || { echo 'not ok - Time Machine telemetry service was not discovered' >&2; exit 1; }
