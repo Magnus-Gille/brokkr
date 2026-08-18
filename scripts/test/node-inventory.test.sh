@@ -364,6 +364,20 @@ check assert "$TMP/down.json" \
 nas_mocks
 mock tailscale <<'EOF'
 #!/bin/sh
+echo '{"BackendState":"NeedsLogin"}'
+EOF
+run_inventory BROKKR_NODE_ID=fixture-nas BROKKR_INVENTORY_NOW=2026-07-23T10:00:00Z \
+  BROKKR_INVENTORY_OVERLAY="$NAS_OVERLAY" >"$TMP/needs-login.json" 2>"$TMP/needs-login.err"
+check assert "$TMP/needs-login.json" \
+  '!r.network_capabilities.includes("tailnet")' \
+  'r.capability_status === "unknown"' \
+  'r.extensions.some((e) => e.id === "probe-failed-tailnet-auth-required")' \
+  '!r.extensions.some((e) => e.id === "probe-failed-tailnet-stopped")'
+grep -q 'partial probes=tailnet-auth-required' "$TMP/needs-login.err"
+
+nas_mocks
+mock tailscale <<'EOF'
+#!/bin/sh
 echo '{"BackendState":"Running","Self":{"Online":false}}'
 EOF
 run_inventory BROKKR_NODE_ID=fixture-nas BROKKR_INVENTORY_NOW=2026-07-23T10:00:00Z \

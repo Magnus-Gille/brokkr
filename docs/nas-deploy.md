@@ -20,17 +20,25 @@ BROKKR_HEIMDALL_SOURCE_ENV=/etc/brokkr/heimdall-source.env \
   ./scripts/deploy-nas.sh
 ```
 
-The optional Heimdall source is a server-side, root-owned regular file with mode
+The optional protected runtime source is a server-side, root-owned regular file with mode
 `0400` or `0600`. It must contain exactly one non-empty
-`HEIMDALL_HUB_URL=` and `HEIMDALL_FLEET_TOKEN=` assignment. The deployer copies
-only those assignments into the runtime user's `~/.config/brokkr/env` with mode
+`HEIMDALL_HUB_URL=` and `HEIMDALL_FLEET_TOKEN=` assignment, plus exactly one
+valid `BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=` (`disabled` or `monitored`) and
+`BROKKR_TAILSCALE_EXPECTED_DNS_NAME=` assignment. It may contain one positive
+integer `BROKKR_TAILSCALE_EXPIRY_WARN_SECS=` override; the default is 14 days.
+The deployer copies only these allow-listed assignments into the runtime user's
+`~/.config/brokkr/env` with mode
 `0600`; it never prints their values or the source path. Omitting the source
 preserves an existing runtime environment when it is a non-empty, non-symlink,
 runtime-user-owned and readable regular file with mode `0400` or `0600`. The
-deployer checks only that file's metadata, not credential values, and the
+deployer validates the non-secret Tailscale policy shape without printing the
+private identity or inspecting the Heimdall credential value, and the
 immediately triggered health snapshot remains the delivery check. With neither
 a source nor an existing runtime environment, pushes remain intentionally
 unconfigured and the deployer reports that state.
+
+See the [Tailscale authentication recovery runbook](../runbooks/tailscale-auth-recovery.md)
+for the policy decision, protected example, and reboot acceptance procedure.
 
 Before synchronizing a first release, the deployer creates the nested target as
 the runtime user. An existing target must be a non-symlink, runtime-user-owned,

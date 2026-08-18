@@ -112,7 +112,9 @@ ssh "$NAS" "
 
   runtime_env='$RUNTIME_HOME/.config/brokkr/env'
 
-  # Copy only the two expected assignments from a protected server-side source.
+  # Copy only the expected Heimdall and Tailscale-policy assignments from a
+  # protected server-side source. The expected DNS name is operator-local
+  # topology and stays in the same protected runtime file as the credential.
   # Never print the source path or its values. When no provisioning source was
   # supplied, inspect only metadata for an existing runtime env; the health
   # snapshot below remains the semantic delivery check.
@@ -129,8 +131,21 @@ ssh "$NAS" "
       echo 'ERROR: Heimdall source must contain exactly one non-empty URL and fleet token' >&2
       exit 2
     fi
+    policy_count=\$(sudo grep -Ec '^BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=' '$HEIMDALL_SOURCE_ENV' || true)
+    expected_count=\$(sudo grep -Ec '^BROKKR_TAILSCALE_EXPECTED_DNS_NAME=' '$HEIMDALL_SOURCE_ENV' || true)
+    warn_count=\$(sudo grep -Ec '^BROKKR_TAILSCALE_EXPIRY_WARN_SECS=' '$HEIMDALL_SOURCE_ENV' || true)
+    if [ \"\$policy_count\" -ne 1 ] \
+      || [ \"\$(sudo grep -Ec '^BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=(disabled|monitored)$' '$HEIMDALL_SOURCE_ENV')\" -ne 1 ] \
+      || [ \"\$expected_count\" -ne 1 ] \
+      || [ \"\$(sudo grep -Ec '^BROKKR_TAILSCALE_EXPECTED_DNS_NAME=[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?[.]?$' '$HEIMDALL_SOURCE_ENV')\" -ne 1 ] \
+      || sudo grep -Eq '^BROKKR_TAILSCALE_EXPECTED_DNS_NAME=.*[.][.]' '$HEIMDALL_SOURCE_ENV' \
+      || [ \"\$warn_count\" -gt 1 ] \
+      || { [ \"\$warn_count\" -eq 1 ] && [ \"\$(sudo grep -Ec '^BROKKR_TAILSCALE_EXPIRY_WARN_SECS=[1-9][0-9]*$' '$HEIMDALL_SOURCE_ENV')\" -ne 1 ]; }; then
+      echo 'ERROR: Tailscale policy source assignments are missing or invalid' >&2
+      exit 2
+    fi
     sudo install -d -m 0700 -o '$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr'
-    sudo sh -c \"umask 077; grep -E '^HEIMDALL_(HUB_URL|FLEET_TOKEN)=' '$HEIMDALL_SOURCE_ENV' > '$RUNTIME_HOME/.config/brokkr/env'\"
+    sudo sh -c \"umask 077; grep -E '^HEIMDALL_(HUB_URL|FLEET_TOKEN)=|^BROKKR_TAILSCALE_(KEY_EXPIRY_POLICY|EXPECTED_DNS_NAME|EXPIRY_WARN_SECS)=' '$HEIMDALL_SOURCE_ENV' > '$RUNTIME_HOME/.config/brokkr/env'\"
     sudo chown '$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr/env'
     sudo chmod 0600 '$RUNTIME_HOME/.config/brokkr/env'
     echo '   Heimdall runtime environment provisioned from protected source'
@@ -147,6 +162,19 @@ ssh "$NAS" "
       400|600) ;;
       *) echo 'ERROR: preserved Heimdall runtime environment has unsafe permissions' >&2; exit 2 ;;
     esac
+    policy_count=\$(sudo grep -Ec '^BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=' \$runtime_env || true)
+    expected_count=\$(sudo grep -Ec '^BROKKR_TAILSCALE_EXPECTED_DNS_NAME=' \$runtime_env || true)
+    warn_count=\$(sudo grep -Ec '^BROKKR_TAILSCALE_EXPIRY_WARN_SECS=' \$runtime_env || true)
+    if [ \"\$policy_count\" -ne 1 ] \
+      || [ \"\$(sudo grep -Ec '^BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=(disabled|monitored)$' \$runtime_env)\" -ne 1 ] \
+      || [ \"\$expected_count\" -ne 1 ] \
+      || [ \"\$(sudo grep -Ec '^BROKKR_TAILSCALE_EXPECTED_DNS_NAME=[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?[.]?$' \$runtime_env)\" -ne 1 ] \
+      || sudo grep -Eq '^BROKKR_TAILSCALE_EXPECTED_DNS_NAME=.*[.][.]' \$runtime_env \
+      || [ \"\$warn_count\" -gt 1 ] \
+      || { [ \"\$warn_count\" -eq 1 ] && [ \"\$(sudo grep -Ec '^BROKKR_TAILSCALE_EXPIRY_WARN_SECS=[1-9][0-9]*$' \$runtime_env)\" -ne 1 ]; }; then
+      echo 'ERROR: preserved runtime Tailscale policy assignments are missing or invalid' >&2
+      exit 2
+    fi
     echo '   Heimdall runtime environment preserved (provisioning source omitted)'
   else
     echo '   WARNING: Heimdall runtime environment not configured; pushes will be skipped'

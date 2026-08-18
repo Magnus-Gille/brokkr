@@ -4,6 +4,13 @@ This directory contains public, placeholder-only examples for host-level network
 configuration. Live tunnel IDs, credential paths, ingress domains, addresses, and
 host inventory are operator-local data and must not be committed.
 
+The local [`check-tailscale-auth.py`](check-tailscale-auth.py) check validates a
+running, online Tailscale identity and an explicit `disabled` or `monitored`
+node-key expiry policy without printing the host's DNS name or addresses. The
+NAS health snapshot runs it every 15 minutes. Use the public, placeholder-only
+[`Tailscale authentication recovery runbook`](../runbooks/tailscale-auth-recovery.md)
+for an attended `NeedsLogin` recovery and post-reboot verification.
+
 ## cloudflared
 
 Copy [`cloudflared/config.example.yml`](cloudflared/config.example.yml) to the

@@ -5,7 +5,7 @@
 # COMPOSES the platform checks into a heimdall.json-shaped payload (the same contract the
 # services serve, e.g. mimir's /heimdall.json) and prints it to stdout.
 #
-# Runs ON the NAS Pi (it invokes the disk checks). The Time Machine check is macOS-only and
+# Runs ON the NAS Pi (it invokes the disk and Tailscale-auth checks). The Time Machine check is macOS-only and
 # is reported separately from the Mac; feed its result in via $BROKKR_TM_STATUS plus
 # $BROKKR_TM_OBSERVED_AT (epoch seconds) if desired. Undated/stale evidence stays unknown.
 #
@@ -51,6 +51,7 @@ run_check() {
 
 run_check "disk-mount"    "$HERE/disk/check-mount.sh"
 run_check "disk-capacity" "$HERE/disk/check-capacity.sh"
+run_check "tailscale-auth" "$HERE/network/check-tailscale-auth.py"
 
 # Time Machine can only be observed on the Mac. An absent/invalid Mac-side result is
 # therefore a WARN with explicit UNKNOWN detail, never an implicit platform PASS.
