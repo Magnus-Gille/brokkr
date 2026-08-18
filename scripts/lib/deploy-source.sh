@@ -127,6 +127,7 @@ require_brokkr_deploy_source_binding() {
 
 materialize_brokkr_deploy_payload() {
   local source_root=${1:-} revision=${2:-}
+  local archive_file
 
   is_full_commit_sha "$revision" || {
     echo "ERROR: deploy payload requires an explicit full commit SHA" >&2
@@ -142,9 +143,17 @@ materialize_brokkr_deploy_payload() {
     echo "ERROR: could not create deploy payload root" >&2
     return 1
   }
-  if ! git -C "$source_root" archive "$revision" | tar -x -C "$DEPLOY_PAYLOAD_ROOT"; then
+  # Do not pipe `git archive` directly into BSD tar. BSD tar can close the pipe
+  # after the tar end markers while git is still flushing padding, which makes
+  # git exit on SIGPIPE under the caller's `pipefail` despite a complete
+  # extraction. Materialize the bounded committed archive first so both stages
+  # have an independently verifiable exit status.
+  archive_file="$DEPLOY_PAYLOAD_PARENT/payload.tar"
+  if ! git -C "$source_root" archive --format=tar --output="$archive_file" "$revision" \
+    || ! tar -xf "$archive_file" -C "$DEPLOY_PAYLOAD_ROOT"; then
     rm -rf "$DEPLOY_PAYLOAD_PARENT"
     echo "ERROR: could not materialize committed deploy payload" >&2
     return 1
   fi
+  rm -f "$archive_file"
 }

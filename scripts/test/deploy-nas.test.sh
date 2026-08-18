@@ -145,7 +145,7 @@ export TMPDIR="$TMP/payload-tmp"
 export MOCK_MUTATE_SOURCE="$SOURCE"
 printf 'ignored-secret\n' >"$SOURCE/.env"
 printf 'ignored-status\n' >"$SOURCE/STATUS.md"
-printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
+printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
 
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
@@ -215,16 +215,40 @@ check "health unit is rendered for the explicit runtime layout" 'grep -Fqx "User
 check "failure services are rendered for the explicit runtime layout" 'grep -Fqx "User=$BROKKR_RUNTIME_USER" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure@.service" && grep -Fqx "WorkingDirectory=$BROKKR_DEPLOY_TARGET" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure-sweep.service" && grep -Fqx "ExecStart=$BROKKR_DEPLOY_TARGET/scripts/systemd-failure-monitor.sh --sweep" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure-sweep.service"'
 check "registry and executable/unit validation happen before systemd mutation" 'grep -q "sudo systemd-analyze verify" "$CALLS" && [[ "$(grep -n "sudo systemd-analyze verify" "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n "/etc/systemd/system/brokkr-health.service" "$CALLS" | head -1 | cut -d: -f1)" ]]'
 check "protected Heimdall values and source path are not printed" '[[ "$OUT" != *secret-sentinel* && "$OUT" != *"$BROKKR_HEIMDALL_SOURCE_ENV"* ]] && ! grep -Fq secret-sentinel "$CALLS" && ! grep -Fq "$BROKKR_HEIMDALL_SOURCE_ENV" "$CALLS"'
+check "protected source provisions only explicit Heimdall and Tailscale assignments" 'grep -Fq "BROKKR_TAILSCALE_(KEY_EXPIRY_POLICY|EXPECTED_DNS_NAME|EXPIRY_WARN_SECS)" "$CALLS"'
+
+: >"$CALLS"
+printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
+run
+check "protected source without explicit key-expiry policy fails before systemd mutation" '[[ "$RC" -ne 0 && "$OUT" == *"Tailscale policy"* ]] && ! grep -q "/etc/systemd/system\|systemctl" "$CALLS"'
+
+: >"$CALLS"
+printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=invalid\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
+run
+check "protected source with invalid key-expiry policy fails before systemd mutation" '[[ "$RC" -ne 0 && "$OUT" == *"Tailscale policy"* ]] && ! grep -q "/etc/systemd/system\|systemctl" "$CALLS"'
+
+: >"$CALLS"
+printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=disabled\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=bad..name.example\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
+run
+check "protected source with invalid expected identity fails without leaking it" '[[ "$RC" -ne 0 && "$OUT" == *"Tailscale policy"* && "$OUT" != *"bad..name"* ]] && ! grep -q "/etc/systemd/system\|systemctl" "$CALLS"'
+
+printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
 
 : >"$CALLS"
 runtime_env="$BROKKR_RUNTIME_HOME/.config/brokkr/env"
 mkdir -p "$(dirname "$runtime_env")"
-printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=preserved-secret-sentinel\n' >"$runtime_env"
+printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=preserved-secret-sentinel\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=disabled\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' >"$runtime_env"
 chmod 600 "$runtime_env"
 unset BROKKR_HEIMDALL_SOURCE_ENV
 run
 check "omitted source preserves and reports an existing protected runtime env" '[[ "$RC" -eq 0 && "$OUT" == *"Heimdall runtime environment preserved"* && "$OUT" != *"pushes will be skipped"* ]]'
 check "preserved runtime credentials are not printed" '[[ "$OUT" != *preserved-secret-sentinel* ]] && ! grep -Fq preserved-secret-sentinel "$CALLS"'
+
+: >"$CALLS"
+printf 'BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored\n' >>"$runtime_env"
+run
+check "duplicate preserved Tailscale policy fails before systemd mutation" '[[ "$RC" -ne 0 && "$OUT" == *"Tailscale policy"* ]] && ! grep -q "/etc/systemd/system\|systemctl" "$CALLS"'
+sed -i.bak '$d' "$runtime_env"; rm -f "$runtime_env.bak"
 
 : >"$CALLS"
 export MOCK_RUNTIME_MODE=644

@@ -38,9 +38,16 @@ cat > "$TMP/bin/date" <<'EOF'
 if [ "${MOCK_DATE_FAIL:-0}" = 1 ]; then exit 74; fi
 exec /bin/date "$@"
 EOF
-chmod +x "$TMP/bin/mountpoint" "$TMP/bin/findmnt" "$TMP/bin/df" "$TMP/bin/date"
+cat > "$TMP/bin/tailscale" <<'EOF'
+#!/usr/bin/env bash
+[[ "$*" == "status --json" ]] || exit 64
+printf '%s\n' '{"BackendState":"Running","TailscaleIPs":["192.0.2.10"],"Self":{"Online":true,"DNSName":"nas.example.ts.net"}}'
+EOF
+chmod +x "$TMP/bin/mountpoint" "$TMP/bin/findmnt" "$TMP/bin/df" "$TMP/bin/date" "$TMP/bin/tailscale"
 export PATH="$TMP/bin:$PATH"
 export BROKKR_DISK_MOUNT="$TMP/mount" BROKKR_STATE_DIR="$TMP/state"
+export BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=disabled
+export BROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net
 
 PASS=0
 FAIL=0
@@ -64,6 +71,7 @@ run_report
 check "missing Mac evidence keeps report valid" '[[ "$RC" -eq 0 ]] && printf "%s" "$OUT" | python3 -m json.tool >/dev/null'
 check "missing Mac evidence makes aggregate warn" '[[ "$(printf "%s" "$OUT" | json_value '\''data["status"]'\'')" == warn ]]'
 check "missing Mac evidence is explicit and actionable" '[[ "$(printf "%s" "$OUT" | json_value '\''next(c["detail"] for c in data["checks"] if c["name"] == "timemachine")'\'')" == UNKNOWN:* ]]'
+check "healthy Tailscale authentication is included" '[[ "$(printf "%s" "$OUT" | json_value '\''next(c["status"] for c in data["checks"] if c["name"] == "tailscale-auth")'\'')" == pass ]]'
 
 export BROKKR_TM_STATUS=pass BROKKR_TM_DETAIL='OK: Mac-side backup checked' BROKKR_TM_OBSERVED_AT=1999999990
 run_report
