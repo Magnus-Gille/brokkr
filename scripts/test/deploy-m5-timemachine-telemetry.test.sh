@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; ROOT="$(cd "$HERE/../.." && pwd)"
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# shellcheck source=scripts/test/lib/fixture-cleanup.sh
+source "$HERE/lib/fixture-cleanup.sh"
+TMP="$(mktemp -d)"; readonly TMP; trap 'fixture_cleanup_on_exit "$TMP"' EXIT
 REPO="$TMP/repo"; HOME_DIR="$TMP/home"; mkdir -p "$REPO" "$HOME_DIR/.config/brokkr" "$TMP/bin"; REPO="$(cd "$REPO" && pwd -P)"
 cp -R "$ROOT/scripts" "$ROOT/timemachine" "$ROOT/heimdall" "$ROOT/systemd" "$REPO/"
 git init -q "$REPO"; git -C "$REPO" config user.name test; git -C "$REPO" config user.email test@example.invalid
