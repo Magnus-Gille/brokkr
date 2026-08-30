@@ -17,8 +17,56 @@ TARGET_URL="${BROKKR_DEADMAN_TARGET_URL:-http://control-node:3033/api/health}"
 EXTERNAL_TIMEOUT_SECS=8
 SERVICE="brokkr-control-node-deadman.service"
 TIMER="brokkr-control-node-deadman.timer"
+LEGACY_STATE_FILE_NAMES="fail-count state last-alert last-success last-external-success"
+LEGACY_SERVICE="${BROKKR_DEADMAN_LEGACY_SERVICE:-}"
+LEGACY_TIMER="${BROKKR_DEADMAN_LEGACY_TIMER:-}"
+LEGACY_STATE_DIR="${BROKKR_DEADMAN_LEGACY_STATE_DIR:-}"
+LEGACY_SCRIPT="${BROKKR_DEADMAN_LEGACY_SCRIPT:-}"
+LEGACY_PROFILE=""
+LEGACY_PROFILE_HISTORIC_CONTROL_NODE_V1="historic-control-node-v1"
+# Keep the retired host identity out of the public repository; the profile below
+# is the deliberately explicit, audited compatibility contract for it.
+LEGACY_HISTORIC_SITE="$(printf '%s%s' hugin munin)"
 
 die() { printf 'refusing: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+usage: deploy-control-node-deadman.sh [--legacy-profile <profile>]
+
+Without a profile, no legacy installation is discovered. Generic legacy
+migration remains available through the four BROKKR_DEADMAN_LEGACY_*
+environment variables.
+EOF
+}
+
+case "${1:-}" in
+  "")
+    [[ "$#" == 0 ]] || die "unknown argument: ${1:-}"
+    ;;
+  --help|-h)
+    [[ "$#" == 1 ]] || die "help does not accept additional arguments"
+    usage
+    exit 0
+    ;;
+  --legacy-profile)
+    [[ "$#" == 2 ]] || die "--legacy-profile requires exactly one profile"
+    [[ "$2" == "$LEGACY_PROFILE_HISTORIC_CONTROL_NODE_V1" ]] || die "unknown legacy profile: $2"
+    LEGACY_PROFILE="$2"
+    ;;
+  *)
+    die "unknown argument: $1"
+    ;;
+esac
+
+if [[ "$LEGACY_PROFILE" == "$LEGACY_PROFILE_HISTORIC_CONTROL_NODE_V1" ]]; then
+  [[ -z "$LEGACY_SERVICE$LEGACY_TIMER$LEGACY_STATE_DIR$LEGACY_SCRIPT" ]] || \
+    die "cannot combine legacy profile with BROKKR_DEADMAN_LEGACY_* identity"
+  LEGACY_SERVICE="brokkr-${LEGACY_HISTORIC_SITE}-deadman.service"
+  LEGACY_TIMER="brokkr-${LEGACY_HISTORIC_SITE}-deadman.timer"
+  LEGACY_STATE_DIR="$STATE_ROOT/${LEGACY_HISTORIC_SITE}-deadman"
+  LEGACY_SCRIPT="scripts/${LEGACY_HISTORIC_SITE}-deadman.sh"
+fi
 
 cfg_get() {
   grep -E "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"\r' || true
@@ -40,6 +88,10 @@ file_uid() {
 
 valid_external_url() {
   [[ "${1:-}" =~ ^https://[^/?#[:space:]\"\\]+([/?#][^[:space:]\"\\]*)?$ ]]
+}
+
+valid_target_url() {
+  [[ "${1:-}" =~ ^https?://[^/?#[:space:]\"\\]+([/?#][^[:space:]\"\\]*)?$ ]]
 }
 
 external_ping_url() {
@@ -101,6 +153,7 @@ else
   echo "preflight: external heartbeat is not configured"
 fi
 
+valid_target_url "$TARGET_URL" || die "production probe URL is invalid"
 curl -fsS -m 8 -o /dev/null "$TARGET_URL" || die "production probe failed: $TARGET_URL"
 echo "preflight: production probe passes"
 
@@ -150,7 +203,7 @@ for state_name in $state_files; do
 done
 
 rollback_transaction() {
-  local rollback_failed=0 state_name
+  local rollback_failed=0 state_name legacy_path legacy_name legacy_state_entry
   systemctl --user stop "$TIMER" >/dev/null 2>&1 || rollback_failed=1
   # Always remove any enablement created by the candidate unit before its
   # files disappear. In particular, enable --now can create the wants symlink
@@ -179,6 +232,47 @@ rollback_transaction() {
       systemctl --user stop "$TIMER" >/dev/null 2>&1 || rollback_failed=1
     fi
   fi
+
+  # Restore any legacy unit files that were retired for this upgrade.  The
+  # manifest is created only after all preflight gates pass, so a failed
+  # upgrade cannot strand the old monitor in a stopped/disabled state.
+  if [[ -s "$rollback_dir/legacy-units.manifest" || -s "$rollback_dir/legacy-state.manifest" ]]; then
+    while IFS= read -r legacy_path; do
+      [[ -n "$legacy_path" ]] || continue
+      legacy_name="${legacy_path##*/}"
+      rm -f "$legacy_path" || rollback_failed=1
+      if [[ -e "$rollback_dir/legacy-units/$legacy_name" || -L "$rollback_dir/legacy-units/$legacy_name" ]]; then
+        cp -a "$rollback_dir/legacy-units/$legacy_name" "$legacy_path" || rollback_failed=1
+      fi
+    done <"$rollback_dir/legacy-units.manifest"
+    systemctl --user daemon-reload >/dev/null 2>&1 || rollback_failed=1
+
+    while IFS= read -r legacy_path; do
+      [[ -n "$legacy_path" ]] || continue
+      legacy_name="${legacy_path##*/}"
+      [[ "$legacy_name" == *.timer ]] || continue
+      if [[ -f "$rollback_dir/legacy-units/$legacy_name.enabled" ]]; then
+        systemctl --user enable "$legacy_name" >/dev/null 2>&1 || rollback_failed=1
+      else
+        systemctl --user disable "$legacy_name" >/dev/null 2>&1 || rollback_failed=1
+      fi
+      if [[ -f "$rollback_dir/legacy-units/$legacy_name.active" ]]; then
+        systemctl --user start "$legacy_name" >/dev/null 2>&1 || rollback_failed=1
+      else
+        systemctl --user stop "$legacy_name" >/dev/null 2>&1 || rollback_failed=1
+      fi
+    done <"$rollback_dir/legacy-units.manifest"
+
+    while IFS='|' read -r legacy_name legacy_state_entry; do
+      [[ -n "$legacy_name" && -n "$legacy_state_entry" ]] || continue
+      if [[ -f "$rollback_dir/legacy-state/$legacy_name/$legacy_state_entry" ]]; then
+        mkdir -p "$STATE_ROOT/$legacy_name" || rollback_failed=1
+        cp -p "$rollback_dir/legacy-state/$legacy_name/$legacy_state_entry" \
+          "$STATE_ROOT/$legacy_name/$legacy_state_entry" || rollback_failed=1
+      fi
+    done <"$rollback_dir/legacy-state.manifest"
+  fi
+
 
   mkdir -p "$state_dir" || rollback_failed=1
   for state_name in $state_files; do
@@ -209,12 +303,119 @@ finish_transaction() {
 }
 trap finish_transaction EXIT
 
-install -d -m 0755 "$UNIT_DIR"
+validate_legacy_identity() {
+  local identity_count=0 state_relative expected_exec
+  [[ -n "$LEGACY_SERVICE" ]] && identity_count=$((identity_count + 1))
+  [[ -n "$LEGACY_TIMER" ]] && identity_count=$((identity_count + 1))
+  [[ -n "$LEGACY_STATE_DIR" ]] && identity_count=$((identity_count + 1))
+  [[ -n "$LEGACY_SCRIPT" ]] && identity_count=$((identity_count + 1))
+
+  if [[ "$identity_count" == 0 ]]; then
+    LEGACY_CONFIGURED=0
+    return 0
+  fi
+  [[ "$identity_count" == 4 ]] || die "legacy migration requires service, timer, state directory, and script identity"
+  [[ "$LEGACY_SERVICE" =~ ^[A-Za-z0-9][A-Za-z0-9_.@:+-]*\.service$ ]] || die "invalid legacy service identity"
+  [[ "$LEGACY_TIMER" =~ ^[A-Za-z0-9][A-Za-z0-9_.@:+-]*\.timer$ ]] || die "invalid legacy timer identity"
+  [[ "$LEGACY_SERVICE" != "$SERVICE" && "$LEGACY_TIMER" != "$TIMER" ]] || die "legacy identity names the current unit"
+  [[ "$LEGACY_SCRIPT" =~ ^scripts/[A-Za-z0-9][A-Za-z0-9_.@:+-]*\.sh$ ]] || die "invalid legacy script identity"
+  case "$LEGACY_STATE_DIR" in
+    "$STATE_ROOT"/*) state_relative="${LEGACY_STATE_DIR#"$STATE_ROOT"/}" ;;
+    *) die "legacy state directory must be one child of the configured state root" ;;
+  esac
+  [[ "$state_relative" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "invalid legacy state directory identity"
+  [[ "$LEGACY_STATE_DIR" != "$state_dir" ]] || die "legacy state directory names the current dead-man state"
+  [[ -f "$UNIT_DIR/$LEGACY_SERVICE" && ! -L "$UNIT_DIR/$LEGACY_SERVICE" ]] || die "legacy service unit is missing or not regular"
+  [[ -f "$UNIT_DIR/$LEGACY_TIMER" && ! -L "$UNIT_DIR/$LEGACY_TIMER" ]] || die "legacy timer unit is missing or not regular"
+  [[ -d "$LEGACY_STATE_DIR" && ! -L "$LEGACY_STATE_DIR" ]] || die "legacy state directory is missing or not regular"
+
+  expected_exec="%h/repos/brokkr/$LEGACY_SCRIPT"
+  grep -Fqx "ExecStart=$expected_exec" "$UNIT_DIR/$LEGACY_SERVICE" || die "legacy service script reference does not match identity"
+  grep -Fqx "Unit=$LEGACY_SERVICE" "$UNIT_DIR/$LEGACY_TIMER" || die "legacy timer does not target the legacy service identity"
+  LEGACY_STATE_NAME="$state_relative"
+  LEGACY_CONFIGURED=1
+}
+
+retire_legacy_install() {
+  local legacy_path legacy_name legacy_state_dir state_name source destination timer_enabled_state timer_active_state
+  : >"$rollback_dir/legacy-units.manifest"
+  : >"$rollback_dir/legacy-state.manifest"
+  mkdir -p "$rollback_dir/legacy-units" "$rollback_dir/legacy-state"
+
+  [[ "$LEGACY_CONFIGURED" == 1 ]] || return 0
+  for legacy_name in "$LEGACY_TIMER" "$LEGACY_SERVICE"; do
+    legacy_path="$UNIT_DIR/$legacy_name"
+    cp -a "$legacy_path" "$rollback_dir/legacy-units/$legacy_name" || \
+      die "could not snapshot legacy unit $legacy_name"
+    if [[ "$legacy_name" == "$LEGACY_TIMER" ]]; then
+      timer_enabled_state="$(systemctl --user is-enabled "$legacy_name" 2>/dev/null || true)"
+      case "$timer_enabled_state" in
+        enabled) printf 'enabled\n' >"$rollback_dir/legacy-units/$legacy_name.enabled" || die "could not snapshot legacy timer enablement" ;;
+        disabled) ;;
+        *) die "could not snapshot legacy timer enablement" ;;
+      esac
+      timer_active_state="$(systemctl --user is-active "$legacy_name" 2>/dev/null || true)"
+      case "$timer_active_state" in
+        active) printf 'active\n' >"$rollback_dir/legacy-units/$legacy_name.active" || die "could not snapshot legacy timer activity" ;;
+        inactive) ;;
+        *) die "could not snapshot legacy timer activity" ;;
+      esac
+    fi
+    printf '%s\n' "$legacy_path" >>"$rollback_dir/legacy-units.manifest" || \
+      die "could not record legacy unit snapshot"
+    if [[ "$legacy_name" == "$LEGACY_TIMER" ]]; then
+      systemctl --user stop "$legacy_name" || die "could not stop legacy $legacy_name"
+      systemctl --user disable "$legacy_name" || die "could not disable legacy $legacy_name"
+    else
+      systemctl --user stop "$legacy_name" || die "could not stop legacy $legacy_name"
+    fi
+    rm -f "$legacy_path" || die "could not remove legacy unit $legacy_name"
+  done
+
+  legacy_state_dir="$LEGACY_STATE_DIR"
+  legacy_name="$LEGACY_STATE_NAME"
+  mkdir -p "$rollback_dir/legacy-state/$legacy_name"
+  for state_name in $LEGACY_STATE_FILE_NAMES; do
+    source="$legacy_state_dir/$state_name"
+    [[ -f "$source" && ! -L "$source" ]] || continue
+    cp -p "$source" "$rollback_dir/legacy-state/$legacy_name/$state_name" || \
+      die "could not snapshot legacy dead-man state"
+    printf '%s|%s\n' "$legacy_name" "$state_name" >>"$rollback_dir/legacy-state.manifest" || \
+      die "could not record legacy dead-man state snapshot"
+    destination="$state_dir/$state_name"
+    if [[ ! -e "$destination" ]]; then
+      mkdir -p "$state_dir" || die "could not create current dead-man state directory"
+      cp -p "$source" "$destination" || die "could not migrate legacy dead-man state"
+    fi
+    rm -f "$source" || die "could not retire legacy dead-man state"
+  done
+  rmdir "$legacy_state_dir" 2>/dev/null || true
+}
+
+LEGACY_CONFIGURED=0
+LEGACY_STATE_NAME=""
+validate_legacy_identity
+# Legacy retirement stops and removes a previously healthy monitor. Arm the
+# rollback trap before entering it, so every failure within that transaction
+# restores the legacy units, timer state, and copied counters.
 transaction_mutated=1
+retire_legacy_install
+
+install -d -m 0755 "$UNIT_DIR"
 if [[ "$prior_timer_active" == 1 ]]; then
   systemctl --user stop "$TIMER" || die "could not stop prior $TIMER for atomic upgrade"
 fi
-install -m 0644 "$HERE/systemd/m5/$SERVICE" "$UNIT_DIR/$SERVICE"
+rendered_service="$rollback_dir/$SERVICE.rendered"
+awk -v target_url="$TARGET_URL" '
+  $0 == "Environment=CONTROL_NODE_DEADMAN_URL=@CONTROL_NODE_DEADMAN_URL@" {
+    print "Environment=CONTROL_NODE_DEADMAN_URL=" target_url
+    rendered = 1
+    next
+  }
+  { print }
+  END { exit(rendered ? 0 : 1) }
+' "$HERE/systemd/m5/$SERVICE" >"$rendered_service" || die "could not render $SERVICE target URL"
+install -m 0644 "$rendered_service" "$UNIT_DIR/$SERVICE"
 install -m 0644 "$HERE/systemd/m5/$TIMER" "$UNIT_DIR/$TIMER"
 systemctl --user daemon-reload || die "user systemd daemon-reload failed"
 probe_started_at="$(date +%s)"

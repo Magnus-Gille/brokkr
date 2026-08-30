@@ -204,8 +204,41 @@ start the production service before considering recovery complete.
 ## Migration from earlier site-specific names
 
 This public interface replaces earlier site-specific script, unit, environment-variable, and state
-names. Before enabling this timer, disable and remove the corresponding locally named dead-man
-units, then run the installer above. Copy only non-secret counters that are still operationally
-useful into `~/.local/state/brokkr/control-node-deadman`; do not copy credentials into the state
-directory. No compatibility aliases are tracked because they would preserve private deployment
-identity in the public repository.
+names. A migration is deliberately explicit: set all four `BROKKR_DEADMAN_LEGACY_*` variables for
+the exact legacy service unit, timer unit, state directory, and script path before running the
+installer. The installer validates the finite unit/path grammar and exact service↔timer↔script
+correlation; the script identity must be one direct `scripts/*.sh` child with no traversal or
+additional path segment. It then snapshots and disables that one unit/timer, removes those stale unit files, and
+installs the current control-node pair as one transaction. With no legacy identity supplied, no
+legacy files or state are discovered. Only `fail-count`, `state`, `last-alert`, `last-success`, and
+`last-external-success` are migrated into `~/.local/state/brokkr/control-node-deadman`; credentials
+and unknown state files are never copied. In particular, `last-error` is arbitrary diagnostic or
+private content: the installer does not migrate, copy, or delete it, so it remains byte-for-byte in
+the legacy state directory. If a later installation gate fails, the legacy units, timer state, and
+migrated operational state are restored from the local rollback snapshot. No compatibility aliases
+are tracked because they would preserve private deployment identity in the public repository.
+
+For example, an operator migrating a `legacy-node-deadman` install can run:
+
+```bash
+BROKKR_DEADMAN_LEGACY_SERVICE=legacy-node-deadman.service \
+BROKKR_DEADMAN_LEGACY_TIMER=legacy-node-deadman.timer \
+BROKKR_DEADMAN_LEGACY_STATE_DIR="$HOME/.local/state/brokkr/legacy-node-deadman" \
+BROKKR_DEADMAN_LEGACY_SCRIPT=scripts/legacy-node-deadman.sh \
+./scripts/deploy-control-node-deadman.sh
+```
+
+The verified historical M5 installation has a dedicated opt-in
+`historic-control-node-v1` profile. It binds the exact retired service/timer pair,
+state directory, and script identity; it is never inferred from filenames. Run it
+only after confirming those four artifacts belong to the host:
+
+```bash
+./scripts/deploy-control-node-deadman.sh --legacy-profile historic-control-node-v1
+```
+
+The profile refuses any `BROKKR_DEADMAN_LEGACY_*` overrides, validates the service↔timer↔script
+correlation, snapshots timer state and operational counters, and uses the same transactional
+rollback as generic migration. The hermetic deployment test proves successful retirement,
+counter migration, timer disablement, and refusal before systemd mutation when the profile is
+mixed with an explicit identity.

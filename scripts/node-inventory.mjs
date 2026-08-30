@@ -297,6 +297,8 @@ if (tailscaleRes.status === "ok") {
   if (status !== null) {
     if (typeof status !== "object" || Array.isArray(status) || typeof status.BackendState !== "string") {
       failures.push("tailnet-malformed");
+    } else if (status.BackendState === "NeedsLogin") {
+      failures.push("tailnet-auth-required");
     } else if (status.BackendState !== "Running") {
       failures.push("tailnet-stopped");
     } else if (status.Self === null || typeof status.Self !== "object" || Array.isArray(status.Self) || typeof status.Self.Online !== "boolean") {
