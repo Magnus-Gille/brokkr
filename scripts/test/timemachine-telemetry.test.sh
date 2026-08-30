@@ -120,6 +120,7 @@ write_config "$TMP/bands"
 TZ=UTC touch -t 202607111200 "$TMP/bands/0/fresh-band"
 run
 check "stale band evidence is delivered as health failure" '[[ "$RC" -eq 0 && "$(state "data[\"status\"]")" == fail && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=stale_band_files"* ]]'
+check "stale-band delivery preserves failure state" '"$REAL_PYTHON" -c '\''import json,sys; r=json.load(open(sys.argv[1])); assert r["body"]["state"] == "fail"; assert "reason=stale_band_files" in r["body"]["message"]'\'' "$TMP/request.json"'
 
 write_config "$TMP/absent"
 run
@@ -167,9 +168,10 @@ check "authenticated delivery succeeds" '[[ "$RC" -eq 0 && "$OUT" == *"200 (stat
 check "actual Heimdall consumer shape uses the Time Machine panel" '"$REAL_PYTHON" -c '\''import json,sys; r=json.load(open(sys.argv[1])); assert r["authorization"] == "Bearer secret-sentinel"; assert r["body"] == {"service":"brokkr","panel":"timemachine","kind":"status","label":"Time Machine Freshness","state":"pass","message":"1 checks, all nominal"}; assert r["timeout"] == 10'\'' "$TMP/request.json"'
 
 rm -f "$TMP/request.json"
+TZ=UTC touch -t 202607111200 "$TMP/bands/0/fresh-band"
 export MOCK_DELIVERY_FAIL=1
 run_delivery
-check "delivery transport failure remains non-zero" '[[ "$RC" -ne 0 && "$OUT" == *"brokkr push failed"* && ! -e "$TMP/request.json" ]]'
+check "unhealthy-state delivery transport failure remains non-zero" '[[ "$RC" -ne 0 && "$(state "data[\"status\"]")" == fail && "$OUT" == *"brokkr push failed"* && ! -e "$TMP/request.json" ]]'
 unset MOCK_DELIVERY_FAIL
 
 rm -f "$TMP/request.json"
