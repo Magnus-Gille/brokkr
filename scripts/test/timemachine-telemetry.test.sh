@@ -23,6 +23,7 @@ EOF
 cat > "$TMP/bin/python3" <<'EOF'
 #!/usr/bin/env bash
 if [ "${MOCK_PYTHON_FAIL:-}" = snapshot ] && [ "$1" = - ] && [ "$#" -eq 3 ]; then exit 70; fi
+if [ "${MOCK_PYTHON_FAIL:-}" = probe ] && [[ "$1" == *destination-probe.py ]]; then exit 70; fi
 if [ "${MOCK_PROBE_TIMEOUT:-}" = 1 ] && [[ "$1" == *destination-probe.py ]]; then
   printf '%s\n' '{"status":"warn","reason":"scan_timeout","observed_at":1783947600,"count":0,"size_bytes":0}'
   exit 1
@@ -39,6 +40,8 @@ class Response:
     def __exit__(self, *_args): return False
 class Opener:
     def open(self, request, timeout):
+        if os.environ.get("MOCK_DELIVERY_FAIL"):
+            raise OSError("delivery fixture failure")
         with open(os.environ["MOCK_REQUEST_FILE"], "w", encoding="utf-8") as fh:
             json.dump({"authorization":request.get_header("Authorization"), "body":json.loads(request.data.decode()), "timeout":timeout}, fh)
         return Response()
@@ -116,28 +119,30 @@ check "leading whitespace before an absolute source fails closed" '[[ "$RC" -eq 
 write_config "$TMP/bands"
 TZ=UTC touch -t 202607111200 "$TMP/bands/0/fresh-band"
 run
-check "stale band evidence is fail" '[[ "$RC" -eq 2 && "$(state "data[\"status\"]")" == fail && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=stale_band_files"* ]]'
+check "stale band evidence is delivered as health failure" '[[ "$RC" -eq 0 && "$(state "data[\"status\"]")" == fail && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=stale_band_files"* ]]'
+check "stale-band delivery preserves failure state" '"$REAL_PYTHON" -c '\''import json,sys; r=json.load(open(sys.argv[1])); assert r["body"]["state"] == "fail"; assert "reason=stale_band_files" in r["body"]["message"]'\'' "$TMP/request.json"'
 
 write_config "$TMP/absent"
 run
-check "absent destination is explicit unknown" '[[ "$RC" -eq 1 && "$(state "data[\"status\"]")" == warn && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=source_unavailable"* ]]'
+check "absent destination warning is delivered successfully" '[[ "$RC" -eq 0 && "$(state "data[\"status\"]")" == warn && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=source_unavailable"* && "$OUT" == *"200 (state=warn)"* ]]'
+check "source-unavailable delivery preserves warning state" '"$REAL_PYTHON" -c '\''import json,sys; r=json.load(open(sys.argv[1])); assert r["body"]["state"] == "warn"; assert "reason=source_unavailable" in r["body"]["message"]'\'' "$TMP/request.json"'
 
 write_config "$TMP/bands"
 chmod 000 "$TMP/bands"
 run
-check "unreadable destination is explicit unknown" '[[ "$RC" -eq 1 && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=source_unreadable"* ]]'
+check "unreadable destination warning is delivered" '[[ "$RC" -eq 0 && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=source_unreadable"* ]]'
 chmod 700 "$TMP/bands"
 
 write_config "$TMP/bands"
 export MOCK_PROBE_TIMEOUT=1
 run
-check "bounded timeout is explicit unknown" '[[ "$RC" -eq 1 && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=scan_timeout"* ]]'
+check "bounded timeout warning is delivered" '[[ "$RC" -eq 0 && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=scan_timeout"* ]]'
 unset MOCK_PROBE_TIMEOUT
 
 ln -s "$TMP/bands" "$TMP/bands-link"
 write_config "$TMP/bands-link"
 run
-check "symlink destination fails closed" '[[ "$RC" -eq 1 && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=invalid_source"* ]]'
+check "symlink destination warning is delivered" '[[ "$RC" -eq 0 && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=invalid_source"* ]]'
 
 write_config "$TMP/bands/../bands"
 run
@@ -163,6 +168,18 @@ check "authenticated delivery succeeds" '[[ "$RC" -eq 0 && "$OUT" == *"200 (stat
 check "actual Heimdall consumer shape uses the Time Machine panel" '"$REAL_PYTHON" -c '\''import json,sys; r=json.load(open(sys.argv[1])); assert r["authorization"] == "Bearer secret-sentinel"; assert r["body"] == {"service":"brokkr","panel":"timemachine","kind":"status","label":"Time Machine Freshness","state":"pass","message":"1 checks, all nominal"}; assert r["timeout"] == 10'\'' "$TMP/request.json"'
 
 rm -f "$TMP/request.json"
+TZ=UTC touch -t 202607111200 "$TMP/bands/0/fresh-band"
+export MOCK_DELIVERY_FAIL=1
+run_delivery
+check "unhealthy-state delivery transport failure remains non-zero" '[[ "$RC" -ne 0 && "$(state "data[\"status\"]")" == fail && "$OUT" == *"brokkr push failed"* && ! -e "$TMP/request.json" ]]'
+unset MOCK_DELIVERY_FAIL
+
+rm -f "$TMP/request.json"
+export MOCK_PYTHON_FAIL=probe
+run_delivery
+check "probe execution failure remains non-zero" '[[ "$RC" -eq 2 && "$OUT" == *"probe produced no result"* && ! -e "$TMP/request.json" ]]'
+unset MOCK_PYTHON_FAIL
+
 # shellcheck disable=SC2034 # assertion consumes this through check/eval
 previous_snapshot="$(cat "$TMP/state/timemachine-health.json")"
 export MOCK_PYTHON_FAIL=snapshot
