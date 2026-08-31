@@ -112,16 +112,63 @@ check "cleanup refuses root" '[[ "$root_rc" -ne 0 ]]'
 check "cleanup refuses broad system temp parent" '[[ "$tmp_rc" -ne 0 ]]'
 check "cleanup refuses ordinary existing directory" '[[ "$ordinary_rc" -ne 0 && -d "$ordinary" ]]'
 check "cleanup refuses missing target" '[[ "$missing_rc" -ne 0 ]]'
-check "cleanup refuses non-private parent" '[[ "$broad_rc" -ne 0 && -d "$broad_target" ]]'
+check "cleanup refuses target with no allocation marker" '[[ "$broad_rc" -ne 0 && -d "$broad_target" ]]'
+
+# Each remaining guard needs a target that reaches it. A case rejected by an earlier guard would
+# assert nothing about the guard it is named for, so these trees are forged to be well-formed in
+# every respect except the single property under test.
+forge_allocation() {
+  local parent=$1 name=$2 mode=$3 identity_source=$4
+  local target="$parent/$name" marker="$parent/.brokkr-fixture.$name" identity
+
+  mkdir -p "$target"
+  if [[ "$identity_source" == self ]]; then
+    identity="$(fixture_cleanup_stat_field '%d:%i' '%d:%i' "$target")"
+  else
+    identity="$identity_source"
+  fi
+  printf 'brokkr-fixture-v1\n%s' "$identity" >"$marker"
+  chmod 600 "$marker"
+  chmod "$mode" "$parent"
+  printf '%s\n' "$target"
+}
+
+# Well-formed except the parent mode: only the ownership/mode guard can refuse this.
+marked_broad_parent="$TMP/marked-broad"
+mkdir -p "$marked_broad_parent"
+marked_broad="$(forge_allocation "$marked_broad_parent" fixture.ABCDEI 755 self)"
+# shellcheck disable=SC2034 # assertion expressions consume these through eval
+if fixture_cleanup_dir "$marked_broad" 2>/dev/null; then marked_broad_rc=0; else marked_broad_rc=$?; fi
+check "cleanup refuses an otherwise well-formed non-private parent" '[[ "$marked_broad_rc" -ne 0 && -d "$marked_broad" ]]'
+
+# Well-formed except the recorded identity: only the marker-identity guard can refuse this.
+forged_parent="$TMP/forged"
+mkdir -p "$forged_parent"
+forged="$(forge_allocation "$forged_parent" fixture.ABCDEJ 700 0:0)"
+# shellcheck disable=SC2034 # assertion expressions consume these through eval
+if fixture_cleanup_dir "$forged" 2>/dev/null; then forged_rc=0; else forged_rc=$?; fi
+check "cleanup refuses a marker whose recorded identity does not match" '[[ "$forged_rc" -ne 0 && -d "$forged" ]]'
 
 outside="$TMP/outside"
-link="$TMP/link"
 mkdir -p "$outside"
 printf 'protected\n' >"$outside/marker"
-ln -s "$outside" "$link"
+
+# A symlink named "link" is rejected by the basename guard, which would leave the symlink guard
+# itself unexercised. This one carries an allocation-shaped name and a marker so it reaches it.
+symlink_parent="$TMP/symlink-parent"
+mkdir -p "$symlink_parent"
+symlink_target="$symlink_parent/fixture.ABCDEK"
+ln -s "$outside" "$symlink_target"
+# Record the identity that stat actually reports for this path, so the identity guard passes on
+# both GNU (follows symlinks) and BSD (does not) and `-L` is the only guard left to refuse. With
+# it removed, cleanup would rename and delete the symlink's destination.
+symlink_identity="$(fixture_cleanup_stat_field '%d:%i' '%d:%i' "$symlink_target")"
+printf 'brokkr-fixture-v1\n%s' "$symlink_identity" >"$symlink_parent/.brokkr-fixture.fixture.ABCDEK"
+chmod 600 "$symlink_parent/.brokkr-fixture.fixture.ABCDEK"
+chmod 700 "$symlink_parent"
 # shellcheck disable=SC2034 # assertion expressions consume unsafe_rc through eval
-if fixture_cleanup_dir "$link"; then unsafe_rc=0; else unsafe_rc=$?; fi
-check "cleanup refuses a symlink target" '[[ "$unsafe_rc" -ne 0 && -L "$link" ]]'
+if fixture_cleanup_dir "$symlink_target" 2>/dev/null; then unsafe_rc=0; else unsafe_rc=$?; fi
+check "cleanup refuses an allocation-shaped symlink target" '[[ "$unsafe_rc" -ne 0 && -L "$symlink_target" ]]'
 check "cleanup refusal leaves symlink destination untouched" '[[ -f "$outside/marker" ]]'
 
 fixture="$(new_fixture)"

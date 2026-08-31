@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 # Bounded cleanup for hermetic test fixtures allocated by fixture_cleanup_alloc.
+#
+# Scope: these guards contain ACCIDENTS, not adversaries. They exist so this library can never
+# remove a directory it did not itself allocate when handed an empty, stale, mistyped or
+# unexpected path — the failure mode that turns a cleanup helper into data loss.
+#
+# They are deliberately NOT a security boundary against a same-UID process. Such a process can
+# already delete every one of these files directly, without involving this library at all, so
+# hardening the marker against forgery or closing the stat/rm TOCTOU window would buy no real
+# protection. Do not mistake the ownership, mode, marker and identity checks for defence against
+# a local attacker; they are assertions that the target is ours.
 
 fixture_cleanup_stat_field() {
   local field=$1 fallback=$2 path=$3
@@ -64,7 +74,7 @@ fixture_cleanup_dir() {
   basename=${target##*/}
   marker="$parent/.brokkr-fixture.$basename"
   if [[ -z "$target" || "$parent" == "$target" || "$parent" == / ||
-    ! "$basename" =~ ^fixture\.[[:alnum:]]{6}$ || ! -d "$parent" || -L "$parent" ||
+    ! "$basename" =~ ^fixture\.[A-Za-z0-9]{6}$ || ! -d "$parent" || -L "$parent" ||
     ! -d "$target" || -L "$target" || ! -f "$marker" || -L "$marker" ]]; then
     printf 'fixture cleanup refused unsafe or unallocated target: %s\n' "$target" >&2
     return 1
