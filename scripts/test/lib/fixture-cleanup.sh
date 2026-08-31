@@ -10,6 +10,25 @@ fixture_cleanup_stat_field() {
   stat -f "$fallback" "$path"
 }
 
+# Bounded listing of what is still inside a directory, so a recurrence is attributable to an
+# actual writer instead of an anonymous "Directory not empty". Entries are printed relative to
+# the fixture root, so nothing outside the fixture's own tree is ever disclosed.
+fixture_cleanup_residue() {
+  local root=$1 max=20 total=0 shown=0 entry
+
+  total="$(find "$root" -mindepth 1 2>/dev/null | wc -l | tr -d '[:space:]')" || total=0
+  while IFS= read -r entry; do
+    printf '  residue: %s\n' "${entry#"$root"/}" >&2
+    shown=$((shown + 1))
+  done < <(find "$root" -mindepth 1 -maxdepth 4 2>/dev/null | LC_ALL=C sort | head -n "$max")
+  if ((shown == 0)); then
+    printf '  residue: none visible\n' >&2
+  elif ((total > shown)); then
+    printf '  residue: %d further entries not listed (%d total)\n' \
+      "$((total - shown))" "$total" >&2
+  fi
+}
+
 fixture_cleanup_alloc() {
   local parent target basename identity marker
 
@@ -117,6 +136,7 @@ fixture_cleanup_dir() {
       fi
       if [[ -e "$target" || -L "$target" ]]; then
         printf 'fixture cleanup preserved replacement at: %s\n' "$target" >&2
+        fixture_cleanup_residue "$target"
         return 1
       fi
       printf 'fixture cleanup failed to remove private parent: %s\n' "$parent" >&2
@@ -125,12 +145,18 @@ fixture_cleanup_dir() {
       last_status=$?
     fi
     if ((attempt < 3)); then
-      sleep 0.01
+      # Escalating but still bounded. A racing writer holding an open descriptor needs more
+      # than a few milliseconds to finish; the success path never reaches this sleep at all.
+      case $attempt in
+        1) sleep 0.05 ;;
+        *) sleep 0.25 ;;
+      esac
     fi
   done
 
   printf 'fixture cleanup failed after 3 attempts (last status %d): %s\n' \
     "$last_status" "$quarantine" >&2
+  fixture_cleanup_residue "$quarantine"
   return 1
 }
 

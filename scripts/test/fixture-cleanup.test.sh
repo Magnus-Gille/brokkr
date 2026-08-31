@@ -133,6 +133,7 @@ check "transient cleanup retries quarantined identity" '[[ "$(cat "$TMP/state-tr
 check "transient cleanup preserves replacement at original path" '[[ -f "$fixture/marker" ]]'
 check "transient cleanup attributes preserved replacement" 'grep -q "fixture cleanup preserved replacement at" "$TMP/out-transient-17"'
 check "transient cleanup has no final failure attribution" '! grep -q "fixture cleanup failed" "$TMP/out-transient-17"'
+check "transient cleanup lists the replacement residue" 'grep -q "residue: marker" "$TMP/out-transient-17"'
 
 mkdir -p "$TMP/unrelated"
 printf 'protected\n' >"$TMP/unrelated/marker"
@@ -146,6 +147,8 @@ check "persistent cleanup attributes final failure" 'grep -q "fixture cleanup fa
 check "persistent cleanup passes only the quarantined target" '[[ "$(grep -Fc -- "-rf -- $fixture" "$TMP/calls-persistent-23")" -eq 0 ]]'
 check "persistent cleanup leaves quarantined fixture intact" '[[ -d "$(first_call_target "$TMP/calls-persistent-23")" ]]'
 check "persistent cleanup leaves unrelated data intact" '[[ -f "$TMP/unrelated/marker" ]]'
+check "persistent cleanup lists residue for attribution" 'grep -q "residue: .git/marker" "$TMP/out-persistent-23"'
+check "persistent cleanup residue stays relative to the fixture" '! grep -q "residue: /" "$TMP/out-persistent-23"'
 
 fixture="$(new_fixture)"
 FIXTURE_PARENTS+=("${fixture%/*}")
