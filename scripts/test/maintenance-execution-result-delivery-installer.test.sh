@@ -637,3 +637,43 @@ if run_installer "$ALIAS_DASH_PREFIX_DROPIN_ROOT" >"$TMP/alias-dash-prefix-dropi
 fi
 test ! -e "$ALIAS_DASH_PREFIX_DROPIN_ROOT/etc/systemd/system/brokkr-maintenance-execution-result-delivery.service"
 printf 'ok - installer rejects alias dash-prefix unit drop-ins discovered across configured roots\n'
+
+# Release staging must not stream `git archive` into a reader that can stop early. bsdtar exits at
+# the end-of-archive marker without draining the trailing padding, which SIGPIPEs git archive and,
+# under `set -o pipefail`, aborts the installer with 141 — the macOS failure in issue #119. The same
+# defect existed here as in the canary installer.
+#
+# The stub reproduces that reader behaviour on EVERY platform, so the regression is caught on the
+# Linux runner too, where GNU tar drains and the bug cannot otherwise appear. Only a real file
+# operand delegates to the real tar; `-f -` and `--file=-` still read stdin and must not qualify.
+mkdir -p "$TMP/sigpipe-bin"
+SIGPIPE_REAL_TAR="$(command -v tar)"
+cat >"$TMP/sigpipe-bin/tar" <<EOF
+#!/usr/bin/env bash
+prev=""
+for arg in "\$@"; do
+  operand=""
+  if [[ "\$prev" == -f || "\$prev" == --file ]]; then
+    operand="\$arg"
+  elif [[ "\$arg" == --file=* ]]; then
+    operand="\${arg#--file=}"
+  fi
+  if [[ -n "\$operand" && "\$operand" != - && -f "\$operand" ]]; then
+    exec "$SIGPIPE_REAL_TAR" "\$@"
+  fi
+  prev="\$arg"
+done
+dd bs=10240 count=1 >/dev/null 2>&1
+exit 0
+EOF
+chmod 0755 "$TMP/sigpipe-bin/tar"
+
+SIGPIPE_ROOT="$TMP/sigpipe-root"
+if ! run_installer "$SIGPIPE_ROOT" PATH="$TMP/sigpipe-bin:$TMP/bin:$PATH" \
+  >"$TMP/sigpipe.out" 2>&1; then
+  echo "installer failed against an early-exiting tar (issue #119 regression):" >&2
+  tail -5 "$TMP/sigpipe.out" >&2
+  exit 1
+fi
+test -z "$(find "$SIGPIPE_ROOT" -name 'release.tar' -print -quit)"
+printf 'ok - installer stages the release archive instead of streaming it into tar\n'

@@ -913,11 +913,21 @@ mkdir -p "$TMP/sigpipe-bin"
 REAL_TAR="$(command -v tar)"
 cat >"$TMP/sigpipe-bin/tar" <<EOF
 #!/usr/bin/env bash
-# Reading from a file is safe: no writer to signal. Delegate to the real tar.
+# Only a real file operand is safe: there is no writer to signal. \`-f -\` and \`--file=-\` still
+# read stdin, so they must NOT be treated as file-backed or the stub would wave through a
+# streaming regression.
+prev=""
 for arg in "\$@"; do
-  if [[ "\$arg" == -f || "\$arg" == --file || "\$arg" == --file=* ]]; then
+  operand=""
+  if [[ "\$prev" == -f || "\$prev" == --file ]]; then
+    operand="\$arg"
+  elif [[ "\$arg" == --file=* ]]; then
+    operand="\${arg#--file=}"
+  fi
+  if [[ -n "\$operand" && "\$operand" != - && -f "\$operand" ]]; then
     exec "$REAL_TAR" "\$@"
   fi
+  prev="\$arg"
 done
 # Streamed: consume one block, then exit without draining, exactly as bsdtar does.
 dd bs=10240 count=1 >/dev/null 2>&1
