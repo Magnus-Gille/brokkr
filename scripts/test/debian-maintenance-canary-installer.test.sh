@@ -895,4 +895,63 @@ fi
 grep -Fq "source worktree is dirty" "$TMP/dirty.out"
 test ! -e "$TMP/dirty-root/etc"
 
+# Release staging must not stream `git archive` into a reader that can stop early. bsdtar exits at
+# the end-of-archive marker without draining the trailing padding, which SIGPIPEs git archive and,
+# under `set -o pipefail`, aborts the installer with 141 — the macOS-only failure in issue #119.
+#
+# This stub reproduces that reader behaviour on EVERY platform, so the regression is caught on the
+# Linux runner too. Testing with the real bsdtar would assert nothing in CI, where GNU tar drains
+# and the bug cannot appear. When handed `-f`, the stub delegates to the real tar so a correctly
+# staged install still completes and its blob verification is exercised.
+# The dirty-source case above left $SOURCE dirty, and the installer refuses a dirty worktree.
+# Commit it so this case exercises staging rather than re-testing the dirty-source refusal.
+git -C "$SOURCE" add -A
+git -C "$SOURCE" commit -qm "sigpipe fixture"
+SIGPIPE_REVISION="$(git -C "$SOURCE" rev-parse HEAD)"
+
+mkdir -p "$TMP/sigpipe-bin"
+REAL_TAR="$(command -v tar)"
+cat >"$TMP/sigpipe-bin/tar" <<EOF
+#!/usr/bin/env bash
+# Only a real file operand is safe: there is no writer to signal. \`-f -\` and \`--file=-\` still
+# read stdin, so they must NOT be treated as file-backed or the stub would wave through a
+# streaming regression.
+prev=""
+for arg in "\$@"; do
+  operand=""
+  if [[ "\$prev" == -f || "\$prev" == --file ]]; then
+    operand="\$arg"
+  elif [[ "\$arg" == --file=* ]]; then
+    operand="\${arg#--file=}"
+  fi
+  if [[ -n "\$operand" && "\$operand" != - && -f "\$operand" ]]; then
+    exec "$REAL_TAR" "\$@"
+  fi
+  prev="\$arg"
+done
+# Streamed: consume one block, then exit without draining, exactly as bsdtar does.
+dd bs=10240 count=1 >/dev/null 2>&1
+exit 0
+EOF
+chmod 0755 "$TMP/sigpipe-bin/tar"
+
+if ! env \
+  PATH="$TMP/sigpipe-bin:$PATH" \
+  BROKKR_CANARY_INSTALL_TEST_ROOT="$TMP/sigpipe-root" \
+  BROKKR_CANARY_SYSTEMCTL="$TMP/systemctl" \
+  BROKKR_CANARY_FALLOCATE="$TMP/fallocate" \
+  BROKKR_CANARY_NODE="$NODE_BIN" \
+  BROKKR_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" \
+  "$INSTALLER" install \
+    --source "$SOURCE" \
+    --revision "$SIGPIPE_REVISION" \
+    --canary canary-sigpipe >"$TMP/sigpipe.out" 2>&1; then
+  echo "installer failed against an early-exiting tar (issue #119 regression):" >&2
+  tail -5 "$TMP/sigpipe.out" >&2
+  exit 1
+fi
+test -f "$TMP/sigpipe-root/usr/local/lib/brokkr/releases/$SIGPIPE_REVISION/scripts/maintenance-controller.mjs"
+# The staged archive must not survive extraction.
+test -z "$(find "$TMP/sigpipe-root/usr/local/lib/brokkr/releases" -name 'release.tar' -print -quit)"
+
 echo "debian canary installer: exact revision, disabled units, headroom, and evidence-preserving disarm OK"

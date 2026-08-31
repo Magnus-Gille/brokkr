@@ -427,9 +427,15 @@ stage_release() {
   STAGE_ROOT="$(mktemp -d "$RELEASE_PARENT/.brokkr-delivery-$REVISION.XXXXXX")"
   chmod 0700 "$STAGE_ROOT"
   mkdir -p "$STAGE_ROOT/release"
-  git -C "$SOURCE" archive --format=tar "$REVISION" -- \
-    "${RELEASE_FILES[@]}" |
-    tar -x -C "$STAGE_ROOT/release"
+  # Materialize the archive before extracting instead of streaming it. A reader that stops at the
+  # end-of-archive marker without draining the trailing padding (bsdtar does; GNU tar does not)
+  # sends SIGPIPE to git archive, which `set -o pipefail` then turns into a 141 exit. Mirrors
+  # scripts/lib/deploy-source.sh, and lets each exit status be checked on its own.
+  local staged_archive="$STAGE_ROOT/release.tar"
+  git -C "$SOURCE" archive --format=tar --output="$staged_archive" "$REVISION" -- \
+    "${RELEASE_FILES[@]}"
+  tar -x -f "$staged_archive" -C "$STAGE_ROOT/release"
+  rm -f "$staged_archive"
   local file
   local expected_blob
   local actual_blob

@@ -361,9 +361,15 @@ stage_exact_release() {
   chmod 0700 "$STAGE_ROOT"
   local staged_release="$STAGE_ROOT/release"
   mkdir -p "$staged_release"
-  git -C "$SOURCE" archive --format=tar "$REVISION" -- \
-    "${RELEASE_FILES[@]}" |
-    tar -x -C "$staged_release"
+  # Materialize the archive before extracting instead of streaming it. A reader that stops at the
+  # end-of-archive marker without draining the trailing padding (bsdtar does; GNU tar does not)
+  # sends SIGPIPE to git archive, which `set -o pipefail` then turns into a 141 exit. Mirrors
+  # scripts/lib/deploy-source.sh, and lets each exit status be checked on its own.
+  local staged_archive="$STAGE_ROOT/release.tar"
+  git -C "$SOURCE" archive --format=tar --output="$staged_archive" "$REVISION" -- \
+    "${RELEASE_FILES[@]}"
+  tar -x -f "$staged_archive" -C "$staged_release"
+  rm -f "$staged_archive"
   local file
   local expected_blob
   local actual_blob
