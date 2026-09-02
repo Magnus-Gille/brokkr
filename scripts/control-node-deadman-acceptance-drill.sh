@@ -17,7 +17,7 @@ EXTERNAL_MAX_AGE_SECS="${BROKKR_DEADMAN_EXTERNAL_MAX_AGE_SECS:-300}"
 RECOVERY_URL="${BROKKR_DEADMAN_DRILL_RECOVERY_URL:-}"
 
 usage() {
-  printf '%s\n' "usage: $0 --confirm-live-alerts" >&2
+  printf '%s\n' "usage: control-node-deadman-acceptance-drill.sh --confirm-live-alerts" >&2
   printf '%s\n' "Sends three operator test notifications; never mutates the production timer or state." >&2
 }
 

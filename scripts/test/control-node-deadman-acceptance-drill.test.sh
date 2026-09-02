@@ -105,6 +105,11 @@ run_helper
 check "missing explicit live confirmation refuses" test "$RC" -eq 64
 check "refusal sends no notification" test ! -s "$MOCK_NOTIFY_LOG"
 check "refusal makes no systemd call" test ! -s "$MOCK_SYSTEMCTL_LOG"
+if grep -Fq "$TMP" <<<"$OUT"; then
+  bad "refusal output contains no private path"
+else
+  ok "refusal output contains no private path"
+fi
 
 MOCK_UID=0 run_helper --confirm-live-alerts
 check "root execution refuses" test "$RC" -ne 0
