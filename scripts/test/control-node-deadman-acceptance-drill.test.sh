@@ -72,8 +72,11 @@ payload="$2.py"
 cat >"$payload"
 "$REAL_PYTHON" -m py_compile "$payload" || exit 93
 printf '43123' >"$2"
+attempt=0
 while [[ ! -e "$MOCK_RESPONDER_RELEASE" ]]; do
+  [[ "$attempt" -lt 1000 ]] || exit 94
   sleep 0.01
+  attempt=$((attempt + 1))
 done
 EOF
 
