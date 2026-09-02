@@ -39,19 +39,42 @@ case "$*" in
 esac
 EOF
 
-REAL_CURL="$(command -v curl)"
+REAL_PYTHON="$(command -v python3)"
 cat >"$TMP/bin/curl" <<'EOF'
 #!/usr/bin/env bash
-case " $* " in
-  *" http://127.0.0.1:9/ "*)
+target=""
+for arg in "$@"; do
+  if [[ "$arg" == http://* || "$arg" == https://* ]]; then
+    target="$arg"
+  fi
+done
+case "$target" in
+  "http://127.0.0.1:9/")
     printf 'fixture connection refused\n' >&2
     exit 7
     ;;
-  *" http://127.0.0.1:8/ "*)
+  "http://127.0.0.1:8/")
     exit 0
     ;;
 esac
-exec "$REAL_CURL" "$@"
+if [[ "$target" == "http://127.0.0.1:43123/" ]]; then
+  : >"$MOCK_RESPONDER_RELEASE"
+  exit 0
+fi
+printf 'unexpected curl target\n' >&2
+exit 91
+EOF
+
+cat >"$TMP/bin/python3" <<'EOF'
+#!/usr/bin/env bash
+[[ "$#" -eq 2 && "$1" == - ]] || exit 92
+payload="$2.py"
+cat >"$payload"
+"$REAL_PYTHON" -m py_compile "$payload" || exit 93
+printf '43123' >"$2"
+while [[ ! -e "$MOCK_RESPONDER_RELEASE" ]]; do
+  sleep 0.01
+done
 EOF
 
 cat >"$TMP/notify.sh" <<'EOF'
@@ -66,19 +89,21 @@ TELEGRAM_BOT_TOKEN=fixture-bot-secret
 TELEGRAM_ALLOWED_USERS=123456
 EOF
 chmod 600 "$TMP/notify.env"
-chmod +x "$TMP/bin/id" "$TMP/bin/systemctl" "$TMP/bin/curl"
+chmod +x "$TMP/bin/id" "$TMP/bin/systemctl" "$TMP/bin/curl" "$TMP/bin/python3"
 
 REAL_UID="$(id -u)"
 export PATH="$TMP/bin:$PATH"
-export REAL_CURL
+export REAL_PYTHON
 export MOCK_SYSTEMCTL_LOG="$TMP/systemctl.log"
 export MOCK_NOTIFY_LOG="$TMP/notify.log"
+export MOCK_RESPONDER_RELEASE="$TMP/responder.release"
 export BROKKR_DEADMAN_ID_BIN="$TMP/bin/id"
 export BROKKR_DEADMAN_SYSTEMCTL_BIN="$TMP/bin/systemctl"
 export BROKKR_DEADMAN_SCRIPT="$RUNTIME"
 export BROKKR_DEADMAN_NOTIFY_HELPER="$TMP/notify.sh"
 export BROKKR_DEADMAN_PRODUCTION_STATE_DIR="$TMP/production-state"
 export BROKKR_DEADMAN_DRILL_TMPDIR="$TMP/drills"
+export BROKKR_DEADMAN_PYTHON_BIN="$TMP/bin/python3"
 export BROKKR_DEADMAN_DRILL_RECOVERY_URL="http://127.0.0.1:8/"
 export NOTIFY_ENV="$TMP/notify.env"
 export MOCK_UID="$REAL_UID" MOCK_TIMER_ENABLED=1 MOCK_TIMER_ACTIVE=1
@@ -151,6 +176,17 @@ if grep -Fq 'fixture-send-secret' <<<"$OUT" ||
 else
   ok "receipt contains no secrets, paths, or URLs"
 fi
+
+export BROKKR_DEADMAN_DRILL_RECOVERY_URL=''
+: >"$MOCK_SYSTEMCTL_LOG"
+: >"$MOCK_NOTIFY_LOG"
+rm -f "$MOCK_RESPONDER_RELEASE"
+run_helper --confirm-live-alerts
+check "default loopback recovery responder succeeds" test "$RC" -eq 0
+check "default responder produces the recovery notification" grep -q "recovered" "$MOCK_NOTIFY_LOG"
+check "default responder drill attempts exactly three notifications" test "$(wc -l <"$MOCK_NOTIFY_LOG" | tr -d ' ')" -eq 3
+check "default responder drill cleans up its state" test -z "$(find "$TMP/drills" -mindepth 1 -maxdepth 1 -print -quit)"
+export BROKKR_DEADMAN_DRILL_RECOVERY_URL="http://127.0.0.1:8/"
 
 export MOCK_TIMER_ACTIVE=0
 : >"$MOCK_NOTIFY_LOG"
