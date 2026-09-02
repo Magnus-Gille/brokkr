@@ -140,66 +140,44 @@ notification delivery.
 
 ## Acceptance Drill
 
-Run the two drills separately. A target blackhole proves threshold/recovery behavior, but it does
-**not** prove the direct fallback because Ratatoskr remains reachable during that drill.
+Run the local alert-path drill and the external-provider missed-window drill separately. Neither
+drill stops, overrides, restarts, enables, or disables the production timer.
 
-### 1. Target-blackhole and recovery drill
+### 1. Isolated target/recovery and direct-fallback drill
 
-Run the script directly with an isolated state root. This leaves the enabled timer and its
-production state untouched:
-
-```bash
-cd ~/repos/brokkr
-drill_root="$(mktemp -d)"
-
-for attempt in 1 2 3; do
-  BROKKR_STATE_DIR="$drill_root" \
-  CONTROL_NODE_DEADMAN_URL=http://127.0.0.1:9/ \
-  ./scripts/control-node-deadman.sh
-done
-
-BROKKR_STATE_DIR="$drill_root" ./scripts/control-node-deadman.sh
-```
-
-Expected: one Telegram alert after the third miss, followed by one recovery Telegram from the
-normal-URL run. Do not use `systemctl --user set-environment` for this drill: the service unit's
-explicit `Environment=CONTROL_NODE_DEADMAN_URL=...` takes precedence, so that command does not
-blackhole this unit.
-
-### 2. Ratatoskr-blackhole fallback drill
-
-This forces only the preferred Ratatoskr path to fail. The helper must fall through to the direct
-Telegram Bot API using `TELEGRAM_BOT_TOKEN` from the protected file:
+The helper requires an explicit live-notification confirmation. It verifies that the production
+timer is enabled and active, the production state is `pass`, and the last external heartbeat is
+fresh. It then uses helper-owned private state and loopback-only endpoints to produce one threshold
+alert, one recovery alert, and one Ratatoskr-blackhole/direct-Telegram fallback notification:
 
 ```bash
 cd ~/repos/brokkr
-RATATOSKR_URL=http://127.0.0.1:9/ \
-RATATOSKR_ENV="$HOME/.config/grimnir/not-present" \
-NOTIFY_ENV="$HOME/.config/grimnir/notify.env" \
-bash -c 'source scripts/lib/notify.sh; notify_telegram "Brokkr dead-man direct fallback drill from monitoring host"'
+./scripts/control-node-deadman-acceptance-drill.sh --confirm-live-alerts
 ```
 
-Expected: a Telegram message containing `direct fallback drill from monitoring host`. Receipt of
-that message is the live credential/delivery gate; the script intentionally treats notification as
-best-effort.
+Confirm receipt of all three messages through the operator channel. The helper intentionally calls
+the existing best-effort notifier, so its metadata receipt records each notification as
+`attempted`, never falsely as delivered. It captures detailed command output in its private
+temporary directory, emits no URLs, credentials, chat IDs, or private paths, and removes that
+directory before printing the receipt. It then re-verifies the read-only production gates.
 
-### Cleanup and recovery
+The helper never uses the deployment-specific control-node name for simulated recovery. Its healthy
+endpoint is a temporary loopback-only responder on an OS-assigned port, avoiding the fragile
+assumption that the public example name `control-node` resolves in an interactive shell.
 
-The direct drill creates no systemd override or manager environment. Remove only its isolated
-state, then re-run the production unit and confirm it records `pass`:
+### 2. External provider missed-window drill
 
-```bash
-rm -rf "$drill_root"
-unset drill_root
-systemctl --user start brokkr-control-node-deadman.service
-test "$(cat ~/.local/state/brokkr/control-node-deadman/state)" = pass
-systemctl --user is-enabled --quiet brokkr-control-node-deadman.timer
-systemctl --user is-active --quiet brokkr-control-node-deadman.timer
-```
+The helper's receipt ends with `provider_missed_window_drill=required` because local alert-path
+testing cannot prove an independently hosted provider notification. In the provider UI, use a
+built-in test notification if available. Otherwise create a separate disposable check with the
+same notification integration and let only that check lapse through its configured period and
+grace window. Confirm both the down notification and its recovery, then delete the disposable
+check. Never pause, blackhole, or expose the production ping URL for this drill.
 
-Do not delete `~/.local/state/brokkr/control-node-deadman`; that is the live timer's state. If a
-future drill uses a runtime drop-in instead, remove it, run `systemctl --user daemon-reload`, and
-start the production service before considering recovery complete.
+Record only the helper receipt, operator-confirmed delivery booleans, the disposable check's
+non-secret provider receipt/timestamps, and the production timer's final enabled/active state.
+Never record the production or disposable ping URL, check UUID, project key, private locator, or
+notification credential.
 
 ## Migration from earlier site-specific names
 
