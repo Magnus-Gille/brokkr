@@ -22,12 +22,14 @@ def emit(status, reason, observed_at, count=0, size_bytes=0, latest_epoch=None):
     return {"pass": 0, "warn": 1, "fail": 2}[status]
 
 
-def integer(name, default, minimum):
+def integer(name, default, minimum, maximum=None):
     try:
         value = int(os.environ.get(name, default))
     except ValueError:
         raise ValueError(name)
     if value < minimum:
+        raise ValueError(name)
+    if maximum is not None and value > maximum:
         raise ValueError(name)
     return value
 
@@ -45,7 +47,7 @@ def valid_path(value):
 def main():
     try:
         now = integer("BROKKR_TM_NOW_EPOCH", str(int(time.time())), 1)
-        max_age = integer("BROKKR_TM_MAX_AGE_SECS", "93600", 1)
+        max_age = integer("BROKKR_TM_MAX_AGE_SECS", "93600", 1, 2678400)
         max_entries = integer("BROKKR_TM_PROBE_MAX_ENTRIES", "100000", 1)
         max_depth = integer("BROKKR_TM_PROBE_MAX_DEPTH", "3", 1)
         timeout = integer("BROKKR_TM_PROBE_TIMEOUT_SECS", "20", 1)

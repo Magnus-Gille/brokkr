@@ -7,6 +7,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="${BROKKR_TM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/brokkr}"
 CONFIG="${BROKKR_TM_PROBE_SOURCE:-${XDG_CONFIG_HOME:-$HOME/.config}/brokkr/timemachine-probe.env}"
+DEFAULT_MAX_AGE_SECS=93600
+MAX_ALLOWED_AGE_SECS=2678400
 
 fail() { echo "brokkr Time Machine telemetry: $1" >&2; exit 2; }
 stat_attr() { # GNU stat first: GNU accepts -f with unrelated filesystem semantics.
@@ -22,15 +24,26 @@ case "$CONFIG" in /*) ;; *) fail "protected source is invalid" ;; esac
 owner="$(stat_attr '%u' '%u' "$CONFIG")"
 mode="$(stat_attr '%a' '%Lp' "$CONFIG")"
 [ "$owner" = "$(id -u)" ] && [ "$mode" = 600 ] || fail "protected source is unsafe"
-[ "$(grep -Ec '^BROKKR_TM_BANDS_DIR=/.*$' "$CONFIG")" -eq 1 ] || fail "protected source is invalid"
-awk 'END { exit (NR == 1 ? 0 : 1) }' "$CONFIG" || fail "protected source is invalid"
 if grep -q '[[:cntrl:]]' "$CONFIG"; then
   fail "protected source is invalid"
 fi
+[ "$(tail -c 1 "$CONFIG" | od -An -tu1 | tr -d '[:space:]')" = 10 ] || fail "protected source is invalid"
+bands_count="$(grep -Ec '^BROKKR_TM_BANDS_DIR=/.*$' "$CONFIG" || true)"
+max_age_count="$(grep -Ec '^BROKKR_TM_MAX_AGE_SECS=[1-9][0-9]*$' "$CONFIG" || true)"
+line_count="$(wc -l < "$CONFIG" | tr -d '[:space:]')"
+[ "$bands_count" -eq 1 ] && [ "$max_age_count" -le 1 ] &&
+  [ "$line_count" -eq $((bands_count + max_age_count)) ] || fail "protected source is invalid"
 BROKKR_TM_BANDS_DIR="${CONFIG:+$(sed -n 's/^BROKKR_TM_BANDS_DIR=//p' "$CONFIG")}"
 case "$BROKKR_TM_BANDS_DIR" in /*) ;; *) fail "protected source is invalid" ;; esac
 case "$BROKKR_TM_BANDS_DIR" in /|*/|*'//'*|*'/./'*|*'/../'*|./*|../*|*/.|*/..|.) fail "protected source is invalid" ;; esac
-export BROKKR_TM_BANDS_DIR
+BROKKR_TM_MAX_AGE_SECS="$(sed -n 's/^BROKKR_TM_MAX_AGE_SECS=//p' "$CONFIG")"
+if [ -z "$BROKKR_TM_MAX_AGE_SECS" ]; then
+  BROKKR_TM_MAX_AGE_SECS=$DEFAULT_MAX_AGE_SECS
+elif [ "${#BROKKR_TM_MAX_AGE_SECS}" -gt 7 ] ||
+  [ "$BROKKR_TM_MAX_AGE_SECS" -gt "$MAX_ALLOWED_AGE_SECS" ]; then
+  fail "protected source is invalid"
+fi
+export BROKKR_TM_BANDS_DIR BROKKR_TM_MAX_AGE_SECS
 
 mkdir -p "$STATE_DIR" || fail "cannot create state directory"
 [ -n "${HEIMDALL_HUB_URL:-}" ] && [ -n "${HEIMDALL_FLEET_TOKEN:-}" ] || fail "Heimdall delivery is not configured"

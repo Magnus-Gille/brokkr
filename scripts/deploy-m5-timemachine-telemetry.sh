@@ -25,7 +25,29 @@ validate_source() { # file required keys
   grep -Eq "^${first}=.+$" "$file" || { echo "refusing: protected runtime input incomplete" >&2; exit 2; }
   [ -z "$second" ] || grep -Eq "^${second}=.+$" "$file" || { echo "refusing: protected runtime input incomplete" >&2; exit 2; }
 }
-validate_source "$probe_source" BROKKR_TM_BANDS_DIR
+validate_probe_source() {
+  local file=$1 bands_count max_age_count line_count max_age
+  validate_source "$file" BROKKR_TM_BANDS_DIR
+  ! grep -q '[[:cntrl:]]' "$file" || { echo "refusing: protected runtime input invalid" >&2; exit 2; }
+  [ "$(tail -c 1 "$file" | od -An -tu1 | tr -d '[:space:]')" = 10 ] || {
+    echo "refusing: protected runtime input invalid" >&2
+    exit 2
+  }
+  bands_count="$(grep -Ec '^BROKKR_TM_BANDS_DIR=/.*$' "$file" || true)"
+  max_age_count="$(grep -Ec '^BROKKR_TM_MAX_AGE_SECS=[1-9][0-9]*$' "$file" || true)"
+  line_count="$(wc -l < "$file" | tr -d '[:space:]')"
+  [ "$bands_count" -eq 1 ] && [ "$max_age_count" -le 1 ] &&
+    [ "$line_count" -eq $((bands_count + max_age_count)) ] || {
+      echo "refusing: protected runtime input invalid" >&2
+      exit 2
+    }
+  max_age="$(sed -n 's/^BROKKR_TM_MAX_AGE_SECS=//p' "$file")"
+  if [ -n "$max_age" ] && { [ "${#max_age}" -gt 7 ] || [ "$max_age" -gt 2678400 ]; }; then
+    echo "refusing: protected runtime input invalid" >&2
+    exit 2
+  fi
+}
+validate_probe_source "$probe_source"
 validate_source "$delivery_source" HEIMDALL_HUB_URL HEIMDALL_FLEET_TOKEN
 
 release_root="${BROKKR_TM_RELEASE_ROOT:-$HOME/.local/lib/brokkr/timemachine-telemetry}"

@@ -53,6 +53,10 @@ ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 write_config() { printf 'BROKKR_TM_BANDS_DIR=%s\n' "$1" > "$CONFIG"; chmod 600 "$CONFIG"; }
+write_config_with_max_age() {
+  printf 'BROKKR_TM_BANDS_DIR=%s\nBROKKR_TM_MAX_AGE_SECS=%s\n' "$1" "$2" > "$CONFIG"
+  chmod 600 "$CONFIG"
+}
 run() {
   # shellcheck disable=SC2034 # assertions consume these through check/eval
   OUT="$(TZ=UTC PATH="$TMP/bin:$PATH" PYTHONPATH="$TMP/python" MOCK_REQUEST_FILE="$TMP/request.json" BROKKR_TM_PROBE_SOURCE="$CONFIG" BROKKR_TM_STATE_DIR="$TMP/state" BROKKR_TM_NOW_EPOCH="$NOW" HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel "$SCRIPT" 2>&1)"
@@ -121,6 +125,43 @@ TZ=UTC touch -t 202607111200 "$TMP/bands/0/fresh-band"
 run
 check "stale band evidence is delivered as health failure" '[[ "$RC" -eq 0 && "$(state "data[\"status\"]")" == fail && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=stale_band_files"* ]]'
 check "stale-band delivery preserves failure state" '"$REAL_PYTHON" -c '\''import json,sys; r=json.load(open(sys.argv[1])); assert r["body"]["state"] == "fail"; assert "reason=stale_band_files" in r["body"]["message"]'\'' "$TMP/request.json"'
+
+TZ=UTC touch -t 202607101300 "$TMP/bands/0/fresh-band"
+write_config "$TMP/bands"
+run
+check "legacy default still rejects three-day-old band evidence" '[[ "$RC" -eq 0 && "$(state "data[\"status\"]")" == fail ]]'
+write_config_with_max_age "$TMP/bands" 1296000
+run
+check "protected fifteen-day policy accepts a three-day-old rotating destination" '[[ "$RC" -eq 0 && "$(state "data[\"status\"]")" == pass && "$(state "data[\"checks\"][0][\"detail\"]")" == *"reason=fresh_band_files"* ]]'
+check "freshness policy is neither printed nor published" '[[ "$OUT" != *"1296000"* ]] && ! grep -Fq "1296000" "$TMP/state/timemachine-health.json" && ! grep -Fq "1296000" "$TMP/request.json"'
+write_config "$TMP/bands"
+export BROKKR_TM_MAX_AGE_SECS=1296000
+run
+check "inherited max age cannot override legacy protected default" '[[ "$RC" -eq 0 && "$(state "data[\"status\"]")" == fail ]]'
+unset BROKKR_TM_MAX_AGE_SECS
+
+# Defense in depth: the Python probe rejects an over-cap value even when called
+# directly without the protected shell wrapper.
+# shellcheck disable=SC2034 # assertion consumes this through check/eval
+OUT="$(BROKKR_TM_BANDS_DIR="$TMP/bands" BROKKR_TM_NOW_EPOCH="$NOW" BROKKR_TM_MAX_AGE_SECS=2678401 "$REAL_PYTHON" "$HERE/../../timemachine/destination-probe.py" 2>&1)"
+# shellcheck disable=SC2034 # assertion consumes this through check/eval
+RC=$?
+check "direct probe rejects an over-cap max age" '[[ "$RC" -eq 1 && "$OUT" == *"invalid_configuration"* ]]'
+
+for invalid_age in 0 -1 +1 01 abc 2678401 99999999999999999999; do
+  write_config_with_max_age "$TMP/bands" "$invalid_age"
+  run
+  check "invalid protected max age $invalid_age fails before probe or delivery" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+done
+printf 'BROKKR_TM_BANDS_DIR=%s\nBROKKR_TM_MAX_AGE_SECS=1296000\nBROKKR_TM_MAX_AGE_SECS=1296000\n' "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
+run
+check "duplicate protected max age fails before probe or delivery" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+printf 'BROKKR_TM_BANDS_DIR=%s\nBROKKR_TM_MAX_AGE_SECS=1296000\nBROKKR_TM_UNKNOWN=1\n' "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
+run
+check "unknown protected policy key fails before probe or delivery" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
+printf 'BROKKR_TM_BANDS_DIR=%s\nBROKKR_TM_MAX_AGE_SECS=1296000' "$TMP/bands" > "$CONFIG"; chmod 600 "$CONFIG"
+run
+check "unterminated protected policy fails before probe or delivery" '[[ "$RC" -eq 2 && "$OUT" == *"protected source is invalid"* ]]'
 
 write_config "$TMP/absent"
 run
