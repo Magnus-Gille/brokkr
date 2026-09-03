@@ -59,8 +59,23 @@ install -m 0644 "$SOURCE" "$DEST"
 
 if $restart; then
   systemctl restart systemd-journald.service
+  journalctl --flush
   systemctl is-active --quiet systemd-journald.service
-  echo "installed: persistent journal policy active after explicit journald restart"
+  persistent_journal_found=false
+  for machine_dir in "$JOURNAL_DIR"/*; do
+    [[ -d "$machine_dir" && ! -L "$machine_dir" ]] || continue
+    for journal_file in "$machine_dir"/*.journal; do
+      if [[ -f "$journal_file" && ! -L "$journal_file" && -s "$journal_file" ]]; then
+        persistent_journal_found=true
+        break 2
+      fi
+    done
+  done
+  if ! $persistent_journal_found; then
+    echo "ERROR: no persistent journal file was created after journalctl --flush" >&2
+    exit 1
+  fi
+  echo "installed: persistent journal policy active after explicit journald restart and verified persistent journal flush"
 else
   echo "installed: persistent journal policy will be active after the next boot (or rerun with --restart)"
 fi

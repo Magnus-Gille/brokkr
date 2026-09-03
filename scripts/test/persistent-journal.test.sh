@@ -20,7 +20,29 @@ cat >"$TMP/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$MOCK_CALLS"
 EOF
-chmod +x "$TMP/bin/id" "$TMP/bin/systemctl"
+cat >"$TMP/bin/journalctl" <<'EOF'
+#!/usr/bin/env bash
+printf 'journalctl %s\n' "$*" >>"$MOCK_CALLS"
+[[ "$*" == "--flush" ]] || exit 98
+[[ "${MOCK_JOURNALCTL_EXIT:-0}" -eq 0 ]] || exit "$MOCK_JOURNALCTL_EXIT"
+case "${MOCK_JOURNALCTL_CREATE:-0}" in
+  1)
+    install -d -m 2755 "$JOURNALD_LOG_DIR/mock-machine-id"
+    printf 'mock-journal\n' >"$JOURNALD_LOG_DIR/mock-machine-id/system.journal"
+    ;;
+  tilde)
+    install -d -m 2755 "$JOURNALD_LOG_DIR/mock-machine-id"
+    printf 'unclean-journal\n' >"$JOURNALD_LOG_DIR/mock-machine-id/system.journal~"
+    ;;
+  symlink)
+    install -d -m 2755 "$JOURNALD_LOG_DIR/mock-machine-id"
+    printf 'outside-journal\n' >"$JOURNALD_LOG_DIR/mock-target"
+    ln -s "$JOURNALD_LOG_DIR/mock-target" \
+      "$JOURNALD_LOG_DIR/mock-machine-id/system.journal"
+    ;;
+esac
+EOF
+chmod +x "$TMP/bin/id" "$TMP/bin/systemctl" "$TMP/bin/journalctl"
 
 export PATH="$TMP/bin:$PATH" MOCK_CALLS="$CALLS"
 export JOURNALD_DROPIN_DIR="$TMP/dropins" JOURNALD_LOG_DIR="$TMP/journal"
@@ -54,8 +76,41 @@ check "root apply installs the tracked bounded policy" '[[ "$RC" -eq 0 && "$OUT"
 check "installed policy keeps persistent storage and a finite cap" 'grep -Fqx "Storage=persistent" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemMaxUse=256M" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemKeepFree=1G" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf"'
 
 : >"$CALLS"
+export MOCK_JOURNALCTL_CREATE=1 MOCK_JOURNALCTL_EXIT=0
 run --apply --restart
-check "journald restart needs the explicit restart flag and confirms recovery" '[[ "$RC" -eq 0 && "$OUT" == *"explicit journald restart"* && "$(cat "$CALLS")" == $'\''restart systemd-journald.service\nis-active --quiet systemd-journald.service'\'' ]]'
+check "journald restart explicitly flushes before confirming service recovery" '[[ "$RC" -eq 0 && "$OUT" == *"verified persistent journal"* && "$(cat "$CALLS")" == $'\''restart systemd-journald.service\njournalctl --flush\nis-active --quiet systemd-journald.service'\'' ]]'
+check "successful restart verifies a non-empty persistent journal file" '[[ -s "$JOURNALD_LOG_DIR/mock-machine-id/system.journal" ]]'
+
+export JOURNALD_LOG_DIR="$TMP/journal-missing"
+mkdir -p "$JOURNALD_LOG_DIR"
+: >"$CALLS"
+export MOCK_JOURNALCTL_CREATE=0
+run --apply --restart
+check "flush success without an on-disk journal fails closed" '[[ "$RC" -ne 0 && "$OUT" == *"no persistent journal file"* && "$(cat "$CALLS")" == $'\''restart systemd-journald.service\njournalctl --flush\nis-active --quiet systemd-journald.service'\'' ]]'
+
+export JOURNALD_LOG_DIR="$TMP/journal-unclean"
+mkdir -p "$JOURNALD_LOG_DIR"
+: >"$CALLS"
+export MOCK_JOURNALCTL_CREATE=tilde
+run --apply --restart
+check "an unclean journal~ artifact does not prove persistence" '[[ "$RC" -ne 0 && "$OUT" == *"no persistent journal file"* ]]'
+
+export JOURNALD_LOG_DIR="$TMP/journal-symlink"
+mkdir -p "$JOURNALD_LOG_DIR"
+: >"$CALLS"
+export MOCK_JOURNALCTL_CREATE=symlink
+run --apply --restart
+check "a symlinked journal file does not prove persistence" '[[ "$RC" -ne 0 && "$OUT" == *"no persistent journal file"* ]]'
+
+export JOURNALD_LOG_DIR="$TMP/journal-flush-failure"
+mkdir -p "$JOURNALD_LOG_DIR"
+: >"$CALLS"
+export MOCK_JOURNALCTL_EXIT=23
+run --apply --restart
+check "flush command failure stops before success verification" '[[ "$RC" -eq 23 && "$OUT" != *"verified persistent journal"* && "$(cat "$CALLS")" == $'\''restart systemd-journald.service\njournalctl --flush'\'' ]]'
+
+export JOURNALD_LOG_DIR="$TMP/journal"
+export MOCK_JOURNALCTL_CREATE=0 MOCK_JOURNALCTL_EXIT=0
 
 rm -f "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf"
 printf 'sentinel\n' >"$TMP/sentinel"

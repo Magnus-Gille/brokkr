@@ -32,6 +32,12 @@ the host's maintenance window, make that separate choice explicitly:
 sudo ./scripts/setup-persistent-journal.sh --apply --restart
 ```
 
+The explicit restart path restarts `systemd-journald`, flushes the runtime
+journal into persistent storage, confirms the service is active, and then
+requires a non-empty regular `.journal` file below `/var/log/journal` before it
+reports success. A missing file, a symlink, or only a `.journal~` file fails
+closed; an active service alone is not evidence that persistence is working.
+
 After a planned reboot, verify that more than one boot is available:
 
 ```bash
