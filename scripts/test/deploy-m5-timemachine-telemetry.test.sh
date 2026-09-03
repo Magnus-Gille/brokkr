@@ -26,6 +26,20 @@ run(){ # shellcheck disable=SC2034 # assertions consume OUT/RC through check/eva
 echo deploy-m5-timemachine-telemetry.test.sh
 RC=0; run "$SCRIPT" "$REPO/wrong" "$SHA"; check "wrong source refuses before mutation" '[[ "$RC" -ne 0 && ! -e "$HOME_DIR/.local/lib/brokkr" ]]'
 RC=0; printf dirty >> "$REPO/timemachine/telemetry.sh"; run "$SCRIPT" "$REPO" "$SHA"; check "dirty source refuses before mutation" '[[ "$RC" -ne 0 && ! -e "$HOME_DIR/.local/lib/brokkr" ]]'; git -C "$REPO" checkout -- timemachine/telemetry.sh
+printf 'BROKKR_TM_BANDS_DIR=/private/bands\nBROKKR_TM_MAX_AGE_SECS=1296000\n' > "$HOME_DIR/.config/brokkr/timemachine-probe.env"
+RC=0; run "$SCRIPT" "$REPO" "$SHA"; check "protected max-age policy passes deploy dry-run" '[[ "$RC" -eq 0 && "$OUT" == *"DRY-RUN"* && ! -e "$HOME_DIR/.local/lib/brokkr" ]]'
+for invalid_age in 0 -1 +1 01 abc 2678401 99999999999999999999; do
+  printf 'BROKKR_TM_BANDS_DIR=/private/bands\nBROKKR_TM_MAX_AGE_SECS=%s\n' "$invalid_age" > "$HOME_DIR/.config/brokkr/timemachine-probe.env"
+  RC=0; run "$SCRIPT" "$REPO" "$SHA"
+  check "invalid protected max age $invalid_age refuses deploy" '[[ "$RC" -ne 0 && "$OUT" == *"protected runtime input invalid"* && ! -e "$HOME_DIR/.local/lib/brokkr" ]]'
+done
+printf 'BROKKR_TM_BANDS_DIR=/private/bands\nBROKKR_TM_MAX_AGE_SECS=1296000\nBROKKR_TM_MAX_AGE_SECS=1296000\n' > "$HOME_DIR/.config/brokkr/timemachine-probe.env"
+RC=0; run "$SCRIPT" "$REPO" "$SHA"; check "duplicate max-age policy refuses deploy" '[[ "$RC" -ne 0 && "$OUT" == *"protected runtime input invalid"* && ! -e "$HOME_DIR/.local/lib/brokkr" ]]'
+printf 'BROKKR_TM_BANDS_DIR=/private/bands\nBROKKR_TM_MAX_AGE_SECS=1296000\nBROKKR_TM_UNKNOWN=1\n' > "$HOME_DIR/.config/brokkr/timemachine-probe.env"
+RC=0; run "$SCRIPT" "$REPO" "$SHA"; check "unknown probe policy refuses deploy" '[[ "$RC" -ne 0 && "$OUT" == *"protected runtime input invalid"* && ! -e "$HOME_DIR/.local/lib/brokkr" ]]'
+printf 'BROKKR_TM_BANDS_DIR=/private/bands\nBROKKR_TM_MAX_AGE_SECS=1296000' > "$HOME_DIR/.config/brokkr/timemachine-probe.env"
+RC=0; run "$SCRIPT" "$REPO" "$SHA"; check "unterminated probe policy refuses deploy" '[[ "$RC" -ne 0 && "$OUT" == *"protected runtime input invalid"* && ! -e "$HOME_DIR/.local/lib/brokkr" ]]'
+printf 'BROKKR_TM_BANDS_DIR=/private/bands\nBROKKR_TM_MAX_AGE_SECS=1296000\n' > "$HOME_DIR/.config/brokkr/timemachine-probe.env"
 RC=0; run "$SCRIPT" "$REPO" "$SHA" --apply
 # shellcheck disable=SC2034 # assertions consume this through check/eval
 UNIT="$HOME_DIR/.config/systemd/user/brokkr-timemachine-telemetry.service"
