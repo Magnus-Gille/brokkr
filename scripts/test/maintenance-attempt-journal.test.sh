@@ -752,7 +752,12 @@ if (process.env.WORKER_MODE) {
     waitBriefly(holdDeadlineMs);
     process.exit(0);
   }
-  if (process.env.BARRIER) waitForReleaseFile(process.env.BARRIER, "worker-barrier");
+  if (process.env.BARRIER) {
+    if (process.env.BARRIER_READY) {
+      fs.writeFileSync(process.env.BARRIER_READY, "ready\n");
+    }
+    waitForReleaseFile(process.env.BARRIER, "worker-barrier");
+  }
   const workerArtifacts = bundle();
   const overBudgetWorkerTimes = process.env.OVER_BUDGET_WATCH_ANCHOR ?
     Array(12).fill("2026-07-26T00:00:00Z") : null;
@@ -2846,13 +2851,29 @@ function bounded(file) { return JSON.parse(fs.readFileSync(file, "utf8")); }
 assert.equal(crashJournal.entries[0].phase, "prepare");
 assert.equal(crashJournal.entries.length, 1, "crash after actuation leaves an ambiguous prepared receipt");
 const recoveryLog = `${tmp}/crash-recovery.log`, recoveryBarrier = `${tmp}/recovery-barrier`;
-const recoveryWorkers = [
-  runWorker({ WORKER_MODE: "recover", WORKER_DIR: crashDir, RECOVERY_LOG: recoveryLog, BARRIER: recoveryBarrier }),
-  runWorker({ WORKER_MODE: "recover", WORKER_DIR: crashDir, RECOVERY_LOG: recoveryLog, BARRIER: recoveryBarrier }),
+const recoveryReady = [
+  `${tmp}/recovery-worker-1.ready`,
+  `${tmp}/recovery-worker-2.ready`,
 ];
+const recoveryWorkers = [
+  runWorker({
+    WORKER_MODE: "recover", WORKER_DIR: crashDir, RECOVERY_LOG: recoveryLog,
+    BARRIER: recoveryBarrier, BARRIER_READY: recoveryReady[0],
+  }),
+  runWorker({
+    WORKER_MODE: "recover", WORKER_DIR: crashDir, RECOVERY_LOG: recoveryLog,
+    BARRIER: recoveryBarrier, BARRIER_READY: recoveryReady[1],
+  }),
+];
+for (const ready of recoveryReady) waitForFile(ready);
 fs.writeFileSync(recoveryBarrier, "");
-await Promise.all(recoveryWorkers);
-assert.equal(fs.readFileSync(recoveryLog, "utf8").trim().split("\n").length, 1, "recovery claim is process-safe and one-shot");
+const recoveryWorkerStatuses = await Promise.all(recoveryWorkers);
+assert.equal(recoveryWorkerStatuses.includes(0), true,
+  "at least one recovery worker completes the contested claim");
+const recoveryClaimCount = fs.existsSync(recoveryLog) ?
+  fs.readFileSync(recoveryLog, "utf8").trim().split("\n").filter(Boolean).length : 0;
+assert.equal(recoveryClaimCount, 1,
+  "recovery claim is process-safe and exactly one worker claims it");
 assert.equal(bounded(`${crashDir}/${binding().idempotency_key}.json`).entries.at(-1).phase, "disarm");
 
 const staleRecoveryDir = `${tmp}/stale-recovery`;
