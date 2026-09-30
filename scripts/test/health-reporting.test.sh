@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Hermetic tests for Brokkr's report -> snapshot -> Heimdall push path.
+# shellcheck disable=SC2016 # assertions are intentionally evaluated later by check/eval
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,7 +18,7 @@ exit "${MOCK_MOUNT_RC:-0}"
 EOF
 cat > "$TMP/bin/findmnt" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' /dev/mock-backup
+printf '%s\n' "${MOCK_FINDMNT_OUTPUT:-/dev/mock-backup}"
 EOF
 cat > "$TMP/bin/df" <<'EOF'
 #!/usr/bin/env bash
@@ -48,6 +49,7 @@ export PATH="$TMP/bin:$PATH"
 export BROKKR_DISK_MOUNT="$TMP/mount" BROKKR_STATE_DIR="$TMP/state"
 export BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=disabled
 export BROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net
+export MOCK_FINDMNT_OUTPUT=/dev/mock-backup
 
 PASS=0
 FAIL=0
@@ -65,35 +67,28 @@ run_report() {
 echo "health-reporting.test.sh"
 
 export BROKKR_NOW_EPOCH=2000000000
-unset BROKKR_TM_STATUS BROKKR_TM_DETAIL BROKKR_TM_OBSERVED_AT
 export MOCK_MOUNT_RC=0 MOCK_USED_PCT=70 MOCK_AVAIL=600G
+export BROKKR_TM_STATUS='pass","detail":"forged' BROKKR_TM_DETAIL='legacy Mac evidence must be ignored' BROKKR_TM_OBSERVED_AT=1999999990
 run_report
-check "missing Mac evidence keeps report valid" '[[ "$RC" -eq 0 ]] && printf "%s" "$OUT" | python3 -m json.tool >/dev/null'
-check "missing Mac evidence makes aggregate warn" '[[ "$(printf "%s" "$OUT" | json_value '\''data["status"]'\'')" == warn ]]'
-check "missing Mac evidence is explicit and actionable" '[[ "$(printf "%s" "$OUT" | json_value '\''next(c["detail"] for c in data["checks"] if c["name"] == "timemachine")'\'')" == UNKNOWN:* ]]'
+check "legacy Mac evidence is ignored and report stays valid" '[[ "$RC" -eq 0 ]] && printf "%s" "$OUT" | python3 -m json.tool >/dev/null'
+check "report contains exactly the three platform checks" '[[ "$(printf "%s" "$OUT" | json_value '\''[c["name"] for c in data["checks"]]'\'')" == "['"'"'disk-mount'"'"', '"'"'disk-capacity'"'"', '"'"'tailscale-auth'"'"']" ]]'
+check "legacy Mac evidence cannot add a Time Machine row" '[[ "$OUT" != *timemachine* && "$OUT" != *"legacy Mac evidence"* && "$OUT" != *"forged"* ]]'
+check "healthy platform checks produce aggregate pass" '[[ "$(printf "%s" "$OUT" | json_value '\''data["status"]'\'')" == pass ]]'
 check "healthy Tailscale authentication is included" '[[ "$(printf "%s" "$OUT" | json_value '\''next(c["status"] for c in data["checks"] if c["name"] == "tailscale-auth")'\'')" == pass ]]'
 
-export BROKKR_TM_STATUS=pass BROKKR_TM_DETAIL='OK: Mac-side backup checked' BROKKR_TM_OBSERVED_AT=1999999990
+export MOCK_FINDMNT_OUTPUT=$'hostile\r\ttab\bbackspace\fformfeed\x01one\x1funit quote" slash\\ newline\nend'
 run_report
-check "explicit Mac pass permits aggregate pass" '[[ "$(printf "%s" "$OUT" | json_value '\''data["status"]'\'')" == pass ]]'
-check "Mac evidence detail is preserved" '[[ "$(printf "%s" "$OUT" | json_value '\''next(c["detail"] for c in data["checks"] if c["name"] == "timemachine")'\'')" == "OK: Mac-side backup checked" ]]'
+check "all JSON-forbidden control bytes from a platform check are escaped and round-trip" 'printf "%s" "$OUT" | python3 -c '\''import json,os,sys; data=json.load(sys.stdin); detail=next(c["detail"] for c in data["checks"] if c["name"] == "disk-mount"); assert detail.endswith("(" + os.environ["MOCK_FINDMNT_OUTPUT"] + ")")'\'''
 
-export BROKKR_TM_DETAIL=$'hostile\r\ttab\bbackspace\fformfeed\x01one\x1funit quote" slash\\ newline\nend'
+export MOCK_FINDMNT_OUTPUT=/dev/mock-backup MOCK_MOUNT_RC=2
 run_report
-check "all JSON-forbidden control bytes are escaped and round-trip" 'printf "%s" "$OUT" | python3 -c '\''import json,os,sys; data=json.load(sys.stdin); detail=next(c["detail"] for c in data["checks"] if c["name"] == "timemachine"); assert detail == os.environ["BROKKR_TM_DETAIL"]'\'''
-
-export BROKKR_TM_STATUS='pass","detail":"forged' BROKKR_TM_DETAIL='ignored'
-run_report
-check "invalid Mac status cannot forge JSON or pass" '[[ "$(printf "%s" "$OUT" | json_value '\''data["status"]'\'')" == warn ]] && printf "%s" "$OUT" | python3 -m json.tool >/dev/null'
-
-export BROKKR_TM_STATUS=pass BROKKR_TM_DETAIL='OK: Mac-side backup checked' BROKKR_TM_OBSERVED_AT=1999999990 MOCK_MOUNT_RC=2
-run_report
-check "disk failure dominates an explicit Mac pass" '[[ "$(printf "%s" "$OUT" | json_value '\''data["status"]'\'')" == fail ]]'
+check "platform failure produces aggregate fail" '[[ "$(printf "%s" "$OUT" | json_value '\''data["status"]'\'')" == fail ]]'
 export MOCK_MOUNT_RC=0
 
-export BROKKR_TM_STATUS=pass BROKKR_TM_DETAIL='stale pass' BROKKR_TM_OBSERVED_AT=1999000000
+export MOCK_USED_PCT=80
 run_report
-check "stale Mac pass is downgraded to explicit unknown" '[[ "$(printf "%s" "$OUT" | json_value '\''data["status"]'\'')" == warn ]] && [[ "$(printf "%s" "$OUT" | json_value '\''next(c["detail"] for c in data["checks"] if c["name"] == "timemachine")'\'')" == *stale* ]]'
+check "platform warning produces aggregate warn" '[[ "$(printf "%s" "$OUT" | json_value '\''data["status"]'\'')" == warn ]]'
+export MOCK_USED_PCT=70
 
 mkdir -p "$TMP/python"
 cat > "$TMP/python/sitecustomize.py" <<'PY'
@@ -151,7 +146,7 @@ check "partial push configuration fails loudly" '[[ "$RC" -ne 0 && -s "$TMP/stat
 export MOCK_HTTP_STATUS=200 HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel
 run_push
 check "successful push records current success" '[[ "$RC" -eq 0 && -s "$TMP/state/last-push-success" && ! -e "$TMP/state/last-push-failure" ]]'
-check "successful push includes explicit Time Machine unknown" 'python3 -c '\''import json,sys; r=json.load(open(sys.argv[1])); assert r["authorization"] == "Bearer secret-sentinel"; assert "timemachine: UNKNOWN" in r["body"]["message"]'\'' "$TMP/request.json"'
+check "successful push includes only the three platform checks" 'python3 -c '\''import json,sys; r=json.load(open(sys.argv[1])); assert r["authorization"] == "Bearer secret-sentinel"; assert r["body"]["message"] == "3 checks, all nominal"; assert "timemachine" not in r["body"]["message"]'\'' "$TMP/request.json"'
 
 rm -f "$TMP/state/last-push-success" "$TMP/state/last-push-failure"
 export MOCK_DATE_FAIL=1
@@ -186,7 +181,8 @@ OUT="$(bash "$ROOT/scripts/health-snapshot.sh" 2>&1)"
 # shellcheck disable=SC2034 # assertion consumes these through check/eval
 RC=$?
 check "snapshot path succeeds unconfigured and writes valid JSON atomically" '[[ "$RC" -eq 0 && -f "$TMP/state/health.json" ]] && python3 -m json.tool "$TMP/state/health.json" >/dev/null'
-check "snapshot exposes unknown Time Machine as aggregate warn" '[[ "$(json_value '\''data["status"]'\'' < "$TMP/state/health.json")" == warn ]]'
+check "snapshot exposes healthy platform checks as aggregate pass" '[[ "$(json_value '\''data["status"]'\'' < "$TMP/state/health.json")" == pass ]]'
+check "snapshot contains exactly the three platform checks" '[[ "$(json_value '\''[c["name"] for c in data["checks"]]'\'' < "$TMP/state/health.json")" == "['"'"'disk-mount'"'"', '"'"'disk-capacity'"'"', '"'"'tailscale-auth'"'"']" ]]'
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"

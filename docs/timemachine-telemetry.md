@@ -5,6 +5,11 @@ client. This producer therefore does not call `tmutil`. It reads bounded
 metadata from the sparsebundle **band-files directory** on M5: writes change a
 band file, while the sparsebundle directory timestamp alone is not evidence.
 
+M5 destination telemetry is separate from the NAS platform health report. The
+retired NAS-side `BROKKR_TM_STATUS`, `BROKKR_TM_DETAIL`, and
+`BROKKR_TM_OBSERVED_AT` Mac result feed is not consumed; this producer publishes
+its own authenticated `timemachine` panel from M5-local evidence.
+
 ## Truth and privacy contract
 
 The M5 user service reads one owner-only, mode-0600 configuration file at
