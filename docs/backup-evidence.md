@@ -51,9 +51,10 @@ tmutil destinationinfo
 ```
 
 If `tmutil` itself fails, the result is `unknown`, not “no backups.” A successful empty
-query is the distinct, proven “no backups” failure state. A result passed to the NAS-side
-Heimdall report also needs `BROKKR_TM_OBSERVED_AT` (epoch seconds); an undated or stale
-`BROKKR_TM_STATUS` is deliberately downgraded to `unknown`.
+query is the distinct, proven “no backups” failure state. This is Mac-side evidence only:
+the NAS-side Heimdall report no longer accepts a Mac result feed, so
+`BROKKR_TM_STATUS`, `BROKKR_TM_DETAIL`, and `BROKKR_TM_OBSERVED_AT` are retired and
+must not be supplied to it.
 
 ### NAS tenants (NAS Pi)
 
