@@ -10,8 +10,10 @@
 #
 # Contract: installs timemachine.conf, removes ANY inline [TimeMachine] stanza, ensures the
 # include directive is present, and — after ANY change to EITHER file — validates that the
-# [TimeMachine] share still resolves with `fruit:time machine = yes` (scoped to that section,
-# honouring testparm's exit code). On failure it restores BOTH files and does NOT reload.
+# [TimeMachine] share resolves in the requested state (retired by default).
+# Active shares require explicit BROKKR_SAMBA_TIME_MACHINE_STATE=active.
+# Validation is section-scoped and honours testparm's exit code. On failure it
+# restores BOTH files. A failed reload also restores the files and reports failure.
 # smb.conf/timemachine.conf are backed up next to themselves (`.bak-brokkr30-<ts>`); the
 # backups are kept when a change was made and removed on a no-op run.
 set -euo pipefail
@@ -21,6 +23,17 @@ SMB="$ETC/smb.conf"
 TMCONF="$ETC/timemachine.conf"
 SUDO="${SUDO-sudo}"
 : "${STAGE:?STAGE (staged timemachine.conf path) is required}"
+VALIDATE_ONLY=0
+case "${1-}" in
+  --validate-stage) VALIDATE_ONLY=1 ;;
+  "") ;;
+  *) echo "ERROR: invalid deploy-remote argument" >&2; exit 2 ;;
+esac
+TIME_MACHINE_STATE="${BROKKR_SAMBA_TIME_MACHINE_STATE-retired}"
+case "$TIME_MACHINE_STATE" in
+  retired|active) ;;
+  *) echo "ERROR: invalid BROKKR_SAMBA_TIME_MACHINE_STATE; expected retired or active" >&2; exit 2 ;;
+esac
 
 # ERE for an ACTIVE include of our file: case-insensitive, whitespace-tolerant around '=',
 # anchored at line start so a commented "# include = ..." never matches. Dots are escaped.
@@ -28,21 +41,38 @@ TMCONF_RE="$(printf '%s' "$TMCONF" | sed 's/[.]/\\./g')"
 INC_RE="^[[:space:]]*include[[:space:]]*=[[:space:]]*${TMCONF_RE}[[:space:]]*\$"
 
 CHANGED=0 BK_SMB="" BK_TM="" had_tm=0
-ts() { date +%Y%m%d-%H%M%S; }
+ts() { printf '%s-%s' "$(date +%Y%m%d-%H%M%S)" "$$"; }
 
-# True iff the [TimeMachine] share resolves: testparm EXITS 0 AND that section (only) carries
-# `fruit:time machine = yes`. Section names are matched case-insensitively / whitespace-agnostic.
+# Require both retirement flags in this section. Flags in another share cannot
+# satisfy the guard, and the last assignment wins as in Samba's config parser.
+config_has_state() {
+  awk -v state="$TIME_MACHINE_STATE" '
+    function norm(l){ gsub(/[ \t\r]/,"",l); return tolower(l) }
+    { line=norm($0) }
+    line ~ /^\[.*\]$/ { intm=(line=="[timemachine]"); if(intm) count++; next }
+    intm && line ~ /^available=/ { available=substr(line,index(line,"=")+1) }
+    intm && line ~ /^fruit:timemachine=/ { fruit=substr(line,index(line,"=")+1) }
+    END {
+      if(count!=1) exit 1
+      if(state=="retired") exit !(available=="no" && fruit=="no")
+      exit !(fruit=="yes" && (available=="" || available=="yes"))
+    }
+  ' "${1:--}"
+}
+
+# Reject a stale enabled operator config before changing or backing up anything.
+if ! config_has_state "$STAGE"; then
+  echo "ERROR: staged [TimeMachine] config does not match requested $TIME_MACHINE_STATE state" >&2
+  exit 2
+fi
+[ "$VALIDATE_ONLY" = 0 ] || exit 0
+
+# True iff testparm succeeds and this section resolves in the requested state.
+# Section and boolean matching is case-insensitive and whitespace-tolerant.
 validate_share() {
   local eff
   if ! eff="$($SUDO testparm -s 2>/dev/null)"; then return 1; fi
-  printf '%s\n' "$eff" | awk '
-    function norm(l){ gsub(/[ \t]/,"",l); return tolower(l) }
-    function ishdr(l){ return norm(l) ~ /^\[.*\]$/ }
-    norm($0)=="[timemachine]" { intm=1; next }
-    intm && ishdr($0)         { intm=0 }
-    intm && tolower($0) ~ /fruit:time machine[ \t]*=[ \t]*yes/ { found=1 }
-    END { exit(found?0:1) }
-  '
+  printf '%s\n' "$eff" | config_has_state
 }
 count_inline() {  # inline [TimeMachine] section headers in $1 (case/space-insensitive)
   $SUDO awk 'function norm(l){gsub(/[ \t]/,"",l);return tolower(l)}
@@ -81,13 +111,23 @@ if [ "$has_inline" != "0" ] || [ "$has_include" = "0" ]; then
 fi
 
 # 3. After ANY change, validate the share; reload only on success, else restore both files.
+if ! validate_share; then
+  if [ "$CHANGED" = "1" ]; then
+    echo "   ABORT: [TimeMachine] does not resolve in $TIME_MACHINE_STATE state — rolling back (no reload)"
+    rollback
+  else
+    [ -n "$BK_SMB" ] && $SUDO rm -f "$BK_SMB"
+    [ -n "$BK_TM" ] && $SUDO rm -f "$BK_TM"
+    echo "   ABORT: existing [TimeMachine] does not resolve in $TIME_MACHINE_STATE state (no reload)" >&2
+  fi
+  exit 2
+fi
 if [ "$CHANGED" = "1" ]; then
-  if ! validate_share; then
-    echo "   ABORT: [TimeMachine] does not resolve with fruit:time machine=yes — rolling back (no reload)"
+  if ! $SUDO systemctl reload smbd; then
+    echo "   ABORT: smbd reload failed — restoring both config files; verify live service before retry" >&2
     rollback
     exit 2
   fi
-  $SUDO systemctl reload smbd
   echo "   smbd reloaded"
   [ -n "$BK_SMB" ] && echo "   backup: $BK_SMB"
   [ -n "$BK_TM" ]  && echo "   backup: $BK_TM"
