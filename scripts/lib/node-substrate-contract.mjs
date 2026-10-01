@@ -59,9 +59,9 @@ export const evidenceDigest = (record) => {
 // producer validates them itself before parsing the schema so an accidental or
 // hostile local edit cannot silently change the contract it enforces.
 export const PINNED_CONTRACT_SHA256 = Object.freeze({
-  schema: "9a69f1b23499cd6e70fdaa80ee57bf983e7e5b288882e0cf2b0f01f10824fbbe",
+  schema: "d7cd93443fdfb556fbfda8fe3fe20eb51bc5db0ffeebbeeec30a9145887f0344",
   manifest: "355481f2b3866840795ba18033077d6f36487d1a447b36c323384cf7837c5fcb",
-  provenance: "ec8918cfc52e5ad95e1f339ab7aa6fd5af1411f2aaaa400228357c061bdf1bea",
+  provenance: "76dda442e57bc7e9c97620b1e1b022dbad6b840696e3f7280345ff59359393dd",
 });
 
 const sha256File = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
