@@ -30,9 +30,11 @@ verified, so any failure leaves it closed.
    that fails these checks is first expired, its published key withdrawn and its sessions
    ended, and only then refused. It never removes groups or ranges
    itself.
-3. Writes a `user-<uid>.slice` resource drop-in (below), starts or updates the slice, and
-   reads the kernel's `memory.max`, `memory.high`, `memory.swap.max`, `pids.max` and
-   `cpu.max` back; a mismatch aborts.
+3. Writes a `user-<uid>.slice` resource drop-in (below), checks systemd's configured
+   values (`systemctl show`), and reads the kernel's `memory.max`, `memory.high`,
+   `memory.swap.max`, `pids.max` and `cpu.max` back through a transient root scope in the
+   slice (`systemd-run --scope --slice=`). An empty slice has no cgroup, and the expired
+   account cannot start `user@<uid>` itself (PAM account check). A mismatch aborts.
 4. Writes the SSH key to `/etc/brokkr/agent-account/<user>.keys` (root-owned), validates
    the nftables ruleset with `nft -c`, and installs `brokkr-agent-egress-<user>.service`.
    The unit loads the ruleset and only then publishes the key to
@@ -63,8 +65,9 @@ verified, so any failure leaves it closed.
    the previous drop-in. sshd never reads `~/.ssh` for this
    account, so the agent cannot add keys or drop the `from=` restriction, and root never
    writes inside the agent's home.
-7. Enables linger (tmux and user services survive logout) and, as the very last step,
-   the account itself (no usable password, no expiry).
+7. Enables linger (tmux and user services survive logout), then the account itself (no
+   usable password, no expiry), then starts `user@<uid>`, which could not start while the
+   account was expired.
 
 Run it as the operator without `sudo`; it escalates per command. It refuses root.
 `--apply` requires `BROKKR_EXPECTED_SOURCE` and `BROKKR_EXPECTED_COMMIT`
