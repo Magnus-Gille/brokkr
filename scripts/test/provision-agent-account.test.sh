@@ -123,7 +123,7 @@ case "$1" in
     [[ ${STUB_FAIL:-} != enable ]] || exit 1
     unit=${!#}
     if ! grep -qx -- "$unit" "$STUB_STATE/active"; then echo "$unit" >>"$STUB_STATE/active"; load "$unit"; fi ;;
-  restart) load "$2" ;;
+  restart|reload) load "$2" ;;
   daemon-reload|set-property) : ;;
   *) echo "systemctl stub: unexpected: $*" >&2; exit 99 ;;
 esac
@@ -266,7 +266,7 @@ expected_nft() { # allowlist
     "${T}${T}meta skuid 1001 ip6 daddr { fc00::/7, fe80::/10 } counter reject" \
     "${T}}" '}'
 }
-EXPECT_UNIT=$'[Unit]\nDescription=Brokkr egress isolation for agent account agent-dev\nBefore=user@1001.service systemd-user-sessions.service\nDefaultDependencies=no\nAfter=local-fs.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/sbin/nft -f /etc/brokkr/agent-account/agent-dev.nft\nExecStop=/usr/sbin/nft delete table inet brokkr_agent_agent_dev\n\n[Install]\nWantedBy=multi-user.target'
+EXPECT_UNIT=$'[Unit]\nDescription=Brokkr egress isolation for agent account agent-dev\nBefore=user@1001.service systemd-user-sessions.service\nDefaultDependencies=no\nAfter=local-fs.target nftables.service\nPartOf=nftables.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/sbin/nft -f /etc/brokkr/agent-account/agent-dev.nft\nExecReload=/usr/sbin/nft -f /etc/brokkr/agent-account/agent-dev.nft\nExecStop=/usr/sbin/nft delete table inet brokkr_agent_agent_dev\n\n[Install]\nWantedBy=multi-user.target'
 EXPECT_AUTH="from=\"$SSH_FROM\",no-agent-forwarding,no-X11-forwarding ssh-ed25519 $B64 brokkr-agent-account"
 
 seed_user() { # name uid groups [marker-uid]
@@ -323,11 +323,13 @@ check 'linger is enabled' has_call 'sudo loginctl enable-linger agent-dev'
 check 'inactive slice gets no runtime set-property' no_call 'set-property'
 check 'every mutation went through sudo' only_via_sudo
 check 'the egress unit is enabled and started' has_call 'sudo systemctl enable --now brokkr-agent-egress-agent-dev.service'
-check 'a first install does not restart the unit' no_call 'restart'
+check 'a first install does not restart or reload the unit' no_call 'systemctl (restart|reload) '
 check 'nft -c precedes enable --now' before 'sudo nft -c -f' 'sudo systemctl enable --now'
 check 'enable --now precedes the table readback' before 'sudo systemctl enable --now' 'sudo nft list table inet brokkr_agent_agent_dev'
 check 'the table readback precedes authorized_keys' before 'sudo nft list table inet brokkr_agent_agent_dev' '/dev/stdin '"$AUTH"
 check 'authorized_keys precedes linger' before '/dev/stdin '"$AUTH" 'sudo loginctl enable-linger'
+check 'the account is denied cron' same_content "$ROOT_DIR/etc/cron.deny" 'agent-dev'
+check 'cron is denied before authorized_keys' before 'sudo tee -a '"$ROOT_DIR"'/etc/cron.deny' '/dev/stdin '"$AUTH"
 check 'nft -c precedes linger' before 'sudo nft -c -f' 'sudo loginctl enable-linger'
 check 'useradd precedes the egress unit' before 'sudo useradd' 'sudo systemctl enable --now'
 check 'output points at the docs' out_has 'docs/agent-account.md'
@@ -339,13 +341,15 @@ check 're-run succeeds' rc_is 0
 check 're-run creates no second account' test "$(call_count 'useradd')" = 0
 check 're-run converges on identical files' test "$SNAP1" = "$(snapshot)"
 check 're-run keeps a single key line' test "$(wc -l <"$AUTH" | tr -d ' ')" = 1
+check 're-run lists the account in cron.deny once' test "$(grep -cx agent-dev "$ROOT_DIR/etc/cron.deny")" = 1
 check 're-run re-enables a possibly revoked account' has_call 'sudo usermod -p * --expiredate  agent-dev'
-check 're-run restarts the active egress unit' has_call 'sudo systemctl restart brokkr-agent-egress-agent-dev.service'
+check 're-run reloads the active egress unit atomically' has_call 'sudo systemctl reload brokkr-agent-egress-agent-dev.service'
+check 're-run never restarts the egress unit' no_call 'systemctl restart '
 run --apply "${BASE[@]}" --cpu-quota 400% --memory-high 6G --memory-max 8G --tasks-max 1024 --allow-local-tcp '3000,40000-40100'
 check 'changed limits re-run succeeds' rc_is 0
 check 'slice drop-in follows the new limits' same_content "$SLICE" $'[Slice]\nCPUQuota=400%\nCPUWeight=20\nIOWeight=20\nMemoryHigh=6G\nMemoryMax=8G\nMemorySwapMax=0\nTasksMax=1024'
 check 'nft ruleset follows the new allowlist' same_content "$NFT" "$(expected_nft '3000, 40000-40100')"
-check 'restart loaded the changed ruleset' same_content "$STATE/loaded.nft" "$(expected_nft '3000, 40000-40100')"
+check 'reload loaded the changed ruleset' same_content "$STATE/loaded.nft" "$(expected_nft '3000, 40000-40100')"
 run --apply "${BASE[@]}" --allow-local-tcp '0080,443-443'
 check 'ports are rendered as normalised decimals' same_content "$NFT" "$(expected_nft '80, 443')"
 

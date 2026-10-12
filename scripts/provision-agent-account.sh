@@ -255,10 +255,12 @@ render_unit() {
     "Description=Brokkr egress isolation for agent account $USER_NAME" \
     "Before=user@$U.service systemd-user-sessions.service" \
     'DefaultDependencies=no' \
-    'After=local-fs.target' \
+    'After=local-fs.target nftables.service' \
+    'PartOf=nftables.service' \
     '' '[Service]' \
     'Type=oneshot' 'RemainAfterExit=yes' \
     "ExecStart=/usr/sbin/nft -f /etc/brokkr/agent-account/$USER_NAME.nft" \
+    "ExecReload=/usr/sbin/nft -f /etc/brokkr/agent-account/$USER_NAME.nft" \
     "ExecStop=/usr/sbin/nft delete table inet $NFT_TABLE" \
     '' '[Install]' 'WantedBy=multi-user.target'
 }
@@ -431,9 +433,10 @@ UNIT_WAS_ACTIVE=0
 if [[ $APPLY -eq 1 ]] && systemctl is-active --quiet "$UNIT_NAME"; then UNIT_WAS_ACTIVE=1; fi
 run systemctl enable --now "$UNIT_NAME"
 if [[ $APPLY -eq 0 ]]; then
-  echo "if $UNIT_NAME was already active, would also run: sudo systemctl restart $UNIT_NAME"
+  echo "if $UNIT_NAME was already active, would also run: sudo systemctl reload $UNIT_NAME"
 elif [[ $UNIT_WAS_ACTIVE -eq 1 ]]; then
-  sudo systemctl restart "$UNIT_NAME"
+  # The ruleset file replaces the table in one nft transaction, so a reload never leaves a gap.
+  sudo systemctl reload "$UNIT_NAME"
 fi
 if [[ $APPLY -eq 1 ]]; then
   systemctl is-active --quiet "$UNIT_NAME" || fatal "$UNIT_NAME is not active; no SSH key was written"
@@ -444,11 +447,23 @@ else
   echo "would verify: sudo nft list table inet $NFT_TABLE"
 fi
 
-step '5. SSH access (this script owns and overwrites authorized_keys)'
+step '5. cron (cron jobs run outside the user slice, so the account may not schedule any)'
+CRON_DENY=$ROOT/etc/cron.deny
+if [[ $APPLY -eq 1 ]]; then
+  if sudo grep -qxF -- "$USER_NAME" "$CRON_DENY" 2>/dev/null; then
+    echo "$USER_NAME is already listed in $CRON_DENY"
+  else
+    printf '%s\n' "$USER_NAME" | sudo tee -a "$CRON_DENY" >/dev/null
+  fi
+else
+  echo "would ensure $USER_NAME is listed once in $CRON_DENY"
+fi
+
+step '6. SSH access (this script owns and overwrites authorized_keys)'
 run install -d -m 0700 -o "$USER_NAME" -g "$USER_NAME" "$SSH_DIR"
 render_authorized_keys | put_file 0600 "$USER_NAME" "$USER_NAME" "$AUTH_FILE"
 
-step '6. linger'
+step '7. linger'
 run loginctl enable-linger "$USER_NAME"
 
 step 'summary'

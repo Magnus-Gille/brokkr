@@ -25,8 +25,14 @@ Idempotent; re-running converges and never duplicates anything.
 3. Writes a `user-<uid>.slice` resource drop-in (below) and applies it to a live slice.
 4. Renders an nftables ruleset, validates it with `nft -c`, and installs
    `brokkr-agent-egress-<user>.service`, which loads it before `user@<uid>.service`
-   and `systemd-user-sessions.service`. Re-runs restart the unit so a changed ruleset loads.
-5. Only after the unit is active and the table reads back, writes
+   and `systemd-user-sessions.service`, after (and `PartOf=`) `nftables.service`, so an
+   `nftables.service` start or restart that flushes the ruleset reloads this table too.
+   Re-runs `reload` the unit; the file replaces the table in one nft transaction, so the
+   rules are never absent.
+5. Adds the account to `/etc/cron.deny`: cron jobs run in `cron.service`, outside the
+   user slice, and would bypass the resource budget. (If `/etc/cron.allow` exists, cron
+   already ignores the deny list and only listed users may use it.)
+6. Only after the unit is active and the table reads back, writes
    `~/.ssh/authorized_keys` (one key, restricted to `--ssh-from`, no agent or X11
    forwarding; the script owns and overwrites this file) and enables linger so tmux and
    user services survive logout.
@@ -71,7 +77,11 @@ from the tailnet.
 - Any service listening on an allowlisted port (including ephemeral ports) is reachable
   by the agent. Keep sensitive services outside the allowlist and outside 32768-60999.
 - `/tmp` is shared; do not put secrets there.
-- A re-run restarts the egress unit, so the ruleset is briefly unloaded.
+- Example of the above: a database query engine or similar helper that binds a random
+  localhost port lands in the ephemeral range and stays reachable. Audit `ss -ltn`.
+- Only private IPv4 and IPv6 ULA/link-local destinations are blocked. LAN devices with
+  global IPv6 addresses remain reachable.
+- `ssh -L` forwarding runs as the agent, so it is subject to the same rules.
 - The ruleset is only syntax-checked (`nft -c`) on apply; the repository tests use stubs
   and never exercise a live kernel, so run the verification below after every change.
 
