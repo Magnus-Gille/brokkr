@@ -169,9 +169,23 @@ case "$1" in
     [[ ${STUB_FAIL:-} != enable ]] || exit 1
     unit=${!#}
     if ! grep -qx -- "$unit" "$STUB_STATE/active"; then mark_active "$unit"; load "$unit"; fi ;;
+  show) # show UNIT -p Key...: systemd's configured slice limits, from the drop-in
+    show_unit=$2
+    show_conf="$BROKKR_AGENT_ROOT/etc/systemd/system/$show_unit.d/70-brokkr-agent-account.conf"
+    [[ -f $show_conf ]] || exit 1
+    while IFS='=' read -r key val; do
+      case $key in
+        MemoryMax|MemoryHigh)
+          b=$(bytes "$val")
+          if [[ $key == MemoryMax && ${STUB_SHOW_WRONG:-} == 1 ]]; then b=infinity; fi
+          echo "$key=$b" ;;
+        MemorySwapMax|TasksMax) echo "$key=$val" ;;
+      esac
+    done <"$show_conf" ;;
   start)
     mark_active "$2"
     case $2 in
+      user@*) : ;;
       *.slice)
         if [[ ${STUB_CG_MISSING:-} != 1 ]]; then
           grep '=' "$BROKKR_AGENT_ROOT/etc/systemd/system/$2.d/70-brokkr-agent-account.conf" | cgroup "$2"
@@ -242,6 +256,21 @@ case "$1" in
     fi ;;
   *) exit 99 ;;
 esac
+EOF
+stub systemd-run <<'EOF'
+#!/usr/bin/env bash
+[[ -n ${STUB_SUDO:-} ]] || printf 'systemd-run %s\n' "$*" >>"$STUB_CALLS"
+slice=
+while [[ $# -gt 0 && $1 != -- ]]; do
+  case $1 in --slice=*) slice=${1#--slice=} ;; esac
+  shift
+done
+shift
+# A transient scope realizes an empty slice from its drop-in; an existing cgroup keeps its values.
+if [[ -n $slice && ! -d "$BROKKR_AGENT_ROOT/sys/fs/cgroup/user.slice/$slice" ]]; then
+  STUB_SUDO=1 systemctl start "$slice"
+fi
+exec "$@"
 EOF
 stub findmnt <<'EOF'
 #!/usr/bin/env bash
@@ -461,7 +490,7 @@ check 'dry-run says nothing is changed' out_has 'DRY-RUN'
 check 'dry-run creates the account expired' out_has 'would run: sudo useradd --create-home --home-dir /home/agent-dev --shell /bin/bash --user-group --expiredate 1 -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 agent-dev'
 check 'dry-run plans the home mode' out_has "would run: sudo chmod 0700 $HOMEDIR"
 check 'dry-run renders the slice drop-in' out_has 'MemoryMax=24G'
-check 'dry-run plans the cgroup readback' out_has 'and verify memory.max, memory.high, memory.swap.max, pids.max and cpu.max'
+check 'dry-run plans the cgroup readback' out_has 'via a transient root scope in the slice, memory.max, memory.high, memory.swap.max, pids.max and cpu.max'
 check 'dry-run renders the nft table with a uid placeholder' out_has 'meta skuid <uid> ip daddr 127.0.0.0/8 tcp dport { 1420, 4173, 5173, 32768-60999 } accept'
 check 'dry-run renders the root-owned key file path' out_has "--- would write $KEYF (mode 0644, owner root:root) ---"
 check 'dry-run renders the restricted key line' out_has "$EXPECT_KEYS"
@@ -504,7 +533,8 @@ check 'useradd creates the account already expired' first_sudo_is 'sudo useradd 
 check 'a fresh account needs no separate expiry call' no_call 'usermod --expiredate 1'
 check 'the account is enabled exactly once' test "$(call_count 'usermod -p')" = 1
 check 'the account is enabled with an unusable password and no expiry' has_call 'sudo usermod -p * --expiredate  agent-dev'
-check 'the account enable is the last privileged call' last_sudo_is 'sudo usermod -p * --expiredate  agent-dev'
+check 'the user manager is started as the last privileged call' last_sudo_is 'sudo systemctl start user@1001.service'
+check 'the user manager starts only after the account is enabled' before 'sudo usermod -p' 'sudo systemctl start user@1001.service'
 check 'a fresh account has no sessions to terminate' no_call 'terminate-user'
 check 'a fresh host without nftables.conf is noted' out_has "no $ROOT_DIR/etc/nftables.conf on this host"
 check 'a fresh host without nftables.conf gets none created' absent "$ROOT_DIR/etc/nftables.conf"
@@ -519,16 +549,19 @@ check 'useradd precedes the egress unit' before 'sudo useradd' 'sudo systemctl e
 # resource slice and cgroup readback
 check 'slice drop-in is exact' same_content "$SLICE" "$EXPECT_SLICE"
 check 'slice drop-in is 0644 root' meta_has "$SLICE 0644 root root"
-check 'an inactive slice is started' has_call 'sudo systemctl start user-1001.slice'
+check 'the kernel limits are read through a transient scope in the slice' has_call 'sudo systemd-run --quiet --collect --scope --slice=user-1001.slice'
+check 'the configured slice limits are read from systemd' has_call 'systemctl show user-1001.slice -p MemoryMax -p MemoryHigh -p MemorySwapMax -p TasksMax'
+check 'the slice itself is never started directly' no_call 'systemctl start user-1001.slice'
 check 'an inactive slice gets no runtime set-property' no_call 'set-property'
-check 'the slice drop-in is loaded before the slice starts' before 'sudo systemctl daemon-reload' 'sudo systemctl start user-1001.slice'
+check 'the slice drop-in is loaded before the readback' before 'sudo systemctl daemon-reload' 'sudo systemd-run --quiet --collect --scope --slice=user-1001.slice'
 check 'cgroup memory.max is read back as 24G' cg_is memory.max 25769803776
 check 'cgroup memory.high is read back as 20G' cg_is memory.high 21474836480
 check 'cgroup memory.swap.max is read back as 0' cg_is memory.swap.max 0
 check 'cgroup pids.max is read back as 4096' cg_is pids.max 4096
 check 'cgroup cpu.max is read back as 2000%' cg_is cpu.max '2000000 100000'
 check 'the cgroup readback is reported as passed' out_has 'ok: effective limits'
-check 'the slice limits are verified before the account is enabled' before 'sudo systemctl start user-1001.slice' 'sudo usermod -p'
+check 'the slice limits are verified before the account is enabled' before 'sudo systemd-run --quiet --collect --scope --slice=user-1001.slice' 'sudo usermod -p'
+check 'the slice limits are verified before any SSH key exists' before 'sudo systemd-run --quiet --collect --scope --slice=user-1001.slice' 'sudo systemctl enable --now'
 # egress isolation
 check 'nft ruleset is exact' same_content "$NFT" "$(expected_nft '1420, 4173, 5173, 32768-60999')"
 check 'nft ruleset is staged then validated root-owned' meta_has "$NFT.new 0644 root root"
@@ -614,7 +647,8 @@ check 're-run reloads sshd after the policy check' before 'sudo sshd -T' 'sudo s
 check 're-run goes through sudo only' only_via_sudo
 check 're-run with the egress table loaded ends no sessions' no_call 'terminate-user'
 check 're-run looks for the egress table after the initial expiry' before 'sudo usermod --expiredate 1 agent-dev' 'sudo nft list table inet brokkr_agent_agent_dev'
-check 're-run enables the account as its last privileged call' last_sudo_is 'sudo usermod -p * --expiredate  agent-dev'
+check 're-run starts the user manager as its last privileged call' last_sudo_is 'sudo systemctl start user@1001.service'
+check 're-run enables the account before starting the user manager' before 'sudo usermod -p' 'sudo systemctl start user@1001.service'
 check 're-run enables linger before the account' before 'sudo loginctl enable-linger' 'sudo usermod -p'
 check 're-run checks the sshd policy from loopback and both ranges' test "$(call_count 'sudo sshd -T')" = 3
 check 're-run keeps the reload-withdrawn key republished' same_content "$RUNKEY" "$EXPECT_KEYS"
@@ -1017,6 +1051,12 @@ done
 reset_host
 STUB_CG_WRONG=1 run --apply "${BASE[@]}"
 check 'STUB_CG_WRONG=1 corrupts memory.max' out_has "memory.max is 'max', expected 24G"
+reset_host
+STUB_SHOW_WRONG=1 run --apply "${BASE[@]}"
+check 'a wrong configured MemoryMax aborts non-zero' rc_is 1
+check 'a wrong configured MemoryMax is named' out_has 'does not have MemoryMax=25769803776'
+check 'a wrong configured MemoryMax keeps the account expired' stays_expired
+check 'a wrong configured MemoryMax starts no egress unit' no_call 'enable --now'
 reset_host
 STUB_CG_MISSING=1 run --apply "${BASE[@]}"
 check 'unreadable cgroup files abort non-zero' rc_is 1

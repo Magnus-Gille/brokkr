@@ -81,7 +81,7 @@ done
 
 # --- environment ------------------------------------------------------------------------------
 missing=()
-for tool in useradd usermod loginctl systemctl nft getent id install findmnt ssh-keygen sshd; do
+for tool in useradd usermod loginctl systemctl systemd-run nft getent id install findmnt ssh-keygen sshd; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [[ $APPLY -eq 1 ]]; then
@@ -576,20 +576,21 @@ run install -d -m 0755 -o root -g root "$(dirname "$SLICE_FILE")"
 render_slice | put_file 0644 root root "$SLICE_FILE"
 run systemctl daemon-reload
 SLICE_PROPS=("CPUQuota=$CPU_QUOTA" CPUWeight=20 IOWeight=20 "MemoryHigh=$MEM_HIGH" "MemoryMax=$MEM_MAX" MemorySwapMax=0 "TasksMax=$TASKS_MAX")
-if [[ $APPLY -eq 1 ]]; then
-  if systemctl is-active --quiet "$SLICE_UNIT"; then
-    sudo systemctl set-property --runtime "$SLICE_UNIT" "${SLICE_PROPS[@]}"
-  else
-    sudo systemctl start "$SLICE_UNIT"
-  fi
-  # Read the kernel's effective limits back; systemd ignores directives it cannot apply.
+# Kernel limits. An empty slice has no cgroup, and the expired account cannot start user@<uid>
+# (PAM account check), so a transient root scope in the slice realizes it while reading the files.
+verify_cgroup() {
+  local dump cg_max cg_high cg_swap cg_pids cg_cpu cpu_quota cpu_period
   page_floor() { echo $(( $1 - $1 % 4096 )); }
-  read_cg() { [[ -r $CGROUP_DIR/$1 ]] && cat "$CGROUP_DIR/$1"; }
-  cg_max=$(read_cg memory.max) || fatal "cannot read $CGROUP_DIR/memory.max"
-  cg_high=$(read_cg memory.high) || fatal "cannot read $CGROUP_DIR/memory.high"
-  cg_swap=$(read_cg memory.swap.max) || fatal "cannot read $CGROUP_DIR/memory.swap.max"
-  cg_pids=$(read_cg pids.max) || fatal "cannot read $CGROUP_DIR/pids.max"
-  cg_cpu=$(read_cg cpu.max) || fatal "cannot read $CGROUP_DIR/cpu.max"
+  # shellcheck disable=SC2016 # expanded by the transient shell, not here
+  dump=$(sudo systemd-run --quiet --collect --scope --slice="$SLICE_UNIT" -- /bin/sh -c \
+    'cd "$1" && for f in memory.max memory.high memory.swap.max pids.max cpu.max; do printf "%s=%s\n" "$f" "$(cat "$f")"; done' \
+    sh "$CGROUP_DIR") || fatal "cannot read the kernel limits of $SLICE_UNIT; the account stays expired"
+  read_cg() { local line; line=$(grep -m1 "^$1=" <<<"$dump") && echo "${line#*=}"; }
+  cg_max=$(read_cg memory.max) || fatal "memory.max missing for $SLICE_UNIT; the account stays expired"
+  cg_high=$(read_cg memory.high) || fatal "memory.high missing for $SLICE_UNIT; the account stays expired"
+  cg_swap=$(read_cg memory.swap.max) || fatal "memory.swap.max missing for $SLICE_UNIT; the account stays expired"
+  cg_pids=$(read_cg pids.max) || fatal "pids.max missing for $SLICE_UNIT; the account stays expired"
+  cg_cpu=$(read_cg cpu.max) || fatal "cpu.max missing for $SLICE_UNIT; the account stays expired"
   read -r cpu_quota cpu_period <<<"$cg_cpu"
   [[ $cg_max == "$(page_floor "$MEM_MAX_BYTES")" ]] || fatal "memory.max is '$cg_max', expected $MEM_MAX ($MEM_MAX_BYTES bytes)"
   [[ $cg_high == "$(page_floor "$MEM_HIGH_BYTES")" ]] || fatal "memory.high is '$cg_high', expected $MEM_HIGH"
@@ -599,8 +600,23 @@ if [[ $APPLY -eq 1 ]]; then
     $((cpu_quota * 100)) -eq $((${CPU_QUOTA%\%} * cpu_period)) ]] ||
     fatal "cpu.max is '$cg_cpu', expected $CPU_QUOTA"
   echo "ok: effective limits memory.max=$cg_max memory.high=$cg_high pids.max=$cg_pids cpu.max=$cg_cpu"
+}
+
+if [[ $APPLY -eq 1 ]]; then
+  if systemctl is-active --quiet "$SLICE_UNIT"; then
+    sudo systemctl set-property --runtime "$SLICE_UNIT" "${SLICE_PROPS[@]}"
+  fi
+  # systemd's configured limits; systemd ignores directives it cannot parse.
+  slice_cfg=$(systemctl show "$SLICE_UNIT" -p MemoryMax -p MemoryHigh -p MemorySwapMax -p TasksMax) ||
+    fatal "cannot read the configuration of $SLICE_UNIT"
+  for want in "MemoryMax=$MEM_MAX_BYTES" "MemoryHigh=$MEM_HIGH_BYTES" MemorySwapMax=0 "TasksMax=$TASKS_MAX"; do
+    grep -qxF -- "$want" <<<"$slice_cfg" ||
+      fatal "$SLICE_UNIT does not have $want (systemd reports: $(tr '\n' ' ' <<<"$slice_cfg")); the account stays expired"
+  done
+  verify_cgroup
 else
-  echo "would start or update $SLICE_UNIT (set-property --runtime ${SLICE_PROPS[*]}) and verify memory.max, memory.high, memory.swap.max, pids.max and cpu.max under $CGROUP_DIR"
+  echo "if $SLICE_UNIT is active, would run: sudo systemctl set-property --runtime $SLICE_UNIT ${SLICE_PROPS[*]}"
+  echo "would verify systemctl show $SLICE_UNIT (MemoryMax, MemoryHigh, MemorySwapMax, TasksMax) and, via a transient root scope in the slice, memory.max, memory.high, memory.swap.max, pids.max and cpu.max under $CGROUP_DIR"
 fi
 
 step "4. egress isolation ($NFT_TABLE) and SSH key gate"
@@ -738,6 +754,13 @@ fi
 step '7. linger, then enable the account (the last step; any earlier failure leaves it expired)'
 run loginctl enable-linger "$USER_NAME"
 run usermod -p '*' --expiredate '' "$USER_NAME"
+# The expired account's user manager could not start (PAM account check); start it now.
+if [[ $APPLY -eq 1 ]]; then
+  sudo systemctl start "user@$U.service" ||
+    echo "warning: user@$U.service did not start; it starts on the next login or boot" >&2
+else
+  echo "would run: sudo systemctl start user@$U.service"
+fi
 
 step 'summary'
 proc_opts=$(findmnt -no OPTIONS /proc 2>/dev/null || true)
