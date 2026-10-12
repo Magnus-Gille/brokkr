@@ -23,7 +23,11 @@ verified, so any failure leaves it closed.
    marker `/var/lib/brokkr/agent-account/<user>.managed` holding the UID; a re-run first
    expires an existing account. An existing account without the marker is never adopted.
 2. Fails closed if the account has any group beyond its own (sudo, adm, lxd, docker,
-   render, ...). It never removes groups itself.
+   render, ...) or any `/etc/subuid`/`/etc/subgid` range. It is created with
+   `-K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0`: with subordinate IDs, `newuidmap` and rootless
+   containers (`podman --network=host`) could run processes under other uids in the host
+   network namespace, outside the per-uid egress rules. It never removes groups or ranges
+   itself.
 3. Writes a `user-<uid>.slice` resource drop-in (below), starts or updates the slice, and
    reads the kernel's `memory.max`, `memory.high`, `memory.swap.max`, `pids.max` and
    `cpu.max` back; a mismatch aborts.
@@ -92,6 +96,10 @@ runs as the agent and is subject to the same rules; use it to reach an agent's d
 - `/proc` shows other users' process arguments unless the host mounts it with `hidepid`;
   the script reports the current mount. Keep secrets out of command lines.
 - Global IPv6 LAN addresses are not blocked; check `ip -6 addr show scope global`.
+- The rules match the socket's uid. Setuid-root programs and system daemons that connect
+  on the agent's behalf are not covered; audit fstab `user` mounts and world-writable
+  daemon sockets. The Tailscale LocalAPI socket is world-accessible but grants non-root,
+  non-operator users read access only (status), not dialing.
 - Restarting `nftables.service` with a flushing ruleset leaves a short window before this
   table is re-created; existing agent connections are not cut. Never run
   `nft flush ruleset` by hand on the host.

@@ -89,6 +89,12 @@ printf '%s:x:%s:%s::/home/%s:/bin/bash\n' "$name" "$uid" "$uid" "$name" >>"$STUB
 printf '%s:x:%s:\n' "$name" "$uid" >>"$STUB_STATE/group"
 mkdir -p "$STUB_STATE/groups" "$BROKKR_AGENT_ROOT/home/$name"
 printf '%s%s\n' "$name" "${STUB_EXTRA_GROUP:+ $STUB_EXTRA_GROUP}" >"$STUB_STATE/groups/$name"
+# Like useradd with SUB_UID_COUNT > 0 in login.defs: allocate subordinate ranges unless -K zeroes them.
+if [[ " $* " != *' -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 '* || -n ${STUB_USERADD_SUBIDS:-} ]]; then
+  mkdir -p "$BROKKR_AGENT_ROOT/etc"
+  printf '%s:100000:65536\n' "$name" >>"$BROKKR_AGENT_ROOT/etc/subuid"
+  printf '%s:100000:65536\n' "$name" >>"$BROKKR_AGENT_ROOT/etc/subgid"
+fi
 EOF
 stub usermod <<'EOF'
 #!/usr/bin/env bash
@@ -389,7 +395,7 @@ reset_host
 NOBIND=1 run "${BASE[@]}"
 check 'dry-run succeeds without a deploy-source binding' rc_is 0
 check 'dry-run says nothing is changed' out_has 'DRY-RUN'
-check 'dry-run creates the account expired' out_has 'would run: sudo useradd --create-home --home-dir /home/agent-dev --shell /bin/bash --user-group --expiredate 1 agent-dev'
+check 'dry-run creates the account expired' out_has 'would run: sudo useradd --create-home --home-dir /home/agent-dev --shell /bin/bash --user-group --expiredate 1 -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 agent-dev'
 check 'dry-run plans the home mode' out_has "would run: sudo chmod 0700 $HOMEDIR"
 check 'dry-run renders the slice drop-in' out_has 'MemoryMax=24G'
 check 'dry-run plans the cgroup readback' out_has 'and verify memory.max, memory.high, memory.swap.max, pids.max and cpu.max'
@@ -425,7 +431,7 @@ reset_host
 run --apply "${BASE[@]}"
 check 'apply on a fresh host succeeds' rc_is 0
 # account lifecycle: created expired, enabled once, at the very end
-check 'useradd creates the account already expired' first_sudo_is 'sudo useradd --create-home --home-dir /home/agent-dev --shell /bin/bash --user-group --expiredate 1 agent-dev'
+check 'useradd creates the account already expired' first_sudo_is 'sudo useradd --create-home --home-dir /home/agent-dev --shell /bin/bash --user-group --expiredate 1 -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 agent-dev'
 check 'a fresh account needs no separate expiry call' no_call 'usermod --expiredate 1'
 check 'the account is enabled exactly once' test "$(call_count 'usermod -p')" = 1
 check 'the account is enabled with an unusable password and no expiry' has_call 'sudo usermod -p * --expiredate  agent-dev'
@@ -572,6 +578,29 @@ printf 'agent-dev2\nxagent-dev\n' >"$ROOT_DIR/etc/cron.allow"
 run --apply "${BASE[@]}"
 check 'a cron.allow listing only other names does not block the apply' rc_is 0
 
+# 3e. subordinate IDs would bypass the per-uid egress rules ----------------------------------------
+reset_host
+run --apply "${BASE[@]}"
+check 'a fresh account gets no subuid range' test ! -s "$ROOT_DIR/etc/subuid"
+check 'a fresh account gets no subgid range' test ! -s "$ROOT_DIR/etc/subgid"
+reset_host
+STUB_USERADD_SUBIDS=1 run --apply "${BASE[@]}"
+check 'subordinate IDs allocated anyway abort the apply' rc_is 64
+check 'the subordinate-ID refusal names the cause' out_has 'subordinate IDs'
+check 'subordinate IDs keep the account expired' no_call 'usermod -p'
+check 'subordinate IDs prevent linger' no_call 'enable-linger'
+check 'subordinate IDs prevent any key publication' absent "$ROOT_DIR/run/brokkr-agent-keys/agent-dev"
+reset_host
+seed_user agent-dev 1500 agent-dev 1500
+mkdir -p "$ROOT_DIR/etc"
+printf 'agent-dev:165536:65536\n' >"$ROOT_DIR/etc/subuid"
+expect_refusal 'refuses a managed account with a subuid range by name' 'subordinate IDs' --apply "${BASE[@]}"
+reset_host
+seed_user agent-dev 1500 agent-dev 1500
+mkdir -p "$ROOT_DIR/etc"
+printf '1500:165536:65536\n' >"$ROOT_DIR/etc/subgid"
+expect_refusal 'refuses a managed account with a subgid range by uid' 'subordinate IDs' "${BASE[@]}"
+
 # 4. refusals ------------------------------------------------------------------------------------
 reset_host
 echo 0 >"$STATE/euid"
@@ -684,7 +713,7 @@ reset_host
 STUB_EXTRA_GROUP=sudo run --apply "${BASE[@]}"
 check 'the group check fails closed with exit 64' rc_is 64
 check 'the group check names the problem' out_has 'only to its own group'
-check 'the account was created expired' has_call '--user-group --expiredate 1 agent-dev'
+check 'the account was created expired' has_call '--user-group --expiredate 1 -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 agent-dev'
 check 'the key file is not written when the group check fails' absent "$KEYF"
 check 'no key is published when the group check fails' absent "$RUNKEY"
 check 'the account stays expired when the group check fails' stays_expired

@@ -384,6 +384,15 @@ require_uid_floor() {
   [[ $UID_NUM -ge 1000 ]] || die "account $USER_NAME has uid $UID_NUM (< 1000); refusing"
 }
 
+check_subids() { # subordinate IDs would let newuidmap/rootless containers run under other uids
+  local file
+  for file in "$ROOT/etc/subuid" "$ROOT/etc/subgid"; do
+    if [[ -f $file ]] && grep -qE "^($USER_NAME|$UID_NUM):" "$file"; then
+      die "account $USER_NAME has subordinate IDs in $file; processes under those uids would bypass the per-uid egress rules (remove them with usermod --del-subuids/--del-subgids)"
+    fi
+  done
+}
+
 check_groups() { # fail closed on ANY supplementary group; never removes groups automatically
   local groups
   groups=$(id -nG "$USER_NAME") || fatal "cannot read group membership of $USER_NAME"
@@ -398,7 +407,7 @@ if read_account; then
   require_uid_floor
   require_home
   U=$UID_NUM
-  if [[ $REVOKE -eq 0 ]]; then check_groups; fi
+  if [[ $REVOKE -eq 0 ]]; then check_groups; check_subids; fi
 elif [[ $REVOKE -eq 1 ]]; then
   die "account $USER_NAME does not exist; nothing to revoke"
 elif getent group "$USER_NAME" >/dev/null 2>&1; then
@@ -476,7 +485,9 @@ if [[ $EXISTS -eq 1 ]]; then
   echo "account exists (uid $UID_NUM, managed)"
   run usermod --expiredate 1 "$USER_NAME"
 else
-  run useradd --create-home --home-dir "$HOME_DIR" --shell /bin/bash --user-group --expiredate 1 "$USER_NAME"
+  # No subordinate ID ranges: the per-uid egress rules must cover every process the account runs.
+  run useradd --create-home --home-dir "$HOME_DIR" --shell /bin/bash --user-group --expiredate 1 \
+    -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 "$USER_NAME"
   if [[ $APPLY -eq 1 ]]; then
     read_account || fatal "account $USER_NAME not found after useradd"
     U=$UID_NUM
@@ -492,12 +503,13 @@ fi
 # /home is root-owned, so the agent cannot swap its home directory for a symlink.
 run chmod 0700 "$HOME_PATH"
 
-step '2. group membership (must be only its own group)'
+step '2. group membership and subordinate IDs'
 if [[ $APPLY -eq 1 ]]; then
   check_groups
-  echo "ok: $(id -nG "$USER_NAME")"
+  check_subids
+  echo "ok: groups '$(id -nG "$USER_NAME")', no subordinate IDs"
 else
-  echo "would verify: id -nG $USER_NAME is exactly '$USER_NAME'"
+  echo "would verify: id -nG $USER_NAME is exactly '$USER_NAME' and it has no /etc/subuid or /etc/subgid range"
 fi
 
 SLICE_UNIT=user-$U.slice
