@@ -277,9 +277,17 @@ run() { # privileged command: executed via sudo on --apply, printed on dry-run
 }
 
 put_file() { # mode owner group path; content on stdin
-  local mode=$1 owner=$2 group=$3 path=$4
+  local mode=$1 owner=$2 group=$3 path=$4 tmp
   if [[ $APPLY -eq 1 ]]; then
-    sudo install -m "$mode" -o "$owner" -g "$group" /dev/stdin "$path"
+    # Stage in a private regular file: uutils install (the Ubuntu 26.04 default) cannot copy from a
+    # pipe such as /dev/stdin over an existing destination.
+    tmp=$(mktemp "${TMPDIR:-/tmp}/brokkr-agent-account.XXXXXX")
+    cat >"$tmp"
+    if ! sudo install -m "$mode" -o "$owner" -g "$group" "$tmp" "$path"; then
+      rm -f "$tmp"
+      return 1
+    fi
+    rm -f "$tmp"
   else
     printf -- '--- would write %s (mode %s, owner %s:%s) ---\n' "$path" "$mode" "$owner" "$group"
     cat

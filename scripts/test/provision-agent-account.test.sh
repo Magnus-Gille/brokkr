@@ -297,6 +297,11 @@ if [[ $dir -eq 1 ]]; then
     printf '%s %s %s %s\n' "$d" "$mode" "$owner" "$group" >>"$STUB_STATE/meta"
   done
 else
+  # Like uutils install 0.8 (Ubuntu 26.04): a pipe source cannot replace an existing file.
+  if [[ ( $1 == /dev/stdin || $1 == /proc/self/fd/0 ) && -e $2 ]]; then
+    echo 'install: No such file or directory' >&2
+    exit 1
+  fi
   cat "$1" >"$2" && chmod "$mode" "$2" || exit 1
   printf '%s %s %s %s\n' "$2" "$mode" "$owner" "$group" >>"$STUB_STATE/meta"
 fi
@@ -393,8 +398,11 @@ file_before() { # file earlier-line later-line (first occurrence of each)
 last_sudo_is() { [[ "$(grep '^sudo ' "$CALLS" | tail -1)" == "$1" ]]; }
 first_sudo_is() { [[ "$(grep -m1 '^sudo ' "$CALLS")" == "$1" ]]; }
 cg_is() { [[ "$(cat "$CGDIR/$1" 2>/dev/null)" == "$2" ]]; }
-only_via_sudo() { no_call '^(useradd|usermod|loginctl|nft|install|chmod|mv|rm) ' &&
+# The only unprivileged mutation allowed is removing put_file's own staging file.
+only_via_sudo() { ! grep -E '^(useradd|usermod|loginctl|nft|install|chmod|mv|rm) ' "$CALLS" |
+  grep -vqE '^rm -f [^ ]*/brokkr-agent-account\.[A-Za-z0-9]+$' &&
   no_call '^systemctl (daemon-reload|enable|start|restart|reload|try-reload-or-restart|set-property)'; }
+staging_cleaned() { ! ls "${TMPDIR:-/tmp}"/brokkr-agent-account.* >/dev/null 2>&1; }
 nothing_mutated() { only_via_sudo && no_call '^sudo '; }
 stays_expired() { no_call 'usermod -p ' && no_call 'enable-linger'; }
 refused() { # pattern: rc 64, prefixed message, no mutation at all
@@ -575,7 +583,7 @@ check 'the egress unit never deletes the table' lacks_re "$UNIT" 'delete table'
 check 'user manager drop-in is exact' same_content "$UMDROP" "$EXPECT_UMDROP"
 check 'user manager drop-in is 0644 root' meta_has "$UMDROP 0644 root root"
 check 'user manager drop-in directory is root-owned' meta_has "$ROOT_DIR/etc/systemd/system/user@1001.service.d 0755 root root"
-check 'the user manager drop-in is in place before the unit starts' before "/dev/stdin $UMDROP" 'sudo systemctl enable --now'
+check 'the user manager drop-in is in place before the unit starts' before " $UMDROP" 'sudo systemctl enable --now'
 check 'the egress unit is enabled and started' has_call "sudo systemctl enable --now $UNIT_NAME"
 check 'a first install does not restart or reload the unit' no_call 'sudo systemctl (restart|reload) '
 check 'nft -c precedes enable --now' before 'sudo nft -c -f' 'sudo systemctl enable --now'
@@ -586,7 +594,7 @@ check 'persistent key file is exactly one restricted key line' same_content "$KE
 check 'persistent key file is 0644 owned by root' meta_has "$KEYF 0644 root root"
 check 'persistent key file mode on disk is 644' mode_is "$KEYF" 644
 check 'the config directory is root-owned' meta_has "$ROOT_DIR/etc/brokkr/agent-account 0755 root root"
-check 'the key file is written before the egress unit starts' before "/dev/stdin $KEYF" 'sudo systemctl enable --now'
+check 'the key file is written before the egress unit starts' before " $KEYF" 'sudo systemctl enable --now'
 check 'the egress unit published the key under /run' same_content "$RUNKEY" "$EXPECT_KEYS"
 check 'the published key is identical to the persistent key' cmp -s "$KEYF" "$RUNKEY"
 check 'the script verifies the published key against the persistent key' has_call "sudo cmp -s $KEYF $RUNKEY"
@@ -623,6 +631,8 @@ check 'the account is denied at' same_content "$AT_DENY" 'agent-dev'
 check 'cron is denied before the account is enabled' before "sudo tee -a $CRON_DENY" 'sudo usermod -p'
 check 'at is denied before the account is enabled' before "sudo tee -a $AT_DENY" 'sudo usermod -p'
 check 'every mutation went through sudo' only_via_sudo
+check 'put_file stages through a private file, not /dev/stdin' no_call 'install .* /dev/stdin '
+check 'put_file leaves no staging file behind' staging_cleaned
 check 'output points at the docs' out_has 'docs/agent-account.md'
 
 # 3. idempotent re-run ---------------------------------------------------------------------------
@@ -645,6 +655,8 @@ check 're-run applies runtime properties to the active slice' has_call "sudo sys
 check 're-run does not start the active slice' no_call 'sudo systemctl start user-1001.slice'
 check 're-run reloads sshd after the policy check' before 'sudo sshd -T' 'sudo systemctl try-reload-or-restart ssh.service'
 check 're-run goes through sudo only' only_via_sudo
+check 're-run can replace existing files (uutils install)' rc_is 0
+check 're-run leaves no staging file behind' staging_cleaned
 check 're-run with the egress table loaded ends no sessions' no_call 'terminate-user'
 check 're-run looks for the egress table after the initial expiry' before 'sudo usermod --expiredate 1 agent-dev' 'sudo nft list table inet brokkr_agent_agent_dev'
 check 're-run starts the user manager as its last privileged call' last_sudo_is 'sudo systemctl start user@1001.service'
