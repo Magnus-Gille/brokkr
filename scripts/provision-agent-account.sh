@@ -232,7 +232,12 @@ NFT_FILE=$CONF_DIR/$USER_NAME.nft
 KEYS_FILE=$CONF_DIR/$USER_NAME.keys
 RUN_KEYS_DIR=/run/brokkr-agent-keys
 RUN_KEY=$RUN_KEYS_DIR/$USER_NAME
-SSHD_DROPIN=$ROOT/etc/ssh/sshd_config.d/70-brokkr-agent-$USER_NAME.conf
+# 00- sorts first: sshd keeps the first value it obtains, so later Match Address/Host blocks cannot
+# override these settings for the account.
+SSHD_DROPIN=$ROOT/etc/ssh/sshd_config.d/00-brokkr-agent-$USER_NAME.conf
+NFT_CONF=$ROOT/etc/nftables.conf
+NFT_INCLUDE='include "/etc/brokkr/agent-account/*.nft"'
+ATJOBS_DIR=$ROOT/var/spool/cron/atjobs
 MARKER_DIR=$ROOT/var/lib/brokkr/agent-account
 MARKER=$MARKER_DIR/$USER_NAME.managed
 NFT_TABLE=brokkr_agent_${USER_NAME//-/_}
@@ -317,6 +322,8 @@ render_unit() {
     "ExecStart=/usr/sbin/nft -f /etc/brokkr/agent-account/$USER_NAME.nft" \
     "ExecStartPost=/usr/bin/install -d -m 0755 -o root -g root $RUN_KEYS_DIR" \
     "ExecStartPost=$install /etc/brokkr/agent-account/$USER_NAME.keys $RUN_KEY" \
+    '# Reload withdraws the key first and republishes it only after the ruleset loaded.' \
+    "ExecReload=/usr/bin/rm -f $RUN_KEY" \
     "ExecReload=/usr/sbin/nft -f /etc/brokkr/agent-account/$USER_NAME.nft" \
     "ExecReload=$install /etc/brokkr/agent-account/$USER_NAME.keys $RUN_KEY" \
     '# Stopping keeps the table (isolation stays) and withdraws the key (no new logins).' \
@@ -331,6 +338,11 @@ render_user_manager_dropin() {
 render_sshd_dropin() {
   printf '%s\n' "Match User $USER_NAME" \
     "    AuthorizedKeysFile $RUN_KEYS_DIR/%u" \
+    '    AuthorizedKeysCommand none' \
+    '    AuthorizedPrincipalsFile none' \
+    '    AuthorizedPrincipalsCommand none' \
+    '    TrustedUserCAKeys none' \
+    '    HostbasedAuthentication no' \
     '    AuthenticationMethods publickey' \
     '    PasswordAuthentication no' \
     '    KbdInteractiveAuthentication no' \
@@ -345,6 +357,11 @@ render_sshd_dropin() {
 # Effective policy sshd must report for the account (sshd -T lowercases keywords).
 SSHD_EXPECT=(
   "authorizedkeysfile $RUN_KEYS_DIR/%u"
+  'authorizedkeyscommand none'
+  'authorizedprincipalsfile none'
+  'authorizedprincipalscommand none'
+  'trustedusercakeys none'
+  'hostbasedauthentication no'
   'authenticationmethods publickey'
   'passwordauthentication no'
   'kbdinteractiveauthentication no'
@@ -423,6 +440,15 @@ print_mode() {
 }
 
 # --- revoke -----------------------------------------------------------------------------------
+terminate_sessions() { # 0 when ended or none were running; prints the error otherwise
+  local out
+  if out=$(sudo loginctl terminate-user "$USER_NAME" 2>&1); then return 0; fi
+  case $out in
+    *'not logged in'*) echo "terminate-user: $USER_NAME has no sessions"; return 0 ;;
+    *) echo "$out"; return 1 ;;
+  esac
+}
+
 REVOKE_FAILURES=()
 attempt() { # revoke step: every step runs even if an earlier one failed
   if [[ $APPLY -eq 1 ]]; then
@@ -441,11 +467,10 @@ revoke() {
   attempt rm -f "$ROOT$RUN_KEY"
   attempt loginctl disable-linger "$USER_NAME"
   if [[ $APPLY -eq 1 ]]; then
-    if ! out=$(sudo loginctl terminate-user "$USER_NAME" 2>&1); then
-      case $out in
-        *'not logged in'*) echo "terminate-user: $USER_NAME has no sessions" ;;
-        *) REVOKE_FAILURES+=("loginctl terminate-user $USER_NAME: $out") ;;
-      esac
+    if ! out=$(terminate_sessions); then
+      REVOKE_FAILURES+=("loginctl terminate-user $USER_NAME: $out")
+    else
+      [[ -z $out ]] || echo "$out"
     fi
   else
     echo "would run: sudo loginctl terminate-user $USER_NAME (a 'not logged in' failure is ignored)"
@@ -461,6 +486,7 @@ Full removal is manual and destructive. After reviewing the home directory, run:
   sudo rm -f $UNIT_FILE $NFT_FILE $KEYS_FILE $SSHD_DROPIN $MARKER
   sudo rm -rf $ROOT/etc/systemd/system/user-$U.slice.d $ROOT/etc/systemd/system/user@$U.service.d
   sudo sed -i '/^$USER_NAME\$/d' $CRON_DENY $AT_DENY
+  (and remove the line '$NFT_INCLUDE' from $NFT_CONF once no agent account remains)
   sudo systemctl daemon-reload
 EOF
   if [[ ${#REVOKE_FAILURES[@]} -gt 0 ]]; then
@@ -484,6 +510,15 @@ step '1. account (kept expired until every protection is verified)'
 if [[ $EXISTS -eq 1 ]]; then
   echo "account exists (uid $UID_NUM, managed)"
   run usermod --expiredate 1 "$USER_NAME"
+  if [[ $APPLY -eq 1 ]]; then
+    if ! sudo nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+      echo "egress table $NFT_TABLE is not loaded: ending sessions that ran without isolation"
+      out=$(terminate_sessions) || fatal "could not end sessions of $USER_NAME: $out (the account stays expired)"
+      [[ -z $out ]] || echo "$out"
+    fi
+  else
+    echo "if table $NFT_TABLE is not loaded, would also run: sudo loginctl terminate-user $USER_NAME"
+  fi
 else
   # No subordinate ID ranges: the per-uid egress rules must cover every process the account runs.
   run useradd --create-home --home-dir "$HOME_DIR" --shell /bin/bash --user-group --expiredate 1 \
@@ -558,9 +593,32 @@ if [[ $APPLY -eq 1 ]]; then
     fatal 'nft rejected the ruleset; nothing was enabled and the account stays expired'
   fi
   sudo mv -f "$NFT_FILE.new" "$NFT_FILE"
+  if sudo test -e "$NFT_CONF"; then
+    sudo test -f "$NFT_CONF" && ! sudo test -L "$NFT_CONF" ||
+      fatal "$NFT_CONF is not a regular file; the account stays expired"
+    if sudo grep -qxF -- "$NFT_INCLUDE" "$NFT_CONF"; then
+      echo "$NFT_CONF already includes the agent rulesets"
+    else
+      # Any nftables.service start/reload that flushes the ruleset re-creates these tables in the
+      # same transaction. Validate the whole file and restore it on failure.
+      sudo cp -a "$NFT_CONF" "$NFT_CONF.brokkr-previous"
+      {
+        if sudo test -s "$NFT_CONF" && [[ -n "$(sudo tail -c 1 "$NFT_CONF")" ]]; then printf '\n'; fi
+        printf '%s\n' "$NFT_INCLUDE"
+      } | sudo tee -a "$NFT_CONF" >/dev/null
+      if ! sudo nft -c -f "$NFT_CONF"; then
+        sudo mv -f "$NFT_CONF.brokkr-previous" "$NFT_CONF"
+        fatal "nft rejected $NFT_CONF with the include; it was restored and the account stays expired"
+      fi
+      sudo rm -f "$NFT_CONF.brokkr-previous"
+    fi
+  else
+    echo "no $NFT_CONF on this host; the egress unit alone loads the table"
+  fi
 else
   render_nft | put_file 0644 root root "$NFT_FILE"
   echo "would stage as $NFT_FILE.new, validate with 'sudo nft -c -f', then move into place"
+  echo "would ensure $NFT_CONF (if present) contains: $NFT_INCLUDE (validated with nft -c, restored on failure)"
 fi
 render_unit | put_file 0644 root root "$UNIT_FILE"
 USER_MANAGER_DROPIN=$ROOT/etc/systemd/system/user@$U.service.d/70-brokkr-agent-egress.conf
@@ -596,6 +654,9 @@ if [[ $APPLY -eq 1 ]]; then
   if sudo test -e "$ROOT/var/spool/cron/crontabs/$USER_NAME"; then
     fatal "$USER_NAME already has a crontab; review and remove it (the account stays expired)"
   fi
+  if sudo test -d "$ATJOBS_DIR" && [[ -n "$(sudo find "$ATJOBS_DIR" -maxdepth 1 -type f -uid "$U" -print -quit)" ]]; then
+    fatal "$USER_NAME has queued at jobs in $ATJOBS_DIR; review and remove them (the account stays expired)"
+  fi
   for deny in "$CRON_DENY" "$AT_DENY"; do
     if sudo grep -qxF -- "$USER_NAME" "$deny" 2>/dev/null; then
       echo "$USER_NAME is already listed in $deny"
@@ -610,7 +671,7 @@ if [[ $APPLY -eq 1 ]]; then
     fi
   done
 else
-  echo "would refuse if $USER_NAME is in cron.allow/at.allow or already has a crontab"
+  echo "would refuse if $USER_NAME is in cron.allow/at.allow or already has a crontab or queued at jobs"
   echo "would ensure $USER_NAME is listed once in $CRON_DENY and $AT_DENY"
 fi
 
@@ -631,26 +692,32 @@ if [[ $APPLY -eq 1 ]]; then
     restore_sshd_dropin
     fatal 'sshd rejected the configuration; the previous drop-in state was restored and sshd was not reloaded'
   fi
-  sshd_policy=$(sudo sshd -T -C "user=$USER_NAME,host=localhost,addr=127.0.0.1") || {
-    restore_sshd_dropin
-    fatal 'sshd -T failed; the previous drop-in state was restored and sshd was not reloaded'
-  }
-  for want in "${SSHD_EXPECT[@]}"; do
-    if ! grep -qxF -- "$want" <<<"$sshd_policy"; then
+  # Check loopback and the network address of every --ssh-from range, so an address-specific
+  # Match block elsewhere cannot hand real clients a different policy.
+  contexts=(127.0.0.1)
+  for cidr in "${cidr_items[@]}"; do contexts+=("${cidr%/*}"); done
+  for addr in "${contexts[@]}"; do
+    sshd_policy=$(sudo sshd -T -C "user=$USER_NAME,host=$addr,addr=$addr,lport=22") || {
       restore_sshd_dropin
-      fatal "sshd policy for $USER_NAME is not effective (missing '$want'; is sshd_config.d included, or does an earlier rule override it?); previous drop-in restored"
-    fi
+      fatal "sshd -T failed for addr=$addr; the previous drop-in state was restored and sshd was not reloaded"
+    }
+    for want in "${SSHD_EXPECT[@]}"; do
+      if ! grep -qxF -- "$want" <<<"$sshd_policy"; then
+        restore_sshd_dropin
+        fatal "sshd policy for $USER_NAME is not effective from $addr (missing '$want'; is sshd_config.d included, or does an earlier rule override it?); previous drop-in restored"
+      fi
+    done
   done
   [[ -z $SSHD_BACKUP ]] || sudo rm -f "$SSHD_BACKUP"
   sudo systemctl try-reload-or-restart ssh.service
 else
   render_sshd_dropin | put_file 0644 root root "$SSHD_DROPIN"
-  echo "would validate with 'sudo sshd -t' and 'sudo sshd -T -C user=$USER_NAME,...' (restoring the previous drop-in on failure), then: sudo systemctl try-reload-or-restart ssh.service"
+  echo "would validate with 'sudo sshd -t' and 'sudo sshd -T -C user=$USER_NAME,addr=...' for 127.0.0.1 and every --ssh-from range (restoring the previous drop-in on failure), then: sudo systemctl try-reload-or-restart ssh.service"
 fi
 
-step '7. enable the account and linger (only after steps 1-6 passed)'
-run usermod -p '*' --expiredate '' "$USER_NAME"
+step '7. linger, then enable the account (the last step; any earlier failure leaves it expired)'
 run loginctl enable-linger "$USER_NAME"
+run usermod -p '*' --expiredate '' "$USER_NAME"
 
 step 'summary'
 proc_opts=$(findmnt -no OPTIONS /proc 2>/dev/null || true)

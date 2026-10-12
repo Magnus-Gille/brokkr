@@ -107,6 +107,9 @@ stub loginctl <<'EOF'
 if [[ $1 == disable-linger && ${STUB_DISABLE_LINGER_FAIL:-} == 1 ]]; then
   echo "Failed to disable linger for user $2: Access denied" >&2; exit 1
 fi
+if [[ $1 == enable-linger && ${STUB_ENABLE_LINGER_FAIL:-} == 1 ]]; then
+  echo "Failed to enable linger for user $2: Access denied" >&2; exit 1
+fi
 if [[ $1 == terminate-user ]]; then
   case ${STUB_TERMINATE:-ok} in
     notloggedin) echo "Failed to terminate user $2: User ID 1001 is not logged in." >&2; exit 1 ;;
@@ -180,7 +183,26 @@ case "$1" in
     slice=$3
     shift 3
     if [[ ${STUB_CG_MISSING:-} != 1 ]]; then printf '%s\n' "$@" | cgroup "$slice"; fi ;;
-  restart|reload) load "$2" ;;
+  restart) load "$2" ;;
+  reload) # run the installed unit's ExecReload= lines in order; a failing line stops the rest
+    reload_unit=${2#brokkr-agent-egress-}
+    reload_unit=${reload_unit%.service}
+    reload_conf="$BROKKR_AGENT_ROOT/etc/brokkr/agent-account"
+    while IFS= read -r line; do
+      cmd=${line#ExecReload=}
+      case $cmd in
+        '/usr/bin/rm -f '*) rm -f "$BROKKR_AGENT_ROOT${cmd#/usr/bin/rm -f }" ;;
+        '/usr/sbin/nft -f '*)
+          [[ ${STUB_RELOAD_NFT_FAIL:-} != 1 ]] || { echo 'systemctl stub: ExecReload nft -f failed' >&2; exit 1; }
+          cp "$reload_conf/$reload_unit.nft" "$STUB_STATE/loaded.nft" ;;
+        '/usr/bin/install '*)
+          if [[ ${STUB_NO_PUBLISH:-} != 1 ]]; then
+            mkdir -p "$BROKKR_AGENT_ROOT/run/brokkr-agent-keys"
+            cp "$reload_conf/$reload_unit.keys" "$BROKKR_AGENT_ROOT/run/brokkr-agent-keys/$reload_unit"
+          fi ;;
+        *) echo "systemctl stub: unexpected ExecReload: $cmd" >&2; exit 99 ;;
+      esac
+    done < <(grep '^ExecReload=' "$BROKKR_AGENT_ROOT/etc/systemd/system/$2") ;;
   daemon-reload|try-reload-or-restart) : ;;
   *) echo "systemctl stub: unexpected: $*" >&2; exit 99 ;;
 esac
@@ -190,6 +212,12 @@ stub nft <<'EOF'
 [[ -n ${STUB_SUDO:-} ]] || printf 'nft %s\n' "$*" >>"$STUB_CALLS"
 case "$1 $2" in
   '-c -f')
+    case $3 in
+      */nftables.conf) # the host's main ruleset file, validated after the include was appended
+        cp "$3" "$STUB_STATE/nftconf.checked"
+        [[ ${STUB_NFTCONF_FAIL:-} != 1 ]] || { echo 'nft stub: Error: nftables.conf rejected' >&2; exit 1; }
+        exit 0 ;;
+    esac
     [[ ${STUB_NFT_CHECK_FAIL:-} != 1 ]] || { echo 'nft stub: Error: syntax error' >&2; exit 1; }
     grep -q '^table inet brokkr_agent_' "$3" ;;
   'list table') [[ -f "$STUB_STATE/loaded.nft" ]] || exit 1; cat "$STUB_STATE/loaded.nft" ;;
@@ -202,8 +230,12 @@ stub sshd <<'EOF'
 case "$1" in
   -t) [[ ${STUB_SSHD_T_FAIL:-} != 1 ]] || { echo 'sshd stub: bad configuration' >&2; exit 255; } ;;
   -T) # effective policy: the agent drop-in's settings, unless an earlier rule overrides it
-    dropin=$(ls "$BROKKR_AGENT_ROOT"/etc/ssh/sshd_config.d/70-brokkr-agent-*.conf 2>/dev/null | head -1)
-    if [[ -n $dropin && ${STUB_SSHD_OVERRIDE:-} != 1 ]]; then
+    # STUB_SSHD_DEFAULT_ADDR=<addr>: an address-specific Match block elsewhere hands only that
+    # connection address the default (ungated) policy.
+    addr=${3#*addr=}
+    addr=${addr%%,*}
+    dropin=$(ls "$BROKKR_AGENT_ROOT"/etc/ssh/sshd_config.d/00-brokkr-agent-*.conf 2>/dev/null | head -1)
+    if [[ -n $dropin && ${STUB_SSHD_OVERRIDE:-} != 1 && ${STUB_SSHD_DEFAULT_ADDR:-} != "$addr" ]]; then
       sed -n 's/^    \([A-Za-z0-9]*\) \(.*\)$/\1 \2/p' "$dropin" | awk '{ $1 = tolower($1); print }'
     else
       printf '%s\n' 'authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2' 'passwordauthentication no'
@@ -240,6 +272,22 @@ else
   printf '%s %s %s %s\n' "$2" "$mode" "$owner" "$group" >>"$STUB_STATE/meta"
 fi
 EOF
+# find: the real binary (resolved here, before any stub dir is on PATH) except for the at spool,
+# where STUB_ATJOB=1 reports a queued job for the account.
+REAL_FIND=$(type -P find)
+cat >"$STUBS/find" <<EOF
+#!/usr/bin/env bash
+if [[ \${STUB_ATJOB:-} == 1 ]]; then
+  for arg in "\$@"; do
+    if [[ \$arg == "\$BROKKR_AGENT_ROOT/var/spool/cron/atjobs" ]]; then
+      echo "\$arg/a0000100abcdef"
+      exit 0
+    fi
+  done
+fi
+exec "$REAL_FIND" "\$@"
+EOF
+chmod +x "$STUBS/find"
 for tool in chmod mv rm; do
   cat >"$STUBS/$tool" <<EOF
 #!/usr/bin/env bash
@@ -302,6 +350,18 @@ absent() { [[ ! -e $1 && ! -L $1 ]]; }
 rc_is() { [[ $RC -eq $1 ]]; }
 files_under_root() { find "$ROOT_DIR" -mindepth 1 | wc -l | tr -d ' '; }
 snapshot() { (cd "$ROOT_DIR" && find . -type f | sort | while read -r f; do printf '%s ' "$f"; cksum <"$f"; done); }
+out_line() { grep -nF -- "$1" <<<"$OUT" | head -1 | cut -d: -f1; }
+out_before() { # earlier-line later-line, within the script output
+  local a b
+  a=$(out_line "$1"); b=$(out_line "$2")
+  [[ -n $a && -n $b && $a -lt $b ]]
+}
+file_before() { # file earlier-line later-line (first occurrence of each)
+  local a b
+  a=$(grep -nF -- "$2" "$1" | head -1 | cut -d: -f1); b=$(grep -nF -- "$3" "$1" | head -1 | cut -d: -f1)
+  [[ -n $a && -n $b && $a -lt $b ]]
+}
+last_sudo_is() { [[ "$(grep '^sudo ' "$CALLS" | tail -1)" == "$1" ]]; }
 first_sudo_is() { [[ "$(grep -m1 '^sudo ' "$CALLS")" == "$1" ]]; }
 cg_is() { [[ "$(cat "$CGDIR/$1" 2>/dev/null)" == "$2" ]]; }
 only_via_sudo() { no_call '^(useradd|usermod|loginctl|nft|install|chmod|mv|rm) ' &&
@@ -320,7 +380,7 @@ expect_refusal() { # description pattern script-args...
 
 KEYF="$ROOT_DIR/etc/brokkr/agent-account/agent-dev.keys"
 RUNKEY="$ROOT_DIR/run/brokkr-agent-keys/agent-dev"
-DROPIN="$ROOT_DIR/etc/ssh/sshd_config.d/70-brokkr-agent-agent-dev.conf"
+DROPIN="$ROOT_DIR/etc/ssh/sshd_config.d/00-brokkr-agent-agent-dev.conf"
 UMDROP="$ROOT_DIR/etc/systemd/system/user@1001.service.d/70-brokkr-agent-egress.conf"
 SLICE="$ROOT_DIR/etc/systemd/system/user-1001.slice.d/70-brokkr-agent-account.conf"
 CGDIR="$ROOT_DIR/sys/fs/cgroup/user.slice/user-1001.slice"
@@ -368,6 +428,8 @@ EXPECT_UNIT=$(printf '%s\n' \
   'ExecStart=/usr/sbin/nft -f /etc/brokkr/agent-account/agent-dev.nft' \
   'ExecStartPost=/usr/bin/install -d -m 0755 -o root -g root /run/brokkr-agent-keys' \
   'ExecStartPost=/usr/bin/install -m 0644 -o root -g root /etc/brokkr/agent-account/agent-dev.keys /run/brokkr-agent-keys/agent-dev' \
+  '# Reload withdraws the key first and republishes it only after the ruleset loaded.' \
+  'ExecReload=/usr/bin/rm -f /run/brokkr-agent-keys/agent-dev' \
   'ExecReload=/usr/sbin/nft -f /etc/brokkr/agent-account/agent-dev.nft' \
   'ExecReload=/usr/bin/install -m 0644 -o root -g root /etc/brokkr/agent-account/agent-dev.keys /run/brokkr-agent-keys/agent-dev' \
   '# Stopping keeps the table (isolation stays) and withdraws the key (no new logins).' \
@@ -375,7 +437,7 @@ EXPECT_UNIT=$(printf '%s\n' \
   '' '[Install]' \
   'WantedBy=multi-user.target')
 EXPECT_UMDROP=$'[Unit]\nRequires=brokkr-agent-egress-agent-dev.service\nAfter=brokkr-agent-egress-agent-dev.service'
-EXPECT_DROPIN=$'Match User agent-dev\n    AuthorizedKeysFile /run/brokkr-agent-keys/%u\n    AuthenticationMethods publickey\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    PermitUserRC no\n    AllowAgentForwarding no\n    X11Forwarding no\n    PermitTunnel no\n    GatewayPorts no\nMatch all'
+EXPECT_DROPIN=$'Match User agent-dev\n    AuthorizedKeysFile /run/brokkr-agent-keys/%u\n    AuthorizedKeysCommand none\n    AuthorizedPrincipalsFile none\n    AuthorizedPrincipalsCommand none\n    TrustedUserCAKeys none\n    HostbasedAuthentication no\n    AuthenticationMethods publickey\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    PermitUserRC no\n    AllowAgentForwarding no\n    X11Forwarding no\n    PermitTunnel no\n    GatewayPorts no\nMatch all'
 EXPECT_KEYS="from=\"$SSH_FROM\",no-agent-forwarding,no-X11-forwarding ssh-ed25519 $B64 brokkr-agent-account"
 
 seed_user() { # name uid groups [marker-uid]
@@ -406,8 +468,14 @@ check 'dry-run renders the egress unit key publication' out_has 'ExecStartPost=/
 check 'dry-run renders the user manager drop-in' out_has 'Requires=brokkr-agent-egress-agent-dev.service'
 check 'dry-run renders the sshd drop-in key location' out_has 'AuthorizedKeysFile /run/brokkr-agent-keys/%u'
 check 'dry-run plans the key publication check' out_has 'and that /run/brokkr-agent-keys/agent-dev matches'
-check 'dry-run plans the cron and at policy' out_has 'would refuse if agent-dev is in cron.allow/at.allow or already has a crontab'
+check 'dry-run plans the cron and at policy' out_has 'would refuse if agent-dev is in cron.allow/at.allow or already has a crontab or queued at jobs'
 check 'dry-run plans the late account enable' out_has "would run: sudo usermod -p '*' --expiredate '' agent-dev"
+check 'dry-run plans linger before the account enable' out_before 'would run: sudo loginctl enable-linger agent-dev' "would run: sudo usermod -p '*' --expiredate '' agent-dev"
+check 'dry-run plans the effective sshd policy check for loopback and every range' out_has "'sudo sshd -T -C user=agent-dev,addr=...' for 127.0.0.1 and every --ssh-from range"
+check 'dry-run plans the nftables.conf include' out_has "would ensure $ROOT_DIR/etc/nftables.conf (if present) contains: include \"/etc/brokkr/agent-account/*.nft\""
+check 'dry-run renders the drop-in under the 00- name' out_has "--- would write $DROPIN (mode 0644, owner root:root) ---"
+check 'dry-run renders the sshd drop-in key command lockout' out_has '    AuthorizedKeysCommand none'
+check 'dry-run renders the reload key withdrawal' out_has 'ExecReload=/usr/bin/rm -f /run/brokkr-agent-keys/agent-dev'
 check 'dry-run notes the missing hidepid mount' out_has 'without hidepid'
 check 'dry-run writes nothing under the root' test "$(find "$ROOT_DIR" -type f | wc -l | tr -d ' ')" = 0
 check 'dry-run runs no mutating command' nothing_mutated
@@ -435,6 +503,12 @@ check 'useradd creates the account already expired' first_sudo_is 'sudo useradd 
 check 'a fresh account needs no separate expiry call' no_call 'usermod --expiredate 1'
 check 'the account is enabled exactly once' test "$(call_count 'usermod -p')" = 1
 check 'the account is enabled with an unusable password and no expiry' has_call 'sudo usermod -p * --expiredate  agent-dev'
+check 'the account enable is the last privileged call' last_sudo_is 'sudo usermod -p * --expiredate  agent-dev'
+check 'a fresh account has no sessions to terminate' no_call 'terminate-user'
+check 'a fresh host without nftables.conf is noted' out_has "no $ROOT_DIR/etc/nftables.conf on this host"
+check 'a fresh host without nftables.conf gets none created' absent "$ROOT_DIR/etc/nftables.conf"
+check 'a fresh host without nftables.conf validates none' no_call 'nft -c -f .*nftables.conf'
+check 'a fresh host without an at spool runs no find' no_call 'sudo find'
 check 'home is 0700' mode_is "$HOMEDIR" 700
 check 'home is chmodded 0700 through sudo' has_call "sudo chmod 0700 $HOMEDIR"
 check 'the home chmod precedes the account being enabled' before "sudo chmod 0700 $HOMEDIR" 'sudo usermod -p'
@@ -493,11 +567,22 @@ check 'the sshd drop-in serves the key from /run' grep -qxF '    AuthorizedKeysF
 check 'the sshd drop-in is staged root-owned 0644' meta_has "$DROPIN.new 0644 root root"
 check 'no staged sshd drop-in is left behind' absent "$DROPIN.new"
 check 'sshd -t validates the configuration' has_call 'sudo sshd -t'
-check 'sshd -T checks the effective policy for the account' has_call 'sudo sshd -T -C user=agent-dev,host=localhost,addr=127.0.0.1'
+check 'the egress unit reloads by withdrawing the key, then the ruleset, then the key' file_before "$UNIT" 'ExecReload=/usr/bin/rm -f /run/brokkr-agent-keys/agent-dev' 'ExecReload=/usr/sbin/nft -f '
+check 'the egress unit republishes only after the ruleset reload' file_before "$UNIT" 'ExecReload=/usr/sbin/nft -f ' 'ExecReload=/usr/bin/install '
+check 'sshd -T checks the effective policy from loopback' has_call 'sudo sshd -T -C user=agent-dev,host=127.0.0.1,addr=127.0.0.1,lport=22'
+check 'sshd -T checks the effective policy from the IPv4 --ssh-from range' has_call 'sudo sshd -T -C user=agent-dev,host=100.64.0.0,addr=100.64.0.0,lport=22'
+check 'sshd -T checks the effective policy from the IPv6 --ssh-from range' has_call 'sudo sshd -T -C user=agent-dev,host=fd7a:115c:a1e0::,addr=fd7a:115c:a1e0::,lport=22'
+check 'sshd -T runs exactly once per context' test "$(call_count 'sudo sshd -T')" = 3
+check 'the sshd drop-in sorts first so later Match blocks cannot override it' test "$(basename "$DROPIN")" = 00-brokkr-agent-agent-dev.conf
+for setting in AuthorizedKeysCommand AuthorizedPrincipalsFile AuthorizedPrincipalsCommand TrustedUserCAKeys; do
+  check "the sshd drop-in sets $setting to none" grep -qxF "    $setting none" "$DROPIN"
+done
+check 'the sshd drop-in disables host-based authentication' grep -qxF '    HostbasedAuthentication no' "$DROPIN"
 check 'sshd is reloaded only after the policy check' before 'sudo sshd -T' 'sudo systemctl try-reload-or-restart ssh.service'
 check 'the account is enabled only after the sshd reload' before 'sudo systemctl try-reload-or-restart ssh.service' 'sudo usermod -p'
 check 'linger is enabled' has_call 'sudo loginctl enable-linger agent-dev'
-check 'linger follows the account enable' before 'sudo usermod -p' 'sudo loginctl enable-linger'
+check 'linger precedes the account enable' before 'sudo loginctl enable-linger' 'sudo usermod -p'
+check 'linger follows the sshd reload' before 'sudo systemctl try-reload-or-restart ssh.service' 'sudo loginctl enable-linger'
 # cron and at
 check 'the account is denied cron' same_content "$CRON_DENY" 'agent-dev'
 check 'the account is denied at' same_content "$AT_DENY" 'agent-dev'
@@ -526,6 +611,12 @@ check 're-run applies runtime properties to the active slice' has_call "sudo sys
 check 're-run does not start the active slice' no_call 'sudo systemctl start user-1001.slice'
 check 're-run reloads sshd after the policy check' before 'sudo sshd -T' 'sudo systemctl try-reload-or-restart ssh.service'
 check 're-run goes through sudo only' only_via_sudo
+check 're-run with the egress table loaded ends no sessions' no_call 'terminate-user'
+check 're-run looks for the egress table after the initial expiry' before 'sudo usermod --expiredate 1 agent-dev' 'sudo nft list table inet brokkr_agent_agent_dev'
+check 're-run enables the account as its last privileged call' last_sudo_is 'sudo usermod -p * --expiredate  agent-dev'
+check 're-run enables linger before the account' before 'sudo loginctl enable-linger' 'sudo usermod -p'
+check 're-run checks the sshd policy from loopback and both ranges' test "$(call_count 'sudo sshd -T')" = 3
+check 're-run keeps the reload-withdrawn key republished' same_content "$RUNKEY" "$EXPECT_KEYS"
 STUB_FAIL=usermod run --apply "${BASE[@]}"
 check 'a failing initial expiry aborts the re-run' rc_is 1
 check 'a failing initial expiry changes nothing else' test "$(grep -c '^sudo ' "$CALLS")" = 1
@@ -548,6 +639,7 @@ check 'dry-run on a managed account succeeds' rc_is 0
 check 'dry-run on a managed account renders the real uid' out_has 'meta skuid 1001 fib daddr type local counter reject'
 check 'dry-run on a managed account plans the initial expiry' out_has 'would run: sudo usermod --expiredate 1 agent-dev'
 check 'dry-run on a managed account targets its user manager drop-in' out_has "--- would write $UMDROP (mode 0644, owner root:root) ---"
+check 'dry-run on a managed account plans ending sessions when the table is not loaded' out_has 'if table brokkr_agent_agent_dev is not loaded, would also run: sudo loginctl terminate-user agent-dev'
 check 'dry-run on a managed account mutates nothing' nothing_mutated
 
 # 3c. runtime properties for an already-active slice ---------------------------------------------
@@ -600,6 +692,59 @@ seed_user agent-dev 1500 agent-dev 1500
 mkdir -p "$ROOT_DIR/etc"
 printf '1500:165536:65536\n' >"$ROOT_DIR/etc/subgid"
 expect_refusal 'refuses a managed account with a subgid range by uid' 'subordinate IDs' "${BASE[@]}"
+
+# 3f. a failing reload must not leave a published key ----------------------------------------------
+reset_host
+run --apply "${BASE[@]}"
+STUB_RELOAD_NFT_FAIL=1 run --apply "${BASE[@]}"
+check 'a failing unit reload aborts the re-run non-zero' rc_is 1
+check 'a failing unit reload is reported as an abort' out_has 'aborted (exit 1)'
+check 'a failing unit reload was attempted' has_call "sudo systemctl reload $UNIT_NAME"
+check 'a failing unit reload leaves no published key' absent "$RUNKEY"
+check 'a failing unit reload re-expired the account first' first_sudo_is 'sudo usermod --expiredate 1 agent-dev'
+check 'a failing unit reload keeps the account expired' stays_expired
+check 'a failing unit reload leaves sshd alone' no_call 'try-reload-or-restart'
+check 'a failing unit reload keeps the persistent key file' same_content "$KEYF" "$EXPECT_KEYS"
+run --apply "${BASE[@]}"
+check 'the next re-run recovers after a failing reload' rc_is 0
+check 'the next re-run publishes the key again' same_content "$RUNKEY" "$EXPECT_KEYS"
+check 'the next re-run enables the account again' has_call 'sudo usermod -p * --expiredate  agent-dev'
+
+# 3g. an unloaded egress table means earlier sessions ran without isolation -------------------------
+reset_host
+run --apply "${BASE[@]}"
+rm -f "$STATE/loaded.nft"
+run --apply "${BASE[@]}"
+check 're-run with the egress table not loaded succeeds' rc_is 0
+check 're-run with the egress table not loaded says why it ends sessions' out_has 'egress table brokkr_agent_agent_dev is not loaded: ending sessions that ran without isolation'
+check 'an unloaded egress table ends the sessions' has_call 'sudo loginctl terminate-user agent-dev'
+check 'sessions end after the initial expiry' before 'sudo usermod --expiredate 1 agent-dev' 'sudo loginctl terminate-user agent-dev'
+check 'sessions end after the table check' before 'sudo nft list table inet brokkr_agent_agent_dev' 'sudo loginctl terminate-user agent-dev'
+check 'sessions end before anything is rewritten' before 'sudo loginctl terminate-user agent-dev' 'sudo chmod 0700'
+check 'sessions end before the account is enabled again' before 'sudo loginctl terminate-user agent-dev' 'sudo usermod -p'
+check 'the account is enabled again once isolation is back' has_call 'sudo usermod -p * --expiredate  agent-dev'
+rm -f "$STATE/loaded.nft"
+STUB_TERMINATE=notloggedin run --apply "${BASE[@]}"
+check 'a not-logged-in terminate failure does not stop the re-run' rc_is 0
+check 'a not-logged-in terminate failure is reported as no sessions' out_has 'terminate-user: agent-dev has no sessions'
+check 'a not-logged-in terminate failure still enables the account' has_call 'sudo usermod -p * --expiredate  agent-dev'
+rm -f "$STATE/loaded.nft"
+STUB_TERMINATE=error run --apply "${BASE[@]}"
+check 'any other terminate failure aborts non-zero' rc_is 1
+check 'any other terminate failure is named' out_has 'could not end sessions of agent-dev: Failed to terminate user agent-dev: Access denied'
+check 'any other terminate failure says the account stays expired' out_has 'the account stays expired'
+check 'any other terminate failure expired the account first' first_sudo_is 'sudo usermod --expiredate 1 agent-dev'
+check 'any other terminate failure keeps the account expired' stays_expired
+check 'any other terminate failure changes nothing else' no_call 'sudo (systemctl|chmod|install|tee)'
+
+# 3h. every --ssh-from range is checked, not only loopback ------------------------------------------
+reset_host
+run --apply --user agent-dev --pubkey "$PUB" --ssh-from '10.1.2.3/32,2001:db8::/32'
+check 'apply with a /32 and an IPv6 range succeeds' rc_is 0
+check 'sshd -T checks loopback' has_call 'sudo sshd -T -C user=agent-dev,host=127.0.0.1,addr=127.0.0.1,lport=22'
+check 'sshd -T checks the /32 host address' has_call 'sudo sshd -T -C user=agent-dev,host=10.1.2.3,addr=10.1.2.3,lport=22'
+check 'sshd -T checks the IPv6 network address' has_call 'sudo sshd -T -C user=agent-dev,host=2001:db8::,addr=2001:db8::,lport=22'
+check 'sshd -T runs once per context' test "$(call_count 'sudo sshd -T')" = 3
 
 # 4. refusals ------------------------------------------------------------------------------------
 reset_host
@@ -737,6 +882,95 @@ check 'a failing egress start publishes no key' absent "$RUNKEY"
 check 'a failing egress start keeps the account expired' stays_expired
 check 'a failing egress start leaves sshd alone' no_call 'try-reload-or-restart'
 
+# 5-conf. the host's nftables.conf must load the agent rulesets after a flush -------------------------
+NFTCONF="$ROOT_DIR/etc/nftables.conf"
+INCLUDE='include "/etc/brokkr/agent-account/*.nft"'
+CONF_BASE=$'#!/usr/sbin/nft -f\nflush ruleset\ninclude "/etc/nftables.d/*.nft"'
+CONF_WANT="$CONF_BASE"$'\n'"$INCLUDE"
+include_count() { grep -cxF -- "$INCLUDE" "$NFTCONF"; }
+reset_host
+printf '%s\n' "$CONF_BASE" >"$NFTCONF"
+run --apply "${BASE[@]}"
+check 'apply next to an existing nftables.conf succeeds' rc_is 0
+check 'an existing nftables.conf keeps its content and gains the include' same_content "$NFTCONF" "$CONF_WANT"
+check 'the include is appended exactly once' test "$(include_count)" = 1
+check 'the nftables.conf is validated whole' has_call "sudo nft -c -f $NFTCONF"
+check 'the validated nftables.conf already contained the include' same_content "$STATE/nftconf.checked" "$CONF_WANT"
+check 'the nftables.conf backup is removed after validation' absent "$NFTCONF.brokkr-previous"
+check 'the staged ruleset is validated before nftables.conf is touched' before "sudo nft -c -f $NFT.new" "sudo cp -a $NFTCONF"
+check 'nftables.conf is backed up before the include is appended' before "sudo cp -a $NFTCONF $NFTCONF.brokkr-previous" "sudo tee -a $NFTCONF"
+check 'the include is appended before the nftables.conf validation' before "sudo tee -a $NFTCONF" "sudo nft -c -f $NFTCONF"
+check 'the nftables.conf validation precedes the egress unit start' before "sudo nft -c -f $NFTCONF" 'sudo systemctl enable --now'
+check 'the nftables.conf validation precedes the account enable' before "sudo nft -c -f $NFTCONF" 'sudo usermod -p'
+check 'the nftables.conf validation precedes linger' before "sudo nft -c -f $NFTCONF" 'sudo loginctl enable-linger'
+run --apply "${BASE[@]}"
+check 're-run next to nftables.conf succeeds' rc_is 0
+check 're-run does not duplicate the include' test "$(include_count)" = 1
+check 're-run leaves nftables.conf as it was' same_content "$NFTCONF" "$CONF_WANT"
+check 're-run says the include is already there' out_has "$NFTCONF already includes the agent rulesets"
+check 're-run does not write nftables.conf' no_call "tee -a $NFTCONF"
+check 're-run takes no nftables.conf backup' no_call "$NFTCONF.brokkr-previous"
+reset_host
+printf '%s' "$CONF_BASE" >"$NFTCONF"
+run --apply "${BASE[@]}"
+check 'apply next to an unterminated nftables.conf succeeds' rc_is 0
+check 'an unterminated nftables.conf gets the include on its own line' same_content "$NFTCONF" "$CONF_WANT"
+check 'an unterminated nftables.conf is validated with the include on its own line' same_content "$STATE/nftconf.checked" "$CONF_WANT"
+reset_host
+: >"$NFTCONF"
+run --apply "${BASE[@]}"
+check 'apply next to an empty nftables.conf succeeds' rc_is 0
+check 'an empty nftables.conf gets no leading blank line' same_content "$NFTCONF" "$INCLUDE"
+reset_host
+printf '%s' "$CONF_BASE" >"$NFTCONF"
+cp "$NFTCONF" "$TMP/nftconf.orig"
+STUB_NFTCONF_FAIL=1 run --apply "${BASE[@]}"
+check 'a rejected nftables.conf aborts non-zero' rc_is 1
+check 'a rejected nftables.conf is named and reported as restored' out_has "nft rejected $NFTCONF with the include; it was restored and the account stays expired"
+check 'the validation saw the appended include' same_content "$STATE/nftconf.checked" "$CONF_WANT"
+check 'a rejected nftables.conf is restored byte for byte' cmp -s "$TMP/nftconf.orig" "$NFTCONF"
+check 'a rejected nftables.conf leaves no backup' absent "$NFTCONF.brokkr-previous"
+check 'a rejected nftables.conf keeps the account expired' stays_expired
+check 'a rejected nftables.conf starts no egress unit' no_call 'enable --now'
+check 'a rejected nftables.conf publishes no key' absent "$RUNKEY"
+check 'a rejected nftables.conf leaves sshd alone' no_call 'try-reload-or-restart'
+run --apply "${BASE[@]}"
+check 'the apply recovers once nftables.conf validates' rc_is 0
+check 'the recovered nftables.conf has the include once' test "$(include_count)" = 1
+reset_host
+printf '%s\n' "$CONF_BASE" >"$TMP/nftconf.target"
+ln -s "$TMP/nftconf.target" "$NFTCONF"
+run --apply "${BASE[@]}"
+check 'a symlinked nftables.conf aborts non-zero' rc_is 1
+check 'a symlinked nftables.conf is named' out_has "$NFTCONF is not a regular file; the account stays expired"
+check 'a symlinked nftables.conf target is untouched' same_content "$TMP/nftconf.target" "$CONF_BASE"
+check 'a symlinked nftables.conf stays a symlink' test -L "$NFTCONF"
+check 'a symlinked nftables.conf is never written' no_call "tee -a $NFTCONF"
+check 'a symlinked nftables.conf keeps the account expired' stays_expired
+check 'a symlinked nftables.conf starts no egress unit' no_call 'enable --now'
+reset_host
+mkdir "$NFTCONF"
+run --apply "${BASE[@]}"
+check 'a directory at nftables.conf aborts non-zero' rc_is 1
+check 'a directory at nftables.conf is named' out_has "$NFTCONF is not a regular file"
+check 'a directory at nftables.conf keeps the account expired' stays_expired
+rm -rf "$NFTCONF"
+
+# 5-last. linger first, then the account enable as the last mutating call ------------------------------
+reset_host
+STUB_ENABLE_LINGER_FAIL=1 run --apply "${BASE[@]}"
+check 'a failing enable-linger aborts non-zero' rc_is 1
+check 'a failing enable-linger is reported as an abort' out_has 'aborted (exit 1)'
+check 'a failing enable-linger was attempted' has_call 'sudo loginctl enable-linger agent-dev'
+check 'a failing enable-linger never enables the account' no_call 'usermod -p'
+check 'a failing enable-linger leaves nothing after it' last_sudo_is 'sudo loginctl enable-linger agent-dev'
+reset_host
+run --apply "${BASE[@]}"
+STUB_ENABLE_LINGER_FAIL=1 run --apply "${BASE[@]}"
+check 'a failing enable-linger on a re-run aborts non-zero' rc_is 1
+check 'a failing enable-linger on a re-run had re-expired the account' first_sudo_is 'sudo usermod --expiredate 1 agent-dev'
+check 'a failing enable-linger on a re-run never enables the account' no_call 'usermod -p'
+
 # 5a. the kernel's limits must match what was asked -----------------------------------------------
 for file in memory.max memory.high memory.swap.max pids.max cpu.max; do
   reset_host
@@ -798,6 +1032,27 @@ rm -f "$ROOT_DIR/var/spool/cron/crontabs/agent-dev"
 run --apply "${BASE[@]}"
 check 'the apply succeeds once the crontab is gone' rc_is 0
 check 'the account is enabled once the crontab is gone' has_call 'sudo usermod -p * --expiredate  agent-dev'
+ATJOBS="$ROOT_DIR/var/spool/cron/atjobs"
+reset_host
+mkdir -p "$ATJOBS"
+STUB_ATJOB=1 run --apply "${BASE[@]}"
+check 'a queued at job is refused' rc_is 1
+check 'a queued at job is named' out_has "agent-dev has queued at jobs in $ATJOBS; review and remove them (the account stays expired)"
+check 'the at spool is searched for files owned by the account uid only' has_call "sudo find $ATJOBS -maxdepth 1 -type f -uid 1001 -print -quit"
+check 'a queued at job keeps the account expired' stays_expired
+check 'a queued at job leaves sshd alone' no_call 'try-reload-or-restart'
+check 'a queued at job records no deny entry' absent "$CRON_DENY"
+check 'a queued at job leaves no at deny entry' absent "$AT_DENY"
+reset_host
+mkdir -p "$ATJOBS"
+run --apply "${BASE[@]}"
+check 'an empty at spool does not block the apply' rc_is 0
+check 'an empty at spool is searched' has_call "sudo find $ATJOBS -maxdepth 1 -type f -uid 1001 -print -quit"
+check 'an empty at spool lets the account be enabled' has_call 'sudo usermod -p * --expiredate  agent-dev'
+reset_host
+STUB_ATJOB=1 run --apply "${BASE[@]}"
+check 'a host without an at spool directory does not block the apply' rc_is 0
+check 'a host without an at spool directory runs no find' no_call 'sudo find'
 
 # 5b. sshd validation failures -------------------------------------------------------------------
 reset_host
@@ -814,6 +1069,29 @@ check 'an overridden sshd policy names the missing setting' out_has 'is not effe
 check 'an overridden sshd policy removes the new drop-in' absent "$DROPIN"
 check 'an overridden sshd policy does not reload sshd' no_call 'try-reload-or-restart'
 check 'an overridden sshd policy keeps the account expired' stays_expired
+n=0
+for addr in 127.0.0.1 100.64.0.0 fd7a:115c:a1e0::; do
+  n=$((n + 1))
+  reset_host
+  STUB_SSHD_DEFAULT_ADDR=$addr run --apply "${BASE[@]}"
+  check "an address-specific policy for $addr aborts non-zero" rc_is 1
+  check "an address-specific policy for $addr is named" out_has "sshd policy for agent-dev is not effective from $addr"
+  check "an address-specific policy for $addr was checked" has_call "sudo sshd -T -C user=agent-dev,host=$addr,addr=$addr,lport=22"
+  check "the checks stop at the failing address $addr" test "$(call_count 'sudo sshd -T')" = "$n"
+  check "an address-specific policy for $addr removes the new drop-in" absent "$DROPIN"
+  check "an address-specific policy for $addr does not reload sshd" no_call 'try-reload-or-restart'
+  check "an address-specific policy for $addr enables no linger" no_call 'enable-linger'
+  check "an address-specific policy for $addr never enables the account" no_call 'usermod -p'
+done
+reset_host
+run --apply "${BASE[@]}"
+printf '# previous\n' >"$DROPIN"
+STUB_SSHD_DEFAULT_ADDR=100.64.0.0 run --apply "${BASE[@]}"
+check 'an address-specific failure on a re-run aborts non-zero' rc_is 1
+check 'an address-specific failure on a re-run restores the previous drop-in' same_content "$DROPIN" '# previous'
+check 'an address-specific failure on a re-run leaves no backup' absent "$DROPIN.previous"
+check 'an address-specific failure on a re-run does not reload sshd' no_call 'try-reload-or-restart'
+check 'an address-specific failure on a re-run keeps the account expired' stays_expired
 reset_host
 run --apply "${BASE[@]}"
 printf '# previous\n' >"$DROPIN"
@@ -860,6 +1138,8 @@ check 'revoke dry-run plans the lock' out_has 'would run: sudo usermod --lock --
 check 'revoke dry-run plans the key withdrawal' out_has "would run: sudo install -m 0644 -o root -g root /dev/null $KEYF"
 check 'revoke dry-run plans removing the run key' out_has "would run: sudo rm -f $RUNKEY"
 check 'revoke dry-run prints the manual removal commands' out_has 'sudo userdel -r agent-dev'
+check 'revoke dry-run names the nftables.conf include to remove by hand' out_has "(and remove the line 'include \"/etc/brokkr/agent-account/*.nft\"' from $ROOT_DIR/etc/nftables.conf once no agent account remains)"
+check 'revoke dry-run lists the 00- sshd drop-in for removal' out_has "$DROPIN"
 check 'revoke dry-run mutates nothing' nothing_mutated
 check 'revoke dry-run leaves the files untouched' test "$SNAP2" = "$(snapshot)"
 echo 'agent-dev sudo' >"$STATE/groups/agent-dev"
@@ -888,6 +1168,7 @@ check 'revoke does not stop or reload any unit' no_call '^(sudo )?systemctl '
 check 'revoke goes through sudo only' only_via_sudo
 STUB_TERMINATE=notloggedin run --revoke --apply --user agent-dev
 check 'revoke ignores a not-logged-in terminate failure' rc_is 0
+check 'revoke reports a not-logged-in terminate failure as no sessions' out_has 'terminate-user: agent-dev has no sessions'
 STUB_TERMINATE=error run --revoke --apply --user agent-dev
 check 'revoke surfaces any other terminate failure' rc_is 1
 check 'revoke names the failed terminate step' out_has 'revoke step failed: loginctl terminate-user agent-dev: Failed to terminate user agent-dev: Access denied'

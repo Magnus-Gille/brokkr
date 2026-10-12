@@ -39,19 +39,29 @@ verified, so any failure leaves it closed.
    reachable. A `user@<uid>.service` drop-in `Requires=` the unit, so lingering user
    services do not start without isolation either. The unit runs after and is `PartOf=`
    and `ReloadPropagatedFrom=` `nftables.service`, so starting, restarting or reloading a
-   ruleset that flushes everything re-creates this table. Re-runs `reload` the unit; the
-   file replaces the table in one nft transaction.
-5. Refuses if the account is in `/etc/cron.allow` or `/etc/at.allow` or already has a
-   crontab, then lists it in `/etc/cron.deny` and `/etc/at.deny`: their jobs run outside
-   the user slice and would bypass the budget.
-6. Installs an sshd `Match User` drop-in whose `AuthorizedKeysFile` is the published key
-   (public key only, no agent/X11 forwarding, no tunnels, no `~/.ssh/rc`). It is validated
-   with `sshd -t` and `sshd -T -C user=<user>,...` before sshd is reloaded; a rejected or
-   overridden policy restores the previous drop-in. sshd never reads `~/.ssh` for this
+   ruleset that flushes everything re-creates this table. If `/etc/nftables.conf` exists,
+   it also gains one line, `include "/etc/brokkr/agent-account/*.nft"` (validated with
+   `nft -c`, restored on failure), so any start or reload of the canonical ruleset re-creates
+   the agent tables in the same transaction. Re-runs `reload` the unit: it withdraws the
+   key, replaces the table in one nft transaction, and republishes the key only on success.
+   If a re-run finds the table missing, it ends the account's sessions, which ran without
+   isolation.
+5. Refuses if the account is in `/etc/cron.allow` or `/etc/at.allow`, already has a
+   crontab or has queued at jobs, then lists it in `/etc/cron.deny` and `/etc/at.deny`:
+   their jobs run outside the user slice and would bypass the budget.
+6. Installs `sshd_config.d/00-brokkr-agent-<user>.conf`, a `Match User` block whose
+   `AuthorizedKeysFile` is the published key. Every other key source is disabled
+   (`AuthorizedKeysCommand`, `AuthorizedPrincipalsFile`/`Command`, `TrustedUserCAKeys`,
+   host-based authentication), and the block also sets public key only, no agent/X11
+   forwarding, no tunnels and no `~/.ssh/rc`. The `00-` prefix makes it the first value sshd
+   obtains, so a later `Match Address` block cannot override it. It is validated with
+   `sshd -t`, and with `sshd -T -C` for loopback and the network address of every
+   `--ssh-from` range, before sshd is reloaded; a rejected or overridden policy restores
+   the previous drop-in. sshd never reads `~/.ssh` for this
    account, so the agent cannot add keys or drop the `from=` restriction, and root never
    writes inside the agent's home.
-7. Only then enables the account (no usable password, no expiry) and linger, so tmux and
-   user services survive logout.
+7. Enables linger (tmux and user services survive logout) and, as the very last step,
+   the account itself (no usable password, no expiry).
 
 Run it as the operator without `sudo`; it escalates per command. It refuses root.
 `--apply` requires `BROKKR_EXPECTED_SOURCE` and `BROKKR_EXPECTED_COMMIT`
@@ -100,9 +110,10 @@ runs as the agent and is subject to the same rules; use it to reach an agent's d
   on the agent's behalf are not covered; audit fstab `user` mounts and world-writable
   daemon sockets. The Tailscale LocalAPI socket is world-accessible but grants non-root,
   non-operator users read access only (status), not dialing.
-- Restarting `nftables.service` with a flushing ruleset leaves a short window before this
-  table is re-created; existing agent connections are not cut. Never run
-  `nft flush ruleset` by hand on the host.
+- A hand-run `nft flush ruleset` (outside `nftables.service`) removes the table until the
+  unit is reloaded; established agent connections are not cut. Do not flush by hand.
+- Expiring the account during a re-run blocks new logins but leaves running sessions;
+  sessions are ended only when the table was found missing.
 - `/tmp` is shared; do not put secrets there.
 - The repository tests use stubs and never exercise a live kernel, sshd or systemd, so
   run the verification below after every apply.
