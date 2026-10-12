@@ -100,7 +100,7 @@ verify_brokkr_deploy_source_binding() {
     return 1
   fi
 
-  verify_deploy_source_identity "$expected_source" "$expected_revision" "$PWD"
+  verify_deploy_source_identity "$expected_source" "$expected_revision" "$PWD" || return 1
 
   resolved_expected_source=$(cd "$expected_source" 2>/dev/null && pwd -P) || return 1
   resolved_entry_source=$(cd "$entry_source" 2>/dev/null && pwd -P) || {
