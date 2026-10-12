@@ -14,8 +14,9 @@ The services split across **two systemd managers** — verified on m5, not assum
 - **`user/`** → installed to `~/.config/systemd/user/<svc>.service.d/` (your user;
   `systemctl --user`). **The two workshop culprits from the incident (`open-webui` and the
   code-server) run as *user* units** (`uid=1000` in the OOM log), not system services — so
-  their limits must live in user scope or they're silently inert. The memory controller is
-  delegated to the user manager on m5, so user-scope `MemoryMax` is honored.
+  their limits must live in user scope or they're silently inert. User-scope limits require memory-controller delegation and actual cgroup
+  readback. The example configuration does not prove current host enforcement;
+  use the [memory preflight and bounded verification](../../docs/pi-memory-cgroups.md).
 
 | Drop-in | Scope | Class | Effect |
 |---------|-------|-------|--------|

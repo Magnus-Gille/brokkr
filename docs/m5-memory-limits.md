@@ -21,7 +21,9 @@ the other.
 
 ## Safe rollout
 
-Applying `MemoryMax` to a running process takes effect immediately. Review current usage
+An effective `MemoryMax` can immediately reclaim memory or kill a running process.
+Installing drop-ins and daemon-reloading alone does not prove limits are active.
+Require [actual cgroup readback](pi-memory-cgroups.md) in the intended scope. Review current usage
 and run the deploy helper in dry-run mode while the host is quiet:
 
 ```bash
