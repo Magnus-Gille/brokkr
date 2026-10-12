@@ -12,6 +12,10 @@
 # mutate nothing. --apply mutates and requires BROKKR_EXPECTED_SOURCE/BROKKR_EXPECTED_COMMIT
 # (see scripts/lib/deploy-source.sh). See docs/agent-account.md.
 #
+# Fail-closed design: the account stays expired until every protection is in place and verified;
+# its only SSH key is served from /run by the egress unit, so no loaded ruleset means no login;
+# root never writes inside the agent's home.
+#
 # Test seams (production leaves both unset):
 #   BROKKR_AGENT_ROOT  prefix for every absolute host path the script reads or writes
 #   BROKKR_AGENT_SBIN  extra PATH suffix for sbin tools (default /usr/local/sbin:/usr/sbin:/sbin)
@@ -77,14 +81,14 @@ done
 
 # --- environment ------------------------------------------------------------------------------
 missing=()
-for tool in useradd usermod loginctl systemctl nft getent id install findmnt ssh-keygen; do
+for tool in useradd usermod loginctl systemctl nft getent id install findmnt ssh-keygen sshd; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [[ $APPLY -eq 1 ]]; then
   command -v sudo >/dev/null 2>&1 || missing+=(sudo)
 fi
 [[ ${#missing[@]} -eq 0 ]] ||
-  die "required tool(s) missing: ${missing[*]} (this script needs Linux with systemd, nftables and shadow-utils)"
+  die "required tool(s) missing: ${missing[*]} (this script needs Linux with systemd, nftables, OpenSSH and shadow-utils)"
 [[ -z $ROOT || $ROOT == /* ]] || die 'BROKKR_AGENT_ROOT must be an absolute path'
 [[ "$(id -u)" =~ ^[0-9]+$ ]] || die 'cannot determine the invoking uid'
 [[ "$(id -u)" -ne 0 ]] ||
@@ -99,6 +103,30 @@ if [[ $REVOKE -eq 1 && $PROVISION_OPTS_GIVEN -eq 1 ]]; then
   die '--revoke accepts only --user and --apply'
 fi
 
+valid_ipv6() { # structural check: hex groups of 1-4 digits, eight of them or at most one "::"
+  local addr=$1 head tail half group count=0
+  local -a groups
+  [[ $addr =~ ^[0-9a-fA-F:]+$ && $addr != *:::* ]] || return 1
+  if [[ $addr == *::* ]]; then
+    head=${addr%%::*}
+    tail=${addr#*::}
+    [[ $tail != *::* ]] || return 1
+  else
+    head=$addr
+    tail=
+  fi
+  for half in "$head" "$tail"; do
+    [[ -n $half ]] || continue
+    [[ $half != :* && $half != *: ]] || return 1
+    IFS=: read -r -a groups <<<"$half"
+    for group in "${groups[@]}"; do
+      [[ $group =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+      count=$((count + 1))
+    done
+  done
+  if [[ $addr == *::* ]]; then [[ $count -le 7 ]]; else [[ $count -eq 8 ]]; fi
+}
+
 valid_cidr() {
   local item=$1 addr prefix a b c d g
   [[ $item =~ ^[0-9a-fA-F.:]+/[0-9]{1,3}$ ]] || return 1
@@ -111,8 +139,7 @@ valid_cidr() {
       [[ $g =~ ^(0|[1-9][0-9]{0,2})$ && $g -le 255 ]] || return 1
     done
   else
-    [[ $addr =~ ^[0-9a-fA-F:]+$ && $addr == *:*:* && $addr != *:::* && $prefix -le 128 ]] || return 1
-    [[ ! $addr =~ [0-9a-fA-F]{5} ]] || return 1
+    [[ $prefix -le 128 ]] && valid_ipv6 "$addr"
   fi
 }
 
@@ -122,7 +149,7 @@ render_ports() {
   local list=$1 item lo hi i out=
   local -a items los his
   los=(); his=()
-  [[ -n $list && $list != ,* && $list != *, && $list != *,,* ]] || return 1
+  [[ $list =~ ^[0-9,-]+$ && $list != ,* && $list != *, && $list != *,,* ]] || return 1
   IFS=, read -r -a items <<<"$list"
   for item in "${items[@]}"; do
     [[ $item =~ ^[0-9]{1,5}(-[0-9]{1,5})?$ ]] || return 1
@@ -142,7 +169,18 @@ render_ports() {
   LOCAL_TCP_RENDERED=$out
 }
 
-nonzero() { [[ ! $1 =~ ^0+[KMGT%]?$ ]]; }
+to_bytes() { # 1-6 digits plus K/M/G/T; bounded so the arithmetic cannot overflow
+  local value=$1 number unit
+  [[ $value =~ ^[1-9][0-9]{0,5}[KMGT]$ ]] || return 1
+  number=${value%?}
+  unit=${value: -1}
+  case $unit in
+    K) echo $((number * 1024)) ;;
+    M) echo $((number * 1024 * 1024)) ;;
+    G) echo $((number * 1024 * 1024 * 1024)) ;;
+    T) echo $((number * 1024 * 1024 * 1024 * 1024)) ;;
+  esac
+}
 
 PUBKEY_B64=
 if [[ $REVOKE -eq 0 ]]; then
@@ -159,18 +197,24 @@ if [[ $REVOKE -eq 0 ]]; then
   key_rest=${key_line#ssh-ed25519 }
   PUBKEY_B64=${key_rest%% *}
 
+  # Character allowlist first: the whole string is rendered into the key file, so no newline,
+  # quote or option syntax may survive validation.
+  [[ $SSH_FROM =~ ^[0-9a-fA-F.:/,]+$ ]] || die '--ssh-from may contain only CIDR characters and commas'
   [[ $SSH_FROM != ,* && $SSH_FROM != *, && $SSH_FROM != *,,* ]] || die '--ssh-from has an empty entry'
   IFS=, read -r -a cidr_items <<<"$SSH_FROM"
   for cidr in "${cidr_items[@]}"; do
     valid_cidr "$cidr" || die "--ssh-from entry is not an IPv4/IPv6 CIDR with explicit prefix: $cidr"
   done
 
-  { [[ $MEM_HIGH =~ ^[0-9]+[KMGT]$ ]] && nonzero "$MEM_HIGH"; } || die '--memory-high must look like 20G (non-zero, K/M/G/T)'
-  { [[ $MEM_MAX =~ ^[0-9]+[KMGT]$ ]] && nonzero "$MEM_MAX"; } || die '--memory-max must look like 24G (non-zero, K/M/G/T)'
-  { [[ $CPU_QUOTA =~ ^[0-9]+%$ ]] && nonzero "$CPU_QUOTA"; } || die '--cpu-quota must look like 2000% (non-zero)'
-  { [[ $TASKS_MAX =~ ^[0-9]+$ ]] && nonzero "$TASKS_MAX"; } || die '--tasks-max must be a non-zero integer'
+  MEM_HIGH_BYTES=$(to_bytes "$MEM_HIGH") || die '--memory-high must look like 20G (1-6 digits, K/M/G/T)'
+  MEM_MAX_BYTES=$(to_bytes "$MEM_MAX") || die '--memory-max must look like 24G (1-6 digits, K/M/G/T)'
+  [[ $MEM_HIGH_BYTES -le $MEM_MAX_BYTES ]] || die '--memory-high must not exceed --memory-max'
+  [[ $CPU_QUOTA =~ ^[1-9][0-9]{0,4}%$ ]] || die '--cpu-quota must look like 2000% (1-99999%)'
+  [[ $TASKS_MAX =~ ^[1-9][0-9]{0,6}$ ]] || die '--tasks-max must be an integer from 1 to 9999999'
   render_ports "$LOCAL_TCP" ||
     die '--allow-local-tcp must be comma-separated, non-overlapping ports or ranges within 1-65535'
+  [[ -d $ROOT/etc/ssh/sshd_config.d && ! -L $ROOT/etc/ssh/sshd_config.d ]] ||
+    die '/etc/ssh/sshd_config.d is missing; this script needs an sshd that includes drop-ins'
 fi
 
 if [[ $APPLY -eq 1 ]]; then
@@ -180,15 +224,22 @@ fi
 # --- derived names and paths ------------------------------------------------------------------
 HOME_DIR=/home/$USER_NAME
 HOME_PATH=$ROOT$HOME_DIR
-SSH_DIR=$HOME_PATH/.ssh
-AUTH_FILE=$SSH_DIR/authorized_keys
+CONF_DIR=$ROOT/etc/brokkr/agent-account
+NFT_FILE=$CONF_DIR/$USER_NAME.nft
+# The persistent key is root-owned and outside the agent's home. sshd reads only the copy the
+# egress unit places in /run after its ruleset loaded, so root never writes where the agent can
+# redirect it, the agent cannot add keys or drop the from= restriction, and no ruleset means no key.
+KEYS_FILE=$CONF_DIR/$USER_NAME.keys
+RUN_KEYS_DIR=/run/brokkr-agent-keys
+RUN_KEY=$RUN_KEYS_DIR/$USER_NAME
+SSHD_DROPIN=$ROOT/etc/ssh/sshd_config.d/70-brokkr-agent-$USER_NAME.conf
 MARKER_DIR=$ROOT/var/lib/brokkr/agent-account
 MARKER=$MARKER_DIR/$USER_NAME.managed
-NFT_DIR=$ROOT/etc/brokkr/agent-account
-NFT_FILE=$NFT_DIR/$USER_NAME.nft
 NFT_TABLE=brokkr_agent_${USER_NAME//-/_}
 UNIT_NAME=brokkr-agent-egress-$USER_NAME.service
 UNIT_FILE=$ROOT/etc/systemd/system/$UNIT_NAME
+CRON_DENY=$ROOT/etc/cron.deny
+AT_DENY=$ROOT/etc/at.deny
 
 UID_NUM=
 HOME_FIELD=
@@ -233,39 +284,78 @@ render_slice() {
 }
 
 render_nft() {
-  local t=$'\t' skuid="meta skuid $U fib daddr type local"
+  local t=$'\t' m="meta skuid $U"
   printf '%s\n' '#!/usr/sbin/nft -f' \
     "table inet $NFT_TABLE" \
     "delete table inet $NFT_TABLE" \
     "table inet $NFT_TABLE {" \
     "${t}chain output {" \
     "${t}${t}type filter hook output priority filter; policy accept;" \
-    "${t}${t}$skuid udp dport 53 accept" \
-    "${t}${t}$skuid tcp dport 53 accept" \
-    "${t}${t}$skuid tcp dport { $LOCAL_TCP_RENDERED } accept" \
-    "${t}${t}$skuid counter reject" \
-    "${t}${t}meta skuid $U ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } counter reject" \
-    "${t}${t}meta skuid $U ip6 daddr { fc00::/7, fe80::/10 } counter reject" \
+    "${t}${t}$m ct state established,related accept" \
+    "${t}${t}$m fib daddr type local udp dport 53 accept" \
+    "${t}${t}$m fib daddr type local tcp dport 53 accept" \
+    "${t}${t}$m ip daddr 127.0.0.0/8 tcp dport { $LOCAL_TCP_RENDERED } accept" \
+    "${t}${t}$m ip6 daddr ::1 tcp dport { $LOCAL_TCP_RENDERED } accept" \
+    "${t}${t}$m fib daddr type local counter reject" \
+    "${t}${t}$m ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter reject" \
+    "${t}${t}$m ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } counter reject" \
     "${t}}" \
     '}'
 }
 
 render_unit() {
+  local install='/usr/bin/install -m 0644 -o root -g root'
   printf '%s\n' '[Unit]' \
-    "Description=Brokkr egress isolation for agent account $USER_NAME" \
-    "Before=user@$U.service systemd-user-sessions.service" \
+    "Description=Brokkr egress isolation and SSH key gate for agent account $USER_NAME" \
     'DefaultDependencies=no' \
     'After=local-fs.target nftables.service' \
+    "Before=user@$U.service systemd-user-sessions.service" \
     'PartOf=nftables.service' \
+    'ReloadPropagatedFrom=nftables.service' \
     '' '[Service]' \
     'Type=oneshot' 'RemainAfterExit=yes' \
     "ExecStart=/usr/sbin/nft -f /etc/brokkr/agent-account/$USER_NAME.nft" \
+    "ExecStartPost=/usr/bin/install -d -m 0755 -o root -g root $RUN_KEYS_DIR" \
+    "ExecStartPost=$install /etc/brokkr/agent-account/$USER_NAME.keys $RUN_KEY" \
     "ExecReload=/usr/sbin/nft -f /etc/brokkr/agent-account/$USER_NAME.nft" \
-    "ExecStop=/usr/sbin/nft delete table inet $NFT_TABLE" \
+    "ExecReload=$install /etc/brokkr/agent-account/$USER_NAME.keys $RUN_KEY" \
+    '# Stopping keeps the table (isolation stays) and withdraws the key (no new logins).' \
+    "ExecStopPost=/usr/bin/rm -f $RUN_KEY" \
     '' '[Install]' 'WantedBy=multi-user.target'
 }
 
-render_authorized_keys() {
+render_user_manager_dropin() {
+  printf '%s\n' '[Unit]' "Requires=$UNIT_NAME" "After=$UNIT_NAME"
+}
+
+render_sshd_dropin() {
+  printf '%s\n' "Match User $USER_NAME" \
+    "    AuthorizedKeysFile $RUN_KEYS_DIR/%u" \
+    '    AuthenticationMethods publickey' \
+    '    PasswordAuthentication no' \
+    '    KbdInteractiveAuthentication no' \
+    '    PermitUserRC no' \
+    '    AllowAgentForwarding no' \
+    '    X11Forwarding no' \
+    '    PermitTunnel no' \
+    '    GatewayPorts no' \
+    'Match all'
+}
+
+# Effective policy sshd must report for the account (sshd -T lowercases keywords).
+SSHD_EXPECT=(
+  "authorizedkeysfile $RUN_KEYS_DIR/%u"
+  'authenticationmethods publickey'
+  'passwordauthentication no'
+  'kbdinteractiveauthentication no'
+  'permituserrc no'
+  'allowagentforwarding no'
+  'x11forwarding no'
+  'permittunnel no'
+  'gatewayports no'
+)
+
+render_keys() {
   printf 'from="%s",no-agent-forwarding,no-X11-forwarding ssh-ed25519 %s brokkr-agent-account\n' \
     "$SSH_FROM" "$PUBKEY_B64"
 }
@@ -324,19 +414,28 @@ print_mode() {
 }
 
 # --- revoke -----------------------------------------------------------------------------------
+REVOKE_FAILURES=()
+attempt() { # revoke step: every step runs even if an earlier one failed
+  if [[ $APPLY -eq 1 ]]; then
+    if ! sudo "$@"; then REVOKE_FAILURES+=("$(shq "$@")"); fi
+  else
+    printf 'would run: sudo %s\n' "$(shq "$@")"
+  fi
+}
+
 revoke() {
   local out
   print_mode
-  step 'revoke: remove SSH access, linger and logins (isolation stays in force)'
-  run install -d -m 0700 -o "$USER_NAME" -g "$USER_NAME" "$SSH_DIR"
-  run install -m 0600 -o "$USER_NAME" -g "$USER_NAME" /dev/null "$AUTH_FILE"
-  run loginctl disable-linger "$USER_NAME"
-  run usermod --lock --expiredate 1 "$USER_NAME"
+  step 'revoke: expire first, then withdraw keys, linger and sessions (isolation stays in force)'
+  attempt usermod --lock --expiredate 1 "$USER_NAME"
+  attempt install -m 0644 -o root -g root /dev/null "$KEYS_FILE"
+  attempt rm -f "$ROOT$RUN_KEY"
+  attempt loginctl disable-linger "$USER_NAME"
   if [[ $APPLY -eq 1 ]]; then
     if ! out=$(sudo loginctl terminate-user "$USER_NAME" 2>&1); then
       case $out in
         *'not logged in'*) echo "terminate-user: $USER_NAME has no sessions" ;;
-        *) fatal "loginctl terminate-user failed: $out" ;;
+        *) REVOKE_FAILURES+=("loginctl terminate-user $USER_NAME: $out") ;;
       esac
     fi
   else
@@ -345,14 +444,20 @@ revoke() {
   cat <<EOF
 
 Not removed (isolation must stay in force while the account exists): the account, its home,
-$UNIT_FILE, $NFT_FILE, the user-$U.slice drop-in and the marker.
+$UNIT_FILE, $NFT_FILE, $SSHD_DROPIN, the user@$U.service and user-$U.slice drop-ins and the marker.
 Full removal is manual and destructive. After reviewing the home directory, run:
   sudo systemctl disable --now $UNIT_NAME
   sudo userdel -r $USER_NAME
-  sudo rm -f $UNIT_FILE $NFT_FILE $MARKER
-  sudo rm -rf $ROOT/etc/systemd/system/user-$U.slice.d
+  sudo nft delete table inet $NFT_TABLE
+  sudo rm -f $UNIT_FILE $NFT_FILE $KEYS_FILE $SSHD_DROPIN $MARKER
+  sudo rm -rf $ROOT/etc/systemd/system/user-$U.slice.d $ROOT/etc/systemd/system/user@$U.service.d
+  sudo sed -i '/^$USER_NAME\$/d' $CRON_DENY $AT_DENY
   sudo systemctl daemon-reload
 EOF
+  if [[ ${#REVOKE_FAILURES[@]} -gt 0 ]]; then
+    printf 'brokkr agent account: revoke step failed: %s\n' "${REVOKE_FAILURES[@]}" >&2
+    exit 1
+  fi
 }
 
 if [[ $REVOKE -eq 1 ]]; then
@@ -364,15 +469,14 @@ fi
 print_mode
 echo "target: user=$USER_NAME home=$HOME_DIR ssh-from=$SSH_FROM"
 echo "budget: CPUQuota=$CPU_QUOTA MemoryHigh=$MEM_HIGH MemoryMax=$MEM_MAX TasksMax=$TASKS_MAX"
-echo "egress: local TCP allowlist { $LOCAL_TCP_RENDERED }"
+echo "egress: loopback TCP allowlist { $LOCAL_TCP_RENDERED }"
 
-step '1. account'
+step '1. account (kept expired until every protection is verified)'
 if [[ $EXISTS -eq 1 ]]; then
-  echo "account exists (uid $UID_NUM, managed); re-enabling in case it was revoked"
-  run usermod -p '*' --expiredate '' "$USER_NAME"
-  run chmod 0700 "$HOME_PATH"
+  echo "account exists (uid $UID_NUM, managed)"
+  run usermod --expiredate 1 "$USER_NAME"
 else
-  run useradd --create-home --home-dir "$HOME_DIR" --shell /bin/bash --user-group "$USER_NAME"
+  run useradd --create-home --home-dir "$HOME_DIR" --shell /bin/bash --user-group --expiredate 1 "$USER_NAME"
   if [[ $APPLY -eq 1 ]]; then
     read_account || fatal "account $USER_NAME not found after useradd"
     U=$UID_NUM
@@ -384,9 +488,9 @@ else
     require_uid_floor
     require_home
   fi
-  run usermod -p '*' "$USER_NAME"
-  run chmod 0700 "$HOME_PATH"
 fi
+# /home is root-owned, so the agent cannot swap its home directory for a symlink.
+run chmod 0700 "$HOME_PATH"
 
 step '2. group membership (must be only its own group)'
 if [[ $APPLY -eq 1 ]]; then
@@ -398,6 +502,7 @@ fi
 
 SLICE_UNIT=user-$U.slice
 SLICE_FILE=$ROOT/etc/systemd/system/$SLICE_UNIT.d/70-brokkr-agent-account.conf
+CGROUP_DIR=$ROOT/sys/fs/cgroup/user.slice/$SLICE_UNIT
 
 step "3. resource slice $SLICE_UNIT"
 run install -d -m 0755 -o root -g root "$(dirname "$SLICE_FILE")"
@@ -408,19 +513,37 @@ if [[ $APPLY -eq 1 ]]; then
   if systemctl is-active --quiet "$SLICE_UNIT"; then
     sudo systemctl set-property --runtime "$SLICE_UNIT" "${SLICE_PROPS[@]}"
   else
-    echo "$SLICE_UNIT is not active; the drop-in applies when the user manager starts"
+    sudo systemctl start "$SLICE_UNIT"
   fi
+  # Read the kernel's effective limits back; systemd ignores directives it cannot apply.
+  page_floor() { echo $(( $1 - $1 % 4096 )); }
+  read_cg() { [[ -r $CGROUP_DIR/$1 ]] && cat "$CGROUP_DIR/$1"; }
+  cg_max=$(read_cg memory.max) || fatal "cannot read $CGROUP_DIR/memory.max"
+  cg_high=$(read_cg memory.high) || fatal "cannot read $CGROUP_DIR/memory.high"
+  cg_swap=$(read_cg memory.swap.max) || fatal "cannot read $CGROUP_DIR/memory.swap.max"
+  cg_pids=$(read_cg pids.max) || fatal "cannot read $CGROUP_DIR/pids.max"
+  cg_cpu=$(read_cg cpu.max) || fatal "cannot read $CGROUP_DIR/cpu.max"
+  read -r cpu_quota cpu_period <<<"$cg_cpu"
+  [[ $cg_max == "$(page_floor "$MEM_MAX_BYTES")" ]] || fatal "memory.max is '$cg_max', expected $MEM_MAX ($MEM_MAX_BYTES bytes)"
+  [[ $cg_high == "$(page_floor "$MEM_HIGH_BYTES")" ]] || fatal "memory.high is '$cg_high', expected $MEM_HIGH"
+  [[ $cg_swap == 0 ]] || fatal "memory.swap.max is '$cg_swap', expected 0"
+  [[ $cg_pids == "$TASKS_MAX" ]] || fatal "pids.max is '$cg_pids', expected $TASKS_MAX"
+  [[ $cpu_quota =~ ^[0-9]+$ && $cpu_period =~ ^[0-9]+$ &&
+    $((cpu_quota * 100)) -eq $((${CPU_QUOTA%\%} * cpu_period)) ]] ||
+    fatal "cpu.max is '$cg_cpu', expected $CPU_QUOTA"
+  echo "ok: effective limits memory.max=$cg_max memory.high=$cg_high pids.max=$cg_pids cpu.max=$cg_cpu"
 else
-  echo "if $SLICE_UNIT is active, would also run: sudo systemctl set-property --runtime $SLICE_UNIT ${SLICE_PROPS[*]}"
+  echo "would start or update $SLICE_UNIT (set-property --runtime ${SLICE_PROPS[*]}) and verify memory.max, memory.high, memory.swap.max, pids.max and cpu.max under $CGROUP_DIR"
 fi
 
-step "4. egress isolation ($NFT_TABLE), loaded BEFORE any SSH key or linger"
-run install -d -m 0755 -o root -g root "$NFT_DIR"
+step "4. egress isolation ($NFT_TABLE) and SSH key gate"
+run install -d -m 0755 -o root -g root "$CONF_DIR"
+render_keys | put_file 0644 root root "$KEYS_FILE"
 if [[ $APPLY -eq 1 ]]; then
   render_nft | put_file 0644 root root "$NFT_FILE.new"
   if ! sudo nft -c -f "$NFT_FILE.new"; then
     sudo rm -f "$NFT_FILE.new"
-    fatal 'nft rejected the ruleset; nothing was enabled and no SSH key was written'
+    fatal 'nft rejected the ruleset; nothing was enabled and the account stays expired'
   fi
   sudo mv -f "$NFT_FILE.new" "$NFT_FILE"
 else
@@ -428,6 +551,9 @@ else
   echo "would stage as $NFT_FILE.new, validate with 'sudo nft -c -f', then move into place"
 fi
 render_unit | put_file 0644 root root "$UNIT_FILE"
+USER_MANAGER_DROPIN=$ROOT/etc/systemd/system/user@$U.service.d/70-brokkr-agent-egress.conf
+run install -d -m 0755 -o root -g root "$(dirname "$USER_MANAGER_DROPIN")"
+render_user_manager_dropin | put_file 0644 root root "$USER_MANAGER_DROPIN"
 run systemctl daemon-reload
 UNIT_WAS_ACTIVE=0
 if [[ $APPLY -eq 1 ]] && systemctl is-active --quiet "$UNIT_NAME"; then UNIT_WAS_ACTIVE=1; fi
@@ -439,31 +565,79 @@ elif [[ $UNIT_WAS_ACTIVE -eq 1 ]]; then
   sudo systemctl reload "$UNIT_NAME"
 fi
 if [[ $APPLY -eq 1 ]]; then
-  systemctl is-active --quiet "$UNIT_NAME" || fatal "$UNIT_NAME is not active; no SSH key was written"
+  systemctl is-active --quiet "$UNIT_NAME" || fatal "$UNIT_NAME is not active; the account stays expired"
   table_out=$(sudo nft list table inet "$NFT_TABLE") ||
-    fatal "nft table $NFT_TABLE is not loaded; no SSH key was written"
-  [[ $table_out == *reject* ]] || fatal "nft table $NFT_TABLE has no reject rules; no SSH key was written"
+    fatal "nft table $NFT_TABLE is not loaded; the account stays expired"
+  [[ $table_out == *reject* ]] || fatal "nft table $NFT_TABLE has no reject rules; the account stays expired"
+  sudo cmp -s "$KEYS_FILE" "$ROOT$RUN_KEY" || fatal "the egress unit did not publish $RUN_KEY; the account stays expired"
 else
-  echo "would verify: sudo nft list table inet $NFT_TABLE"
+  echo "would verify: sudo nft list table inet $NFT_TABLE, and that $RUN_KEY matches $KEYS_FILE"
 fi
 
-step '5. cron (cron jobs run outside the user slice, so the account may not schedule any)'
-CRON_DENY=$ROOT/etc/cron.deny
+step '5. cron and at (their jobs run outside the user slice, so the account may not schedule any)'
 if [[ $APPLY -eq 1 ]]; then
-  if sudo grep -qxF -- "$USER_NAME" "$CRON_DENY" 2>/dev/null; then
-    echo "$USER_NAME is already listed in $CRON_DENY"
-  else
-    printf '%s\n' "$USER_NAME" | sudo tee -a "$CRON_DENY" >/dev/null
+  for allow in "$ROOT/etc/cron.allow" "$ROOT/etc/at.allow"; do
+    if sudo grep -qxF -- "$USER_NAME" "$allow" 2>/dev/null; then
+      fatal "$USER_NAME is listed in $allow; remove it (the account stays expired)"
+    fi
+  done
+  if sudo test -e "$ROOT/var/spool/cron/crontabs/$USER_NAME"; then
+    fatal "$USER_NAME already has a crontab; review and remove it (the account stays expired)"
   fi
+  for deny in "$CRON_DENY" "$AT_DENY"; do
+    if sudo grep -qxF -- "$USER_NAME" "$deny" 2>/dev/null; then
+      echo "$USER_NAME is already listed in $deny"
+    else
+      # Never glue the name onto an unterminated last line ($(...) strips a trailing newline).
+      {
+        if sudo test -s "$deny" && [[ -n "$(sudo tail -c 1 "$deny")" ]]; then printf '\n'; fi
+        printf '%s\n' "$USER_NAME"
+      } | sudo tee -a "$deny" >/dev/null
+      sudo grep -qxF -- "$USER_NAME" "$deny" ||
+        fatal "could not list $USER_NAME in $deny; the account stays expired"
+    fi
+  done
 else
-  echo "would ensure $USER_NAME is listed once in $CRON_DENY"
+  echo "would refuse if $USER_NAME is in cron.allow/at.allow or already has a crontab"
+  echo "would ensure $USER_NAME is listed once in $CRON_DENY and $AT_DENY"
 fi
 
-step '6. SSH access (this script owns and overwrites authorized_keys)'
-run install -d -m 0700 -o "$USER_NAME" -g "$USER_NAME" "$SSH_DIR"
-render_authorized_keys | put_file 0600 "$USER_NAME" "$USER_NAME" "$AUTH_FILE"
+step '6. sshd policy (Match block serving only the gated key)'
+restore_sshd_dropin() { # a rejected drop-in must not stay installed (a later sshd restart would fail)
+  if [[ -n ${SSHD_BACKUP:-} ]]; then sudo mv -f "$SSHD_BACKUP" "$SSHD_DROPIN"; else sudo rm -f "$SSHD_DROPIN"; fi
+}
+if [[ $APPLY -eq 1 ]]; then
+  SSHD_BACKUP=
+  if sudo test -e "$SSHD_DROPIN"; then
+    SSHD_BACKUP=$SSHD_DROPIN.previous
+    sudo cp -a "$SSHD_DROPIN" "$SSHD_BACKUP"
+  fi
+  # Stage beside the target; the .new name does not match the *.conf include pattern.
+  render_sshd_dropin | put_file 0644 root root "$SSHD_DROPIN.new"
+  sudo mv -f "$SSHD_DROPIN.new" "$SSHD_DROPIN"
+  if ! sudo sshd -t; then
+    restore_sshd_dropin
+    fatal 'sshd rejected the configuration; the previous drop-in state was restored and sshd was not reloaded'
+  fi
+  sshd_policy=$(sudo sshd -T -C "user=$USER_NAME,host=localhost,addr=127.0.0.1") || {
+    restore_sshd_dropin
+    fatal 'sshd -T failed; the previous drop-in state was restored and sshd was not reloaded'
+  }
+  for want in "${SSHD_EXPECT[@]}"; do
+    if ! grep -qxF -- "$want" <<<"$sshd_policy"; then
+      restore_sshd_dropin
+      fatal "sshd policy for $USER_NAME is not effective (missing '$want'; is sshd_config.d included, or does an earlier rule override it?); previous drop-in restored"
+    fi
+  done
+  [[ -z $SSHD_BACKUP ]] || sudo rm -f "$SSHD_BACKUP"
+  sudo systemctl try-reload-or-restart ssh.service
+else
+  render_sshd_dropin | put_file 0644 root root "$SSHD_DROPIN"
+  echo "would validate with 'sudo sshd -t' and 'sudo sshd -T -C user=$USER_NAME,...' (restoring the previous drop-in on failure), then: sudo systemctl try-reload-or-restart ssh.service"
+fi
 
-step '7. linger'
+step '7. enable the account and linger (only after steps 1-6 passed)'
+run usermod -p '*' --expiredate '' "$USER_NAME"
 run loginctl enable-linger "$USER_NAME"
 
 step 'summary'

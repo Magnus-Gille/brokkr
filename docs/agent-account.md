@@ -15,32 +15,44 @@ cannot reach the operator's account, local services or private networks.
 
 ## What `--apply` does
 
-Idempotent; re-running converges and never duplicates anything.
+Idempotent; re-running converges and never duplicates anything. The account stays
+**expired** (no login possible) from the first step until every protection has been
+verified, so any failure leaves it closed.
 
-1. Creates the account (`useradd`, no usable password, home `0700`) and records a
-   marker `/var/lib/brokkr/agent-account/<user>.managed` holding the UID. An existing
-   account without that marker is never adopted.
+1. Creates the account expired (`useradd --expiredate 1`, home `0700`) and records a
+   marker `/var/lib/brokkr/agent-account/<user>.managed` holding the UID; a re-run first
+   expires an existing account. An existing account without the marker is never adopted.
 2. Fails closed if the account has any group beyond its own (sudo, adm, lxd, docker,
    render, ...). It never removes groups itself.
-3. Writes a `user-<uid>.slice` resource drop-in (below) and applies it to a live slice.
-4. Renders an nftables ruleset, validates it with `nft -c`, and installs
-   `brokkr-agent-egress-<user>.service`, which loads it before `user@<uid>.service`
-   and `systemd-user-sessions.service`, after (and `PartOf=`) `nftables.service`, so an
-   `nftables.service` start or restart that flushes the ruleset reloads this table too.
-   Re-runs `reload` the unit; the file replaces the table in one nft transaction, so the
-   rules are never absent.
-5. Adds the account to `/etc/cron.deny`: cron jobs run in `cron.service`, outside the
-   user slice, and would bypass the resource budget. (If `/etc/cron.allow` exists, cron
-   already ignores the deny list and only listed users may use it.)
-6. Only after the unit is active and the table reads back, writes
-   `~/.ssh/authorized_keys` (one key, restricted to `--ssh-from`, no agent or X11
-   forwarding; the script owns and overwrites this file) and enables linger so tmux and
+3. Writes a `user-<uid>.slice` resource drop-in (below), starts or updates the slice, and
+   reads the kernel's `memory.max`, `memory.high`, `memory.swap.max`, `pids.max` and
+   `cpu.max` back; a mismatch aborts.
+4. Writes the SSH key to `/etc/brokkr/agent-account/<user>.keys` (root-owned), validates
+   the nftables ruleset with `nft -c`, and installs `brokkr-agent-egress-<user>.service`.
+   The unit loads the ruleset and only then publishes the key to
+   `/run/brokkr-agent-keys/<user>`; stopping it withdraws the key but keeps the table.
+   No loaded ruleset means no key, so a failed boot-time load cannot leave the account
+   reachable. A `user@<uid>.service` drop-in `Requires=` the unit, so lingering user
+   services do not start without isolation either. The unit runs after and is `PartOf=`
+   and `ReloadPropagatedFrom=` `nftables.service`, so starting, restarting or reloading a
+   ruleset that flushes everything re-creates this table. Re-runs `reload` the unit; the
+   file replaces the table in one nft transaction.
+5. Refuses if the account is in `/etc/cron.allow` or `/etc/at.allow` or already has a
+   crontab, then lists it in `/etc/cron.deny` and `/etc/at.deny`: their jobs run outside
+   the user slice and would bypass the budget.
+6. Installs an sshd `Match User` drop-in whose `AuthorizedKeysFile` is the published key
+   (public key only, no agent/X11 forwarding, no tunnels, no `~/.ssh/rc`). It is validated
+   with `sshd -t` and `sshd -T -C user=<user>,...` before sshd is reloaded; a rejected or
+   overridden policy restores the previous drop-in. sshd never reads `~/.ssh` for this
+   account, so the agent cannot add keys or drop the `from=` restriction, and root never
+   writes inside the agent's home.
+7. Only then enables the account (no usable password, no expiry) and linger, so tmux and
    user services survive logout.
 
 Run it as the operator without `sudo`; it escalates per command. It refuses root.
 `--apply` requires `BROKKR_EXPECTED_SOURCE` and `BROKKR_EXPECTED_COMMIT`
-([source binding](deployment-source-binding.md)). The sshd policy (`AllowUsers`,
-`AllowGroups`) is not touched; make sure it admits the account.
+([source binding](deployment-source-binding.md)). `AllowUsers`/`AllowGroups` are not
+touched; make sure they admit the account.
 
 ## Default resource budget
 
@@ -60,30 +72,32 @@ services need (see [m5-memory-limits.md](m5-memory-limits.md)).
 
 Applied per UID in an nftables `output` hook (`policy accept`, so the internet works):
 
-- Allowed to local addresses: DNS (TCP/UDP 53, local resolver) and the TCP allowlist
-  `--allow-local-tcp` (default `1420,4173,5173,32768-60999`: common dev-server ports plus
-  the ephemeral range, which also carries replies from the agent's own servers).
-- Rejected: every other local destination, IPv4 `10/8`, `100.64/10`, `169.254/16`,
-  `172.16/12`, `192.168/16`, and IPv6 `fc00::/7` and `fe80::/10`.
+- Allowed: packets of connections that are already established (replies from the
+  agent's own servers), DNS (TCP/UDP 53) to the local resolver, and new TCP connections
+  to **loopback only** on `--allow-local-tcp` (default `1420,4173,5173,32768-60999`:
+  common dev-server ports plus the ephemeral range used by tests that bind port 0).
+- Rejected: every other local destination (including the host's tailnet and LAN
+  addresses), IPv4 `10/8`, `100.64/10`, `169.254/16`, `172.16/12`, `192.168/16`,
+  multicast `224/4` and broadcast, IPv6 `fc00::/7`, `fe80::/10` and multicast `ff00::/8`.
 
-The SSH connection itself belongs to sshd's socket, not the agent UID, so it should be
-unaffected. Reach an agent's dev server with `ssh -L`, not by connecting to it directly
-from the tailnet.
+sshd's connection socket is root-owned, so SSH itself is unaffected. `ssh -L` forwarding
+runs as the agent and is subject to the same rules; use it to reach an agent's dev server.
 
 ## Known residual risks
 
-- `/proc` shows other users' process arguments unless the host mounts it with `hidepid`.
-  The script reports the current mount; recommend a separate, reviewed `hidepid` change.
-- Any service listening on an allowlisted port (including ephemeral ports) is reachable
-  by the agent. Keep sensitive services outside the allowlist and outside 32768-60999.
+- Any service bound to loopback on an allowlisted port is reachable, including helpers
+  that pick a random port in the ephemeral range (for example a database query engine).
+  Audit `ss -ltne` for listeners in that range owned by other users; a stricter
+  separation needs a network namespace for agent sessions.
+- `/proc` shows other users' process arguments unless the host mounts it with `hidepid`;
+  the script reports the current mount. Keep secrets out of command lines.
+- Global IPv6 LAN addresses are not blocked; check `ip -6 addr show scope global`.
+- Restarting `nftables.service` with a flushing ruleset leaves a short window before this
+  table is re-created; existing agent connections are not cut. Never run
+  `nft flush ruleset` by hand on the host.
 - `/tmp` is shared; do not put secrets there.
-- Example of the above: a database query engine or similar helper that binds a random
-  localhost port lands in the ephemeral range and stays reachable. Audit `ss -ltn`.
-- Only private IPv4 and IPv6 ULA/link-local destinations are blocked. LAN devices with
-  global IPv6 addresses remain reachable.
-- `ssh -L` forwarding runs as the agent, so it is subject to the same rules.
-- The ruleset is only syntax-checked (`nft -c`) on apply; the repository tests use stubs
-  and never exercise a live kernel, so run the verification below after every change.
+- The repository tests use stubs and never exercise a live kernel, sshd or systemd, so
+  run the verification below after every apply.
 
 ## Usage
 
@@ -108,8 +122,10 @@ systemctl show user-$(id -u).slice -p MemoryMax -p MemoryHigh -p TasksMax
 id -nG                                                 # only the account's own group
 ```
 
-As the operator: `sudo nft list table inet brokkr_agent_<user>` and
-`systemctl is-active brokkr-agent-egress-<user>`.
+As the operator: `sudo nft list table inet brokkr_agent_<user>`,
+`systemctl is-active brokkr-agent-egress-<user>`, and that
+`sudo sshd -T -C user=<user>,host=localhost,addr=127.0.0.1 | grep authorizedkeysfile`
+shows `/run/brokkr-agent-keys/%u`.
 
 ## Revoke and removal
 
@@ -119,8 +135,10 @@ BROKKR_EXPECTED_SOURCE=... BROKKR_EXPECTED_COMMIT=... \
   ./scripts/provision-agent-account.sh --revoke --apply --user agent
 ```
 
-Revoke empties `authorized_keys`, disables linger, locks and expires the account, and
-ends its sessions. It keeps the account, home, slice drop-in and egress unit so isolation
-stays in force. Re-running provision with `--apply` re-enables the account. Full removal
-is manual and destructive; revoke prints the commands (`userdel -r`, removing the unit,
-nft file, slice drop-in and marker) without running them.
+Revoke first locks and expires the account, then empties the key file, withdraws the
+published key, disables linger and ends its sessions. Every step runs even if an earlier
+one fails, and any failure is reported with a non-zero exit. It keeps the account, home,
+drop-ins and egress unit so isolation stays in force. Re-running provision with `--apply`
+re-enables the account. Full removal is manual and destructive; revoke prints the commands
+(`userdel -r`, deleting the table, unit, files, drop-ins and deny entries) without running
+them.
