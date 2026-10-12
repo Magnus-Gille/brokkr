@@ -215,6 +215,12 @@ if [[ $REVOKE -eq 0 ]]; then
     die '--allow-local-tcp must be comma-separated, non-overlapping ports or ranges within 1-65535'
   [[ -d $ROOT/etc/ssh/sshd_config.d && ! -L $ROOT/etc/ssh/sshd_config.d ]] ||
     die '/etc/ssh/sshd_config.d is missing; this script needs an sshd that includes drop-ins'
+  # sshd keeps the first value it obtains; another drop-in sorting before ours could pre-empt it.
+  first_dropin=$(cd "$ROOT/etc/ssh/sshd_config.d" && LC_ALL=C ls -1 -- *.conf 2>/dev/null | head -1 || true)
+  if [[ -n $first_dropin && $first_dropin != "00-brokkr-agent-$USER_NAME.conf" &&
+    "$(printf '%s\n' "$first_dropin" "00-brokkr-agent-$USER_NAME.conf" | LC_ALL=C sort | head -1)" == "$first_dropin" ]]; then
+    die "sshd drop-in $first_dropin sorts before 00-brokkr-agent-$USER_NAME.conf and could override its settings; rename it"
+  fi
 fi
 
 if [[ $APPLY -eq 1 ]]; then
@@ -304,6 +310,7 @@ render_nft() {
     "${t}${t}$m fib daddr type local counter reject" \
     "${t}${t}$m ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter reject" \
     "${t}${t}$m ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } counter reject" \
+    "${t}${t}$m fib daddr type broadcast counter reject" \
     "${t}}" \
     '}'
 }
@@ -401,21 +408,26 @@ require_uid_floor() {
   [[ $UID_NUM -ge 1000 ]] || die "account $USER_NAME has uid $UID_NUM (< 1000); refusing"
 }
 
-check_subids() { # subordinate IDs would let newuidmap/rootless containers run under other uids
+# Account-shape problems (printed; non-zero when one is found). Neither check removes anything.
+subids_problem() { # subordinate IDs would let newuidmap/rootless containers run under other uids
   local file
   for file in "$ROOT/etc/subuid" "$ROOT/etc/subgid"; do
     if [[ -f $file ]] && grep -qE "^($USER_NAME|$UID_NUM):" "$file"; then
-      die "account $USER_NAME has subordinate IDs in $file; processes under those uids would bypass the per-uid egress rules (remove them with usermod --del-subuids/--del-subgids)"
+      echo "account $USER_NAME has subordinate IDs in $file; processes under those uids would bypass the per-uid egress rules (remove them with usermod --del-subuids/--del-subgids)"
+      return 1
     fi
   done
 }
 
-check_groups() { # fail closed on ANY supplementary group; never removes groups automatically
+groups_problem() { # fail closed on ANY supplementary group
   local groups
-  groups=$(id -nG "$USER_NAME") || fatal "cannot read group membership of $USER_NAME"
-  [[ $groups == "$USER_NAME" ]] ||
-    die "account $USER_NAME must belong only to its own group, found: $groups (remove the extra groups manually)"
+  groups=$(id -nG "$USER_NAME") || { echo "cannot read group membership of $USER_NAME"; return 1; }
+  [[ $groups == "$USER_NAME" ]] && return 0
+  echo "account $USER_NAME must belong only to its own group, found: $groups (remove the extra groups manually)"
+  return 1
 }
+
+account_problem() { groups_problem && subids_problem; }
 
 EXISTS=0
 if read_account; then
@@ -424,7 +436,9 @@ if read_account; then
   require_uid_floor
   require_home
   U=$UID_NUM
-  if [[ $REVOKE -eq 0 ]]; then check_groups; check_subids; fi
+  # Dry-run refuses here without touching anything. --apply checks again in step 2, after it has
+  # expired the account, so a refusal also withdraws access instead of leaving it enabled.
+  if [[ $REVOKE -eq 0 && $APPLY -eq 0 ]]; then problem=$(account_problem) || die "$problem"; fi
 elif [[ $REVOKE -eq 1 ]]; then
   die "account $USER_NAME does not exist; nothing to revoke"
 elif getent group "$USER_NAME" >/dev/null 2>&1; then
@@ -447,6 +461,13 @@ terminate_sessions() { # 0 when ended or none were running; prints the error oth
     *'not logged in'*) echo "terminate-user: $USER_NAME has no sessions"; return 0 ;;
     *) echo "$out"; return 1 ;;
   esac
+}
+
+lockdown_and_die() { # the account is already expired: withdraw its key and end its sessions, then refuse
+  local problem=$1 out
+  sudo rm -f "$ROOT$RUN_KEY" || true
+  out=$(terminate_sessions) || echo "warning: could not end sessions of $USER_NAME: $out" >&2
+  die "$problem (account expired, published key withdrawn, sessions ended)"
 }
 
 REVOKE_FAILURES=()
@@ -540,8 +561,7 @@ run chmod 0700 "$HOME_PATH"
 
 step '2. group membership and subordinate IDs'
 if [[ $APPLY -eq 1 ]]; then
-  check_groups
-  check_subids
+  problem=$(account_problem) || lockdown_and_die "$problem"
   echo "ok: groups '$(id -nG "$USER_NAME")', no subordinate IDs"
 else
   echo "would verify: id -nG $USER_NAME is exactly '$USER_NAME' and it has no /etc/subuid or /etc/subgid range"

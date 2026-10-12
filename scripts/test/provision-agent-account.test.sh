@@ -412,6 +412,7 @@ expected_nft() { # allowlist
     "${T}${T}meta skuid 1001 fib daddr type local counter reject" \
     "${T}${T}meta skuid 1001 ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter reject" \
     "${T}${T}meta skuid 1001 ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } counter reject" \
+    "${T}${T}meta skuid 1001 fib daddr type broadcast counter reject" \
     "${T}}" '}'
 }
 EXPECT_UNIT=$(printf '%s\n' \
@@ -686,12 +687,40 @@ reset_host
 seed_user agent-dev 1500 agent-dev 1500
 mkdir -p "$ROOT_DIR/etc"
 printf 'agent-dev:165536:65536\n' >"$ROOT_DIR/etc/subuid"
-expect_refusal 'refuses a managed account with a subuid range by name' 'subordinate IDs' --apply "${BASE[@]}"
+expect_refusal 'dry-run refuses a managed account with a subuid range by name' 'subordinate IDs' "${BASE[@]}"
+# --apply on an enabled legacy account with a published key: lock it down, then refuse.
+mkdir -p "$ROOT_DIR/run/brokkr-agent-keys"
+echo legacy-key >"$ROOT_DIR/run/brokkr-agent-keys/agent-dev"
+run --apply "${BASE[@]}"
+check 'apply refuses a legacy account with subordinate IDs' rc_is 64
+check 'the legacy refusal names the cause' out_has 'subordinate IDs'
+check 'the legacy account is expired first' first_sudo_is 'sudo usermod --expiredate 1 agent-dev'
+check 'the legacy account loses its published key' absent "$ROOT_DIR/run/brokkr-agent-keys/agent-dev"
+check 'the legacy account sessions are ended' has_call 'sudo loginctl terminate-user agent-dev'
+check 'the legacy account is not re-enabled' no_call 'usermod -p'
+check 'the legacy account gets no linger' no_call 'enable-linger'
+check 'the subordinate ranges are kept for review' grep -qx 'agent-dev:165536:65536' "$ROOT_DIR/etc/subuid"
+check 'the lockdown says what it did' out_has 'published key withdrawn'
+STUB_TERMINATE=error run --apply "${BASE[@]}"
+check 'a failing terminate still aborts' test "$RC" -ne 0
+check 'a failing terminate never re-enables the account' no_call 'usermod -p'
+check 'a failing terminate is reported' out_has 'could not end sessions'
 reset_host
 seed_user agent-dev 1500 agent-dev 1500
 mkdir -p "$ROOT_DIR/etc"
 printf '1500:165536:65536\n' >"$ROOT_DIR/etc/subgid"
 expect_refusal 'refuses a managed account with a subgid range by uid' 'subordinate IDs' "${BASE[@]}"
+
+# 3e2. another sshd drop-in sorting before ours could pre-empt its settings -----------------------
+reset_host
+: >"$ROOT_DIR/etc/ssh/sshd_config.d/00-aaa.conf"
+expect_refusal 'refuses when another sshd drop-in sorts first' 'sorts before' "${BASE[@]}"
+expect_refusal 'apply refuses when another sshd drop-in sorts first' 'sorts before' --apply "${BASE[@]}"
+reset_host
+: >"$ROOT_DIR/etc/ssh/sshd_config.d/10-no-password-auth.conf"
+: >"$ROOT_DIR/etc/ssh/sshd_config.d/70-other.conf"
+run --apply "${BASE[@]}"
+check 'later-sorting sshd drop-ins are accepted' rc_is 0
 
 # 3f. a failing reload must not leave a published key ----------------------------------------------
 reset_host
@@ -848,7 +877,12 @@ expect_refusal 'refuses a managed account below uid 1000' '< 1000' "${BASE[@]}"
 reset_host
 seed_user agent-dev 1500 'agent-dev sudo' 1500
 expect_refusal 'refuses a managed account with a supplementary group' 'only to its own group' "${BASE[@]}"
-expect_refusal 'refuses the supplementary group on apply before any mutation' 'sudo' --apply "${BASE[@]}"
+run --apply "${BASE[@]}"
+check 'apply refuses the supplementary group with exit 64' rc_is 64
+check 'the supplementary-group refusal names the group' out_has 'sudo'
+check 'the supplementary-group account is expired before refusing' first_sudo_is 'sudo usermod --expiredate 1 agent-dev'
+check 'the supplementary-group account sessions are ended' has_call 'sudo loginctl terminate-user agent-dev'
+check 'the supplementary-group account is not re-enabled' no_call 'usermod -p'
 check 'no key file for the supplementary-group account' absent "$KEYF"
 reset_host
 printf 'agent-dev:x:1700:\n' >>"$STATE/group"

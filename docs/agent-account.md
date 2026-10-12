@@ -26,7 +26,9 @@ verified, so any failure leaves it closed.
    render, ...) or any `/etc/subuid`/`/etc/subgid` range. It is created with
    `-K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0`: with subordinate IDs, `newuidmap` and rootless
    containers (`podman --network=host`) could run processes under other uids in the host
-   network namespace, outside the per-uid egress rules. It never removes groups or ranges
+   network namespace, outside the per-uid egress rules. With `--apply`, an existing account
+   that fails these checks is first expired, its published key withdrawn and its sessions
+   ended, and only then refused. It never removes groups or ranges
    itself.
 3. Writes a `user-<uid>.slice` resource drop-in (below), starts or updates the slice, and
    reads the kernel's `memory.max`, `memory.high`, `memory.swap.max`, `pids.max` and
@@ -53,8 +55,9 @@ verified, so any failure leaves it closed.
    `AuthorizedKeysFile` is the published key. Every other key source is disabled
    (`AuthorizedKeysCommand`, `AuthorizedPrincipalsFile`/`Command`, `TrustedUserCAKeys`,
    host-based authentication), and the block also sets public key only, no agent/X11
-   forwarding, no tunnels and no `~/.ssh/rc`. The `00-` prefix makes it the first value sshd
-   obtains, so a later `Match Address` block cannot override it. It is validated with
+   forwarding, no tunnels and no `~/.ssh/rc`. sshd keeps the first value it obtains; the
+   `00-` prefix puts the block before the other drop-ins (the script refuses if another
+   drop-in sorts first), which on a stock `sshd_config` is the first `Include`. It is validated with
    `sshd -t`, and with `sshd -T -C` for loopback and the network address of every
    `--ssh-from` range, before sshd is reloaded; a rejected or overridden policy restores
    the previous drop-in. sshd never reads `~/.ssh` for this
@@ -92,7 +95,7 @@ Applied per UID in an nftables `output` hook (`policy accept`, so the internet w
   common dev-server ports plus the ephemeral range used by tests that bind port 0).
 - Rejected: every other local destination (including the host's tailnet and LAN
   addresses), IPv4 `10/8`, `100.64/10`, `169.254/16`, `172.16/12`, `192.168/16`,
-  multicast `224/4` and broadcast, IPv6 `fc00::/7`, `fe80::/10` and multicast `ff00::/8`.
+  multicast `224/4`, limited and directed broadcast (`fib daddr type broadcast`), IPv6 `fc00::/7`, `fe80::/10` and multicast `ff00::/8`.
 
 sshd's connection socket is root-owned, so SSH itself is unaffected. `ssh -L` forwarding
 runs as the agent and is subject to the same rules; use it to reach an agent's dev server.
