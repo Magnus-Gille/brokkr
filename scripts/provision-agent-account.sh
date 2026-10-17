@@ -6,6 +6,7 @@
 #   provision-agent-account.sh [--apply] --user NAME --pubkey FILE --ssh-from CIDR[,CIDR...]
 #       [--cpu-quota 2000%] [--memory-high 20G] [--memory-max 24G] [--tasks-max 4096]
 #       [--allow-local-tcp '1420,4173,5173,32768-60999']
+#       [--tmp-max-age 7d] [--tmpfs-max-age 1d] [--closing-session-grace 6h|off]
 #   provision-agent-account.sh --revoke [--apply] --user NAME
 #
 # Default is DRY-RUN: validate, print every planned action and every file it would write,
@@ -40,6 +41,7 @@ Usage:
   provision-agent-account.sh [--apply] --user NAME --pubkey FILE --ssh-from CIDR[,CIDR...]
       [--cpu-quota 2000%] [--memory-high 20G] [--memory-max 24G] [--tasks-max 4096]
       [--allow-local-tcp '1420,4173,5173,32768-60999']
+      [--tmp-max-age 7d] [--tmpfs-max-age 1d] [--closing-session-grace 6h|off]
   provision-agent-account.sh --revoke [--apply] --user NAME
 Dry-run unless --apply is given.
 EOF
@@ -55,6 +57,9 @@ MEM_HIGH=20G
 MEM_MAX=24G
 TASKS_MAX=4096
 LOCAL_TCP='1420,4173,5173,32768-60999'
+TMP_MAX_AGE=7d
+TMPFS_MAX_AGE=1d
+CLOSING_GRACE=6h
 PROVISION_OPTS_GIVEN=0
 
 while [[ $# -gt 0 ]]; do
@@ -62,7 +67,8 @@ while [[ $# -gt 0 ]]; do
     -h|--help) usage; exit 0 ;;
     --apply) APPLY=1; shift; continue ;;
     --revoke) REVOKE=1; shift; continue ;;
-    --user|--pubkey|--ssh-from|--cpu-quota|--memory-high|--memory-max|--tasks-max|--allow-local-tcp)
+    --user|--pubkey|--ssh-from|--cpu-quota|--memory-high|--memory-max|--tasks-max|--allow-local-tcp|\
+      --tmp-max-age|--tmpfs-max-age|--closing-session-grace)
       [[ $# -ge 2 ]] || { usage >&2; die "$1 requires a value"; } ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
@@ -75,13 +81,16 @@ while [[ $# -gt 0 ]]; do
     --memory-max) MEM_MAX=$2; PROVISION_OPTS_GIVEN=1 ;;
     --tasks-max) TASKS_MAX=$2; PROVISION_OPTS_GIVEN=1 ;;
     --allow-local-tcp) LOCAL_TCP=$2; PROVISION_OPTS_GIVEN=1 ;;
+    --tmp-max-age) TMP_MAX_AGE=$2; PROVISION_OPTS_GIVEN=1 ;;
+    --tmpfs-max-age) TMPFS_MAX_AGE=$2; PROVISION_OPTS_GIVEN=1 ;;
+    --closing-session-grace) CLOSING_GRACE=$2; PROVISION_OPTS_GIVEN=1 ;;
   esac
   shift 2
 done
 
 # --- environment ------------------------------------------------------------------------------
 missing=()
-for tool in useradd usermod loginctl systemctl systemd-run nft getent id install findmnt ssh-keygen sshd; do
+for tool in useradd usermod loginctl systemctl systemd-run systemd-tmpfiles nft getent id install findmnt stat timeout ssh-keygen sshd; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [[ $APPLY -eq 1 ]]; then
@@ -182,6 +191,16 @@ to_bytes() { # 1-6 digits plus K/M/G/T; bounded so the arithmetic cannot overflo
   esac
 }
 
+span_ok() { [[ $1 =~ ^[1-9][0-9]{0,3}[mhd]$ ]]; } # a systemd time span: 1-9999 minutes, hours or days
+to_seconds() {
+  local n=${1%?}
+  case ${1: -1} in
+    m) echo $((n * 60)) ;;
+    h) echo $((n * 3600)) ;;
+    d) echo $((n * 86400)) ;;
+  esac
+}
+
 PUBKEY_B64=
 if [[ $REVOKE -eq 0 ]]; then
   [[ -n $PUBKEY_FILE ]] || die '--pubkey is required'
@@ -213,6 +232,14 @@ if [[ $REVOKE -eq 0 ]]; then
   [[ $TASKS_MAX =~ ^[1-9][0-9]{0,6}$ ]] || die '--tasks-max must be an integer from 1 to 9999999'
   render_ports "$LOCAL_TCP" ||
     die '--allow-local-tcp must be comma-separated, non-overlapping ports or ranges within 1-65535'
+  span_ok "$TMP_MAX_AGE" || die '--tmp-max-age must look like 7d (1-9999 followed by m, h or d)'
+  span_ok "$TMPFS_MAX_AGE" || die '--tmpfs-max-age must look like 1d (1-9999 followed by m, h or d)'
+  TMPFS_MAX_AGE_MIN=$(($(to_seconds "$TMPFS_MAX_AGE") / 60))
+  CLOSING_GRACE_SEC=
+  if [[ $CLOSING_GRACE != off ]]; then
+    span_ok "$CLOSING_GRACE" || die '--closing-session-grace must be off or look like 6h (1-9999 followed by m, h or d)'
+    CLOSING_GRACE_SEC=$(to_seconds "$CLOSING_GRACE")
+  fi
   [[ -d $ROOT/etc/ssh/sshd_config.d && ! -L $ROOT/etc/ssh/sshd_config.d ]] ||
     die '/etc/ssh/sshd_config.d is missing; this script needs an sshd that includes drop-ins'
   # sshd keeps the first value it obtains; another drop-in sorting before ours could pre-empt it.
@@ -251,6 +278,20 @@ UNIT_NAME=brokkr-agent-egress-$USER_NAME.service
 UNIT_FILE=$ROOT/etc/systemd/system/$UNIT_NAME
 CRON_DENY=$ROOT/etc/cron.deny
 AT_DENY=$ROOT/etc/at.deny
+# Disk-backed TMPDIR. /tmp is a tmpfs on the target host: its files are shmem charged to the
+# account's slice, cannot be reclaimed without swap and outlive the processes that wrote them,
+# so a few days of build scratch pushed the slice to MemoryHigh and throttled every login.
+# The parent is root-owned and outside any world-writable directory, so the account cannot
+# pre-create or redirect it; systemd-tmpfiles creates both levels and ages the contents.
+AGENT_TMP_PARENT=/var/lib/brokkr/agent-tmp
+AGENT_TMP=$AGENT_TMP_PARENT/$USER_NAME
+TMPFILES_CONF=$ROOT/etc/tmpfiles.d/brokkr-agent-$USER_NAME.conf
+# Claude Code appends /claude-<uid>/ to CLAUDE_CODE_TMPDIR for its scratch directories.
+AGENT_ENV=("TMPDIR=$AGENT_TMP" "CLAUDE_CODE_TMPDIR=$AGENT_TMP")
+HELPER=/usr/local/libexec/brokkr-agent-housekeeping
+SWEEP_UNIT=brokkr-agent-tmp-sweep-$USER_NAME
+REAPER_UNIT=brokkr-agent-session-reaper-$USER_NAME
+SYSTEMD_DIR=$ROOT/etc/systemd/system
 
 UID_NUM=
 HOME_FIELD=
@@ -347,7 +388,45 @@ render_unit() {
 }
 
 render_user_manager_dropin() {
-  printf '%s\n' '[Unit]' "Requires=$UNIT_NAME" "After=$UNIT_NAME"
+  printf '%s\n' '[Unit]' "Requires=$UNIT_NAME" "After=$UNIT_NAME" '' '[Service]' "Environment=${AGENT_ENV[*]}"
+}
+
+render_tmpfiles() {
+  printf '%s\n' \
+    "# Disk-backed temporary directory (TMPDIR) of agent account $USER_NAME; entries untouched for $TMP_MAX_AGE are removed." \
+    "d $AGENT_TMP_PARENT 0755 root root -" \
+    "d $AGENT_TMP 0700 $USER_NAME $USER_NAME $TMP_MAX_AGE"
+}
+
+render_sweep_service() {
+  printf '%s\n' '[Unit]' \
+    "Description=Brokkr: remove files agent account $USER_NAME left in /tmp untouched for $TMPFS_MAX_AGE" \
+    '' '[Service]' 'Type=oneshot' \
+    "# As the account itself (unprivileged), in system.slice so a throttled user-$U.slice cannot stall it." \
+    "User=$USER_NAME" "Group=$USER_NAME" \
+    "ExecStart=$HELPER sweep-tmp --user $USER_NAME --dir /tmp --max-age-minutes $TMPFS_MAX_AGE_MIN" \
+    'Nice=10' 'IOSchedulingClass=idle' 'NoNewPrivileges=yes' 'PrivateNetwork=yes' \
+    'ProtectSystem=strict' 'ProtectHome=yes' 'ReadWritePaths=/tmp'
+}
+
+render_sweep_timer() {
+  printf '%s\n' '[Unit]' "Description=Hourly sweep of /tmp files left by agent account $USER_NAME" \
+    '' '[Timer]' 'OnBootSec=15min' 'OnUnitActiveSec=1h' '' '[Install]' 'WantedBy=timers.target'
+}
+
+render_reaper_service() {
+  printf '%s\n' '[Unit]' \
+    "Description=Brokkr: end sessions of agent account $USER_NAME left closing for $CLOSING_GRACE" \
+    'After=systemd-logind.service' \
+    '' '[Service]' 'Type=oneshot' \
+    "ExecStart=$HELPER reap-closing --user $USER_NAME --uid $U --grace-seconds $CLOSING_GRACE_SEC --state-dir /run/brokkr-agent-sessions/$USER_NAME" \
+    "RuntimeDirectory=brokkr-agent-sessions/$USER_NAME" 'RuntimeDirectoryMode=0700' 'RuntimeDirectoryPreserve=yes' \
+    'NoNewPrivileges=yes' 'PrivateNetwork=yes' 'ProtectSystem=strict' 'ProtectHome=yes'
+}
+
+render_reaper_timer() {
+  printf '%s\n' '[Unit]' "Description=Ten-minute check for closing sessions of agent account $USER_NAME" \
+    '' '[Timer]' 'OnBootSec=10min' 'OnUnitActiveSec=10min' '' '[Install]' 'WantedBy=timers.target'
 }
 
 render_sshd_dropin() {
@@ -366,6 +445,7 @@ render_sshd_dropin() {
     '    X11Forwarding no' \
     '    PermitTunnel no' \
     '    GatewayPorts no' \
+    "    SetEnv ${AGENT_ENV[*]}" \
     'Match all'
 }
 
@@ -386,6 +466,24 @@ SSHD_EXPECT=(
   'permittunnel no'
   'gatewayports no'
 )
+
+sshd_sets_env() { # effective policy on stdin; the first value sshd lists for each name must be ours
+  local line word pair first
+  local -a words=()
+  while IFS= read -r line; do
+    if [[ $line == 'setenv '* ]]; then
+      read -r -a line_words <<<"${line#setenv }"
+      words+=("${line_words[@]}")
+    fi
+  done
+  for pair in "${AGENT_ENV[@]}"; do
+    first=
+    for word in ${words[@]+"${words[@]}"}; do
+      if [[ $word == "${pair%%=*}="* ]]; then first=$word; break; fi
+    done
+    [[ $first == "$pair" ]] || return 1
+  done
+}
 
 render_keys() {
   printf 'from="%s",no-agent-forwarding,no-X11-forwarding ssh-ed25519 %s brokkr-agent-account\n' \
@@ -507,15 +605,19 @@ revoke() {
   cat <<EOF
 
 Not removed (isolation must stay in force while the account exists): the account, its home,
-$UNIT_FILE, $NFT_FILE, $SSHD_DROPIN, the user@$U.service and user-$U.slice drop-ins and the marker.
-Full removal is manual and destructive. After reviewing the home directory, run:
+$UNIT_FILE, $NFT_FILE, $SSHD_DROPIN, the user@$U.service and user-$U.slice drop-ins, the marker,
+the temporary directory $AGENT_TMP and the $SWEEP_UNIT/$REAPER_UNIT timers.
+Full removal is manual and destructive. After reviewing the home directory and $AGENT_TMP, run:
+  sudo systemctl disable --now $SWEEP_UNIT.timer $REAPER_UNIT.timer
   sudo systemctl disable --now $UNIT_NAME
   sudo userdel -r $USER_NAME
   sudo nft delete table inet $NFT_TABLE
-  sudo rm -f $UNIT_FILE $NFT_FILE $KEYS_FILE $SSHD_DROPIN $MARKER
+  sudo rm -f $UNIT_FILE $NFT_FILE $KEYS_FILE $SSHD_DROPIN $MARKER $TMPFILES_CONF
+  sudo rm -f $SYSTEMD_DIR/$SWEEP_UNIT.service $SYSTEMD_DIR/$SWEEP_UNIT.timer $SYSTEMD_DIR/$REAPER_UNIT.service $SYSTEMD_DIR/$REAPER_UNIT.timer
+  sudo rm -rf $ROOT$AGENT_TMP
   sudo rm -rf $ROOT/etc/systemd/system/user-$U.slice.d $ROOT/etc/systemd/system/user@$U.service.d
   sudo sed -i '/^$USER_NAME\$/d' $CRON_DENY $AT_DENY
-  (and remove the line '$NFT_INCLUDE' from $NFT_CONF once no agent account remains)
+  (and remove the line '$NFT_INCLUDE' from $NFT_CONF and $ROOT$HELPER once no agent account remains)
   sudo systemctl daemon-reload
 EOF
   if [[ ${#REVOKE_FAILURES[@]} -gt 0 ]]; then
@@ -625,6 +727,51 @@ if [[ $APPLY -eq 1 ]]; then
 else
   echo "if $SLICE_UNIT is active, would run: sudo systemctl set-property --runtime $SLICE_UNIT ${SLICE_PROPS[*]}"
   echo "would verify systemctl show $SLICE_UNIT (MemoryMax, MemoryHigh, MemorySwapMax, TasksMax) and, via a transient root scope in the slice, memory.max, memory.high, memory.swap.max, pids.max and cpu.max under $CGROUP_DIR"
+fi
+
+step "3b. disk-backed TMPDIR $AGENT_TMP and housekeeping"
+run install -d -m 0755 -o root -g root "$(dirname "$TMPFILES_CONF")"
+render_tmpfiles | put_file 0644 root root "$TMPFILES_CONF"
+run systemd-tmpfiles --create "$TMPFILES_CONF"
+want_tmp="directory:root:root:755"$'\n'"directory:$USER_NAME:$USER_NAME:700"
+if [[ $APPLY -eq 1 ]]; then
+  # stat does not follow symlinks, so a redirected path reports 'symbolic link' and fails here.
+  tmp_state=$(sudo stat -c '%F:%U:%G:%a' "$ROOT$AGENT_TMP_PARENT" "$ROOT$AGENT_TMP") ||
+    fatal "cannot read back $AGENT_TMP; the account stays expired"
+  [[ $tmp_state == "$want_tmp" ]] ||
+    fatal "$AGENT_TMP is '${tmp_state##*$'\n'}', expected ${want_tmp##*$'\n'} (parent: '${tmp_state%%$'\n'*}'); the account stays expired"
+  echo "ok: $AGENT_TMP is a directory owned by $USER_NAME with mode 700"
+else
+  echo "would verify with sudo stat that $AGENT_TMP_PARENT is root:root 0755 and $AGENT_TMP is $USER_NAME:$USER_NAME 0700, neither a symlink"
+fi
+run install -d -m 0755 -o root -g root "$ROOT$(dirname "$HELPER")"
+put_file 0755 root root "$ROOT$HELPER" <"$HERE/agent-account-housekeeping.sh"
+render_sweep_service | put_file 0644 root root "$SYSTEMD_DIR/$SWEEP_UNIT.service"
+render_sweep_timer | put_file 0644 root root "$SYSTEMD_DIR/$SWEEP_UNIT.timer"
+if [[ -n $CLOSING_GRACE_SEC ]]; then
+  render_reaper_service | put_file 0644 root root "$SYSTEMD_DIR/$REAPER_UNIT.service"
+  render_reaper_timer | put_file 0644 root root "$SYSTEMD_DIR/$REAPER_UNIT.timer"
+fi
+run systemctl daemon-reload
+# enable --now leaves an active timer alone; the restart applies a changed schedule.
+if [[ -n $CLOSING_GRACE_SEC ]]; then
+  run systemctl enable --now "$SWEEP_UNIT.timer" "$REAPER_UNIT.timer"
+  run systemctl restart "$SWEEP_UNIT.timer" "$REAPER_UNIT.timer"
+else
+  run systemctl enable --now "$SWEEP_UNIT.timer"
+  run systemctl restart "$SWEEP_UNIT.timer"
+  if [[ -e $SYSTEMD_DIR/$REAPER_UNIT.timer ]]; then
+    run systemctl disable --now "$REAPER_UNIT.timer"
+  elif [[ $APPLY -eq 0 ]]; then
+    echo "if $REAPER_UNIT.timer is installed, would run: sudo systemctl disable --now $REAPER_UNIT.timer"
+  fi
+  echo "--closing-session-grace off: closing sessions of $USER_NAME are never ended automatically"
+fi
+if [[ $APPLY -eq 1 ]]; then
+  systemctl is-active --quiet systemd-tmpfiles-clean.timer ||
+    echo "warning: systemd-tmpfiles-clean.timer is not active; $AGENT_TMP is not aged until it runs" >&2
+else
+  echo "would warn if systemd-tmpfiles-clean.timer (which ages $AGENT_TMP) is not active"
 fi
 
 step "4. egress isolation ($NFT_TABLE) and SSH key gate"
@@ -751,6 +898,10 @@ if [[ $APPLY -eq 1 ]]; then
         fatal "sshd policy for $USER_NAME is not effective from $addr (missing '$want'; is sshd_config.d included, or does an earlier rule override it?); previous drop-in restored"
       fi
     done
+    if ! sshd_sets_env <<<"$sshd_policy"; then
+      restore_sshd_dropin
+      fatal "sshd does not set ${AGENT_ENV[*]} for $USER_NAME from $addr (does an earlier SetEnv override it?); previous drop-in restored"
+    fi
   done
   [[ -z $SSHD_BACKUP ]] || sudo rm -f "$SSHD_BACKUP"
   sudo systemctl try-reload-or-restart ssh.service
@@ -763,11 +914,17 @@ step '7. linger, then enable the account (the last step; any earlier failure lea
 run loginctl enable-linger "$USER_NAME"
 run usermod -p '*' --expiredate '' "$USER_NAME"
 # The expired account's user manager could not start (PAM account check); start it now.
+# A user manager that was already running keeps its old environment until it restarts; hand it
+# the TMPDIR now so new user services and systemd-run --user jobs use the disk directory too.
 if [[ $APPLY -eq 1 ]]; then
   sudo systemctl start "user@$U.service" ||
     echo "warning: user@$U.service did not start; it starts on the next login or boot" >&2
+  # The account owns its user bus; the timeout keeps a stalled peer from hanging the run.
+  sudo timeout 30 systemctl --user -M "$USER_NAME@" set-environment "${AGENT_ENV[@]}" ||
+    echo "warning: could not set the environment of the running user manager of $USER_NAME; it takes the drop-in's environment when user@$U.service next starts" >&2
 else
   echo "would run: sudo systemctl start user@$U.service"
+  echo "would run: sudo timeout 30 systemctl --user -M $USER_NAME@ set-environment ${AGENT_ENV[*]}"
 fi
 
 step 'summary'
@@ -778,6 +935,12 @@ case ",$proc_opts," in
   *) echo "note: /proc is mounted without hidepid; process arguments of other users stay visible to the agent" ;;
 esac
 echo "uid=$U slice-dropin=$SLICE_FILE"
+echo "temp files: TMPDIR=$AGENT_TMP (disk, aged $TMP_MAX_AGE); the account's /tmp files are swept after $TMPFS_MAX_AGE"
+if [[ -n $CLOSING_GRACE_SEC ]]; then
+  echo "sessions: closing sessions of $USER_NAME are ended after $CLOSING_GRACE ($REAPER_UNIT.timer)"
+else
+  echo "sessions: closing sessions of $USER_NAME are never ended automatically"
+fi
 if [[ $APPLY -eq 1 ]]; then
   echo "egress unit $UNIT_NAME: $(systemctl is-active "$UNIT_NAME" || true)"
 else

@@ -35,13 +35,21 @@ verified, so any failure leaves it closed.
    `memory.swap.max`, `pids.max` and `cpu.max` back through a transient root scope in the
    slice (`systemd-run --scope --slice=`). An empty slice has no cgroup, and the expired
    account cannot start `user@<uid>` itself (PAM account check). A mismatch aborts.
+   Then it sets up the disk-backed `TMPDIR` and the housekeeping timers
+   ([below](#temporary-files-and-orphaned-sessions)): `/etc/tmpfiles.d/brokkr-agent-<user>.conf`
+   creates `/var/lib/brokkr/agent-tmp/<user>` (owner the account, `0700`, under a root-owned
+   `0755` parent) and ages its contents; `stat` reads both back and a wrong owner, mode or a
+   symlink aborts. It installs `/usr/local/libexec/brokkr-agent-housekeeping` and enables
+   `brokkr-agent-tmp-sweep-<user>.timer` and, unless `--closing-session-grace off`,
+   `brokkr-agent-session-reaper-<user>.timer`.
 4. Writes the SSH key to `/etc/brokkr/agent-account/<user>.keys` (root-owned), validates
    the nftables ruleset with `nft -c`, and installs `brokkr-agent-egress-<user>.service`.
    The unit loads the ruleset and only then publishes the key to
    `/run/brokkr-agent-keys/<user>`; stopping it withdraws the key but keeps the table.
    No loaded ruleset means no key, so a failed boot-time load cannot leave the account
    reachable. A `user@<uid>.service` drop-in `Requires=` the unit, so lingering user
-   services do not start without isolation either. The unit runs after and is `PartOf=`
+   services do not start without isolation either; it also sets `TMPDIR` and
+   `CLAUDE_CODE_TMPDIR` for the user manager and everything it starts. The unit runs after and is `PartOf=`
    and `ReloadPropagatedFrom=` `nftables.service`, so starting, restarting or reloading a
    ruleset that flushes everything re-creates this table. If `/etc/nftables.conf` exists,
    it also gains one line, `include "/etc/brokkr/agent-account/*.nft"` (validated with
@@ -57,17 +65,20 @@ verified, so any failure leaves it closed.
    `AuthorizedKeysFile` is the published key. Every other key source is disabled
    (`AuthorizedKeysCommand`, `AuthorizedPrincipalsFile`/`Command`, `TrustedUserCAKeys`,
    host-based authentication), and the block also sets public key only, no agent/X11
-   forwarding, no tunnels and no `~/.ssh/rc`. sshd keeps the first value it obtains; the
+   forwarding, no tunnels and no `~/.ssh/rc`, and `SetEnv TMPDIR=... CLAUDE_CODE_TMPDIR=...`
+   for every SSH session (interactive logins, `ssh host command`, and the remote sessions of
+   Claude Desktop and the Codex app alike). sshd keeps the first value it obtains; the
    `00-` prefix puts the block before the other drop-ins (the script refuses if another
    drop-in sorts first), which on a stock `sshd_config` is the first `Include`. It is validated with
    `sshd -t`, and with `sshd -T -C` for loopback and the network address of every
-   `--ssh-from` range, before sshd is reloaded; a rejected or overridden policy restores
+   `--ssh-from` range (including the `setenv` values), before sshd is reloaded; a rejected or overridden policy restores
    the previous drop-in. sshd never reads `~/.ssh` for this
    account, so the agent cannot add keys or drop the `from=` restriction, and root never
    writes inside the agent's home.
 7. Enables linger (tmux and user services survive logout), then the account itself (no
    usable password, no expiry), then starts `user@<uid>`, which could not start while the
-   account was expired.
+   account was expired, and hands an already running user manager the new environment
+   (`systemctl --user -M <user>@ set-environment`; a failure only warns).
 
 Run it as the operator without `sudo`; it escalates per command. It refuses root.
 `--apply` requires `BROKKR_EXPECTED_SOURCE` and `BROKKR_EXPECTED_COMMIT`
@@ -87,6 +98,73 @@ touched; make sure they admit the account.
 
 Derive real values from the host's measured headroom and the memory its resident
 services need (see [m5-memory-limits.md](m5-memory-limits.md)).
+
+## Temporary files and orphaned sessions
+
+Why: on hosts where `/tmp` is a tmpfs (Ubuntu 26.04 mounts one by default), every file in it
+is shared memory charged to the writer's cgroup. With `MemorySwapMax=0` it cannot be
+reclaimed, and it stays charged after the process that wrote it has exited. Build scratch
+left there by agent sessions (a Claude Code scratchpad used as a cargo target directory,
+copied baseline binaries, task directories, Node's compile cache) filled the slice up to
+`MemoryHigh`. The kernel then throttled every allocation in the slice, so new SSH logins to
+the account authenticated but never started a shell. Logins of other accounts were unaffected.
+
+What the provisioner sets up:
+
+| Piece | Effect |
+|---|---|
+| `TMPDIR=/var/lib/brokkr/agent-tmp/<user>` and `CLAUDE_CODE_TMPDIR` (same value) via sshd `SetEnv` and the `user@<uid>` drop-in | `mktemp`, Node (`os.tmpdir()`, including its compile cache), Rust's `std::env::temp_dir`, and Claude Code's scratch directories (`<dir>/claude-<uid>/`) land on disk. Page cache is still charged to the slice, but it is reclaimable, so it no longer drives the slice into throttling. |
+| `/etc/tmpfiles.d/brokkr-agent-<user>.conf` (`--tmp-max-age`, default `7d`) | `systemd-tmpfiles-clean.timer` (daily) removes entries of that directory whose access, modification and change times are all older than the age. The directory itself is recreated at boot. |
+| `brokkr-agent-tmp-sweep-<user>.timer` (hourly, `--tmpfs-max-age`, default `1d`) | Runs **as the account** (never root, so it can only delete what the account itself could) in `system.slice` (a throttled agent slice cannot stall it), with no network. It removes the account's regular files and symlinks under `/tmp` whose three times are all older than the age, then its empty directories. Aged directories of the account that it cannot enter (read-only build or module trees) get `u+rwx` first. It does not enter other users' directories, and it keeps sockets and FIFOs (tmux, ssh-agent). Any other error fails the unit after both passes. It covers programs that hard-code `/tmp`. |
+| `brokkr-agent-session-reaper-<user>.timer` (every 10 min, `--closing-session-grace`, default `6h`; `off` disables it) | Root, via logind only. A session whose SSH connection is gone but whose processes remain is `State=closing`. Once a session has been seen closing for the grace period, the reaper ends it with `loginctl terminate-session`, and its processes and their memory go with it. The first-seen times are kept in `/run/brokkr-agent-sessions/<user>`. |
+
+`CARGO_TARGET_DIR` is deliberately **not** set account-wide. Every checkout or worktree
+already builds into its own `target/` on disk. One shared target directory would serialize
+parallel agent sessions on cargo's build lock, and different branches would invalidate
+each other's artifacts. The incident's target directory was in tmpfs only because a session
+put it in its scratchpad, which is now on disk.
+
+### Deliberate long-lived work (tmux)
+
+The reaper cannot tell an abandoned build from a tmux server you started inside an SSH
+session on purpose. Both make the session `closing` when the connection drops. With the
+reaper on, such a tmux survives a disconnect for the grace period (enough to reattach
+after a network change or laptop sleep). Start long-lived work outside any login session
+instead, so neither the reaper nor a later `KillUserProcesses` policy can touch it:
+
+```bash
+systemd-run --user --unit=agent-work tmux new-session -d -s work   # survives logout (linger)
+tmux attach -t work
+```
+
+Lingering user services (`systemd-run --user`, `systemctl --user`) run under `user@<uid>` and
+are never part of a login session. They stay inside the account's slice and budget.
+
+Alternatives considered:
+
+- `KillUserProcesses=yes` with `KillOnlyUsers=<user>` in `logind.conf.d`: kills the session's
+  processes at the moment the connection drops, with no grace period. Plain tmux and
+  `nohup` inside SSH stop working for the account. The setting is one global list for the
+  whole host and takes effect only after logind restarts or the host reboots.
+- `--closing-session-grace off`: today's behaviour; orphaned builds keep their memory until
+  someone ends them by hand.
+
+### Resource budget after the fix
+
+In the incident, the slice (default budget) held about 19 GiB of shmem against about
+2.5 GiB of anonymous memory. The limits were not the cause, so the defaults stay as they are:
+
+- `MemoryHigh`/`MemoryMax`: keep `20G`/`24G`. With scratch on disk, `MemoryHigh` again
+  bounds anonymous memory plus reclaimable cache, which is its purpose. If anonymous-memory
+  pressure from builds recurs, prefer systemd-oomd (`ManagedOOMMemoryPressure=kill` on the
+  slice, which needs the daemon running) over raising the limits.
+- `cargo -j`: cargo's default jobs come from Rust's `available_parallelism`, which honours the
+  slice's cgroup CPU quota (20 with the default `2000%`), not the host's thread count. No
+  change is needed.
+- `vitest` workers: Node's `os.availableParallelism()` reports the host's threads, not the
+  quota, so a default vitest run starts more workers than the slice has CPUs. Each worker is
+  a Node process. Cap `maxWorkers` in the project's vitest configuration if a test run is
+  memory-heavy. That is application configuration and belongs in the project's repository.
 
 ## Egress rules
 
@@ -120,7 +198,22 @@ runs as the agent and is subject to the same rules; use it to reach an agent's d
   unit is reloaded; established agent connections are not cut. Do not flush by hand.
 - Expiring the account during a re-run blocks new logins but leaves running sessions;
   sessions are ended only when the table was found missing.
-- `/tmp` is shared; do not put secrets there.
+- `/tmp` is shared; do not put secrets there. Programs that hard-code `/tmp` instead of
+  honouring `TMPDIR` still write to the tmpfs, so that use only becomes reclaimable once the
+  hourly sweep removes it (after `--tmpfs-max-age`). A hard cap needs a per-user tmpfs quota
+  (`usrquota` on the `/tmp` mount plus a per-boot `setquota`), which is not part of this script.
+- Scratch on disk is no longer bounded by the size of the tmpfs: a runaway build can fill the
+  filesystem that holds `/var/lib/brokkr/agent-tmp` (on a single-partition host, `/`) until the
+  tmpfiles age removes it. Watch free space, or put that directory on its own filesystem or
+  under a project quota where the host's storage allows it.
+- Both cleanups go by age alone. A lock, pid or cache file the account keeps open but has not
+  touched for the age is removed too. The `/tmp` sweep relies on `strictatime` on that mount,
+  so any read counts as a touch.
+- The final `systemctl --user -M <user>@ set-environment` talks to the account's own user bus
+  as root. It carries no secrets, its failure only warns, and it is bounded by a 30-second timeout.
+- The reaper ends any session of the account that stays `closing` for the grace period,
+  including a tmux server started inside an SSH login. Use `systemd-run --user` for work
+  that must outlive the login.
 - The repository tests use stubs and never exercise a live kernel, sshd or systemd, so
   run the verification below after every apply.
 
@@ -147,10 +240,52 @@ systemctl show user-$(id -u).slice -p MemoryMax -p MemoryHigh -p TasksMax
 id -nG                                                 # only the account's own group
 ```
 
-As the operator: `sudo nft list table inet brokkr_agent_<user>`,
+```bash
+echo "$TMPDIR"; echo "$CLAUDE_CODE_TMPDIR"             # both /var/lib/brokkr/agent-tmp/<user>
+ssh agent@host 'echo $TMPDIR'                          # non-interactive sessions too
+systemctl --user show-environment | grep TMPDIR        # the lingering user manager
+mktemp                                                 # a path under that directory
+```
+
+As the operator: `systemctl list-timers 'brokkr-agent-*' systemd-tmpfiles-clean.timer`,
+`journalctl -u brokkr-agent-tmp-sweep-<user> -u brokkr-agent-session-reaper-<user> -n 20`,
+`grep -E '^(anon|file|shmem) ' /sys/fs/cgroup/user.slice/user-<uid>.slice/memory.stat`
+(shmem should stay small), `sudo nft list table inet brokkr_agent_<user>`,
 `systemctl is-active brokkr-agent-egress-<user>`, and that
 `sudo sshd -T -C user=<user>,host=localhost,addr=127.0.0.1 | grep authorizedkeysfile`
-shows `/run/brokkr-agent-keys/%u`.
+shows `/run/brokkr-agent-keys/%u` and `grep setenv` shows both variables.
+
+## Updating an existing account
+
+A re-run with `--apply` converges an existing account. The account is expired while the
+re-run is in progress, so no new logins succeed until it finishes. Running sessions and
+processes are not affected. Then:
+
+1. Sessions that were already open, tmux servers and Claude Code or Codex processes keep
+   their old `TMPDIR`. New SSH sessions and new user services get the new one. Restart
+   long-lived agent processes when convenient.
+2. Files already in `/tmp` are removed by the hourly sweep once they are older than
+   `--tmpfs-max-age`. Sessions that are already `closing` are ended one grace period after
+   the reaper first sees them. Freeing memory sooner is a manual, destructive step for the
+   operator: review the account's `/tmp` files and running processes first.
+
+## Rollback of the temporary-file and session housekeeping
+
+```bash
+sudo systemctl disable --now brokkr-agent-tmp-sweep-<user>.timer brokkr-agent-session-reaper-<user>.timer
+sudo rm -f /etc/systemd/system/brokkr-agent-{tmp-sweep,session-reaper}-<user>.{service,timer} \
+  /etc/tmpfiles.d/brokkr-agent-<user>.conf
+# Re-run the provisioner at the previous accepted commit: it rewrites the sshd and user@<uid>
+# drop-ins without SetEnv/Environment and verifies everything else as before.
+BROKKR_EXPECTED_SOURCE=... BROKKR_EXPECTED_COMMIT=<previous-accepted-sha> \
+  ./scripts/provision-agent-account.sh --apply --user <user> ...
+sudo systemctl daemon-reload
+sudo systemctl --user -M <user>@ unset-environment TMPDIR CLAUDE_CODE_TMPDIR
+```
+
+Leave `/var/lib/brokkr/agent-tmp/<user>` and `/usr/local/libexec/brokkr-agent-housekeeping`
+in place until the directory has been reviewed. Removing them changes nothing once the
+timers are gone.
 
 ## Revoke and removal
 
