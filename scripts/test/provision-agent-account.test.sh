@@ -18,7 +18,7 @@ mkdir -p "$STUBS" "$KEYS"
 
 # --- fixture repository bound to a commit (deploy-source binding) ------------------------------
 mkdir -p "$FIXTURE/scripts/lib"
-cp "$SOURCE_REPO/scripts/provision-agent-account.sh" "$FIXTURE/scripts/"
+cp "$SOURCE_REPO/scripts/provision-agent-account.sh" "$SOURCE_REPO/scripts/agent-account-housekeeping.sh" "$FIXTURE/scripts/"
 cp "$SOURCE_REPO/scripts/lib/deploy-source.sh" "$FIXTURE/scripts/lib/"
 git -C "$FIXTURE" init -q
 git -C "$FIXTURE" config user.name test
@@ -168,7 +168,20 @@ case "$1" in
   enable) # enable --now UNIT: starting an inactive unit runs it, an active one is left alone
     [[ ${STUB_FAIL:-} != enable ]] || exit 1
     unit=${!#}
-    if ! grep -qx -- "$unit" "$STUB_STATE/active"; then mark_active "$unit"; load "$unit"; fi ;;
+    if ! grep -qx -- "$unit" "$STUB_STATE/active"; then
+      mark_active "$unit"
+      [[ $unit != *.timer ]] || exit 0
+      load "$unit"
+    fi ;;
+  disable) # disable --now UNIT
+    unit=${!#}
+    grep -vx -- "$unit" "$STUB_STATE/active" >"$STUB_STATE/active.new" || true
+    mv "$STUB_STATE/active.new" "$STUB_STATE/active" ;;
+  --user) # --user -M NAME@ set-environment K=V...: the running user manager's environment
+    [[ $2 == -M && $4 == set-environment ]] || { echo "systemctl stub: unexpected: $*" >&2; exit 99; }
+    [[ ${STUB_SET_ENV_FAIL:-} != 1 ]] || { echo 'Failed to connect to bus: No medium found' >&2; exit 1; }
+    shift 4
+    printf '%s\n' "$@" >"$STUB_STATE/user-manager.env" ;;
   show) # show UNIT -p Key...: systemd's configured slice limits, from the drop-in
     show_unit=$2
     show_conf="$BROKKR_AGENT_ROOT/etc/systemd/system/$show_unit.d/70-brokkr-agent-account.conf"
@@ -197,7 +210,7 @@ case "$1" in
     slice=$3
     shift 3
     if [[ ${STUB_CG_MISSING:-} != 1 ]]; then printf '%s\n' "$@" | cgroup "$slice"; fi ;;
-  restart) load "$2" ;;
+  restart) [[ $2 == *.timer ]] || load "$2" ;;
   reload) # run the installed unit's ExecReload= lines in order; a failing line stops the rest
     reload_unit=${2#brokkr-agent-egress-}
     reload_unit=${reload_unit%.service}
@@ -250,7 +263,9 @@ case "$1" in
     addr=${addr%%,*}
     dropin=$(ls "$BROKKR_AGENT_ROOT"/etc/ssh/sshd_config.d/00-brokkr-agent-*.conf 2>/dev/null | head -1)
     if [[ -n $dropin && ${STUB_SSHD_OVERRIDE:-} != 1 && ${STUB_SSHD_DEFAULT_ADDR:-} != "$addr" ]]; then
-      sed -n 's/^    \([A-Za-z0-9]*\) \(.*\)$/\1 \2/p' "$dropin" | awk '{ $1 = tolower($1); print }'
+      sed -n 's/^    \([A-Za-z0-9]*\) \(.*\)$/\1 \2/p' "$dropin" | awk '{ $1 = tolower($1); print }' |
+        if [[ ${STUB_SSHD_NO_SETENV:-} == 1 ]]; then grep -v '^setenv ';
+        elif [[ ${STUB_SSHD_SETENV_FIRST:-} == 1 ]]; then sed 's/^setenv /setenv TMPDIR=\/tmp /'; else cat; fi
     else
       printf '%s\n' 'authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2' 'passwordauthentication no'
     fi ;;
@@ -270,6 +285,42 @@ shift
 if [[ -n $slice && ! -d "$BROKKR_AGENT_ROOT/sys/fs/cgroup/user.slice/$slice" ]]; then
   STUB_SUDO=1 systemctl start "$slice"
 fi
+exec "$@"
+EOF
+stub systemd-tmpfiles <<'EOF'
+#!/usr/bin/env bash
+# --create CONF: realise its "d PATH MODE USER GROUP AGE" lines under the root; the effective
+# type:owner:group:mode of each path is kept for the stat stub.
+[[ -n ${STUB_SUDO:-} ]] || printf 'systemd-tmpfiles %s\n' "$*" >>"$STUB_CALLS"
+[[ $1 == --create && -f $2 ]] || { echo "systemd-tmpfiles stub: unexpected: $*" >&2; exit 99; }
+[[ ${STUB_TMPFILES_FAIL:-} != 1 ]] || { echo 'systemd-tmpfiles stub: Failed to create directory' >&2; exit 73; }
+while read -r type path mode owner group _; do
+  [[ $type == d ]] || continue
+  full=$BROKKR_AGENT_ROOT$path
+  if [[ -L $full ]]; then echo "systemd-tmpfiles stub: $path is a symlink, refusing" >&2; exit 73; fi
+  mkdir -p "$full"
+  chmod "$mode" "$full"
+  [[ -z ${STUB_TMPDIR_OWNER:-} || $owner == root ]] || owner=$STUB_TMPDIR_OWNER
+  grep -v "^$full " "$STUB_STATE/stat" >"$STUB_STATE/stat.new" 2>/dev/null || true
+  printf '%s directory:%s:%s:%s\n' "$full" "$owner" "$group" "${mode#0}" >>"$STUB_STATE/stat.new"
+  mv "$STUB_STATE/stat.new" "$STUB_STATE/stat"
+done <"$2"
+EOF
+stub stat <<'EOF'
+#!/usr/bin/env bash
+[[ -n ${STUB_SUDO:-} ]] || printf 'stat %s\n' "$*" >>"$STUB_CALLS"
+[[ $1 == -c && $2 == '%F:%U:%G:%a' ]] || { echo "stat stub: unexpected: $*" >&2; exit 99; }
+shift 2
+for path in "$@"; do
+  if [[ -L $path ]]; then echo 'symbolic link:root:root:777'; continue; fi
+  line=$(grep -m1 "^$path " "$STUB_STATE/stat" 2>/dev/null) || { echo "stat: cannot stat '$path'" >&2; exit 1; }
+  echo "${line#* }"
+done
+EOF
+stub timeout <<'EOF'
+#!/usr/bin/env bash
+[[ -n ${STUB_SUDO:-} ]] || printf 'timeout %s\n' "$*" >>"$STUB_CALLS"
+shift
 exec "$@"
 EOF
 stub findmnt <<'EOF'
@@ -399,9 +450,9 @@ last_sudo_is() { [[ "$(grep '^sudo ' "$CALLS" | tail -1)" == "$1" ]]; }
 first_sudo_is() { [[ "$(grep -m1 '^sudo ' "$CALLS")" == "$1" ]]; }
 cg_is() { [[ "$(cat "$CGDIR/$1" 2>/dev/null)" == "$2" ]]; }
 # The only unprivileged mutation allowed is removing put_file's own staging file.
-only_via_sudo() { ! grep -E '^(useradd|usermod|loginctl|nft|install|chmod|mv|rm) ' "$CALLS" |
+only_via_sudo() { ! grep -E '^(useradd|usermod|loginctl|nft|install|chmod|mv|rm|systemd-tmpfiles) ' "$CALLS" |
   grep -vqE '^rm -f [^ ]*/brokkr-agent-account\.[A-Za-z0-9]+$' &&
-  no_call '^systemctl (daemon-reload|enable|start|restart|reload|try-reload-or-restart|set-property)'; }
+  no_call '^systemctl (daemon-reload|enable|disable|start|restart|reload|try-reload-or-restart|set-property|--user)'; }
 staging_cleaned() { ! ls "${TMPDIR:-/tmp}"/brokkr-agent-account.* >/dev/null 2>&1; }
 nothing_mutated() { only_via_sudo && no_call '^sudo '; }
 stays_expired() { no_call 'usermod -p ' && no_call 'enable-linger'; }
@@ -474,9 +525,46 @@ EXPECT_UNIT=$(printf '%s\n' \
   'ExecStopPost=/usr/bin/rm -f /run/brokkr-agent-keys/agent-dev' \
   '' '[Install]' \
   'WantedBy=multi-user.target')
-EXPECT_UMDROP=$'[Unit]\nRequires=brokkr-agent-egress-agent-dev.service\nAfter=brokkr-agent-egress-agent-dev.service'
-EXPECT_DROPIN=$'Match User agent-dev\n    AuthorizedKeysFile /run/brokkr-agent-keys/%u\n    AuthorizedKeysCommand none\n    AuthorizedPrincipalsFile none\n    AuthorizedPrincipalsCommand none\n    TrustedUserCAKeys none\n    HostbasedAuthentication no\n    AuthenticationMethods publickey\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    PermitUserRC no\n    AllowAgentForwarding no\n    X11Forwarding no\n    PermitTunnel no\n    GatewayPorts no\nMatch all'
+AGENT_TMP=/var/lib/brokkr/agent-tmp/agent-dev
+AGENT_ENV="TMPDIR=$AGENT_TMP CLAUDE_CODE_TMPDIR=$AGENT_TMP"
+EXPECT_UMDROP=$'[Unit]\nRequires=brokkr-agent-egress-agent-dev.service\nAfter=brokkr-agent-egress-agent-dev.service\n\n[Service]\n'"Environment=$AGENT_ENV"
+EXPECT_DROPIN=$'Match User agent-dev\n    AuthorizedKeysFile /run/brokkr-agent-keys/%u\n    AuthorizedKeysCommand none\n    AuthorizedPrincipalsFile none\n    AuthorizedPrincipalsCommand none\n    TrustedUserCAKeys none\n    HostbasedAuthentication no\n    AuthenticationMethods publickey\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    PermitUserRC no\n    AllowAgentForwarding no\n    X11Forwarding no\n    PermitTunnel no\n    GatewayPorts no\n'"    SetEnv $AGENT_ENV"$'\nMatch all'
 EXPECT_KEYS="from=\"$SSH_FROM\",no-agent-forwarding,no-X11-forwarding ssh-ed25519 $B64 brokkr-agent-account"
+
+TMPFILES="$ROOT_DIR/etc/tmpfiles.d/brokkr-agent-agent-dev.conf"
+HELPER="$ROOT_DIR/usr/local/libexec/brokkr-agent-housekeeping"
+SWEEP_SVC="$ROOT_DIR/etc/systemd/system/brokkr-agent-tmp-sweep-agent-dev.service"
+SWEEP_TMR="$ROOT_DIR/etc/systemd/system/brokkr-agent-tmp-sweep-agent-dev.timer"
+REAPER_SVC="$ROOT_DIR/etc/systemd/system/brokkr-agent-session-reaper-agent-dev.service"
+REAPER_TMR="$ROOT_DIR/etc/systemd/system/brokkr-agent-session-reaper-agent-dev.timer"
+SET_ENV_CALL="sudo timeout 30 systemctl --user -M agent-dev@ set-environment TMPDIR=$AGENT_TMP CLAUDE_CODE_TMPDIR=$AGENT_TMP"
+EXPECT_TMPFILES=$(printf '%s\n' \
+  '# Disk-backed temporary directory (TMPDIR) of agent account agent-dev; entries untouched for 7d are removed.' \
+  'd /var/lib/brokkr/agent-tmp 0755 root root -' \
+  'd /var/lib/brokkr/agent-tmp/agent-dev 0700 agent-dev agent-dev 7d')
+expected_sweep_service() { # max-age max-age-minutes
+  printf '%s\n' '[Unit]' \
+    "Description=Brokkr: remove files agent account agent-dev left in /tmp untouched for $1" \
+    '' '[Service]' 'Type=oneshot' \
+    '# As the account itself (unprivileged), in system.slice so a throttled user-1001.slice cannot stall it.' \
+    'User=agent-dev' 'Group=agent-dev' \
+    "ExecStart=/usr/local/libexec/brokkr-agent-housekeeping sweep-tmp --user agent-dev --dir /tmp --max-age-minutes $2" \
+    'Nice=10' 'IOSchedulingClass=idle' 'NoNewPrivileges=yes' 'PrivateNetwork=yes' \
+    'ProtectSystem=strict' 'ProtectHome=yes' 'ReadWritePaths=/tmp'
+}
+EXPECT_SWEEP_TMR=$(printf '%s\n' '[Unit]' 'Description=Hourly sweep of /tmp files left by agent account agent-dev' \
+  '' '[Timer]' 'OnBootSec=15min' 'OnUnitActiveSec=1h' '' '[Install]' 'WantedBy=timers.target')
+expected_reaper_service() { # grace grace-seconds
+  printf '%s\n' '[Unit]' \
+    "Description=Brokkr: end sessions of agent account agent-dev left closing for $1" \
+    'After=systemd-logind.service' \
+    '' '[Service]' 'Type=oneshot' \
+    "ExecStart=/usr/local/libexec/brokkr-agent-housekeeping reap-closing --user agent-dev --uid 1001 --grace-seconds $2 --state-dir /run/brokkr-agent-sessions/agent-dev" \
+    'RuntimeDirectory=brokkr-agent-sessions/agent-dev' 'RuntimeDirectoryMode=0700' 'RuntimeDirectoryPreserve=yes' \
+    'NoNewPrivileges=yes' 'PrivateNetwork=yes' 'ProtectSystem=strict' 'ProtectHome=yes'
+}
+EXPECT_REAPER_TMR=$(printf '%s\n' '[Unit]' 'Description=Ten-minute check for closing sessions of agent account agent-dev' \
+  '' '[Timer]' 'OnBootSec=10min' 'OnUnitActiveSec=10min' '' '[Install]' 'WantedBy=timers.target')
 
 seed_user() { # name uid groups [marker-uid]
   printf '%s:x:%s:%s::/home/%s:/bin/bash\n' "$1" "$2" "$2" "$1" >>"$STATE/passwd"
@@ -515,6 +603,15 @@ check 'dry-run renders the drop-in under the 00- name' out_has "--- would write 
 check 'dry-run renders the sshd drop-in key command lockout' out_has '    AuthorizedKeysCommand none'
 check 'dry-run renders the reload key withdrawal' out_has 'ExecReload=/usr/bin/rm -f /run/brokkr-agent-keys/agent-dev'
 check 'dry-run notes the missing hidepid mount' out_has 'without hidepid'
+check 'dry-run renders the disk-backed tmp directory' out_has 'd /var/lib/brokkr/agent-tmp/agent-dev 0700 agent-dev agent-dev 7d'
+check 'dry-run plans creating it with systemd-tmpfiles' out_has "would run: sudo systemd-tmpfiles --create $TMPFILES"
+check 'dry-run renders the sshd SetEnv' out_has "    SetEnv $AGENT_ENV"
+check 'dry-run renders the user manager environment' out_has "Environment=$AGENT_ENV"
+check 'dry-run renders the tmp sweep' out_has 'sweep-tmp --user agent-dev --dir /tmp --max-age-minutes 1440'
+check 'dry-run leaves closing sessions alone by default' out_has 'closing sessions of agent-dev are never ended automatically'
+check 'dry-run renders no reaper unit by default' test "$(out_has 'reap-closing --user agent-dev' && echo yes)" != yes
+check 'dry-run plans only the sweep timer by default' out_has 'would run: sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'dry-run plans the running user manager environment' out_has "would run: sudo timeout 30 systemctl --user -M agent-dev@ set-environment $AGENT_ENV"
 check 'dry-run writes nothing under the root' test "$(find "$ROOT_DIR" -type f | wc -l | tr -d ' ')" = 0
 check 'dry-run runs no mutating command' nothing_mutated
 STUB_PROC_OPTS=rw,relatime,hidepid=2 run "${BASE[@]}"
@@ -541,7 +638,8 @@ check 'useradd creates the account already expired' first_sudo_is 'sudo useradd 
 check 'a fresh account needs no separate expiry call' no_call 'usermod --expiredate 1'
 check 'the account is enabled exactly once' test "$(call_count 'usermod -p')" = 1
 check 'the account is enabled with an unusable password and no expiry' has_call 'sudo usermod -p * --expiredate  agent-dev'
-check 'the user manager is started as the last privileged call' last_sudo_is 'sudo systemctl start user@1001.service'
+check 'the user manager gets the agent environment as the last privileged call' last_sudo_is "$SET_ENV_CALL"
+check 'the user manager is started before its environment is set' before 'sudo systemctl start user@1001.service' "$SET_ENV_CALL"
 check 'the user manager starts only after the account is enabled' before 'sudo usermod -p' 'sudo systemctl start user@1001.service'
 check 'a fresh account has no sessions to terminate' no_call 'terminate-user'
 check 'a fresh host without nftables.conf is noted' out_has "no $ROOT_DIR/etc/nftables.conf on this host"
@@ -553,7 +651,7 @@ check 'home is chmodded 0700 through sudo' has_call "sudo chmod 0700 $HOMEDIR"
 check 'the home chmod precedes the account being enabled' before "sudo chmod 0700 $HOMEDIR" 'sudo usermod -p'
 check 'managed marker holds the uid' same_content "$MARK" 1001
 check 'managed marker is 0644 root' meta_has "$MARK 0644 root root"
-check 'useradd precedes the egress unit' before 'sudo useradd' 'sudo systemctl enable --now'
+check 'useradd precedes the egress unit' before 'sudo useradd' "sudo systemctl enable --now $UNIT_NAME"
 # resource slice and cgroup readback
 check 'slice drop-in is exact' same_content "$SLICE" "$EXPECT_SLICE"
 check 'slice drop-in is 0644 root' meta_has "$SLICE 0644 root root"
@@ -569,7 +667,7 @@ check 'cgroup pids.max is read back as 4096' cg_is pids.max 4096
 check 'cgroup cpu.max is read back as 2000%' cg_is cpu.max '2000000 100000'
 check 'the cgroup readback is reported as passed' out_has 'ok: effective limits'
 check 'the slice limits are verified before the account is enabled' before 'sudo systemd-run --quiet --collect --scope --slice=user-1001.slice' 'sudo usermod -p'
-check 'the slice limits are verified before any SSH key exists' before 'sudo systemd-run --quiet --collect --scope --slice=user-1001.slice' 'sudo systemctl enable --now'
+check 'the slice limits are verified before any SSH key exists' before 'sudo systemd-run --quiet --collect --scope --slice=user-1001.slice' "sudo systemctl enable --now $UNIT_NAME"
 # egress isolation
 check 'nft ruleset is exact' same_content "$NFT" "$(expected_nft '1420, 4173, 5173, 32768-60999')"
 check 'nft ruleset is staged then validated root-owned' meta_has "$NFT.new 0644 root root"
@@ -583,18 +681,18 @@ check 'the egress unit never deletes the table' lacks_re "$UNIT" 'delete table'
 check 'user manager drop-in is exact' same_content "$UMDROP" "$EXPECT_UMDROP"
 check 'user manager drop-in is 0644 root' meta_has "$UMDROP 0644 root root"
 check 'user manager drop-in directory is root-owned' meta_has "$ROOT_DIR/etc/systemd/system/user@1001.service.d 0755 root root"
-check 'the user manager drop-in is in place before the unit starts' before " $UMDROP" 'sudo systemctl enable --now'
+check 'the user manager drop-in is in place before the unit starts' before " $UMDROP" "sudo systemctl enable --now $UNIT_NAME"
 check 'the egress unit is enabled and started' has_call "sudo systemctl enable --now $UNIT_NAME"
-check 'a first install does not restart or reload the unit' no_call 'sudo systemctl (restart|reload) '
-check 'nft -c precedes enable --now' before 'sudo nft -c -f' 'sudo systemctl enable --now'
-check 'enable --now precedes the table readback' before 'sudo systemctl enable --now' 'sudo nft list table inet brokkr_agent_agent_dev'
+check 'a first install does not restart or reload the egress unit' no_call "sudo systemctl (restart|reload) $UNIT_NAME"
+check 'nft -c precedes enable --now' before 'sudo nft -c -f' "sudo systemctl enable --now $UNIT_NAME"
+check 'enable --now precedes the table readback' before "sudo systemctl enable --now $UNIT_NAME" 'sudo nft list table inet brokkr_agent_agent_dev'
 check 'nft -c precedes linger' before 'sudo nft -c -f' 'sudo loginctl enable-linger'
 # SSH key gate
 check 'persistent key file is exactly one restricted key line' same_content "$KEYF" "$EXPECT_KEYS"
 check 'persistent key file is 0644 owned by root' meta_has "$KEYF 0644 root root"
 check 'persistent key file mode on disk is 644' mode_is "$KEYF" 644
 check 'the config directory is root-owned' meta_has "$ROOT_DIR/etc/brokkr/agent-account 0755 root root"
-check 'the key file is written before the egress unit starts' before " $KEYF" 'sudo systemctl enable --now'
+check 'the key file is written before the egress unit starts' before " $KEYF" "sudo systemctl enable --now $UNIT_NAME"
 check 'the egress unit published the key under /run' same_content "$RUNKEY" "$EXPECT_KEYS"
 check 'the published key is identical to the persistent key' cmp -s "$KEYF" "$RUNKEY"
 check 'the script verifies the published key against the persistent key' has_call "sudo cmp -s $KEYF $RUNKEY"
@@ -635,6 +733,32 @@ check 'put_file stages through a private file, not /dev/stdin' no_call 'install 
 check 'put_file leaves no staging file behind' staging_cleaned
 check 'output points at the docs' out_has 'docs/agent-account.md'
 
+# disk-backed TMPDIR and housekeeping
+check 'tmpfiles.d entry is exact' same_content "$TMPFILES" "$EXPECT_TMPFILES"
+check 'tmpfiles.d entry is 0644 root' meta_has "$TMPFILES 0644 root root"
+check 'the tmp directory is created through systemd-tmpfiles' has_call "sudo systemd-tmpfiles --create $TMPFILES"
+check 'the tmp directory exists on disk under the root' test -d "$ROOT_DIR$AGENT_TMP"
+check 'the tmp directory ownership and mode are read back' has_call "sudo stat -c %F:%U:%G:%a $ROOT_DIR/var/lib/brokkr/agent-tmp $ROOT_DIR$AGENT_TMP"
+check 'the tmp directory readback is reported' out_has "ok: $AGENT_TMP is a directory owned by agent-dev with mode 700"
+check 'the tmp directory exists before sshd hands it out' before 'sudo systemd-tmpfiles --create' 'sudo systemctl try-reload-or-restart ssh.service'
+check 'the tmp directory is verified before the account is enabled' before 'sudo stat -c' 'sudo usermod -p'
+check 'the housekeeping helper is the repository script' cmp -s "$HELPER" "$SOURCE_REPO/scripts/agent-account-housekeeping.sh"
+check 'the housekeeping helper is 0755 root' meta_has "$HELPER 0755 root root"
+check 'the tmp sweep service is exact' same_content "$SWEEP_SVC" "$(expected_sweep_service 1d 1440)"
+check 'the tmp sweep timer is exact' same_content "$SWEEP_TMR" "$EXPECT_SWEEP_TMR"
+check 'the tmp sweep never runs in the agent slice' lacks_re "$SWEEP_SVC" '^Slice='
+check 'the tmp sweep sees the real /tmp' lacks_re "$SWEEP_SVC" '^PrivateTmp='
+check 'the closing-session reaper is opt-in: none by default' absent "$REAPER_SVC"
+check 'no reaper unit is touched by default' no_call 'session-reaper'
+for unit_file in "$SWEEP_SVC" "$SWEEP_TMR"; do
+  check "${unit_file##*/} is 0644 root" meta_has "$unit_file 0644 root root"
+done
+check 'the sweep timer is enabled and started' has_call 'sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'the sweep timer is restarted so a changed schedule applies' has_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'the sweep timer is restarted after it is enabled' before 'sudo systemctl enable --now brokkr-agent-tmp-sweep' 'sudo systemctl restart brokkr-agent-tmp-sweep'
+check 'an inactive tmpfiles clean timer is reported' out_has 'warning: systemd-tmpfiles-clean.timer is not active'
+check 'the running user manager gets the agent environment' same_content "$STATE/user-manager.env" "$(printf '%s\n' "TMPDIR=$AGENT_TMP" "CLAUDE_CODE_TMPDIR=$AGENT_TMP")"
+
 # 3. idempotent re-run ---------------------------------------------------------------------------
 SNAP1=$(snapshot)
 run --apply "${BASE[@]}"
@@ -649,7 +773,7 @@ check 're-run chmods the home again' has_call "sudo chmod 0700 $HOMEDIR"
 check 're-run re-enables the account' has_call 'sudo usermod -p * --expiredate  agent-dev'
 check 're-run enables the account only after the expiry' before 'sudo usermod --expiredate 1 agent-dev' 'sudo usermod -p'
 check 're-run reloads the active egress unit atomically' has_call "sudo systemctl reload $UNIT_NAME"
-check 're-run never restarts the egress unit' no_call 'sudo systemctl restart '
+check 're-run never restarts the egress unit' no_call "sudo systemctl restart $UNIT_NAME"
 check 're-run republishes the key' same_content "$RUNKEY" "$EXPECT_KEYS"
 check 're-run applies runtime properties to the active slice' has_call "sudo systemctl set-property --runtime user-1001.slice $SLICE_PROPS"
 check 're-run does not start the active slice' no_call 'sudo systemctl start user-1001.slice'
@@ -659,7 +783,7 @@ check 're-run can replace existing files (uutils install)' rc_is 0
 check 're-run leaves no staging file behind' staging_cleaned
 check 're-run with the egress table loaded ends no sessions' no_call 'terminate-user'
 check 're-run looks for the egress table after the initial expiry' before 'sudo usermod --expiredate 1 agent-dev' 'sudo nft list table inet brokkr_agent_agent_dev'
-check 're-run starts the user manager as its last privileged call' last_sudo_is 'sudo systemctl start user@1001.service'
+check 're-run sets the running user manager environment as its last privileged call' last_sudo_is "$SET_ENV_CALL"
 check 're-run enables the account before starting the user manager' before 'sudo usermod -p' 'sudo systemctl start user@1001.service'
 check 're-run enables linger before the account' before 'sudo loginctl enable-linger' 'sudo usermod -p'
 check 're-run checks the sshd policy from loopback and both ranges' test "$(call_count 'sudo sshd -T')" = 3
@@ -828,6 +952,11 @@ expect_refusal 'refuses to run as root' 'refusing to run as root' "${BASE[@]}"
 echo 1000 >"$STATE/euid"
 expect_refusal 'refuses the invoking user' 'invoking operator' --user operator --pubkey "$PUB" --ssh-from "$SSH_FROM"
 expect_refusal 'refuses root as the account' 'must not be root' --user root --pubkey "$PUB" --ssh-from "$SSH_FROM"
+expect_refusal 'refuses a zero --tmp-max-age' '--tmp-max-age must look like 7d' "${BASE[@]}" --tmp-max-age 0d
+expect_refusal 'refuses a --tmp-max-age in weeks' '--tmp-max-age must look like 7d' "${BASE[@]}" --tmp-max-age 2w
+expect_refusal 'refuses a --tmpfs-max-age without a unit' '--tmpfs-max-age must look like 1d' "${BASE[@]}" --tmpfs-max-age 7
+expect_refusal 'refuses a --closing-session-grace that is neither a span nor off' '--closing-session-grace must be off or look like 6h' "${BASE[@]}" --closing-session-grace forever
+expect_refusal 'revoke accepts no housekeeping options' '--revoke accepts only' --revoke --user agent-dev --closing-session-grace off
 for name in Agent a 1agent agent_x 'agent;id' 'agent dev' abcdefghijklmnopqrstuvwxyz0123456789; do
   expect_refusal "refuses invalid user name '$name'" '--user must match' --user "$name" --pubkey "$PUB" --ssh-from "$SSH_FROM"
 done
@@ -942,8 +1071,97 @@ check 'the account was created expired' has_call '--user-group --expiredate 1 -K
 check 'the key file is not written when the group check fails' absent "$KEYF"
 check 'no key is published when the group check fails' absent "$RUNKEY"
 check 'the account stays expired when the group check fails' stays_expired
-check 'egress is not started when the group check fails' no_call 'enable --now'
+check 'egress is not started when the group check fails' no_call "enable --now $UNIT_NAME"
 check 'the managed marker survives so a re-run does not strand the account' test -f "$MARK"
+
+# 3i. disk-backed TMPDIR, sshd environment and housekeeping ----------------------------------------
+reset_host
+run "${BASE[@]}" --closing-session-grace 6h
+check 'a dry-run with the reaper renders it' out_has 'reap-closing --user agent-dev --uid <uid> --grace-seconds 21600'
+check 'a dry-run with the reaper plans both timers' out_has 'would run: sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
+run --apply "${BASE[@]}" --closing-session-grace 6h
+check 'an apply with the reaper succeeds' rc_is 0
+check 'the closing-session reaper service is exact' same_content "$REAPER_SVC" "$(expected_reaper_service 6h 21600)"
+check 'the closing-session reaper timer is exact' same_content "$REAPER_TMR" "$EXPECT_REAPER_TMR"
+for unit_file in "$REAPER_SVC" "$REAPER_TMR"; do
+  check "${unit_file##*/} is 0644 root" meta_has "$unit_file 0644 root root"
+done
+check 'both timers are enabled and started' has_call 'sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
+check 'both timers are restarted so changed schedules apply' has_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
+check 'the reaper says what it does' out_has 'sessions: closing sessions of agent-dev are ended after 6h'
+# the longest accepted spans render arguments the installed helper accepts
+reset_host
+run --apply "${BASE[@]}" --tmpfs-max-age 9999d --closing-session-grace 9999d
+check 'the longest spans are accepted' rc_is 0
+check 'the longest sweep age renders 14398560 minutes' grep -qF -- '--max-age-minutes 14398560' "$SWEEP_SVC"
+check 'the longest grace renders 863913600 seconds' grep -qF -- '--grace-seconds 863913600' "$REAPER_SVC"
+mkdir -p "$TMP/reap-state" "$TMP/helper-bin"
+printf '#!/usr/bin/env bash\necho "Failed to get user: User ID 1001 is not logged in or lingering" >&2; exit 1\n' >"$TMP/helper-bin/loginctl"
+chmod +x "$TMP/helper-bin/loginctl"
+reap_args=$(sed -n 's/^ExecStart=[^ ]* reap-closing //p' "$REAPER_SVC" | sed "s#--state-dir [^ ]*#--state-dir $TMP/reap-state#")
+# shellcheck disable=SC2086 # the rendered arguments are split as systemd splits them
+helper_out=$(PATH="$TMP/helper-bin:$PATH" bash "$HELPER" reap-closing $reap_args 2>&1)
+check 'the installed helper accepts the longest rendered grace' test "$?" -eq 0
+sweep_age=$(sed -n 's/.*--max-age-minutes \([0-9]*\)$/\1/p' "$SWEEP_SVC")
+helper_out=$(bash "$HELPER" sweep-tmp --user 'no-such-user-x' --dir "$TMP" --max-age-minutes "$sweep_age" 2>&1)
+check 'the installed helper accepts the longest rendered sweep age' grep -qF 'sweep-tmp must run as no-such-user-x' <<<"$helper_out"
+reset_host
+STUB_TMPDIR_OWNER=operator run --apply "${BASE[@]}"
+check 'a tmp directory with the wrong owner aborts non-zero' rc_is 1
+check 'a tmp directory with the wrong owner is named' out_has "$AGENT_TMP is 'directory:operator:agent-dev:700', expected directory:agent-dev:agent-dev:700"
+check 'a tmp directory with the wrong owner keeps the account expired' stays_expired
+check 'a tmp directory with the wrong owner leaves sshd alone' no_call 'try-reload-or-restart'
+check 'a tmp directory with the wrong owner publishes no key' absent "$RUNKEY"
+reset_host
+mkdir -p "$ROOT_DIR/var/lib/brokkr/agent-tmp" "$TMP/elsewhere"
+ln -s "$TMP/elsewhere" "$ROOT_DIR$AGENT_TMP"
+run --apply "${BASE[@]}"
+check 'a symlinked tmp directory aborts non-zero' test "$RC" -ne 0
+check 'a symlinked tmp directory keeps the account expired' stays_expired
+check 'a symlinked tmp directory is left as it was' test "$(readlink "$ROOT_DIR$AGENT_TMP")" = "$TMP/elsewhere"
+rm -f "$ROOT_DIR$AGENT_TMP"
+rm -rf "$TMP/elsewhere"
+reset_host
+STUB_TMPFILES_FAIL=1 run --apply "${BASE[@]}"
+check 'a failing systemd-tmpfiles aborts non-zero' test "$RC" -ne 0
+check 'a failing systemd-tmpfiles keeps the account expired' stays_expired
+reset_host
+STUB_SSHD_NO_SETENV=1 run --apply "${BASE[@]}"
+check 'an sshd without the agent environment aborts non-zero' rc_is 1
+check 'an sshd without the agent environment is named' out_has "sshd does not set $AGENT_ENV for agent-dev from 127.0.0.1"
+check 'an sshd without the agent environment removes the new drop-in' absent "$DROPIN"
+check 'an sshd without the agent environment does not reload sshd' no_call 'try-reload-or-restart'
+check 'an sshd without the agent environment keeps the account expired' stays_expired
+reset_host
+STUB_SSHD_SETENV_FIRST=1 run --apply "${BASE[@]}"
+check 'an earlier sshd SetEnv value for TMPDIR aborts non-zero' rc_is 1
+check 'an earlier sshd SetEnv value is named' out_has "sshd does not set $AGENT_ENV for agent-dev from 127.0.0.1"
+check 'an earlier sshd SetEnv value keeps the account expired' stays_expired
+reset_host
+echo systemd-tmpfiles-clean.timer >"$STATE/active"
+run --apply "${BASE[@]}"
+check 'an active tmpfiles clean timer gives no warning' test "$(out_has 'systemd-tmpfiles-clean.timer is not active' && echo yes)" != yes
+reset_host
+STUB_SET_ENV_FAIL=1 run --apply "${BASE[@]}"
+check 'a user manager that cannot take the environment does not fail the apply' rc_is 0
+check 'a user manager that cannot take the environment is reported' out_has 'warning: could not set the environment of the running user manager of agent-dev'
+reset_host
+run --apply "${BASE[@]}" --tmp-max-age 3d --tmpfs-max-age 90m --closing-session-grace 2h
+check 'custom housekeeping ages succeed' rc_is 0
+check 'the tmpfiles age follows --tmp-max-age' grep -qxF 'd /var/lib/brokkr/agent-tmp/agent-dev 0700 agent-dev agent-dev 3d' "$TMPFILES"
+check 'the sweep age follows --tmpfs-max-age' same_content "$SWEEP_SVC" "$(expected_sweep_service 90m 90)"
+check 'the reaper grace follows --closing-session-grace' same_content "$REAPER_SVC" "$(expected_reaper_service 2h 7200)"
+run --apply "${BASE[@]}" --closing-session-grace off
+check 'turning the reaper off succeeds' rc_is 0
+check 'turning the reaper off disables its timer' has_call 'sudo systemctl disable --now brokkr-agent-session-reaper-agent-dev.timer'
+check 'turning the reaper off keeps the sweep timer' has_call 'sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'turning the reaper off does not enable it' no_call 'enable --now brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper'
+check 'turning the reaper off says so' out_has 'closing sessions of agent-dev are never ended automatically'
+reset_host
+run --apply "${BASE[@]}" --closing-session-grace off
+check 'a fresh host without the reaper succeeds' rc_is 0
+check 'a fresh host without the reaper installs no reaper' absent "$REAPER_SVC"
+check 'a fresh host without the reaper touches no reaper unit' no_call 'session-reaper'
 
 # 5. nft -c failure ------------------------------------------------------------------------------
 reset_host
@@ -952,7 +1170,7 @@ check 'nft -c failure aborts non-zero' rc_is 1
 check 'nft -c failure names the cause' out_has 'nft rejected the ruleset'
 check 'nft -c failure publishes no key' absent "$RUNKEY"
 check 'nft -c failure keeps the account expired' stays_expired
-check 'nft -c failure starts no egress unit' no_call 'enable --now'
+check 'nft -c failure starts no egress unit' no_call "enable --now $UNIT_NAME"
 check 'nft -c failure installs no ruleset' absent "$NFT"
 check 'nft -c failure removes the staged ruleset' absent "$NFT.new"
 reset_host
@@ -980,7 +1198,7 @@ check 'the nftables.conf backup is removed after validation' absent "$NFTCONF.br
 check 'the staged ruleset is validated before nftables.conf is touched' before "sudo nft -c -f $NFT.new" "sudo cp -a $NFTCONF"
 check 'nftables.conf is backed up before the include is appended' before "sudo cp -a $NFTCONF $NFTCONF.brokkr-previous" "sudo tee -a $NFTCONF"
 check 'the include is appended before the nftables.conf validation' before "sudo tee -a $NFTCONF" "sudo nft -c -f $NFTCONF"
-check 'the nftables.conf validation precedes the egress unit start' before "sudo nft -c -f $NFTCONF" 'sudo systemctl enable --now'
+check 'the nftables.conf validation precedes the egress unit start' before "sudo nft -c -f $NFTCONF" "sudo systemctl enable --now $UNIT_NAME"
 check 'the nftables.conf validation precedes the account enable' before "sudo nft -c -f $NFTCONF" 'sudo usermod -p'
 check 'the nftables.conf validation precedes linger' before "sudo nft -c -f $NFTCONF" 'sudo loginctl enable-linger'
 run --apply "${BASE[@]}"
@@ -1011,7 +1229,7 @@ check 'the validation saw the appended include' same_content "$STATE/nftconf.che
 check 'a rejected nftables.conf is restored byte for byte' cmp -s "$TMP/nftconf.orig" "$NFTCONF"
 check 'a rejected nftables.conf leaves no backup' absent "$NFTCONF.brokkr-previous"
 check 'a rejected nftables.conf keeps the account expired' stays_expired
-check 'a rejected nftables.conf starts no egress unit' no_call 'enable --now'
+check 'a rejected nftables.conf starts no egress unit' no_call "enable --now $UNIT_NAME"
 check 'a rejected nftables.conf publishes no key' absent "$RUNKEY"
 check 'a rejected nftables.conf leaves sshd alone' no_call 'try-reload-or-restart'
 run --apply "${BASE[@]}"
@@ -1027,7 +1245,7 @@ check 'a symlinked nftables.conf target is untouched' same_content "$TMP/nftconf
 check 'a symlinked nftables.conf stays a symlink' test -L "$NFTCONF"
 check 'a symlinked nftables.conf is never written' no_call "tee -a $NFTCONF"
 check 'a symlinked nftables.conf keeps the account expired' stays_expired
-check 'a symlinked nftables.conf starts no egress unit' no_call 'enable --now'
+check 'a symlinked nftables.conf starts no egress unit' no_call "enable --now $UNIT_NAME"
 reset_host
 mkdir "$NFTCONF"
 run --apply "${BASE[@]}"
@@ -1058,7 +1276,7 @@ for file in memory.max memory.high memory.swap.max pids.max cpu.max; do
   check "a wrong $file aborts non-zero" rc_is 1
   check "a wrong $file is named" out_has "$file is 'max"
   check "a wrong $file keeps the account expired" stays_expired
-  check "a wrong $file starts no egress unit" no_call 'enable --now'
+  check "a wrong $file starts no egress unit" no_call "enable --now $UNIT_NAME"
 done
 reset_host
 STUB_CG_WRONG=1 run --apply "${BASE[@]}"
@@ -1068,7 +1286,7 @@ STUB_SHOW_WRONG=1 run --apply "${BASE[@]}"
 check 'a wrong configured MemoryMax aborts non-zero' rc_is 1
 check 'a wrong configured MemoryMax is named' out_has 'does not have MemoryMax=25769803776'
 check 'a wrong configured MemoryMax keeps the account expired' stays_expired
-check 'a wrong configured MemoryMax starts no egress unit' no_call 'enable --now'
+check 'a wrong configured MemoryMax starts no egress unit' no_call "enable --now $UNIT_NAME"
 reset_host
 STUB_CG_MISSING=1 run --apply "${BASE[@]}"
 check 'unreadable cgroup files abort non-zero' rc_is 1
@@ -1224,8 +1442,10 @@ check 'revoke dry-run plans the lock' out_has 'would run: sudo usermod --lock --
 check 'revoke dry-run plans the key withdrawal' out_has "would run: sudo install -m 0644 -o root -g root /dev/null $KEYF"
 check 'revoke dry-run plans removing the run key' out_has "would run: sudo rm -f $RUNKEY"
 check 'revoke dry-run prints the manual removal commands' out_has 'sudo userdel -r agent-dev'
-check 'revoke dry-run names the nftables.conf include to remove by hand' out_has "(and remove the line 'include \"/etc/brokkr/agent-account/*.nft\"' from $ROOT_DIR/etc/nftables.conf once no agent account remains)"
+check 'revoke dry-run names the nftables.conf include and the helper to remove by hand' out_has "(and remove the line 'include \"/etc/brokkr/agent-account/*.nft\"' from $ROOT_DIR/etc/nftables.conf and $HELPER once no agent account remains)"
 check 'revoke dry-run lists the 00- sshd drop-in for removal' out_has "$DROPIN"
+check 'revoke dry-run lists the housekeeping timers for removal' out_has 'sudo systemctl disable --now brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
+check 'revoke dry-run lists the tmp directory for review' out_has "$AGENT_TMP"
 check 'revoke dry-run mutates nothing' nothing_mutated
 check 'revoke dry-run leaves the files untouched' test "$SNAP2" = "$(snapshot)"
 echo 'agent-dev sudo' >"$STATE/groups/agent-dev"
@@ -1248,6 +1468,7 @@ check 'revoke never deletes the user' no_call 'userdel'
 check 'revoke keeps the egress unit, ruleset, slice and marker' test -f "$UNIT" -a -f "$NFT" -a -f "$SLICE" -a -f "$MARK"
 check 'revoke keeps the user manager and sshd drop-ins' test -f "$UMDROP" -a -f "$DROPIN"
 check 'revoke keeps the home directory' test -d "$HOMEDIR"
+check 'revoke keeps the housekeeping units and the tmp directory' test -f "$SWEEP_SVC" -a -f "$TMPFILES" -a -d "$ROOT_DIR$AGENT_TMP"
 check 'revoke never touches the agent home .ssh' no_call 'home/agent-dev/\.ssh'
 check 'revoke leaves no .ssh in the agent home' absent "$HOMEDIR/.ssh"
 check 'revoke does not stop or reload any unit' no_call '^(sudo )?systemctl '

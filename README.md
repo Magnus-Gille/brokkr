@@ -55,6 +55,7 @@ required to run or understand Brokkr.
 | `scripts/m5-fde-preflight.sh` | Read-only M5 LUKS/Secure Boot/TPM and backup-evidence ceremony gate |
 | `scripts/m5-network-profile.py` | Default-deny M5 UFW plus pre-INPUT tailnet/SSH/Samba/inference transaction with timed rollback and independent confirmation |
 | `scripts/provision-agent-account.sh` | Dry-run-first provisioning of an unprivileged, resource-bounded, egress-isolated [agent/build account](docs/agent-account.md) |
+| `scripts/agent-account-housekeeping.sh` | Agent-account timers: sweep the account's stale `/tmp` files and end sessions left `closing` ([agent account](docs/agent-account.md#temporary-files-and-orphaned-sessions)) |
 | `heimdall/` | Compose and push hardware-health snapshots |
 | `systemd/brokkr-systemd-failure*` | Fail-loud reporting for failed system services and timer-driven oneshots |
 | `journald/`, `scripts/setup-persistent-journal.sh` | Bounded persistent-journal policy for post-reboot evidence |
