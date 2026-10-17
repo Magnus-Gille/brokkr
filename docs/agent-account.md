@@ -40,8 +40,8 @@ verified, so any failure leaves it closed.
    creates `/var/lib/brokkr/agent-tmp/<user>` (owner the account, `0700`, under a root-owned
    `0755` parent) and ages its contents; `stat` reads both back and a wrong owner, mode or a
    symlink aborts. It installs `/usr/local/libexec/brokkr-agent-housekeeping` and enables
-   `brokkr-agent-tmp-sweep-<user>.timer` and, unless `--closing-session-grace off`,
-   `brokkr-agent-session-reaper-<user>.timer`.
+   `brokkr-agent-tmp-sweep-<user>.timer` and, only when `--closing-session-grace` is given a
+   span (the default is `off`), `brokkr-agent-session-reaper-<user>.timer`.
 4. Writes the SSH key to `/etc/brokkr/agent-account/<user>.keys` (root-owned), validates
    the nftables ruleset with `nft -c`, and installs `brokkr-agent-egress-<user>.service`.
    The unit loads the ruleset and only then publishes the key to
@@ -116,7 +116,7 @@ What the provisioner sets up:
 | `TMPDIR=/var/lib/brokkr/agent-tmp/<user>` and `CLAUDE_CODE_TMPDIR` (same value) via sshd `SetEnv` and the `user@<uid>` drop-in | `mktemp`, Node (`os.tmpdir()`, including its compile cache), Rust's `std::env::temp_dir`, and Claude Code's scratch directories (`<dir>/claude-<uid>/`) land on disk. Page cache is still charged to the slice, but it is reclaimable, so it no longer drives the slice into throttling. |
 | `/etc/tmpfiles.d/brokkr-agent-<user>.conf` (`--tmp-max-age`, default `7d`) | `systemd-tmpfiles-clean.timer` (daily) removes entries of that directory whose access, modification and change times are all older than the age. The directory itself is recreated at boot. |
 | `brokkr-agent-tmp-sweep-<user>.timer` (hourly, `--tmpfs-max-age`, default `1d`) | Runs **as the account** (never root, so it can only delete what the account itself could) in `system.slice` (a throttled agent slice cannot stall it), with no network. It removes the account's regular files and symlinks under `/tmp` whose three times are all older than the age, then its empty directories. Aged directories of the account that it cannot enter (read-only build or module trees) get `u+rwx` first. It does not enter other users' directories, and it keeps sockets and FIFOs (tmux, ssh-agent). Any other error fails the unit after both passes. It covers programs that hard-code `/tmp`. |
-| `brokkr-agent-session-reaper-<user>.timer` (every 10 min, `--closing-session-grace`, default `6h`; `off` disables it) | Root, via logind only. A session whose SSH connection is gone but whose processes remain is `State=closing`. Once a session has been seen closing for the grace period, the reaper ends it with `loginctl terminate-session`, and its processes and their memory go with it. The first-seen times are kept in `/run/brokkr-agent-sessions/<user>`. |
+| `brokkr-agent-session-reaper-<user>.timer` (opt-in: every 10 min once `--closing-session-grace` is a span such as `6h`; the default `off` installs nothing) | Root, via logind only. A session whose SSH connection is gone but whose processes remain is `State=closing`. Once a session has been seen closing for the grace period, the reaper ends it with `loginctl terminate-session`; if it is still closing on a later run (processes that ignore SIGTERM), it sends SIGKILL with `loginctl kill-session`. It keeps a session whose scope holds a tmux server with an attached client (tmux sets its socket's execute bit while a client is attached), and a session whose processes it cannot read. The first-seen and terminate times are kept in `/run/brokkr-agent-sessions/<user>`. It is resource hygiene for a cooperative account, not a security boundary. |
 
 `CARGO_TARGET_DIR` is deliberately **not** set account-wide. Every checkout or worktree
 already builds into its own `target/` on disk. One shared target directory would serialize
@@ -126,28 +126,36 @@ put it in its scratchpad, which is now on disk.
 
 ### Deliberate long-lived work (tmux)
 
-The reaper cannot tell an abandoned build from a tmux server you started inside an SSH
-session on purpose. Both make the session `closing` when the connection drops. With the
-reaper on, such a tmux survives a disconnect for the grace period (enough to reattach
-after a network change or laptop sleep). Start long-lived work outside any login session
-instead, so neither the reaper nor a later `KillUserProcesses` policy can touch it:
+A tmux server stays in the scope of the SSH login that started it, for as long as it runs.
+When that connection drops, the login becomes `closing`. **Reattaching from a new login
+does not move the server out of the old scope and does not reset the reaper's grace
+period.** With the reaper on, a tmux server inside a login is spared only while a client is
+attached at the time of a check. Once it is detached and the grace period has passed, it is
+ended at the next check, together with everything running in it. This also covers the
+"laptop off" case of a detached tmux running `claude remote-control`. The reaper cannot tell
+deliberate detached work from an abandoned build, so it is off by default.
+
+Start long-lived work outside any login, in its own scope under the user manager, with a
+dedicated tmux socket so it does not join a server that lives in an old login scope:
 
 ```bash
-systemd-run --user --unit=agent-work tmux new-session -d -s work   # survives logout (linger)
-tmux attach -t work
+systemd-run --user --scope --unit=agent-work tmux -L agent-work new-session -d -s work
+tmux -L agent-work attach -t work
 ```
 
-Lingering user services (`systemd-run --user`, `systemctl --user`) run under `user@<uid>` and
-are never part of a login session. They stay inside the account's slice and budget.
+The transient scope holds the tmux server after the starting client exits, survives logout
+(the account lingers), and stays inside the account's slice and budget. A plain
+`systemd-run --user tmux new-session -d` does **not** work: it creates a `Type=simple`
+service, the client exits after starting the detached server, the unit stops and its
+control group, the server included, is killed.
 
-Alternatives considered:
+Choosing the policy:
 
-- `KillUserProcesses=yes` with `KillOnlyUsers=<user>` in `logind.conf.d`: kills the session's
-  processes at the moment the connection drops, with no grace period. Plain tmux and
-  `nohup` inside SSH stop working for the account. The setting is one global list for the
-  whole host and takes effect only after logind restarts or the host reboots.
-- `--closing-session-grace off`: today's behaviour; orphaned builds keep their memory until
-  someone ends them by hand.
+| Option | Effect on tmux inside an SSH login | Notes |
+|---|---|---|
+| `--closing-session-grace off` (default) | Unaffected | Orphaned builds keep their memory until someone ends them by hand |
+| `--closing-session-grace 6h` (or another span) | Kept while attached; ended at the first check after the grace period once detached | Per account, no logind restart. Move long-lived work to the `systemd-run --user --scope` form first. |
+| `KillUserProcesses=yes` with `KillOnlyUsers=<user>` in `logind.conf.d` (not implemented here) | Killed the moment the connection drops | Plain tmux and `nohup` inside SSH stop working. One global list for the host; takes effect only after logind restarts or the host reboots. |
 
 ### Resource budget after the fix
 
@@ -211,9 +219,11 @@ runs as the agent and is subject to the same rules; use it to reach an agent's d
   so any read counts as a touch.
 - The final `systemctl --user -M <user>@ set-environment` talks to the account's own user bus
   as root. It carries no secrets, its failure only warns, and it is bounded by a 30-second timeout.
-- The reaper ends any session of the account that stays `closing` for the grace period,
-  including a tmux server started inside an SSH login. Use `systemd-run --user` for work
-  that must outlive the login.
+- When enabled, the reaper ends any session of the account that stays `closing` for the
+  grace period, including a detached tmux server started inside an SSH login, even if it
+  was reattached from a later login in between. Use the `systemd-run --user --scope` form
+  above for work that must outlive the login. Attached-client detection covers tmux only
+  (not screen or zellij).
 - The repository tests use stubs and never exercise a live kernel, sshd or systemd, so
   run the verification below after every apply.
 
@@ -265,14 +275,15 @@ processes are not affected. Then:
    their old `TMPDIR`. New SSH sessions and new user services get the new one. Restart
    long-lived agent processes when convenient.
 2. Files already in `/tmp` are removed by the hourly sweep once they are older than
-   `--tmpfs-max-age`. Sessions that are already `closing` are ended one grace period after
-   the reaper first sees them. Freeing memory sooner is a manual, destructive step for the
+   `--tmpfs-max-age`. With the reaper enabled, sessions that are already `closing` are ended
+   one grace period after the reaper first sees them. Freeing memory sooner is a manual, destructive step for the
    operator: review the account's `/tmp` files and running processes first.
 
 ## Rollback of the temporary-file and session housekeeping
 
 ```bash
-sudo systemctl disable --now brokkr-agent-tmp-sweep-<user>.timer brokkr-agent-session-reaper-<user>.timer
+sudo systemctl disable --now brokkr-agent-tmp-sweep-<user>.timer
+sudo systemctl disable --now brokkr-agent-session-reaper-<user>.timer   # only if the reaper was enabled
 sudo rm -f /etc/systemd/system/brokkr-agent-{tmp-sweep,session-reaper}-<user>.{service,timer} \
   /etc/tmpfiles.d/brokkr-agent-<user>.conf
 # Re-run the provisioner at the previous accepted commit: it rewrites the sshd and user@<uid>

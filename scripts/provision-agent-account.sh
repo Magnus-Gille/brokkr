@@ -6,7 +6,7 @@
 #   provision-agent-account.sh [--apply] --user NAME --pubkey FILE --ssh-from CIDR[,CIDR...]
 #       [--cpu-quota 2000%] [--memory-high 20G] [--memory-max 24G] [--tasks-max 4096]
 #       [--allow-local-tcp '1420,4173,5173,32768-60999']
-#       [--tmp-max-age 7d] [--tmpfs-max-age 1d] [--closing-session-grace 6h|off]
+#       [--tmp-max-age 7d] [--tmpfs-max-age 1d] [--closing-session-grace off|6h]
 #   provision-agent-account.sh --revoke [--apply] --user NAME
 #
 # Default is DRY-RUN: validate, print every planned action and every file it would write,
@@ -41,7 +41,7 @@ Usage:
   provision-agent-account.sh [--apply] --user NAME --pubkey FILE --ssh-from CIDR[,CIDR...]
       [--cpu-quota 2000%] [--memory-high 20G] [--memory-max 24G] [--tasks-max 4096]
       [--allow-local-tcp '1420,4173,5173,32768-60999']
-      [--tmp-max-age 7d] [--tmpfs-max-age 1d] [--closing-session-grace 6h|off]
+      [--tmp-max-age 7d] [--tmpfs-max-age 1d] [--closing-session-grace off|6h]
   provision-agent-account.sh --revoke [--apply] --user NAME
 Dry-run unless --apply is given.
 EOF
@@ -59,7 +59,8 @@ TASKS_MAX=4096
 LOCAL_TCP='1420,4173,5173,32768-60999'
 TMP_MAX_AGE=7d
 TMPFS_MAX_AGE=1d
-CLOSING_GRACE=6h
+# Opt-in: the reaper cannot see deliberate detached tmux work inside a login (docs/agent-account.md).
+CLOSING_GRACE=off
 PROVISION_OPTS_GIVEN=0
 
 while [[ $# -gt 0 ]]; do

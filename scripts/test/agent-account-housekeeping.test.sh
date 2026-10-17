@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Hermetic coverage for scripts/agent-account-housekeeping.sh. loginctl and id are PATH shims;
-# the tmp sweep runs the real find against a private directory.
+# the reaper reads a fake cgroup and /proc tree; the tmp sweep runs the real find against a
+# private directory.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,8 +30,14 @@ case $1 in
     line=$(grep -m1 "^$2 " "$STUB_STATE/sessions") || { echo "Failed to get session: No session '$2' known" >&2; exit 1; }
     read -r _ uid state <<<"$line"
     printf 'User=%s\nState=%s\n' "$uid" "$state" ;;
-  terminate-session)
+  terminate-session) # STUB_TERMINATE_NOOP=1: the session ignores SIGTERM and stays closing
     [[ ${STUB_TERMINATE_FAIL:-} != "$2" ]] || { echo "Failed to terminate session: Access denied" >&2; exit 1; }
+    [[ ${STUB_TERMINATE_NOOP:-} == 1 ]] && exit 0
+    grep -v "^$2 " "$STUB_STATE/sessions" >"$STUB_STATE/sessions.new" || true
+    mv "$STUB_STATE/sessions.new" "$STUB_STATE/sessions" ;;
+  kill-session)
+    [[ $3 == --signal=SIGKILL ]] || { echo "loginctl stub: unexpected: $*" >&2; exit 99; }
+    [[ ${STUB_KILL_FAIL:-} != "$2" ]] || { echo "Failed to kill session: Access denied" >&2; exit 1; }
     grep -v "^$2 " "$STUB_STATE/sessions" >"$STUB_STATE/sessions.new" || true
     mv "$STUB_STATE/sessions.new" "$STUB_STATE/sessions" ;;
   *) exit 99 ;;
@@ -49,12 +56,35 @@ no_call() { ! grep -qF -- "$1" "$CALLS"; }
 absent() { [[ ! -e $1 && ! -L $1 ]]; }
 present() { [[ -e $1 || -L $1 ]]; }
 
+CG="$TMP/cgroup"
+PROCFS="$TMP/proc"
 run() { # NOW=<epoch> run args...
   : >"$CALLS"
   OUT=$(PATH="$STUBS:$PATH" STUB_CALLS="$CALLS" STUB_STATE="$STATE" \
+    BROKKR_HOUSEKEEPING_CGROUP_ROOT="$CG" BROKKR_HOUSEKEEPING_PROC="$PROCFS" \
     BROKKR_HOUSEKEEPING_NOW="${NOW:-1000000}" bash "$SCRIPT" "$@" 2>&1)
   RC=$?
 }
+mkscope() { # session-id pid...: the session's scope and the processes in it
+  local dir="$CG/user.slice/user-1001.slice/session-$1.scope"
+  mkdir -p "$dir"
+  shift
+  printf '%s\n' "$@" | grep . >"$dir/cgroup.procs" || : >"$dir/cgroup.procs"
+}
+# mkproc pid exe [socket-path inode]: a process; with a socket, a listening unix socket in
+# its network namespace, as /proc/<pid>/net/unix lists it.
+mkproc() {
+  local d="$PROCFS/$1"
+  mkdir -p "$d/fd" "$d/net"
+  ln -sfn "$2" "$d/exe"
+  printf 'Num       RefCount Protocol Flags    Type St Inode Path\n' >"$d/net/unix"
+  if [[ -n ${3:-} ]]; then
+    ln -sfn "socket:[$4]" "$d/fd/5"
+    printf '0000000000000000: 00000002 00000000 00010000 0001 01 %s %s\n' "$4" "$3" >>"$d/net/unix"
+  fi
+}
+mksocket() { python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"; }
+for id in 10 11 12 13 20 21 30 40 41; do mkscope "$id"; done
 
 echo agent-account-housekeeping.test.sh
 
@@ -80,7 +110,9 @@ check 'a run at the end of the grace period succeeds' rc_is 0
 check 'a session closing for the whole grace period is terminated' has_call 'loginctl terminate-session 11'
 check 'only that session is terminated' test "$(grep -c terminate-session "$CALLS")" = 1
 check 'the termination is reported' out_has 'terminated session 11 of agent, closing for at least 3600s'
-check 'a terminated session loses its record' absent "$SD/11"
+check 'a terminated session records the terminate' grep -qx 'terminated 1003600' "$SD/11"
+NOW=1003700 run "${REAP[@]}"
+check 'the record of a terminated session that ended is removed' absent "$SD/11"
 check 'an active session is never terminated' no_call 'terminate-session 10'
 check 'a session of another uid is never terminated' no_call 'terminate-session 13'
 
@@ -95,14 +127,22 @@ echo 1 >"$SD/99"
 NOW=2000200 run "${REAP[@]}"
 check 'stale records of unknown sessions are removed' absent "$SD/99"
 
-# a record from the future or garbage restarts the grace period instead of terminating
+# a record from the future or garbage restarts the grace period, and is rewritten so the
+# session is still ended one grace period later
 printf '%s\n' '30 1001 closing' >"$STATE/sessions"
 echo 9999999 >"$SD/30"
 NOW=3000000 run "${REAP[@]}"
 check 'a record from the future does not terminate' no_call 'terminate-session'
+check 'a record from the future is rewritten with the current time' test "$(cat "$SD/30")" = 3000000
+NOW=3003600 run "${REAP[@]}"
+check 'a session with a future record is terminated one grace period later' has_call 'loginctl terminate-session 30'
+printf '%s\n' '30 1001 closing' >"$STATE/sessions"
 echo garbage >"$SD/30"
-NOW=3000000 run "${REAP[@]}"
+NOW=3100000 run "${REAP[@]}"
 check 'a garbage record does not terminate' no_call 'terminate-session'
+check 'a garbage record is rewritten with the current time' test "$(cat "$SD/30")" = 3100000
+NOW=3103600 run "${REAP[@]}"
+check 'a session with a garbage record is terminated one grace period later' has_call 'loginctl terminate-session 30'
 
 # failures
 printf '%s\n' '40 1001 closing' '41 1001 closing' >"$STATE/sessions"
@@ -123,7 +163,81 @@ check 'an unexpected session id is refused' rc_is 1
 check 'an unexpected session id is never terminated' no_call 'terminate-session'
 check 'an unexpected session id never becomes a path' absent "$TMP/x"
 
+# a session that ignores the terminate is killed on the next run instead of re-armed
+rm -f "$SD"/*
+printf '%s\n' '42 1001 closing' >"$STATE/sessions"
+mkscope 42
+echo 1 >"$SD/42"
+STUB_TERMINATE_NOOP=1 NOW=4100000 run "${REAP[@]}"
+check 'a stubborn session is first terminated' has_call 'loginctl terminate-session 42'
+check 'a stubborn session is not killed on the same run' no_call 'kill-session'
+check 'a terminated session keeps a record of the terminate' grep -qx 'terminated 4100000' "$SD/42"
+STUB_TERMINATE_NOOP=1 NOW=4100600 run "${REAP[@]}"
+check 'a session still closing after a terminate is killed with SIGKILL' has_call 'loginctl kill-session 42 --signal=SIGKILL'
+check 'a session still closing after a terminate is not terminated again' no_call 'terminate-session 42'
+check 'the kill is reported' out_has 'killed session 42 of agent with SIGKILL: still closing 600s after terminate-session'
+check 'a killed session that ended loses its record' absent "$SD/42"
+printf '%s\n' '43 1001 closing' >"$STATE/sessions"
+mkscope 43
+printf '1\nterminated 4200000\n' >"$SD/43"
+STUB_KILL_FAIL=43 NOW=4200600 run "${REAP[@]}"
+check 'a failing kill exits non-zero' rc_is 1
+check 'a failing kill is named' out_has 'could not kill session 43: Failed to kill session: Access denied'
+check 'a failing kill keeps its record for the next run' grep -qx 'terminated 4200000' "$SD/43"
+
+# a tmux server with an attached client keeps its session; a detached one does not
+rm -f "$SD"/*
+SOCK="$TMP/tmux-sock"
+mksocket "$SOCK"
+mkproc 500 /usr/bin/tmux "$SOCK" 7700
+mkproc 501 /usr/bin/bash
+printf '%s\n' '50 1001 closing' >"$STATE/sessions"
+mkscope 50 501 500
+echo 1 >"$SD/50"
+chmod u+x "$SOCK"
+NOW=5000000 run "${REAP[@]}"
+check 'an attached tmux server keeps a closing session past its grace' no_call 'terminate-session'
+check 'the attached tmux server is reported' out_has "session 50 of agent holds tmux server 500 with an attached client ($SOCK); kept"
+check 'an attached tmux server keeps the original first-seen time' test "$(head -1 "$SD/50")" = 1
+chmod u-x "$SOCK"
+NOW=5000600 run "${REAP[@]}"
+check 'a detached tmux server past the grace is ended' has_call 'loginctl terminate-session 50'
+rm -f "$SOCK"
+printf 'not a socket\n' >"$SOCK"
+chmod 700 "$SOCK"
+printf '%s\n' '51 1001 closing' >"$STATE/sessions"
+mkscope 51 500
+echo 1 >"$SD/51"
+NOW=5000600 run "${REAP[@]}"
+check 'an executable non-socket at the tmux path does not count as attached' has_call 'loginctl terminate-session 51'
+rm -f "$SOCK"
+ln -s /usr/bin/env "$SOCK"
+printf '%s\n' '52 1001 closing' >"$STATE/sessions"
+mkscope 52 500
+echo 1 >"$SD/52"
+NOW=5000600 run "${REAP[@]}"
+check 'a symlink at the tmux path does not count as attached' has_call 'loginctl terminate-session 52'
+rm -f "$SOCK"
+mkproc 502 /usr/bin/python3 "$TMP/py-sock" 7702
+mksocket "$TMP/py-sock"
+chmod u+x "$TMP/py-sock"
+printf '%s\n' '53 1001 closing' >"$STATE/sessions"
+mkscope 53 502
+echo 1 >"$SD/53"
+NOW=5000600 run "${REAP[@]}"
+check 'an attached-looking socket of another program does not keep the session' has_call 'loginctl terminate-session 53'
+# a session whose processes cannot be inspected is kept, never reaped blind
+printf '%s\n' '54 1001 closing' >"$STATE/sessions"
+echo 1 >"$SD/54"
+NOW=5000600 run "${REAP[@]}"
+check 'an uninspectable closing session is kept' no_call 'terminate-session'
+check 'an uninspectable closing session is reported' out_has 'cannot read the processes of session 54'
+
 # argument validation
+run reap-closing --user agent --uid 1001 --grace-seconds 863913600 --state-dir "$SD"
+check 'the longest grace the provisioner renders (9999d) is accepted' rc_is 0
+run reap-closing --user agent --uid 1001 --grace-seconds 1000000000 --state-dir "$SD"
+check 'a grace beyond the limit is refused' rc_is 64
 run reap-closing --user agent --uid 1001 --grace-seconds 0 --state-dir "$SD"
 check 'a zero grace period is refused' rc_is 64
 run reap-closing --user agent --uid x --grace-seconds 60 --state-dir "$SD"
@@ -219,6 +333,14 @@ exit 1
 EOF
 run sweep-tmp --user agent --dir "$TMP" --max-age-minutes 0
 check 'races with the account processes are not errors' rc_is 0
+stub find <<'EOF'
+#!/usr/bin/env bash
+printf 'find %s\n' "$*" >>"$STUB_CALLS"
+exit 2
+EOF
+run sweep-tmp --user agent --dir "$TMP" --max-age-minutes 0
+check 'a find that fails without a message fails the sweep' rc_is 1
+check 'a silent find failure is named with its status' out_has 'find exited with status 2'
 
 # the find expression: other users' directories are pruned and all three times must be old
 stub find <<'EOF'
@@ -231,6 +353,11 @@ case $1 in -u) echo 1001 ;; -un) echo agent ;; esac
 EOF
 run sweep-tmp --user agent --dir "$TMP" --max-age-minutes 1440
 check 'a stubbed sweep succeeds' rc_is 0
+run sweep-tmp --user agent --dir "$TMP" --max-age-minutes 14398560
+check 'the longest age the provisioner renders (9999d) is accepted' rc_is 0
+run sweep-tmp --user agent --dir "$TMP" --max-age-minutes 100000000
+check 'an age beyond the limit is refused' rc_is 64
+run sweep-tmp --user agent --dir "$TMP" --max-age-minutes 1440
 check 'files are matched by owner, type and all three times, outside other users directories' \
   has_call "find $TMP -xdev -mindepth 1 ( -type d ! -user agent -prune ) -o ( -user agent -type d ! -perm -700 -mmin +1440 -cmin +1440 -exec chmod u+rwx -- {} ; -false ) -o ( -user agent ( -type f -o -type l ) -mmin +1440 -cmin +1440 -amin +1440 -print -exec rm -f -- {} + )"
 check 'empty directories are matched by owner and age' \

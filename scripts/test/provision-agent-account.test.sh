@@ -608,8 +608,9 @@ check 'dry-run plans creating it with systemd-tmpfiles' out_has "would run: sudo
 check 'dry-run renders the sshd SetEnv' out_has "    SetEnv $AGENT_ENV"
 check 'dry-run renders the user manager environment' out_has "Environment=$AGENT_ENV"
 check 'dry-run renders the tmp sweep' out_has 'sweep-tmp --user agent-dev --dir /tmp --max-age-minutes 1440'
-check 'dry-run renders the closing-session reaper' out_has 'reap-closing --user agent-dev --uid <uid> --grace-seconds 21600'
-check 'dry-run plans both timers' out_has 'would run: sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
+check 'dry-run leaves closing sessions alone by default' out_has 'closing sessions of agent-dev are never ended automatically'
+check 'dry-run renders no reaper unit by default' test "$(out_has 'reap-closing --user agent-dev' && echo yes)" != yes
+check 'dry-run plans only the sweep timer by default' out_has 'would run: sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer'
 check 'dry-run plans the running user manager environment' out_has "would run: sudo timeout 30 systemctl --user -M agent-dev@ set-environment $AGENT_ENV"
 check 'dry-run writes nothing under the root' test "$(find "$ROOT_DIR" -type f | wc -l | tr -d ' ')" = 0
 check 'dry-run runs no mutating command' nothing_mutated
@@ -747,14 +748,14 @@ check 'the tmp sweep service is exact' same_content "$SWEEP_SVC" "$(expected_swe
 check 'the tmp sweep timer is exact' same_content "$SWEEP_TMR" "$EXPECT_SWEEP_TMR"
 check 'the tmp sweep never runs in the agent slice' lacks_re "$SWEEP_SVC" '^Slice='
 check 'the tmp sweep sees the real /tmp' lacks_re "$SWEEP_SVC" '^PrivateTmp='
-check 'the closing-session reaper service is exact' same_content "$REAPER_SVC" "$(expected_reaper_service 6h 21600)"
-check 'the closing-session reaper timer is exact' same_content "$REAPER_TMR" "$EXPECT_REAPER_TMR"
-for unit_file in "$SWEEP_SVC" "$SWEEP_TMR" "$REAPER_SVC" "$REAPER_TMR"; do
+check 'the closing-session reaper is opt-in: none by default' absent "$REAPER_SVC"
+check 'no reaper unit is touched by default' no_call 'session-reaper'
+for unit_file in "$SWEEP_SVC" "$SWEEP_TMR"; do
   check "${unit_file##*/} is 0644 root" meta_has "$unit_file 0644 root root"
 done
-check 'both timers are enabled and started' has_call 'sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
-check 'both timers are restarted so changed schedules apply' has_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
-check 'the timers are restarted after they are enabled' before 'sudo systemctl enable --now brokkr-agent-tmp-sweep' 'sudo systemctl restart brokkr-agent-tmp-sweep'
+check 'the sweep timer is enabled and started' has_call 'sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'the sweep timer is restarted so a changed schedule applies' has_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'the sweep timer is restarted after it is enabled' before 'sudo systemctl enable --now brokkr-agent-tmp-sweep' 'sudo systemctl restart brokkr-agent-tmp-sweep'
 check 'an inactive tmpfiles clean timer is reported' out_has 'warning: systemd-tmpfiles-clean.timer is not active'
 check 'the running user manager gets the agent environment' same_content "$STATE/user-manager.env" "$(printf '%s\n' "TMPDIR=$AGENT_TMP" "CLAUDE_CODE_TMPDIR=$AGENT_TMP")"
 
@@ -1074,6 +1075,36 @@ check 'egress is not started when the group check fails' no_call "enable --now $
 check 'the managed marker survives so a re-run does not strand the account' test -f "$MARK"
 
 # 3i. disk-backed TMPDIR, sshd environment and housekeeping ----------------------------------------
+reset_host
+run "${BASE[@]}" --closing-session-grace 6h
+check 'a dry-run with the reaper renders it' out_has 'reap-closing --user agent-dev --uid <uid> --grace-seconds 21600'
+check 'a dry-run with the reaper plans both timers' out_has 'would run: sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
+run --apply "${BASE[@]}" --closing-session-grace 6h
+check 'an apply with the reaper succeeds' rc_is 0
+check 'the closing-session reaper service is exact' same_content "$REAPER_SVC" "$(expected_reaper_service 6h 21600)"
+check 'the closing-session reaper timer is exact' same_content "$REAPER_TMR" "$EXPECT_REAPER_TMR"
+for unit_file in "$REAPER_SVC" "$REAPER_TMR"; do
+  check "${unit_file##*/} is 0644 root" meta_has "$unit_file 0644 root root"
+done
+check 'both timers are enabled and started' has_call 'sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
+check 'both timers are restarted so changed schedules apply' has_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
+check 'the reaper says what it does' out_has 'sessions: closing sessions of agent-dev are ended after 6h'
+# the longest accepted spans render arguments the installed helper accepts
+reset_host
+run --apply "${BASE[@]}" --tmpfs-max-age 9999d --closing-session-grace 9999d
+check 'the longest spans are accepted' rc_is 0
+check 'the longest sweep age renders 14398560 minutes' grep -qF -- '--max-age-minutes 14398560' "$SWEEP_SVC"
+check 'the longest grace renders 863913600 seconds' grep -qF -- '--grace-seconds 863913600' "$REAPER_SVC"
+mkdir -p "$TMP/reap-state" "$TMP/helper-bin"
+printf '#!/usr/bin/env bash\necho "Failed to get user: User ID 1001 is not logged in or lingering" >&2; exit 1\n' >"$TMP/helper-bin/loginctl"
+chmod +x "$TMP/helper-bin/loginctl"
+reap_args=$(sed -n 's/^ExecStart=[^ ]* reap-closing //p' "$REAPER_SVC" | sed "s#--state-dir [^ ]*#--state-dir $TMP/reap-state#")
+# shellcheck disable=SC2086 # the rendered arguments are split as systemd splits them
+helper_out=$(PATH="$TMP/helper-bin:$PATH" bash "$HELPER" reap-closing $reap_args 2>&1)
+check 'the installed helper accepts the longest rendered grace' test "$?" -eq 0
+sweep_age=$(sed -n 's/.*--max-age-minutes \([0-9]*\)$/\1/p' "$SWEEP_SVC")
+helper_out=$(bash "$HELPER" sweep-tmp --user 'no-such-user-x' --dir "$TMP" --max-age-minutes "$sweep_age" 2>&1)
+check 'the installed helper accepts the longest rendered sweep age' grep -qF 'sweep-tmp must run as no-such-user-x' <<<"$helper_out"
 reset_host
 STUB_TMPDIR_OWNER=operator run --apply "${BASE[@]}"
 check 'a tmp directory with the wrong owner aborts non-zero' rc_is 1
@@ -1437,7 +1468,7 @@ check 'revoke never deletes the user' no_call 'userdel'
 check 'revoke keeps the egress unit, ruleset, slice and marker' test -f "$UNIT" -a -f "$NFT" -a -f "$SLICE" -a -f "$MARK"
 check 'revoke keeps the user manager and sshd drop-ins' test -f "$UMDROP" -a -f "$DROPIN"
 check 'revoke keeps the home directory' test -d "$HOMEDIR"
-check 'revoke keeps the housekeeping units and the tmp directory' test -f "$SWEEP_SVC" -a -f "$REAPER_SVC" -a -f "$TMPFILES" -a -d "$ROOT_DIR$AGENT_TMP"
+check 'revoke keeps the housekeeping units and the tmp directory' test -f "$SWEEP_SVC" -a -f "$TMPFILES" -a -d "$ROOT_DIR$AGENT_TMP"
 check 'revoke never touches the agent home .ssh' no_call 'home/agent-dev/\.ssh'
 check 'revoke leaves no .ssh in the agent home' absent "$HOMEDIR/.ssh"
 check 'revoke does not stop or reload any unit' no_call '^(sudo )?systemctl '
