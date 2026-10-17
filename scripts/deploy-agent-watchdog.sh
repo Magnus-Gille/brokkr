@@ -11,17 +11,46 @@
 # enabler lands — the watchdog no-ops while the heartbeat file is absent.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENTRY_SCRIPT="${BASH_SOURCE[0]}"
+ENTRY_PATH="$ENTRY_SCRIPT"
+[[ "$ENTRY_PATH" == /* ]] || ENTRY_PATH="$(pwd -P)/$ENTRY_PATH"
+[[ "$ENTRY_PATH" != *$'\n'* && "$ENTRY_PATH" != *$'\r'* ]] || { echo "brokkr watchdog deploy: deployment entry point path must not contain line breaks" >&2; exit 64; }
+ENTRY_CURSOR=/
+IFS=/ read -r -a ENTRY_COMPONENTS <<<"${ENTRY_PATH#/}"
+for ENTRY_COMPONENT in "${ENTRY_COMPONENTS[@]}"; do
+  case "$ENTRY_COMPONENT" in ''|.) continue ;; ..) ENTRY_CURSOR=$(dirname "$ENTRY_CURSOR"); continue ;; esac
+  ENTRY_CURSOR="${ENTRY_CURSOR%/}/$ENTRY_COMPONENT"
+  [[ ! -L "$ENTRY_CURSOR" ]] || { echo "brokkr watchdog deploy: deployment entry point path must not contain symlinks" >&2; exit 64; }
+done
+SCRIPT_DIR="$(cd "$(dirname "$ENTRY_SCRIPT")" && pwd -P)"
+HERE="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+# shellcheck source=scripts/lib/deploy-source.sh
+source "$HERE/scripts/lib/deploy-source.sh"
 # This deploys a user unit whose ExecStart is %h/repos/brokkr.
-DEST="${BROKKR_USER_REMOTE_DIR:-~/repos/brokkr}"
+REMOTE_HOME_MARKER=$'\x7e'
+DEST="${BROKKR_USER_REMOTE_DIR:-${REMOTE_HOME_MARKER}/repos/brokkr}"
+if [[ "$DEST" != "${REMOTE_HOME_MARKER}/repos/brokkr" ]]; then
+  echo "brokkr watchdog deploy: BROKKR_USER_REMOTE_DIR must be ~/repos/brokkr (the user unit executes from that path)" >&2
+  exit 64
+fi
 HOSTS=("$@")
 if [ "${#HOSTS[@]}" -eq 0 ]; then
   read -r -a HOSTS <<<"${BROKKR_FLEET_TARGETS:-brokkr@control-node brokkr@nas-host brokkr@inference-host brokkr@edge-host}"
 fi
 
+# Refuse before any remote I/O unless this is the accepted, clean release source.
+require_brokkr_deploy_source_binding "$HERE"
+DEPLOY_PAYLOAD_PARENT=""
+DEPLOY_PAYLOAD_ROOT=""
+cleanup_deploy_payload() { [[ -z "$DEPLOY_PAYLOAD_PARENT" ]] || rm -rf "$DEPLOY_PAYLOAD_PARENT"; }
+trap cleanup_deploy_payload EXIT
+trap 'cleanup_deploy_payload; exit 1' HUP INT TERM
+materialize_brokkr_deploy_payload "$HERE" "$BROKKR_EXPECTED_COMMIT"
+
 for TARGET in "${HOSTS[@]}"; do
   echo "==> $TARGET : syncing repo"
-  rsync -a --delete --exclude '.git' --exclude '.local' "$HERE/" "$TARGET:$DEST/"
+  rsync -a --delete --exclude '.git' --exclude '.local' --exclude '.env*' --exclude 'secrets/' \
+    "$DEPLOY_PAYLOAD_ROOT/" "$TARGET:$DEST/"
 
   echo "==> $TARGET : installing user units + enabling timer"
   ssh "$TARGET" '

@@ -10,6 +10,7 @@ CONTROL_NODE="${1:-${BROKKR_SSH_TARGET:-brokkr@control-node}}"
 ENTRY_SCRIPT="${BASH_SOURCE[0]}"
 ENTRY_PATH="$ENTRY_SCRIPT"
 [[ "$ENTRY_PATH" == /* ]] || ENTRY_PATH="$(pwd -P)/$ENTRY_PATH"
+[[ "$ENTRY_PATH" != *$'\n'* && "$ENTRY_PATH" != *$'\r'* ]] || { echo "brokkr deploy: deployment entry point path must not contain line breaks" >&2; exit 64; }
 ENTRY_CURSOR=/
 IFS=/ read -r -a ENTRY_COMPONENTS <<<"${ENTRY_PATH#/}"
 for ENTRY_COMPONENT in "${ENTRY_COMPONENTS[@]}"; do
