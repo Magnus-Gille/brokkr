@@ -78,6 +78,10 @@ MIMIR_OFFSITE_REMOTE=brokkr-photos-crypt
 MIMIR_OFFSITE_ROOT="$HOME/Pictures/Photos Library.photoslibrary/originals"
 ```
 
+Panel requests pass the authorization header to `curl` through stdin. A fleet token
+containing a carriage return or newline is rejected and the best-effort panel update
+is skipped; the backup result is unchanged.
+
 Important overrides:
 
 | Variable | Purpose |

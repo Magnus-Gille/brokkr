@@ -27,19 +27,30 @@ if [ "${1:-}" = config ] && [ "${2:-}" = show ]; then
   printf 'type = crypt\nfilename_encryption = standard\ndirectory_name_encryption = true\n'
   exit 0
 fi
+if [ "${MOCK_RCLONE_FAIL:-}" = mkdir ] && [ "${1:-}" = mkdir ]; then exit 23; fi
 if [ "${1:-}" = lsd ]; then exit 0; fi
 exit 0
 MOCK
-chmod +x "$TMP/bin/rclone"
+cat >"$TMP/bin/curl" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >>"$MOCK_CURL_ARGV"
+if [ "${MOCK_CURL_EARLY_EXIT:-}" = 1 ]; then exit 28; fi
+cat >"$MOCK_CURL_STDIN"
+exit "${MOCK_CURL_EXIT:-0}"
+MOCK
+chmod +x "$TMP/bin/rclone" "$TMP/bin/curl"
 
 run_backup() {
   local env_file="$1" output="$2"
   BROKKR_OFFSITE_ENV_FILE="$env_file" \
+    PATH="$TMP/bin:$PATH" \
     BROKKR_TEST_MARKER="$TMP/executed" \
     MIMIR_OFFSITE_ROOT="$TMP/source" \
     MIMIR_OFFSITE_REMOTE=test-crypt \
     MIMIR_OFFSITE_LOG="$TMP/backup.log" \
     MIMIR_OFFSITE_STAMP="$TMP/backup.stamp" \
+    MOCK_CURL_ARGV="$TMP/curl.argv" \
+    MOCK_CURL_STDIN="$TMP/curl.stdin" \
     RCLONE_BIN="$TMP/bin/rclone" \
     bash "$SCRIPT" --dry-run >"$output" 2>&1
 }
@@ -88,6 +99,95 @@ chmod 0600 "$VALID"
 if run_backup "$VALID" "$TMP/valid.out"; then valid_rc=0; else valid_rc=$?; fi
 check "owner-only regular env file is accepted" test "$valid_rc" -eq 0
 check "accepted env reaches dry-run completion" grep -q 'dry-run complete' "$TMP/backup.log"
+
+: >"$TMP/curl.argv"
+if BROKKR_OFFSITE_ENV_FILE="$VALID" PATH="$TMP/bin:$PATH" \
+  MIMIR_OFFSITE_ROOT="$TMP/source" MIMIR_OFFSITE_REMOTE=test-crypt \
+  MIMIR_OFFSITE_LOG="$TMP/backup.log" MIMIR_OFFSITE_STAMP="$TMP/backup.stamp" \
+  RCLONE_BIN="$TMP/bin/rclone" MOCK_CURL_ARGV="$TMP/curl.argv" \
+  MOCK_CURL_STDIN="$TMP/curl.stdin" bash "$SCRIPT" >"$TMP/no-panel.out" 2>&1; then no_panel_rc=0; else no_panel_rc=$?; fi
+check "backup without panel credentials still succeeds" test "$no_panel_rc" -eq 0
+check "backup without panel credentials skips curl" test ! -s "$TMP/curl.argv"
+
+has_no_fleet_token_in_curl_argv() {
+  ! grep -Fq 'offsite-fixture-token' "$TMP/curl.argv"
+}
+has_fleet_header_on_curl_stdin() {
+  grep -Fqx 'Authorization: Bearer offsite-fixture-token' "$TMP/curl.stdin"
+}
+curl_uses_stdin_header_file() {
+  grep -Fqx '@-' "$TMP/curl.argv"
+}
+file_lacks_bad_token() {
+  ! grep -Fq 'bad' "$TMP/bad-token.out"
+}
+
+HEIMDALL_ENV="$TMP/heimdall.env"
+cat >"$HEIMDALL_ENV" <<EOF
+HEIMDALL_HUB_URL=https://heimdall.example/api/panels
+HEIMDALL_FLEET_TOKEN=offsite-fixture-token
+EOF
+chmod 0600 "$HEIMDALL_ENV"
+: >"$TMP/curl.argv"; : >"$TMP/curl.stdin"
+if BROKKR_OFFSITE_ENV_FILE="$HEIMDALL_ENV" \
+  PATH="$TMP/bin:$PATH" \
+  BROKKR_TEST_MARKER="$TMP/executed" MIMIR_OFFSITE_ROOT="$TMP/source" \
+  MIMIR_OFFSITE_REMOTE=test-crypt MIMIR_OFFSITE_LOG="$TMP/backup.log" \
+  MIMIR_OFFSITE_STAMP="$TMP/backup.stamp" RCLONE_BIN="$TMP/bin/rclone" \
+  MOCK_CURL_ARGV="$TMP/curl.argv" MOCK_CURL_STDIN="$TMP/curl.stdin" \
+  bash "$SCRIPT" >"$TMP/panel-pass.out" 2>&1; then pass_rc=0; else pass_rc=$?; fi
+check "backup completes with configured panel" test "$pass_rc" -eq 0
+check "fleet token is absent from curl argv" has_no_fleet_token_in_curl_argv
+check "fleet header reaches curl on stdin" has_fleet_header_on_curl_stdin
+check "panel curl reads authorization header from stdin" curl_uses_stdin_header_file
+check "success panel state is preserved" grep -Fq '"state":"pass"' "$TMP/curl.argv"
+
+# Panel delivery is best-effort for both success and failure states.
+: >"$TMP/curl.argv"; : >"$TMP/curl.stdin"
+if BROKKR_OFFSITE_ENV_FILE="$HEIMDALL_ENV" MIMIR_OFFSITE_ROOT="$TMP/source" \
+  PATH="$TMP/bin:$PATH" \
+  MIMIR_OFFSITE_REMOTE=test-crypt MIMIR_OFFSITE_LOG="$TMP/backup.log" \
+  MIMIR_OFFSITE_STAMP="$TMP/backup.stamp" RCLONE_BIN="$TMP/bin/rclone" \
+  MOCK_CURL_ARGV="$TMP/curl.argv" MOCK_CURL_STDIN="$TMP/curl.stdin" MOCK_CURL_EXIT=28 \
+  bash "$SCRIPT" >"$TMP/panel-curl-fail.out" 2>&1; then curl_fail_pass_rc=0; else curl_fail_pass_rc=$?; fi
+check "curl failure on success panel does not fail backup" test "$curl_fail_pass_rc" -eq 0
+
+: >"$TMP/curl.argv"; : >"$TMP/curl.stdin"
+if BROKKR_OFFSITE_ENV_FILE="$HEIMDALL_ENV" MIMIR_OFFSITE_ROOT="$TMP/source" \
+  PATH="$TMP/bin:$PATH" MIMIR_OFFSITE_REMOTE=test-crypt MIMIR_OFFSITE_LOG="$TMP/backup.log" \
+  MIMIR_OFFSITE_STAMP="$TMP/backup.stamp" RCLONE_BIN="$TMP/bin/rclone" \
+  MOCK_CURL_ARGV="$TMP/curl.argv" MOCK_CURL_STDIN="$TMP/curl.stdin" MOCK_CURL_EARLY_EXIT=1 \
+  bash "$SCRIPT" >"$TMP/panel-curl-early.out" 2>&1; then curl_early_pass_rc=0; else curl_early_pass_rc=$?; fi
+check "early panel curl exit does not fail backup" test "$curl_early_pass_rc" -eq 0
+check "early panel curl exit cannot expose token in argv" has_no_fleet_token_in_curl_argv
+
+: >"$TMP/curl.argv"; : >"$TMP/curl.stdin"
+if BROKKR_OFFSITE_ENV_FILE="$HEIMDALL_ENV" MIMIR_OFFSITE_ROOT="$TMP/source" \
+  PATH="$TMP/bin:$PATH" \
+  MIMIR_OFFSITE_REMOTE=test-crypt MIMIR_OFFSITE_LOG="$TMP/backup.log" \
+  MIMIR_OFFSITE_STAMP="$TMP/backup.stamp" RCLONE_BIN="$TMP/bin/rclone" \
+  MOCK_CURL_ARGV="$TMP/curl.argv" MOCK_CURL_STDIN="$TMP/curl.stdin" MOCK_CURL_EXIT=28 MOCK_RCLONE_FAIL=mkdir \
+  bash "$SCRIPT" >"$TMP/panel-fail.out" 2>&1; then curl_fail_error_rc=0; else curl_fail_error_rc=$?; fi
+check "backup failure remains failed when fail-panel curl fails" test "$curl_fail_error_rc" -ne 0
+check "fail-panel request also keeps fleet token out of curl argv" has_no_fleet_token_in_curl_argv
+check "failure panel state is preserved" grep -Fq '"state":"fail"' "$TMP/curl.argv"
+
+printf '%s\n' \
+  'HEIMDALL_HUB_URL=https://heimdall.example/api/panels' \
+  "HEIMDALL_FLEET_TOKEN='bad" \
+  "token'" >"$TMP/bad-token.env"
+chmod 0600 "$TMP/bad-token.env"
+: >"$TMP/curl.argv"
+if BROKKR_OFFSITE_ENV_FILE="$TMP/bad-token.env" MIMIR_OFFSITE_ROOT="$TMP/source" \
+  PATH="$TMP/bin:$PATH" \
+  MIMIR_OFFSITE_REMOTE=test-crypt MIMIR_OFFSITE_LOG="$TMP/backup.log" \
+  MIMIR_OFFSITE_STAMP="$TMP/backup.stamp" RCLONE_BIN="$TMP/bin/rclone" \
+  MOCK_CURL_ARGV="$TMP/curl.argv" MOCK_CURL_STDIN="$TMP/curl.stdin" \
+  bash "$SCRIPT" >"$TMP/bad-token.out" 2>&1; then bad_token_rc=0; else bad_token_rc=$?; fi
+check "line-broken fleet token does not change backup success" test "$bad_token_rc" -eq 0
+check "line-broken fleet token causes no curl request" test ! -s "$TMP/curl.argv"
+check "line-broken fleet token emits fixed diagnostic" grep -Fq 'WARN: Heimdall token contains a line break — skipping panel push' "$TMP/backup.log"
+check "line-broken token value is not echoed" file_lacks_bad_token
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

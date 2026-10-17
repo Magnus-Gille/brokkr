@@ -11,8 +11,10 @@
 #   munin_discover_token              # sets MUNIN_TOKEN from a service .env
 #   munin_tool_call memory_write "$json_args"
 #
-# Honours a pre-set $MUNIN_TOKEN (e.g. from --munin-token) and a $MUNIN_URL
-# override (defaults to the local MCP endpoint). Never echoes the token value.
+# Honours a pre-set $MUNIN_TOKEN (e.g. from --munin-token-stdin) and a $MUNIN_URL
+# override (defaults to the local MCP endpoint). Authorization is sent to curl
+# on stdin, never in curl argv; values containing CR/LF are rejected. Never
+# echoes the token value.
 # Compatible with bash 3.2+ (macOS default).
 
 MUNIN_URL="${MUNIN_URL:-http://localhost:3030/mcp}"
@@ -42,11 +44,17 @@ munin_call() {
     echo "(Munin token not available)"
     return 1
   fi
-  curl -s --max-time 10 \
+  case "$MUNIN_TOKEN" in
+    *$'\r'*|*$'\n'*)
+      echo "Munin token contains a line break; request skipped" >&2
+      return 1
+      ;;
+  esac
+  printf 'Authorization: Bearer %s\n' "$MUNIN_TOKEN" | curl -s --max-time 10 \
     -X POST "$MUNIN_URL" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
-    -H "Authorization: Bearer $MUNIN_TOKEN" \
+    -H @- \
     -d "$payload" 2>/dev/null | \
     sed -n 's/^data: //p' | head -1 || echo "{}"
 }
