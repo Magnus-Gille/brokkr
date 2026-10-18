@@ -104,8 +104,15 @@ log() { echo "$(ts) $*" | tee -a "$LOG" 2>/dev/null >&2 || true; }
 push_panel() {
   local state="$1" message="$2"
   [ -n "${HEIMDALL_HUB_URL:-}" ] && [ -n "${HEIMDALL_FLEET_TOKEN:-}" ] || return 0
+  case "$HEIMDALL_FLEET_TOKEN" in
+    *$'\r'*|*$'\n'*)
+      log "WARN: Heimdall token contains a line break — skipping panel push"
+      return 0
+      ;;
+  esac
+  printf 'Authorization: Bearer %s\n' "$HEIMDALL_FLEET_TOKEN" | \
   curl -fsS --max-time 5 -X POST "$HEIMDALL_HUB_URL" \
-    -H "Authorization: Bearer ${HEIMDALL_FLEET_TOKEN}" \
+    -H @- \
     -H "Content-Type: application/json" \
     -d "{\"service\":\"${SERVICE}\",\"panel\":\"${PANEL}\",\"kind\":\"status\",\"label\":\"Offsite Photos backup\",\"state\":\"${state}\",\"message\":\"${message}\"}" \
     >/dev/null 2>&1 || true

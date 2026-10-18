@@ -59,10 +59,26 @@ watchdog is deployed but dormant (safe no-op).
 
 ## Deploy
 
+Run the deployer from the accepted Brokkr worktree root, binding it to the full
+commit SHA accepted for the release. The value must come from the release
+acceptance record, not from the checkout at deployment time:
+
+```sh
+cd /path/to/accepted/brokkr-worktree
+BROKKR_EXPECTED_SOURCE="$PWD" BROKKR_EXPECTED_COMMIT=<accepted-full-commit-sha> \
+  bash ./scripts/deploy-agent-watchdog.sh            # configured default role hosts
+BROKKR_EXPECTED_SOURCE="$PWD" BROKKR_EXPECTED_COMMIT=<accepted-full-commit-sha> \
+  bash ./scripts/deploy-agent-watchdog.sh brokkr@edge-host # a single host
 ```
-./scripts/deploy-agent-watchdog.sh                 # configured default role hosts
-./scripts/deploy-agent-watchdog.sh brokkr@edge-host     # a single host
-```
+
+The deployer rejects a mismatched or dirty tracked checkout and symlinked entry
+paths before SSH or rsync. It syncs only files archived from the bound commit.
+The destination must remain `~/repos/brokkr`, which is the path used by the
+user-unit `ExecStart`; a different `BROKKR_USER_REMOTE_DIR` is rejected locally.
+The sync excludes `.git`, `.local`, `.env*`, and `secrets/`, preserving private
+configuration already present in the remote checkout. The watchdog's protected
+`~/.config/brokkr/env` and installed systemd user units are outside that sync
+tree and remain in place.
 
 ## Test
 

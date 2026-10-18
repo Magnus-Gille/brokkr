@@ -32,8 +32,11 @@
 # Override path via REGISTRY_PATH=…; force the working file via REGISTRY_NO_GIT=1.
 #
 # Usage:
-#   scripts/maintenance-report.sh os    [--dry-run] [--verbose] [--munin-token T]
-#   scripts/maintenance-report.sh deps  [--dry-run] [--verbose] [--munin-token T]
+#   scripts/maintenance-report.sh os    [--dry-run] [--verbose] [--munin-token-stdin]
+#   scripts/maintenance-report.sh deps  [--dry-run] [--verbose] [--munin-token-stdin]
+# The explicit token option reads one nonempty line from stdin through EOF. An
+# ambient MUNIN_TOKEN or service .env discovery remains available without it.
+# Legacy --munin-token VALUE and --munin-token=VALUE forms are rejected.
 set -euo pipefail
 
 REPORT_VERSION="1.2.0"
@@ -78,13 +81,41 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift ;;
     --verbose) VERBOSE=true; shift ;;
-    --munin-token) MUNIN_TOKEN="$2"; shift 2 ;;
+    --munin-token-stdin)
+      token_from_stdin=""; token_stdin_extra=""
+      if IFS= read -r token_from_stdin || [[ -n "$token_from_stdin" ]]; then
+        :
+      else
+        echo "Invalid Munin token on stdin; expected one nonempty line without CR/LF" >&2
+        exit 2
+      fi
+      if [[ -z "$token_from_stdin" ]]; then
+        echo "Invalid Munin token on stdin; expected one nonempty line without CR/LF" >&2
+        exit 2
+      fi
+      if IFS= read -r token_stdin_extra || [[ -n "$token_stdin_extra" ]]; then
+        echo "Invalid Munin token on stdin; expected one nonempty line without CR/LF" >&2
+        exit 2
+      fi
+      case "$token_from_stdin" in
+        *$'\r'*|*$'\n'*)
+          echo "Invalid Munin token on stdin; expected one nonempty line without CR/LF" >&2
+          exit 2
+          ;;
+      esac
+      MUNIN_TOKEN="$token_from_stdin"
+      shift
+      ;;
+    --munin-token|--munin-token=*)
+      echo "--munin-token is no longer supported; use --munin-token-stdin" >&2
+      exit 2
+      ;;
     *) echo "Unknown arg: $1" >&2; exit 1 ;;
   esac
 done
 case "$MODE" in
   os|deps|brew) ;;
-  *) echo "Usage: $0 {os|deps|brew} [--dry-run] [--verbose] [--munin-token T]" >&2; exit 1 ;;
+  *) echo "Usage: $0 {os|deps|brew} [--dry-run] [--verbose] [--munin-token-stdin]" >&2; exit 1 ;;
 esac
 
 log_verbose() { $VERBOSE && echo "  $*" >&2 || true; }
