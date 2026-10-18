@@ -3,7 +3,19 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-TMP="$(mktemp -d "${TMPDIR:-/private/tmp}/brokkr-watchdog-deploy.XXXXXX")"
+TMP_BASE="${TMPDIR:-/tmp}"
+TMP_BASE="$(cd "$TMP_BASE" 2>/dev/null && pwd -P)" || {
+  echo 'test temporary directory does not exist or is inaccessible' >&2
+  exit 1
+}
+TMP="$(mktemp -d "${TMP_BASE%/}/brokkr-watchdog-deploy.XXXXXX")" || {
+  echo 'failed to create watchdog deploy test directory' >&2
+  exit 1
+}
+if [[ -z "$TMP" || ! -d "$TMP" ]]; then
+  echo 'mktemp did not create watchdog deploy test directory' >&2
+  exit 1
+fi
 trap 'rm -rf "$TMP"' EXIT
 SOURCE="$TMP/source"
 MOCK_BIN="$TMP/bin"
