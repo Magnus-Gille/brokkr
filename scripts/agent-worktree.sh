@@ -71,6 +71,7 @@ check_final_root() {
 check_directory_permissions() {
   local path=$1
   local allow_home_writable=${2:-no}
+  local allow_sticky=${3:-yes}
   local mode
   local owner_uid
   local current_uid
@@ -104,7 +105,9 @@ check_directory_permissions() {
   if [[ "$group_permissions" == *w* || "$other_permissions" == *w* ]]; then
     if [ "$allow_home_writable" != yes ]; then
       case "$owner_uid:$other_permissions" in
-        0:*t|0:*T) ;;
+        0:*t|0:*T)
+          [ "$allow_sticky" = yes ] || die "path is a writable sticky probe before creation: $path"
+          ;;
         *) die "path is writable by another user without a sticky root owner: $path" ;;
       esac
     fi
@@ -155,6 +158,7 @@ check_ancestor_permissions() {
   local parent
   local first=yes
   local allow_home_writable
+  local allow_sticky
 
   while :; do
     allow_home_writable=no
@@ -163,7 +167,12 @@ check_ancestor_permissions() {
         allow_home_writable=yes
       fi
     fi
-    check_directory_permissions "$path" "$allow_home_writable"
+    allow_sticky=yes
+    if [ "$first" = yes ] && [ "$strict_leaf" != yes ] &&
+      [ "$allow_home_writable" != yes ]; then
+      allow_sticky=no
+    fi
+    check_directory_permissions "$path" "$allow_home_writable" "$allow_sticky"
     [ "$path" = / ] && break
     parent=$(dirname -- "$path")
     [ "$parent" != "$path" ] || break

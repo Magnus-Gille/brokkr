@@ -43,6 +43,14 @@ if [ "${1:-}" = -c ]; then
     esac
     exit $?
   fi
+  if [ "$path" = "${BROKKR_TEST_STICKY_PROBE_PATH:-}" ]; then
+    case "$2" in
+      %A) printf 'drwxrwxrwt\n' ;;
+      %u) printf '0\n' ;;
+      *) exit 1 ;;
+    esac
+    exit $?
+  fi
   if [ "$path" = "${BROKKR_TEST_MALFORMED_UID_PATH:-}" ] && [ "$2" = %u ]; then
     printf 'not-a-uid\n'
     exit 0
@@ -123,6 +131,21 @@ TEST_ROOT="$UNSAFE_ANCESTOR/new-root"
 export TEST_ROOT
 expect_fail run_helper --repo "$REPO" --name unsafe-ancestor --branch reject/unsafe-ancestor
 test ! -e "$TEST_ROOT" || fail '0777 ancestor was accepted'
+
+STICKY_PROBE="$TMP/sticky-probe"
+mkdir -p "$STICKY_PROBE"
+chmod 1777 "$STICKY_PROBE"
+STICKY_PROBE=$(cd -P "$STICKY_PROBE" && pwd -P)
+TEST_ROOT="$STICKY_PROBE/missing-root"
+BROKKR_TEST_STICKY_PROBE_PATH="$STICKY_PROBE"
+BROKKR_TEST_STAT_MODE=disk
+export TEST_ROOT BROKKR_TEST_STICKY_PROBE_PATH BROKKR_TEST_STAT_MODE
+before_worktrees=$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree ')
+expect_fail run_helper --repo "$REPO" --name sticky-probe --branch reject/sticky-probe
+test ! -e "$TEST_ROOT" || fail 'writable sticky probe was accepted for a missing root'
+after_worktrees=$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree ')
+test "$before_worktrees" -eq "$after_worktrees" || fail 'sticky-probe rejection mutated git worktrees'
+unset BROKKR_TEST_STICKY_PROBE_PATH
 
 OTHER_OWNER_PATH="$TMP/other-owner-ancestor"
 mkdir -p "$OTHER_OWNER_PATH"
