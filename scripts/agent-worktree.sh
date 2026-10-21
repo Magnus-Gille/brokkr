@@ -280,6 +280,11 @@ case "$worktree_root" in
   /*) ;;
   *) die "worktree root must be an absolute path: $worktree_root" ;;
 esac
+case "$worktree_root" in
+  */./*|*/.|*/../*|*/..)
+    die "worktree root must not contain . or .. path components: $worktree_root"
+    ;;
+esac
 
 if [ -L "$worktree_root" ]; then
   die "worktree root must not be a symlink: $worktree_root"
@@ -293,8 +298,9 @@ else
   [ -d "$root_probe" ] || die "worktree root parent is not a directory: $root_probe"
   root_probe_is_final=no
 fi
-root_probe=$(canonical_dir "$root_probe") \
-  || die "could not resolve worktree root probe: $root_probe"
+root_probe_lexical=$root_probe
+root_probe=$(canonical_dir "$root_probe_lexical") \
+  || die "could not resolve worktree root probe: $root_probe_lexical"
 private_home=''
 if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && ! [ -L "$HOME" ]; then
   home_candidate=$(canonical_dir "$HOME") \
@@ -308,6 +314,22 @@ if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && ! [ -L "$HOME" ]; then
 fi
 check_ancestor_permissions "$root_probe" "$private_home" "$root_probe_is_final"
 filesystem_type "$root_probe" >/dev/null
+
+if [ "$root_probe_is_final" = yes ]; then
+  worktree_root=$root_probe
+else
+  missing_suffix=${worktree_root#"$root_probe_lexical"}
+  case "$missing_suffix" in
+    /*) ;;
+    *) missing_suffix="/$missing_suffix" ;;
+  esac
+  missing_suffix=${missing_suffix#/}
+  if [ "$root_probe" = / ]; then
+    worktree_root="/$missing_suffix"
+  else
+    worktree_root="$root_probe/$missing_suffix"
+  fi
+fi
 
 # shellcheck disable=SC2174
 if ! mkdir -p -m 0700 -- "$worktree_root"; then

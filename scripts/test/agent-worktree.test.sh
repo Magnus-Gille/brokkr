@@ -27,6 +27,12 @@ expect_fail() {
 
 cat >"$BIN/stat" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = -f ] && [ -n "${BROKKR_TEST_RETARGET_LINK:-}" ] &&
+  [ ! -e "${BROKKR_TEST_RETARGET_MARKER:-}" ]; then
+  : >"$BROKKR_TEST_RETARGET_MARKER"
+  rm -f -- "$BROKKR_TEST_RETARGET_LINK"
+  ln -s -- "$BROKKR_TEST_RETARGET_TO" "$BROKKR_TEST_RETARGET_LINK"
+fi
 if [ "${1:-}" = -c ]; then
   path=$4
   if [ "$path" = "${BROKKR_TEST_OTHER_OWNER_PATH:-}" ]; then
@@ -227,6 +233,11 @@ expect_fail run_helper --repo "$REPO" --name .. --branch leaf/dotdot
 expect_fail run_helper --repo "$REPO" --name 'bad/name' --branch leaf/slash
 expect_fail run_helper --repo "$REPO" --name 'bad name' --branch leaf/space
 
+TEST_ROOT="$TMP/path/../dot-root"
+export TEST_ROOT
+expect_fail run_helper --repo "$REPO" --name dot-component --branch reject/dot-component
+test ! -e "$TMP/dot-root" || fail 'dot component root was created'
+
 expect_fail run_helper --repo "$REPO" --name invalid-branch-space --branch 'bad branch'
 expect_fail run_helper --repo "$REPO" --name invalid-branch-dots --branch 'bad..branch'
 expect_fail run_helper --repo "$REPO" --name invalid-branch-dash --branch '-bad'
@@ -276,6 +287,51 @@ TEST_ROOT="$SYMLINK_PARENT/new-root"
 export TEST_ROOT
 expect_fail run_helper --repo "$REPO" --name reject-ancestor --branch reject/ancestor
 test ! -e "$SYMLINK_TARGET/new-root" || fail 'tmpfs ancestor root was created'
+
+RETARGET_SAFE="$TMP/retarget-safe"
+RETARGET_ALTERNATE="$TMP/retarget-alternate"
+RETARGET_LINK="$TMP/retarget-link"
+RETARGET_MARKER="$TMP/retarget.marker"
+mkdir -p "$RETARGET_SAFE" "$RETARGET_ALTERNATE"
+RETARGET_SAFE=$(cd -P "$RETARGET_SAFE" && pwd -P)
+RETARGET_ALTERNATE=$(cd -P "$RETARGET_ALTERNATE" && pwd -P)
+ln -s "$RETARGET_SAFE" "$RETARGET_LINK"
+TEST_ROOT="$RETARGET_LINK/new-root"
+BROKKR_TEST_STAT_MODE=disk
+BROKKR_TEST_RETARGET_LINK="$RETARGET_LINK"
+BROKKR_TEST_RETARGET_TO="$RETARGET_ALTERNATE"
+BROKKR_TEST_RETARGET_MARKER="$RETARGET_MARKER"
+export TEST_ROOT BROKKR_TEST_STAT_MODE BROKKR_TEST_RETARGET_LINK BROKKR_TEST_RETARGET_TO BROKKR_TEST_RETARGET_MARKER
+if RETARGET_TARGET=$(run_helper --repo "$REPO" --name retarget-leaf --branch leaf/retarget); then
+  case "$RETARGET_TARGET" in
+    "$RETARGET_SAFE/new-root/"*) ;;
+    *) fail 'retargeted symlink ancestor changed the creation path' ;;
+  esac
+else
+  test ! -e "$RETARGET_ALTERNATE/new-root" \
+    || fail 'retargeted symlink ancestor redirected creation into alternate path'
+fi
+test ! -e "$RETARGET_ALTERNATE/new-root" \
+  || fail 'retargeted symlink ancestor redirected creation into alternate path'
+
+mkdir -p "$RETARGET_SAFE/existing-root" "$RETARGET_ALTERNATE/existing-root"
+rm -f -- "$RETARGET_LINK"
+ln -s "$RETARGET_SAFE" "$RETARGET_LINK"
+rm -f -- "$RETARGET_MARKER"
+TEST_ROOT="$RETARGET_LINK/existing-root"
+export TEST_ROOT
+if RETARGET_EXISTING_TARGET=$(run_helper --repo "$REPO" --name retarget-existing --branch leaf/retarget-existing); then
+  case "$RETARGET_EXISTING_TARGET" in
+    "$RETARGET_SAFE/existing-root/"*) ;;
+    *) fail 'retargeted ancestor changed an existing-root creation path' ;;
+  esac
+else
+  test -z "$(find "$RETARGET_ALTERNATE/existing-root" -mindepth 1 -print -prune)" \
+    || fail 'retargeted ancestor redirected existing-root creation into alternate path'
+fi
+test -z "$(find "$RETARGET_ALTERNATE/existing-root" -mindepth 1 -print -prune)" \
+  || fail 'retargeted ancestor redirected existing-root creation into alternate path'
+unset BROKKR_TEST_RETARGET_LINK BROKKR_TEST_RETARGET_TO BROKKR_TEST_RETARGET_MARKER
 
 BROKKR_TEST_STAT_MODE=disk
 export BROKKR_TEST_STAT_MODE
