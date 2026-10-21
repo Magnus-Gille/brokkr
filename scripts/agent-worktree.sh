@@ -2,6 +2,7 @@
 # Create a disk-backed, per-agent Git worktree without changing Git configuration.
 
 set -euo pipefail
+umask 077
 
 die() {
   printf 'agent-worktree: error: %s\n' "$*" >&2
@@ -69,6 +70,7 @@ check_final_root() {
 
 check_directory_permissions() {
   local path=$1
+  local allow_home_writable=${2:-no}
   local mode
   local owner_uid
   local current_uid
@@ -100,23 +102,73 @@ check_directory_permissions() {
   group_permissions=${permissions:3:3}
   other_permissions=${permissions:6:3}
   if [[ "$group_permissions" == *w* || "$other_permissions" == *w* ]]; then
-    case "$owner_uid:$other_permissions" in
-      0:*t|0:*T) ;;
-      *) die "path is writable by another user without a sticky root owner: $path" ;;
-    esac
+    if [ "$allow_home_writable" != yes ]; then
+      case "$owner_uid:$other_permissions" in
+        0:*t|0:*T) ;;
+        *) die "path is writable by another user without a sticky root owner: $path" ;;
+      esac
+    fi
   fi
+}
+
+path_is_under() {
+  local path=$1
+  local base=$2
+
+  [ "$path" != "$base" ] && case "$path/" in
+    "$base/"*) return 0 ;;
+  esac
+  return 1
+}
+
+check_private_home() {
+  local home=$1
+  local mode
+  local owner_uid
+  local current_uid
+
+  [ -d "$home" ] && ! [ -L "$home" ] || return 1
+  if ! mode=$(stat -c %A -- "$home" 2>/dev/null); then
+    return 1
+  fi
+  if ! owner_uid=$(stat -c %u -- "$home" 2>/dev/null); then
+    return 1
+  fi
+  current_uid=$(id -u) || return 1
+  case "$owner_uid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$current_uid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$owner_uid" = "$current_uid" ] || return 1
+  case "$mode" in
+    drwx------|drwx------@|drwx------+) return 0 ;;
+  esac
+  return 1
 }
 
 check_ancestor_permissions() {
   local path=$1
+  local private_home=$2
+  local strict_leaf=$3
   local parent
+  local first=yes
+  local allow_home_writable
 
   while :; do
-    check_directory_permissions "$path"
+    allow_home_writable=no
+    if [ "$first" != yes ] || [ "$strict_leaf" != yes ]; then
+      if [ -n "$private_home" ] && path_is_under "$path" "$private_home"; then
+        allow_home_writable=yes
+      fi
+    fi
+    check_directory_permissions "$path" "$allow_home_writable"
     [ "$path" = / ] && break
     parent=$(dirname -- "$path")
     [ "$parent" != "$path" ] || break
     path=$parent
+    first=no
   done
 }
 
@@ -235,13 +287,26 @@ fi
 if [ -e "$worktree_root" ]; then
   [ -d "$worktree_root" ] || die "worktree root is not a directory: $worktree_root"
   root_probe=$worktree_root
+  root_probe_is_final=yes
 else
   root_probe=$(nearest_existing_parent "$worktree_root")
   [ -d "$root_probe" ] || die "worktree root parent is not a directory: $root_probe"
+  root_probe_is_final=no
 fi
 root_probe=$(canonical_dir "$root_probe") \
   || die "could not resolve worktree root probe: $root_probe"
-check_ancestor_permissions "$root_probe"
+private_home=''
+if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && ! [ -L "$HOME" ]; then
+  home_candidate=$(canonical_dir "$HOME") \
+    || die "could not resolve HOME: $HOME"
+  if path_is_under "$root_probe" "$home_candidate" || [ "$root_probe" = "$home_candidate" ]; then
+    if check_private_home "$home_candidate"; then
+      check_ancestor_permissions "$home_candidate" '' yes
+      private_home=$home_candidate
+    fi
+  fi
+fi
+check_ancestor_permissions "$root_probe" "$private_home" "$root_probe_is_final"
 filesystem_type "$root_probe" >/dev/null
 
 # shellcheck disable=SC2174
@@ -251,7 +316,7 @@ fi
 check_final_root "$worktree_root"
 real_root=$(canonical_dir "$worktree_root") \
   || die "could not resolve created worktree root: $worktree_root"
-check_ancestor_permissions "$real_root"
+check_ancestor_permissions "$real_root" "$private_home" yes
 filesystem_type "$real_root" >/dev/null
 check_final_root "$real_root"
 
@@ -266,7 +331,7 @@ fi
 check_final_root "$namespace_dir"
 real_namespace=$(canonical_dir "$namespace_dir") \
   || die "could not resolve repository namespace: $namespace_dir"
-check_ancestor_permissions "$real_namespace"
+check_ancestor_permissions "$real_namespace" "$private_home" yes
 filesystem_type "$real_namespace" >/dev/null
 check_final_root "$real_namespace"
 

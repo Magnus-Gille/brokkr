@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-HELPER="$ROOT/scripts/agent-worktree.sh"
+HELPER="${BROKKR_TEST_HELPER:-$ROOT/scripts/agent-worktree.sh}"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/brokkr-agent-worktree.XXXXXX")
 BIN="$TMP/bin"
 mkdir -p "$BIN"
@@ -74,6 +74,15 @@ run_helper() {
   PATH="$BIN:$PATH" BROKKR_WORKTREE_ROOT="$TEST_ROOT" "$HELPER" "$@"
 }
 
+run_helper_at_home() {
+  PATH="$BIN:$PATH" HOME="$TEST_HOME" BROKKR_WORKTREE_ROOT="$TEST_ROOT" "$HELPER" "$@"
+}
+
+run_helper_default() {
+  env -u BROKKR_WORKTREE_ROOT -u XDG_STATE_HOME \
+    PATH="$BIN:$PATH" HOME="$TEST_HOME" "$HELPER" "$@"
+}
+
 make_repo "$TMP/repos/space parent/repo one"
 make_repo "$TMP/other parent/repo one"
 REPO="$TMP/repos/space parent/repo one"
@@ -135,6 +144,54 @@ test ! -e "$TEST_ROOT" || fail 'malformed owner ancestor was accepted'
 after_worktrees=$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree ')
 test "$before_worktrees" -eq "$after_worktrees" || fail 'malformed-owner rejection mutated git worktrees'
 unset BROKKR_TEST_MALFORMED_UID_PATH
+
+PRIVATE_HOME="$TMP/private-home"
+mkdir -p "$PRIVATE_HOME/.local/state/brokkr"
+chmod 0700 "$PRIVATE_HOME"
+chmod 0775 "$PRIVATE_HOME/.local" "$PRIVATE_HOME/.local/state" "$PRIVATE_HOME/.local/state/brokkr"
+TEST_HOME="$PRIVATE_HOME"
+TEST_ROOT="$PRIVATE_HOME/.local/state/brokkr/worktrees"
+export TEST_HOME TEST_ROOT
+TARGET_PRIVATE=$(run_helper_at_home --repo "$REPO" --name private-home --branch leaf/private-home)
+test -d "$TARGET_PRIVATE" || fail 'private HOME with writable state parents was rejected'
+
+PRIVATE_UNSAFE_ROOT="$PRIVATE_HOME/.local/state/brokkr/unsafe-root"
+mkdir -p "$PRIVATE_UNSAFE_ROOT"
+chmod 0777 "$PRIVATE_UNSAFE_ROOT"
+TEST_ROOT="$PRIVATE_UNSAFE_ROOT"
+export TEST_ROOT
+expect_fail run_helper_at_home --repo "$REPO" --name private-unsafe --branch reject/private-unsafe
+test ! -e "$PRIVATE_UNSAFE_ROOT/private-unsafe" || fail '0777 root inside private HOME was accepted'
+
+PUBLIC_HOME="$TMP/public-home"
+mkdir -p "$PUBLIC_HOME/.local/state/brokkr"
+chmod 0755 "$PUBLIC_HOME"
+chmod 0775 "$PUBLIC_HOME/.local" "$PUBLIC_HOME/.local/state" "$PUBLIC_HOME/.local/state/brokkr"
+TEST_HOME="$PUBLIC_HOME"
+TEST_ROOT="$PUBLIC_HOME/.local/state/brokkr/rejected-root"
+export TEST_HOME TEST_ROOT
+expect_fail run_helper_at_home --repo "$REPO" --name public-home --branch reject/public-home
+test ! -e "$TEST_ROOT" || fail 'writable state parent under non-private HOME was accepted'
+
+DEFAULT_HOME="$TMP/default-home"
+mkdir -p "$DEFAULT_HOME"
+chmod 0700 "$DEFAULT_HOME"
+DEFAULT_HOME=$(cd -P "$DEFAULT_HOME" && pwd -P)
+TEST_HOME="$DEFAULT_HOME"
+export TEST_HOME
+DEFAULT_TARGET=$(umask 0002; run_helper_default --repo "$REPO" --name default-umask --branch leaf/default-umask)
+test -d "$DEFAULT_TARGET" || fail 'default HOME worktree was not created'
+for private_dir in \
+  "$DEFAULT_HOME/.local" \
+  "$DEFAULT_HOME/.local/state" \
+  "$DEFAULT_HOME/.local/state/brokkr" \
+  "$DEFAULT_HOME/.local/state/brokkr/worktrees"; do
+  private_mode=$(ls -ldn "$private_dir" | awk 'NR == 1 { print $1 }')
+  case "$private_mode" in
+    drwx------|drwx------@|drwx------+) ;;
+    *) fail "default-created directory is not private: $private_dir ($private_mode)" ;;
+  esac
+done
 
 TEST_ROOT="$TMP/state root/worktrees"
 export TEST_ROOT
