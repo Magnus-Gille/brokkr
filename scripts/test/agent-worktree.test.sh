@@ -27,6 +27,15 @@ expect_fail() {
 
 cat >"$BIN/stat" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = -c ]; then
+  path=$4
+  case "$2" in
+    %A) ls -ldn "$path" | awk 'NR == 1 { print $1 }' ;;
+    %u) ls -ldn "$path" | awk 'NR == 1 { print $3 }' ;;
+    *) exit 1 ;;
+  esac
+  exit $?
+fi
 case "${BROKKR_TEST_STAT_MODE:-disk}" in
   disk) printf 'ext2/ext3\n' ;;
   tmpfs) printf 'tmpfs\n' ;;
@@ -72,6 +81,25 @@ TARGET_ONE=$(run_helper --repo "$REPO" --name 'leaf.one' --branch 'leaf/one')
 test -d "$TARGET_ONE" || fail 'disk-backed worktree was not created'
 test -f "$TARGET_ONE/README" || fail 'worktree contents missing'
 
+UNSAFE_ROOT="$TMP/unsafe-root"
+mkdir -p "$UNSAFE_ROOT"
+chmod 0777 "$UNSAFE_ROOT"
+TEST_ROOT="$UNSAFE_ROOT"
+export TEST_ROOT
+expect_fail run_helper --repo "$REPO" --name unsafe-root --branch reject/unsafe-root
+test ! -e "$UNSAFE_ROOT/unsafe-root" || fail '0777 root was accepted'
+
+UNSAFE_ANCESTOR="$TMP/unsafe-ancestor"
+mkdir -p "$UNSAFE_ANCESTOR"
+chmod 0777 "$UNSAFE_ANCESTOR"
+TEST_ROOT="$UNSAFE_ANCESTOR/new-root"
+export TEST_ROOT
+expect_fail run_helper --repo "$REPO" --name unsafe-ancestor --branch reject/unsafe-ancestor
+test ! -e "$TEST_ROOT" || fail '0777 ancestor was accepted'
+
+TEST_ROOT="$TMP/state root/worktrees"
+export TEST_ROOT
+
 TARGET_NESTED=$(run_helper --repo "$REPO/nested/path" --name nested-leaf --branch leaf/nested)
 test "$(dirname "$TARGET_ONE")" = "$(dirname "$TARGET_NESTED")" \
   || fail 'nested repository invocation changed namespace'
@@ -86,6 +114,13 @@ before_worktrees=$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree
 expect_fail run_helper --repo "$REPO" --name 'leaf.one' --branch 'leaf/one-again'
 after_worktrees=$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree ')
 test "$before_worktrees" -eq "$after_worktrees" || fail 'existing target changed worktree count'
+
+NAMESPACE_DIR=$(dirname "$TARGET_ONE")
+chmod 0777 "$NAMESPACE_DIR"
+TEST_ROOT="$TMP/state root/worktrees"
+export TEST_ROOT
+expect_fail run_helper --repo "$REPO" --name unsafe-namespace --branch reject/unsafe-namespace
+chmod 0700 "$NAMESPACE_DIR"
 
 TARGET_SYMLINK_DIR=$(dirname "$TARGET_ONE")
 ln -s "$REPO" "$TARGET_SYMLINK_DIR/symlink-target"

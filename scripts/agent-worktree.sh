@@ -64,6 +64,49 @@ check_final_root() {
   if [ -L "$root" ] || ! [ -d "$root" ] || ! [ -O "$root" ] || ! [ -w "$root" ]; then
     die "worktree root is not a current-user-owned, writable directory: $root"
   fi
+  check_directory_permissions "$root"
+}
+
+check_directory_permissions() {
+  local path=$1
+  local mode
+  local owner_uid
+  local permissions
+  local group_permissions
+  local other_permissions
+
+  if ! mode=$(stat -c %A -- "$path" 2>/dev/null); then
+    die "could not determine permissions for $path"
+  fi
+  if ! owner_uid=$(stat -c %u -- "$path" 2>/dev/null); then
+    die "could not determine owner for $path"
+  fi
+  case "$mode" in
+    d?????????|d?????????@|d?????????+) ;;
+    *) die "path is not a directory with standard permissions: $path" ;;
+  esac
+  permissions=${mode#?}
+  group_permissions=${permissions:3:3}
+  other_permissions=${permissions:6:3}
+  if [[ "$group_permissions" == *w* || "$other_permissions" == *w* ]]; then
+    case "$owner_uid:$other_permissions" in
+      0:*t|0:*T) ;;
+      *) die "path is writable by another user without a sticky root owner: $path" ;;
+    esac
+  fi
+}
+
+check_ancestor_permissions() {
+  local path=$1
+  local parent
+
+  while :; do
+    check_directory_permissions "$path"
+    [ "$path" = / ] && break
+    parent=$(dirname -- "$path")
+    [ "$parent" != "$path" ] || break
+    path=$parent
+  done
 }
 
 common_dir_hash() {
@@ -187,6 +230,7 @@ else
 fi
 root_probe=$(canonical_dir "$root_probe") \
   || die "could not resolve worktree root probe: $root_probe"
+check_ancestor_permissions "$root_probe"
 filesystem_type "$root_probe" >/dev/null
 
 # shellcheck disable=SC2174
@@ -196,6 +240,7 @@ fi
 check_final_root "$worktree_root"
 real_root=$(canonical_dir "$worktree_root") \
   || die "could not resolve created worktree root: $worktree_root"
+check_ancestor_permissions "$real_root"
 filesystem_type "$real_root" >/dev/null
 check_final_root "$real_root"
 
@@ -210,6 +255,7 @@ fi
 check_final_root "$namespace_dir"
 real_namespace=$(canonical_dir "$namespace_dir") \
   || die "could not resolve repository namespace: $namespace_dir"
+check_ancestor_permissions "$real_namespace"
 filesystem_type "$real_namespace" >/dev/null
 check_final_root "$real_namespace"
 
