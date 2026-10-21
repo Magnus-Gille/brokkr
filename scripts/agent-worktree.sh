@@ -71,6 +71,7 @@ check_directory_permissions() {
   local path=$1
   local mode
   local owner_uid
+  local current_uid
   local permissions
   local group_permissions
   local other_permissions
@@ -80,6 +81,16 @@ check_directory_permissions() {
   fi
   if ! owner_uid=$(stat -c %u -- "$path" 2>/dev/null); then
     die "could not determine owner for $path"
+  fi
+  current_uid=$(id -u) || die 'could not determine current user ID'
+  case "$owner_uid" in
+    ''|*[!0-9]*) die "filesystem owner probe returned an invalid UID for $path" ;;
+  esac
+  case "$current_uid" in
+    ''|*[!0-9]*) die 'current user ID is invalid' ;;
+  esac
+  if [ "$owner_uid" != 0 ] && [ "$owner_uid" != "$current_uid" ]; then
+    die "path is owned by another non-root user: $path"
   fi
   case "$mode" in
     d?????????|d?????????@|d?????????+) ;;

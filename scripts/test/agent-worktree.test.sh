@@ -29,6 +29,18 @@ cat >"$BIN/stat" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = -c ]; then
   path=$4
+  if [ "$path" = "${BROKKR_TEST_OTHER_OWNER_PATH:-}" ]; then
+    case "$2" in
+      %A) printf 'drwxr-xr-x\n' ;;
+      %u) printf '424242\n' ;;
+      *) exit 1 ;;
+    esac
+    exit $?
+  fi
+  if [ "$path" = "${BROKKR_TEST_MALFORMED_UID_PATH:-}" ] && [ "$2" = %u ]; then
+    printf 'not-a-uid\n'
+    exit 0
+  fi
   case "$2" in
     %A) ls -ldn "$path" | awk 'NR == 1 { print $1 }' ;;
     %u) ls -ldn "$path" | awk 'NR == 1 { print $3 }' ;;
@@ -96,6 +108,33 @@ TEST_ROOT="$UNSAFE_ANCESTOR/new-root"
 export TEST_ROOT
 expect_fail run_helper --repo "$REPO" --name unsafe-ancestor --branch reject/unsafe-ancestor
 test ! -e "$TEST_ROOT" || fail '0777 ancestor was accepted'
+
+OTHER_OWNER_PATH="$TMP/other-owner-ancestor"
+mkdir -p "$OTHER_OWNER_PATH"
+chmod 0755 "$OTHER_OWNER_PATH"
+OTHER_OWNER_PATH=$(cd -P "$OTHER_OWNER_PATH" && pwd -P)
+TEST_ROOT="$OTHER_OWNER_PATH/new-root"
+BROKKR_TEST_OTHER_OWNER_PATH="$OTHER_OWNER_PATH"
+export TEST_ROOT BROKKR_TEST_OTHER_OWNER_PATH
+before_worktrees=$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree ')
+expect_fail run_helper --repo "$REPO" --name other-owner --branch reject/other-owner
+test ! -e "$TEST_ROOT" || fail 'other-owner ancestor was accepted'
+after_worktrees=$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree ')
+test "$before_worktrees" -eq "$after_worktrees" || fail 'other-owner rejection mutated git worktrees'
+unset BROKKR_TEST_OTHER_OWNER_PATH
+
+MALFORMED_UID_PATH="$TMP/malformed-owner-ancestor"
+mkdir -p "$MALFORMED_UID_PATH"
+MALFORMED_UID_PATH=$(cd -P "$MALFORMED_UID_PATH" && pwd -P)
+TEST_ROOT="$MALFORMED_UID_PATH/new-root"
+BROKKR_TEST_MALFORMED_UID_PATH="$MALFORMED_UID_PATH"
+export TEST_ROOT BROKKR_TEST_MALFORMED_UID_PATH
+before_worktrees=$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree ')
+expect_fail run_helper --repo "$REPO" --name malformed-owner --branch reject/malformed-owner
+test ! -e "$TEST_ROOT" || fail 'malformed owner ancestor was accepted'
+after_worktrees=$(git -C "$REPO" worktree list --porcelain | grep -c '^worktree ')
+test "$before_worktrees" -eq "$after_worktrees" || fail 'malformed-owner rejection mutated git worktrees'
+unset BROKKR_TEST_MALFORMED_UID_PATH
 
 TEST_ROOT="$TMP/state root/worktrees"
 export TEST_ROOT
