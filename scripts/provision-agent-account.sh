@@ -290,6 +290,7 @@ TMPFILES_CONF=$ROOT/etc/tmpfiles.d/brokkr-agent-$USER_NAME.conf
 # Claude Code appends /claude-<uid>/ to CLAUDE_CODE_TMPDIR for its scratch directories.
 AGENT_ENV=("TMPDIR=$AGENT_TMP" "CLAUDE_CODE_TMPDIR=$AGENT_TMP")
 HELPER=/usr/local/libexec/brokkr-agent-housekeeping
+WORKTREE_HELPER=/usr/local/bin/brokkr-agent-worktree
 SWEEP_UNIT=brokkr-agent-tmp-sweep-$USER_NAME
 REAPER_UNIT=brokkr-agent-session-reaper-$USER_NAME
 SYSTEMD_DIR=$ROOT/etc/systemd/system
@@ -742,11 +743,22 @@ if [[ $APPLY -eq 1 ]]; then
   [[ $tmp_state == "$want_tmp" ]] ||
     fatal "$AGENT_TMP is '${tmp_state##*$'\n'}', expected ${want_tmp##*$'\n'} (parent: '${tmp_state%%$'\n'*}'); the account stays expired"
   echo "ok: $AGENT_TMP is a directory owned by $USER_NAME with mode 700"
+  tmp_fs=$(sudo findmnt -n -o FSTYPE -T "$ROOT$AGENT_TMP") ||
+    fatal "cannot determine the filesystem of $AGENT_TMP; the account stays expired"
+  case "$tmp_fs" in
+    tmpfs|ramfs|hugetlbfs|'') fatal "$AGENT_TMP must be disk-backed, found '$tmp_fs'; the account stays expired" ;;
+  esac
+  [[ $tmp_fs =~ ^[A-Za-z0-9_.+-]+$ ]] ||
+    fatal "ambiguous filesystem for $AGENT_TMP; the account stays expired"
+  echo "ok: temporary directory filesystem: $tmp_fs"
 else
   echo "would verify with sudo stat that $AGENT_TMP_PARENT is root:root 0755 and $AGENT_TMP is $USER_NAME:$USER_NAME 0700, neither a symlink"
+  echo "would verify with findmnt that $AGENT_TMP is not on tmpfs, ramfs or hugetlbfs"
 fi
 run install -d -m 0755 -o root -g root "$ROOT$(dirname "$HELPER")"
 put_file 0755 root root "$ROOT$HELPER" <"$HERE/agent-account-housekeeping.sh"
+run install -d -m 0755 -o root -g root "$ROOT$(dirname "$WORKTREE_HELPER")"
+put_file 0755 root root "$ROOT$WORKTREE_HELPER" <"$HERE/agent-worktree.sh"
 render_sweep_service | put_file 0644 root root "$SYSTEMD_DIR/$SWEEP_UNIT.service"
 render_sweep_timer | put_file 0644 root root "$SYSTEMD_DIR/$SWEEP_UNIT.timer"
 if [[ -n $CLOSING_GRACE_SEC ]]; then

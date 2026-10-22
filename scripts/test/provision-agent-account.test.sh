@@ -18,7 +18,7 @@ mkdir -p "$STUBS" "$KEYS"
 
 # --- fixture repository bound to a commit (deploy-source binding) ------------------------------
 mkdir -p "$FIXTURE/scripts/lib"
-cp "$SOURCE_REPO/scripts/provision-agent-account.sh" "$SOURCE_REPO/scripts/agent-account-housekeeping.sh" "$FIXTURE/scripts/"
+cp "$SOURCE_REPO/scripts/provision-agent-account.sh" "$SOURCE_REPO/scripts/agent-account-housekeeping.sh" "$SOURCE_REPO/scripts/agent-worktree.sh" "$FIXTURE/scripts/"
 cp "$SOURCE_REPO/scripts/lib/deploy-source.sh" "$FIXTURE/scripts/lib/"
 git -C "$FIXTURE" init -q
 git -C "$FIXTURE" config user.name test
@@ -326,7 +326,12 @@ EOF
 stub findmnt <<'EOF'
 #!/usr/bin/env bash
 printf 'findmnt %s\n' "$*" >>"$STUB_CALLS"
-echo "${STUB_PROC_OPTS:-rw,nosuid,nodev,noexec,relatime}"
+if [[ "$*" == *'-o FSTYPE'* ]]; then
+  [[ ${STUB_TMP_FS_FAIL:-} != 1 ]] || exit 1
+  printf '%s\n' "${STUB_TMP_FS-ext4}"
+else
+  echo "${STUB_PROC_OPTS:-rw,nosuid,nodev,noexec,relatime}"
+fi
 EOF
 stub install <<'EOF'
 #!/usr/bin/env bash
@@ -645,7 +650,7 @@ check 'a fresh account has no sessions to terminate' no_call 'terminate-user'
 check 'a fresh host without nftables.conf is noted' out_has "no $ROOT_DIR/etc/nftables.conf on this host"
 check 'a fresh host without nftables.conf gets none created' absent "$ROOT_DIR/etc/nftables.conf"
 check 'a fresh host without nftables.conf validates none' no_call 'nft -c -f .*nftables.conf'
-check 'a fresh host without an at spool runs no find' no_call 'sudo find'
+check 'a fresh host without an at spool runs no find' no_call '^sudo find([[:space:]]|$)'
 check 'home is 0700' mode_is "$HOMEDIR" 700
 check 'home is chmodded 0700 through sudo' has_call "sudo chmod 0700 $HOMEDIR"
 check 'the home chmod precedes the account being enabled' before "sudo chmod 0700 $HOMEDIR" 'sudo usermod -p'
@@ -743,6 +748,9 @@ check 'the tmp directory readback is reported' out_has "ok: $AGENT_TMP is a dire
 check 'the tmp directory exists before sshd hands it out' before 'sudo systemd-tmpfiles --create' 'sudo systemctl try-reload-or-restart ssh.service'
 check 'the tmp directory is verified before the account is enabled' before 'sudo stat -c' 'sudo usermod -p'
 check 'the housekeeping helper is the repository script' cmp -s "$HELPER" "$SOURCE_REPO/scripts/agent-account-housekeeping.sh"
+WORKTREE_HELPER="$ROOT_DIR/usr/local/bin/brokkr-agent-worktree"
+check 'the worktree helper is the repository script' cmp -s "$WORKTREE_HELPER" "$SOURCE_REPO/scripts/agent-worktree.sh"
+check 'the worktree helper is installed with root ownership and executable mode' meta_has "$WORKTREE_HELPER 0755 root root"
 check 'the housekeeping helper is 0755 root' meta_has "$HELPER 0755 root root"
 check 'the tmp sweep service is exact' same_content "$SWEEP_SVC" "$(expected_sweep_service 1d 1440)"
 check 'the tmp sweep timer is exact' same_content "$SWEEP_TMR" "$EXPECT_SWEEP_TMR"
@@ -1106,6 +1114,21 @@ sweep_age=$(sed -n 's/.*--max-age-minutes \([0-9]*\)$/\1/p' "$SWEEP_SVC")
 helper_out=$(bash "$HELPER" sweep-tmp --user 'no-such-user-x' --dir "$TMP" --max-age-minutes "$sweep_age" 2>&1)
 check 'the installed helper accepts the longest rendered sweep age' grep -qF 'sweep-tmp must run as no-such-user-x' <<<"$helper_out"
 reset_host
+run --apply "${BASE[@]}"
+check 'the temporary directory filesystem is verified as disk-backed' out_has 'temporary directory filesystem: ext4'
+for fs in tmpfs ramfs hugetlbfs ''; do
+  reset_host
+  STUB_TMP_FS="$fs" run --apply "${BASE[@]}"
+  check "temporary filesystem '$fs' aborts non-zero" rc_is 1
+  check "temporary filesystem '$fs' keeps the account expired" stays_expired
+  check "temporary filesystem '$fs' leaves sshd alone" no_call 'try-reload-or-restart'
+  check "temporary filesystem '$fs' publishes no key" absent "$RUNKEY"
+done
+reset_host
+STUB_TMP_FS_FAIL=1 run --apply "${BASE[@]}"
+check 'a failed filesystem probe aborts non-zero' rc_is 1
+check 'a failed filesystem probe keeps the account expired' stays_expired
+reset_host
 STUB_TMPDIR_OWNER=operator run --apply "${BASE[@]}"
 check 'a tmp directory with the wrong owner aborts non-zero' rc_is 1
 check 'a tmp directory with the wrong owner is named' out_has "$AGENT_TMP is 'directory:operator:agent-dev:700', expected directory:agent-dev:agent-dev:700"
@@ -1356,7 +1379,7 @@ check 'an empty at spool lets the account be enabled' has_call 'sudo usermod -p 
 reset_host
 STUB_ATJOB=1 run --apply "${BASE[@]}"
 check 'a host without an at spool directory does not block the apply' rc_is 0
-check 'a host without an at spool directory runs no find' no_call 'sudo find'
+check 'a host without an at spool directory runs no find' no_call '^sudo find([[:space:]]|$)'
 
 # 5b. sshd validation failures -------------------------------------------------------------------
 reset_host

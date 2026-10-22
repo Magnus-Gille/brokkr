@@ -39,7 +39,8 @@ verified, so any failure leaves it closed.
    ([below](#temporary-files-and-orphaned-sessions)): `/etc/tmpfiles.d/brokkr-agent-<user>.conf`
    creates `/var/lib/brokkr/agent-tmp/<user>` (owner the account, `0700`, under a root-owned
    `0755` parent) and ages its contents; `stat` reads both back and a wrong owner, mode or a
-   symlink aborts. It installs `/usr/local/libexec/brokkr-agent-housekeeping` and enables
+   symlink aborts. `findmnt` must also resolve exactly one filesystem type; tmpfs,
+   ramfs and hugetlbfs (or a failed/empty probe) abort before login is enabled. It installs `/usr/local/libexec/brokkr-agent-housekeeping` and enables
    `brokkr-agent-tmp-sweep-<user>.timer` and, only when `--closing-session-grace` is given a
    span (the default is `off`), `brokkr-agent-session-reaper-<user>.timer`.
 4. Writes the SSH key to `/etc/brokkr/agent-account/<user>.keys` (root-owned), validates
@@ -123,6 +124,33 @@ already builds into its own `target/` on disk. One shared target directory would
 parallel agent sessions on cargo's build lock, and different branches would invalidate
 each other's artifacts. The incident's target directory was in tmpfs only because a session
 put it in its scratchpad, which is now on disk.
+
+### Persistent worktrees and build caches
+
+The provisioner installs `brokkr-agent-worktree` in `/usr/local/bin`. Use it for new
+agent task worktrees instead of choosing a path under `/tmp` or an expiring scratchpad:
+
+```bash
+brokkr-agent-worktree --repo "$HOME/repos/project" --name example-task \
+  --branch codex/example-task --ref origin/main
+```
+
+The default root is `${XDG_STATE_HOME:-$HOME/.local/state}/brokkr/worktrees`, with
+separate namespaces for each repository and task. It is not subject to the temporary-file
+age policy. `BROKKR_WORKTREE_ROOT` may select another persistent root. The helper checks
+its backing filesystem before creating a worktree and refuses tmpfs, ramfs, hugetlbfs,
+a failed filesystem probe, an existing target, or a redirected root. It preserves Git's
+branch and worktree checks and never deletes or prunes existing work.
+
+Cargo's default checkout-local `target/` then stays on the same disk without introducing
+one shared build lock across parallel worktrees. Any explicit `CARGO_TARGET_DIR` must also
+be disk-backed. Keep project verification storage checks enabled: setting `TMPDIR` alone
+cannot protect a build that explicitly chooses `/tmp`.
+
+For an existing account, installing just the reviewed helper does not require re-running
+the account provisioner or restarting SSH/user sessions. Do not re-provision merely to
+install the helper: the provisioner also manages account expiry, keys and network policy.
+Existing worktrees are retained; relocation is a separate, verified operation.
 
 ### Deliberate long-lived work (tmux)
 
