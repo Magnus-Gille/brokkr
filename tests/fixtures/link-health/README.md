@@ -13,5 +13,8 @@ Synthetic `journalctl -k -o short-unix` and `ethtool` output for
 - `incident-stable-100`: the second phase. The port settled at 100 Mb/s more
   than 24 h ago, the partner now advertises only 10/100 modes, and the journal
   shows no recent drops. Only the speed check can catch it.
+- `volatile-after-reboot`: healthy NIC, but the kernel journal begins two
+  hours ago (one drop since). With no record from before the 24 h window the
+  count is only a lower bound, so the result must not be OK.
 
 Identifiers (`fixture-node`, PCI address, PHY name) are generic placeholders.

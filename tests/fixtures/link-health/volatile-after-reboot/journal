@@ -1,0 +1,4 @@
+1792490400.000000 fixture-node kernel: Linux version 6.12.0-fixture (fixture@example) #1 SMP PREEMPT_DYNAMIC
+1792490412.000000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 2.5Gbps/Full - flow control rx/tx
+1792492600.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792492602.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 2.5Gbps/Full - flow control rx/tx

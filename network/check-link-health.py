@@ -131,31 +131,53 @@ def run(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
         return None
 
 
-def read_journal(now: int) -> tuple[list[tuple[int, str]] | None, str | None]:
-    """Return kernel records from the last 24 h, or (None, reason) when unknown."""
+def parse_records(output: str) -> list[tuple[int, str]] | None:
+    records = []
+    for raw in output.splitlines():
+        if not raw.strip() or raw[0].isspace() or BOOT_SEPARATOR.match(raw):
+            continue  # blank, multi-line continuation, or boot separator
+        match = JOURNAL_RECORD.match(raw)
+        if match is None:
+            return None
+        records.append((int(match.group(1)), match.group(2)))
+    return records
+
+
+def read_journal(now: int) -> tuple[list[tuple[int, str]] | None, str | None, int | None]:
+    """Return (records from the last 24 h, unknown reason, history start).
+
+    History start is None when kernel records exist from before the window, so
+    the counts are complete; otherwise it is the earliest record seen, and any
+    count over a window that starts earlier is only a lower bound.
+    """
     base = ["journalctl", "-q", "--no-pager", "-o", "short-unix"]
     # An unprivileged reader sees an empty kernel journal with exit 0. Require a
     # current-boot kernel record first so "no records" cannot mean "no access".
     proof = run(base + ["-k", "-b", "-n", "1"])
     if proof is None or proof.returncode != 0:
-        return None, "journalctl failed"
+        return None, "journalctl failed", None
     if any(hint in proof.stderr for hint in JOURNAL_ACCESS_HINTS) or not proof.stdout.strip():
-        return None, "kernel journal unreadable"
+        return None, "kernel journal unreadable", None
     # Not -k: it implies -b and would hide drops from before a reboot in the window.
     result = run(base + ["--since", f"@{now - DAY}", "_TRANSPORT=kernel"])
     if result is None or result.returncode != 0:
-        return None, "journalctl failed"
+        return None, "journalctl failed", None
     if any(hint in result.stderr for hint in JOURNAL_ACCESS_HINTS):
-        return None, "kernel journal unreadable"
-    records = []
-    for raw in result.stdout.splitlines():
-        if not raw.strip() or raw[0].isspace() or BOOT_SEPARATOR.match(raw):
-            continue  # blank, multi-line continuation, or boot separator
-        match = JOURNAL_RECORD.match(raw)
-        if match is None:
-            return None, "unparsable journal record"
-        records.append((int(match.group(1)), match.group(2)))
-    return records, None
+        return None, "kernel journal unreadable", None
+    records = parse_records(result.stdout)
+    if records is None:
+        return None, "unparsable journal record", None
+    # A volatile or vacuumed journal can begin inside the window (for example after
+    # a reboot). Only a kernel record from before the window proves full coverage.
+    before = run(base + ["--until", f"@{now - DAY}", "-n", "1", "_TRANSPORT=kernel"])
+    if before is None or before.returncode != 0:
+        return None, "journalctl failed", None
+    earlier = parse_records(before.stdout)
+    if earlier is None:
+        return None, "unparsable journal record", None
+    if earlier or any(stamp < now - DAY for stamp, _ in records):
+        return records, None, None
+    return records, None, min((stamp for stamp, _ in records), default=now)
 
 
 def names(*tokens: str | None) -> re.Pattern[str]:
@@ -172,8 +194,8 @@ def journal_events(records: list[tuple[int, str]], now: int, link: dict[str, obj
     drops_1h = drops_24h = downshifts = 0
     last_downshift = None
     for stamp, message in records:
-        if stamp < now - DAY:
-            continue
+        if stamp < now - DAY or stamp > now:
+            continue  # outside the window, or stamped after a clock correction
         if drop.search(message):
             drops_24h += 1
             if stamp >= now - HOUR:
@@ -242,6 +264,8 @@ def error_delta(iface: str, now: int, state_dir: str) -> tuple[str, int | None, 
         return "unknown", None, "tx/rx error counters unavailable"
     current = {"epoch": now, "tx_errors": int(counters["tx_errors"]), "rx_errors": int(counters["rx_errors"])}
 
+    # Without a valid earlier sample there is no error evidence yet: record a new
+    # baseline but report the check unknown until the next run can compare.
     path = os.path.join(state_dir, "link-health", f"{iface}.json")
     previous = None
     try:
@@ -249,14 +273,23 @@ def error_delta(iface: str, now: int, state_dir: str) -> tuple[str, int | None, 
             loaded = json.load(fh)
         if isinstance(loaded, dict) and all(isinstance(loaded.get(k), int) for k in current):
             previous = loaded
+        else:
+            baseline = "error baseline unreadable"
+    except FileNotFoundError:
+        baseline = "error baseline recorded (first run)"
     except (OSError, ValueError):
-        previous = None  # absent or corrupt baseline: start a new one
+        baseline = "error baseline unreadable"
 
     label, delta = "baseline", None
-    if (previous is not None and 0 < now - previous["epoch"] <= DAY
-            and current["tx_errors"] >= previous["tx_errors"] and current["rx_errors"] >= previous["rx_errors"]):
-        delta = (current["tx_errors"] - previous["tx_errors"]) + (current["rx_errors"] - previous["rx_errors"])
-        label = f"+{delta}/{now - previous['epoch']}s"
+    if previous is not None:
+        if not 0 < now - previous["epoch"] <= DAY:
+            baseline = "error baseline stale"
+        elif current["tx_errors"] < previous["tx_errors"] or current["rx_errors"] < previous["rx_errors"]:
+            baseline = "error counters reset (reboot or driver reload)"
+        else:
+            delta = (current["tx_errors"] - previous["tx_errors"]) + (current["rx_errors"] - previous["rx_errors"])
+            label = f"+{delta}/{now - previous['epoch']}s"
+            baseline = None
 
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
@@ -269,14 +302,17 @@ def error_delta(iface: str, now: int, state_dir: str) -> tuple[str, int | None, 
             os.unlink(tmp)
         except OSError:
             pass
-        return label, delta, f"counter baseline not recorded ({error.strerror})"
-    return label, delta, None
+        reason = f"counter baseline not recorded ({error.strerror})"
+        return label, delta, f"{baseline}; {reason}" if baseline else reason
+    return label, delta, baseline
 
 
 def assess(link: dict[str, object], thresholds: dict[str, int], journal: tuple, now: int, state_dir: str) -> dict[str, object]:
     iface = str(link["iface"])
     min_mbps = int(link["min_mbps"])
-    records, journal_unknown = journal
+    records, journal_unknown, history_start = journal
+    partial_24h = history_start is not None and history_start > now - DAY
+    partial_1h = history_start is not None and history_start > now - HOUR
     flapping: list[str] = []
     degraded: list[str] = []
     unknown: list[str] = []
@@ -300,6 +336,9 @@ def assess(link: dict[str, object], thresholds: dict[str, int], journal: tuple, 
     if records is None:
         unknown.append(str(journal_unknown))
     else:
+        if partial_24h:
+            # Partial counts are lower bounds: they can still cross a threshold.
+            unknown.append(f"kernel journal covers only {now - history_start}s of 24h")
         events = journal_events(records, now, link)
         if events["drops_1h"] >= thresholds["DROPS_1H_FAIL"]:
             flapping.append(f"{events['drops_1h']} drops in 1h")
@@ -325,18 +364,23 @@ def assess(link: dict[str, object], thresholds: dict[str, int], journal: tuple, 
         return "unknown" if value is None else f"{value}{suffix}"
 
     counts = events or {"drops_1h": None, "drops_24h": None, "downshifts": None}
+
+    def count(key: str, partial: bool) -> str:
+        value = counts[key]
+        return "=unknown" if value is None else f">={value}" if partial else f"={value}"
+
     segment = " ".join([
         f"{iface} [{', '.join(reasons) or 'nominal'}]",
         f"speed={show(state['speed'], 'Mb/s')}",
         f"min={min_mbps}Mb/s",
         f"partner-max={show(state['partner_max'], 'Mb/s')}",
-        f"drops1h={show(counts['drops_1h'])}",
-        f"drops24h={show(counts['drops_24h'])}",
-        f"downshifts24h={show(counts['downshifts'])}",
+        f"drops1h{count('drops_1h', partial_1h)}",
+        f"drops24h{count('drops_24h', partial_24h)}",
+        f"downshifts24h{count('downshifts', partial_24h)}",
         f"errors={errors_label}",
     ])
 
-    flapping_evidence_missing = records is None or state["detected"] is None
+    flapping_evidence_missing = records is None or partial_24h or state["detected"] is None
     degraded_evidence_missing = bool(unknown)
     provenance = f"ethtool+journalctl-k:{iface}"
     signals = [

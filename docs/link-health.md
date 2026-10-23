@@ -31,11 +31,18 @@ The journal is only trusted after a current-boot kernel record has been read,
 so a reader without journal access cannot mistake an empty result for zero
 drops. The 24 h query matches `_TRANSPORT=kernel` rather than using
 `journalctl -k`, which implies `-b` and would hide drops from before a reboot
-inside the window (with a volatile journal those are lost anyway). A boot or
-resume can log one `Link is Down`, which is why the 24 h warning starts at two. Error-counter deltas use a per-interface baseline in
-`$BROKKR_STATE_DIR/link-health/`; the first run, a counter reset (reboot or
-driver reload), or a baseline older than 24 h records a new baseline
-(`errors=baseline`) without alerting. Counters come from `ethtool -S`, falling
+inside the window. When no kernel record exists from before the window (a
+volatile or vacuumed journal after a reboot), the counts are lower bounds,
+shown as `drops24h>=N`. Unless they already cross a threshold, the result is
+`unknown: kernel journal covers only …`, never a clean zero. Records stamped
+after the observation time (a clock correction) are ignored. A boot or resume
+can log one `Link is Down`, which is why the 24 h warning starts at two.
+
+Error-counter deltas use a per-interface baseline in
+`$BROKKR_STATE_DIR/link-health/`. The first run, an unreadable baseline, a
+counter reset (reboot or driver reload), and a baseline older than 24 h or from
+a later clock all record a new baseline (`errors=baseline`) and report the error
+check as unknown (WARN) for that one run, because there is no comparison yet. Counters come from `ethtool -S`, falling
 back to the generic `/sys/class/net/<iface>/statistics` counters for drivers
 that do not name `tx_errors`/`rx_errors`. The error check compares one run
 with the next, so a slow steady error rate below `ERRORS_WARN` per interval

@@ -32,6 +32,11 @@ cat > "$TMP/bin/journalctl" <<'EOF'
 printf '%s\n' "$*" >> "$MOCK_JOURNAL_ARGS"
 [ -z "${HEIMDALL_FLEET_TOKEN:-}" ] || echo leaked >> "$MOCK_JOURNAL_ARGS.leak"
 case " $* " in
+  *" --until "*)
+    # Newest kernel record before the 24 h window: proves history covers it.
+    [ "${MOCK_NO_HISTORY:-0}" = 1 ] || echo "1792400000.000000 fixture-node kernel: older history"
+    exit 0
+    ;;
   *" -n 1 "*)
     # Readability proof: the newest kernel record of the current boot.
     [ "${MOCK_JOURNAL_PROOF_EMPTY:-0}" = 1 ] || echo "1792497000.000000 fixture-node kernel: proof"
@@ -69,6 +74,11 @@ set_counters() {
   sed -i.bak -E "s/^( +tx_errors: ).*/\\1$1/; s/^( +rx_errors: ).*/\\1$2/" "$TMP/nic/enp1s0.stats"
 }
 fresh_state() { rm -rf "$TMP/state/link-health"; }
+# Record an error-counter baseline 15 minutes earlier so the next run can compare.
+settled() {
+  fresh_state
+  BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH - 900)) python3 "$PROBE" > /dev/null 2>&1
+}
 run_probe() {
   OUT="$(python3 "$PROBE" 2>&1)"
   RC=$?
@@ -82,12 +92,12 @@ write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 scenario healthy
 fresh_state
 run_probe
-check "healthy 2.5G link with no events passes" '[[ "$RC" -eq 0 && "$OUT" == OK:* ]]'
-check "first run records a counter baseline without claiming an error rate" '[[ "$OUT" == *"errors=baseline"* && -f "$TMP/state/link-health/enp1s0.json" ]]'
+check "first run records a counter baseline and reports the error check unknown" '[[ "$RC" -eq 1 && "$OUT" == *"errors=baseline"* && "$OUT" == *"unknown: error baseline recorded"* && -f "$TMP/state/link-health/enp1s0.json" ]]'
 check "kernel records are queried across boots over 24 h (not -k, which implies -b)" 'grep -- "--since @1792411200" "$MOCK_JOURNAL_ARGS" | grep -q "_TRANSPORT=kernel" && ! grep -- "--since" "$MOCK_JOURNAL_ARGS" | grep -q -- " -k "'
 check "journal readability is proven from the current boot" 'grep -q -- "-k -b -n 1" "$MOCK_JOURNAL_ARGS"'
+check "journal history before the window is probed" 'grep -q -- "--until @1792411200" "$MOCK_JOURNAL_ARGS"'
 BROKKR_NOW_EPOCH=1792498500 run_probe
-check "second healthy run reports a zero error delta over its interval" '[[ "$RC" -eq 0 && "$OUT" == *"errors=+0/900s"* ]]'
+check "healthy 2.5G link with no events passes once a baseline exists" '[[ "$RC" -eq 0 && "$OUT" == OK:* && "$OUT" == *"errors=+0/900s"* ]]'
 
 # --- the real incident, phase 1: flapping with PHY downshift -----------------
 scenario incident-flapping
@@ -118,6 +128,7 @@ write_config 'LINK=enp1s0,1000'
 run_probe
 check "a 1G expectation still flags the 100 Mb/s state" '[[ "$RC" -eq 1 && "$OUT" == *"speed 100Mb/s < 1000Mb/s"* ]]'
 write_config 'LINK=enp1s0,100'
+settled
 run_probe
 check "meeting a lowered expectation passes" '[[ "$RC" -eq 0 && "$OUT" == OK:* ]]'
 write_config 'LINK=enp1s0,2500,r8169-0-100:00'
@@ -135,6 +146,7 @@ printf 'not-a-timestamp fixture-node kernel: garbage\n' > "$TMP/garbage.journal"
 MOCK_JOURNAL_FILE="$TMP/garbage.journal" run_probe
 check "an unparsable journal line is unknown" '[[ "$RC" -eq 1 && "$OUT" == *"drops24h=unknown"* ]]'
 printf -- '-- Boot 0123456789abcdef --\n1792490000.000000 fixture-node kernel: line one\n    continuation of a multi-line record\n' > "$TMP/boot.journal"
+settled
 MOCK_JOURNAL_FILE="$TMP/boot.journal" run_probe
 check "boot separators and continuation lines are tolerated" '[[ "$RC" -eq 0 && "$OUT" == *"drops24h=0"* ]]'
 
@@ -154,9 +166,9 @@ check "a missing error counter is unknown, not zero" '[[ "$RC" -eq 1 && "$OUT" =
 mkdir -p "$TMP/sysfs/enp1s0/statistics"
 printf '0\n' > "$TMP/sysfs/enp1s0/statistics/tx_errors"
 printf '0\n' > "$TMP/sysfs/enp1s0/statistics/rx_errors"
-fresh_state
+settled
 run_probe
-check "generic sysfs error counters back up a driver without them in ethtool -S" '[[ "$RC" -eq 0 && "$OUT" == *"errors=baseline"* ]]'
+check "generic sysfs error counters back up a driver without them in ethtool -S" '[[ "$RC" -eq 0 && "$OUT" == *"errors=+0/900s"* ]]'
 printf 'garbage\n' > "$TMP/sysfs/enp1s0/statistics/rx_errors"
 run_probe
 check "an unparsable sysfs counter is unknown" '[[ "$RC" -eq 1 && "$OUT" == *"errors=unknown"* ]]'
@@ -169,14 +181,40 @@ cp "$FIX/healthy/enp1s0.stats" "$TMP/nic/eth1.stats"
 cat > "$TMP/edges.journal" <<'EOF'
 1792411199.999999 fixture-node kernel: e1000e: eth1 NIC Link is Down
 1792411200.000000 fixture-node kernel: e1000e: eth1 NIC Link is Down
+1792493999.999999 fixture-node kernel: e1000e: eth1 NIC Link is Down
 1792494000.000000 fixture-node kernel: igb 0000:03:00.0 eth1: igb: eth1 NIC Link is Down
+1792497600.000000 fixture-node kernel: e1000e: eth1 NIC Link is Down
+1792497601.000000 fixture-node kernel: e1000e: eth1 NIC Link is Down
+1792501200.000000 fixture-node kernel: e1000e: eth1 NIC Link is Down
 1792497000.000000 fixture-node kernel: r8169 0000:02:00.0 eth10: Link is Down
 1792497001.000000 fixture-node kernel: r8169 0000:02:00.0 eth1.10: Link is Down
 1792497002.000000 fixture-node kernel: r8169 0000:02:00.0 veth1: Link is Down
 EOF
 write_config 'LINK=eth1,2500' 'DROPS_24H_WARN=100'
 MOCK_JOURNAL_FILE="$TMP/edges.journal" run_probe
-check "e1000e/igb wording counts once per record; eth10, eth1.10, veth1 are not eth1" '[[ "$OUT" == *"drops1h=1 "* && "$OUT" == *"drops24h=2 "* ]]'
+check "e1000e/igb wording counts once; eth10/eth1.10/veth1 are not eth1; now-24h and now-1h are inside, a second earlier or any record after now is outside" '[[ "$OUT" == *"drops1h=2 "* && "$OUT" == *"drops24h=4 "* ]]'
+
+# --- journal history that starts inside the window (volatile journal after reboot) --
+scenario volatile-after-reboot
+write_config 'LINK=enp1s0,2500,r8169-0-100:00'
+settled
+MOCK_NO_HISTORY=1 run_probe
+check "history starting mid-window is not OK: the 24 h count is a lower bound" '[[ "$RC" -eq 1 && "$OUT" == *"drops24h>=1"* && "$OUT" == *"unknown: kernel journal covers only"* ]]'
+check "a 1 h window fully inside the history is still counted exactly" '[[ "$OUT" == *"drops1h=0 "* ]]'
+settled
+run_probe
+check "the same records with history before the window are a clean count" '[[ "$RC" -eq 0 && "$OUT" == *"drops24h=1 "* ]]'
+printf '%s\n' "1792497000.000000 fixture-node kernel: Linux version fixture" > "$TMP/recent.journal"
+MOCK_NO_HISTORY=1 MOCK_JOURNAL_FILE="$TMP/recent.journal" run_probe
+check "history younger than an hour makes the 1 h count partial too" '[[ "$RC" -eq 1 && "$OUT" == *"drops1h>=0"* && "$OUT" == *"drops24h>=0"* ]]'
+for t in 1792496000 1792496300 1792496600 1792496900 1792497200; do
+  printf '%s.000000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down\n' "$t"
+done > "$TMP/flap-after-boot.journal"
+MOCK_NO_HISTORY=1 MOCK_JOURNAL_FILE="$TMP/flap-after-boot.journal" run_probe
+check "a partial count that already crosses a threshold still fails" '[[ "$RC" -eq 2 && "$OUT" == *"drops1h>=5"* ]]'
+MOCK_NO_HISTORY=1 python3 "$PROBE" --signals > "$TMP/partial-signals.json"
+check "partial history leaves the flapping signal unknown, not ok" 'grep -q "\"network_link_flapping\", \"state\": \"unknown\"" "$TMP/partial-signals.json"'
+scenario healthy
 write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 
 # --- error-counter deltas -------------------------------------------------------
@@ -188,7 +226,7 @@ BROKKR_NOW_EPOCH=1792498500 run_probe
 check "an error-counter increase at the threshold warns" '[[ "$RC" -eq 1 && "$OUT" == *"errors=+16/900s"* ]]'
 set_counters 0 0
 BROKKR_NOW_EPOCH=1792499400 run_probe
-check "a counter reset (reboot/driver reload) rebaselines without alerting" '[[ "$RC" -eq 0 && "$OUT" == *"errors=baseline"* ]]'
+check "a counter reset (reboot/driver reload) rebaselines and reports the error check unknown" '[[ "$RC" -eq 1 && "$OUT" == *"errors=baseline"* && "$OUT" == *"unknown: error counters reset"* ]]'
 set_counters 2 2
 write_config 'LINK=enp1s0,2500,r8169-0-100:00' 'ERRORS_WARN=5'
 BROKKR_NOW_EPOCH=1792500300 run_probe
@@ -200,7 +238,13 @@ check "an error delta at a configured threshold warns" '[[ "$RC" -eq 1 && "$OUT"
 write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 printf '{broken' > "$TMP/state/link-health/enp1s0.json"
 BROKKR_NOW_EPOCH=1792499400 run_probe
-check "an unreadable counter baseline rebaselines instead of crashing" '[[ "$RC" -eq 0 && "$OUT" == *"errors=baseline"* ]]'
+check "an unreadable counter baseline rebaselines as unknown instead of crashing" '[[ "$RC" -eq 1 && "$OUT" == *"errors=baseline"* && "$OUT" == *"unknown: error baseline unreadable"* ]]'
+BROKKR_NOW_EPOCH=$((1792499400 + 86401)) run_probe
+check "a baseline older than 24 h is stale, not a clean comparison" '[[ "$RC" -eq 1 && "$OUT" == *"unknown: error baseline stale"* ]]'
+BROKKR_NOW_EPOCH=1792499400 run_probe
+check "a clock step backwards is stale, not a clean comparison" '[[ "$RC" -eq 1 && "$OUT" == *"unknown: error baseline stale"* ]]'
+BROKKR_NOW_EPOCH=1792500300 run_probe
+check "the run after a rebaseline compares cleanly again" '[[ "$RC" -eq 0 && "$OUT" == *"errors=+0/900s"* ]]'
 
 # --- protected configuration ----------------------------------------------------
 scenario healthy
@@ -229,6 +273,7 @@ check "a symlinked config is rejected" '[[ "$RC" -eq 2 && "$OUT" == FAIL:*config
 BROKKR_LINK_HEALTH_CONFIG="$TMP/missing.conf" run_probe
 check "a missing config fails" '[[ "$RC" -eq 2 && "$OUT" == FAIL:*config* ]]'
 write_config '# wired uplink' '' 'LINK=enp1s0,2500,r8169-0-100:00'
+settled
 run_probe
 check "comments and blank lines are allowed" '[[ "$RC" -eq 0 ]]'
 
@@ -255,6 +300,7 @@ check "stable 100 Mb/s yields only a degraded fault" '[[ "$(categories "$TMP/fau
 scenario healthy; fresh_state
 MOCK_JOURNAL_RC=1 MOCK_ETHTOOL_RC=75 python3 "$PROBE" --signals > "$TMP/signals.json"
 check "missing evidence is signalled unknown, never ok" '[[ "$(signal_state "$TMP/signals.json")" == "network_link_flapping=unknown,network_link_degraded=unknown" ]]'
+settled
 python3 "$PROBE" --signals > "$TMP/signals.json"
 check "a healthy link signals ok" '[[ "$(signal_state "$TMP/signals.json")" == "network_link_flapping=ok,network_link_degraded=ok" ]]'
 MOCK_STATS_RC=75 python3 "$PROBE" --signals > "$TMP/signals.json"
