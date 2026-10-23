@@ -10,6 +10,8 @@ Missing or unparsable evidence is reported as unknown (WARN), never OK.
 Exit: 0 = OK, 1 = WARN (degraded or unknown), 2 = FAIL (flapping, link down, or
 invalid configuration). `--signals` instead prints brokkr-platform-observation
 signals for scripts/platform-fault-detector.mjs and exits 0 (2 on bad config).
+`--check-config` only parses and validates the protected config (no NIC or
+journal access) for deployment preflight: exit 0 when valid, 2 when not.
 """
 
 from __future__ import annotations
@@ -404,9 +406,17 @@ def observation_clock() -> int:
 
 
 def main(argv: list[str]) -> int:
-    if argv not in ([], ["--signals"]):
-        print("usage: check-link-health.py [--signals]", file=sys.stderr)
+    if argv not in ([], ["--signals"], ["--check-config"]):
+        print("usage: check-link-health.py [--signals | --check-config]", file=sys.stderr)
         return 64
+    if argv == ["--check-config"]:
+        try:
+            links, _thresholds = load_config(os.environ.get("BROKKR_LINK_HEALTH_CONFIG") or default_config_path())
+        except ConfigError as error:
+            print(f"FAIL: link-health config invalid: {error}")
+            return FAIL
+        print(f"OK: link-health config valid ({len(links)} link{'s' if len(links) != 1 else ''})")
+        return PASS
     signals_mode = argv == ["--signals"]
     try:
         links, thresholds = load_config(os.environ.get("BROKKR_LINK_HEALTH_CONFIG") or default_config_path())

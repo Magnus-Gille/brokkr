@@ -277,6 +277,27 @@ settled
 run_probe
 check "comments and blank lines are allowed" '[[ "$RC" -eq 0 ]]'
 
+# --check-config validates the protected config with the probe's own parser and
+# reads no NIC or journal (the mocks would fail loudly if it did).
+write_config 'LINK=enp1s0,2500,r8169-0-100:00'
+rm -f "$MOCK_JOURNAL_ARGS"
+OUT="$(python3 "$PROBE" --check-config 2>&1)"; RC=$?
+check "--check-config accepts a valid config and prints no detail beyond a count" '[[ "$RC" -eq 0 && "$OUT" == "OK: link-health config valid (1 link)" ]]'
+check "--check-config does not read the journal or NIC" '[[ ! -e "$MOCK_JOURNAL_ARGS" ]]'
+write_config 'LINK=enp1s0,2500' 'SURPRISE=1'
+OUT="$(python3 "$PROBE" --check-config 2>&1)"; RC=$?
+check "--check-config rejects an invalid config with exit 2" '[[ "$RC" -eq 2 && "$OUT" == FAIL:*config* ]]'
+write_config 'LINK=enp1s0,2500'
+chmod 640 "$BROKKR_LINK_HEALTH_CONFIG"
+OUT="$(python3 "$PROBE" --check-config 2>&1)"; RC=$?
+check "--check-config rejects a group-readable config" '[[ "$RC" -eq 2 && "$OUT" == FAIL:*config* ]]'
+chmod 600 "$BROKKR_LINK_HEALTH_CONFIG"
+OUT="$(python3 "$PROBE" --check-config --signals 2>&1)"; RC=$?
+check "--check-config cannot be combined with other modes" '[[ "$RC" -eq 64 ]]'
+OUT="$(python3 - --check-config < "$PROBE" 2>&1)"; RC=$?
+check "--check-config works when the probe is piped on stdin" '[[ "$RC" -eq 0 && "$OUT" == OK:* ]]'
+write_config 'LINK=enp1s0,2500'
+
 # --- platform-fault signals -----------------------------------------------------
 observation() { # signals JSON on stdin -> observation file $1
   python3 -c 'import json,sys; sig=json.load(sys.stdin); json.dump({"kind":"brokkr-platform-observation","schema_version":"v1","now":"2026-10-20T12:00:00Z","observed_at":"2026-10-20T11:59:00Z","valid_until":"2026-10-20T12:14:00Z","node_substrate_ref":{"contract":"grimnir.node-substrate/v1","node_id":"fixture-node","observation_evidence_id":"obs-fixture-001"},"signals":sig}, open(sys.argv[1],"w"))' "$1"

@@ -1,4 +1,4 @@
-# Brokkr · run the wired-link health snapshot every 15 minutes.
+# Brokkr · run the wired-link health snapshot every 15 minutes (user timer).
 [Unit]
 Description=Run Brokkr wired-link health snapshot every 15 minutes
 
@@ -6,6 +6,7 @@ Description=Run Brokkr wired-link health snapshot every 15 minutes
 OnBootSec=3min
 OnUnitActiveSec=15min
 Persistent=true
+Unit=brokkr-link-health.service
 
 [Install]
 WantedBy=timers.target
