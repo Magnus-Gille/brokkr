@@ -72,7 +72,9 @@ interface names and PHY identifiers stay in the untracked host copy.
   and `SupplementaryGroups=systemd-journal`; without the group the row stays at
   `WARN: unknown: kernel journal unreadable`.
 - **Other fleet nodes.** [`scripts/link-health-snapshot.sh`](../scripts/link-health-snapshot.sh)
-  publishes a dedicated `link-health` Heimdall panel, driven every 15 minutes by
+  publishes one Heimdall panel per node, `link-health-<node>` (the short hostname,
+  lower-cased; override with `BROKKR_LINK_HEALTH_NODE`), so one node's report can
+  never overwrite another's. It is driven every 15 minutes by
   the user timer in [`systemd/user/`](../systemd/user/). The units run as the
   operator's own login user (user lingering keeps them alive without a session),
   read the kernel journal through that user's `adm` membership, and require the
