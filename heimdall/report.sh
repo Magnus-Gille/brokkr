@@ -5,7 +5,8 @@
 # COMPOSES the platform checks into a heimdall.json-shaped payload (the same contract the
 # services serve, e.g. mimir's /heimdall.json) and prints it to stdout.
 #
-# Runs ON the NAS Pi and invokes the disk and Tailscale-auth checks.
+# Runs ON the NAS Pi and invokes the disk and Tailscale-auth checks, plus the wired-link
+# check when BROKKR_LINK_HEALTH_CONFIG names its protected config.
 #
 # Wired to Heimdall: scripts/health-snapshot.sh runs this + heimdall/push.sh (hw-health panel),
 # driven by brokkr-health.timer on the NAS Pi every 15 min. See ../CLAUDE.md (Health model).
@@ -50,6 +51,10 @@ run_check() {
 run_check "disk-mount"    "$HERE/disk/check-mount.sh"
 run_check "disk-capacity" "$HERE/disk/check-capacity.sh"
 run_check "tailscale-auth" "$HERE/network/check-tailscale-auth.py"
+# Optional: wired-link speed/flap/downshift health, enabled by its protected config.
+if [ -n "${BROKKR_LINK_HEALTH_CONFIG:-}" ]; then
+  run_check "link-health" "$HERE/network/check-link-health.py"
+fi
 
 # Emit the descriptor (commas between rows, none after the last).
 echo '{'

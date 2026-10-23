@@ -1,0 +1,4 @@
+1792389600.000000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792389602.000000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 100Mbps/Full - flow control off
+1792494000.000000 fixture-node kernel: usb 1-1: new high-speed USB device number 3 using xhci_hcd
+1792494001.000000 fixture-node kernel: audit: type=1400 audit(0.0:1): apparmor="STATUS" operation="profile_load"
