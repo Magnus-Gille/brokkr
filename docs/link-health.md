@@ -123,21 +123,29 @@ push helper and the two unit templates are shipped. The remote preflight (also
 run by the dry-run) refuses unless the user is not root, lingering is enabled,
 both protected files are regular non-symlink files owned by the user with mode
 `600`, the delivery env has non-empty `HEIMDALL_HUB_URL` and
-`HEIMDALL_FLEET_TOKEN`, the link config passes the shipped probe's own parser
+`HEIMDALL_FLEET_TOKEN` exactly once each and sets none of the variables that
+steer the probe (`PATH`, `HOME`, `BROKKR_LINK_HEALTH_CONFIG`, `BROKKR_STATE_DIR`,
+`BROKKR_ETHTOOL`, ...; systemd applies the env file after the unit's own
+`Environment=`; unrelated keys of a shared file are fine), the link config passes the shipped probe's own parser
 (`check-link-health.py --check-config`), and the release for that SHA does not
 yet exist. Secret values are never printed.
 
 `ethtool` is required. If it is missing, the dry-run reports it and `--apply`
 installs it with `sudo -n apt-get install -y --no-install-recommends ethtool`,
-failing closed when `sudo -n`, `apt-get` or the install is unavailable.
+failing closed when `sudo -n`, `apt-get` or the install is unavailable. The
+install happens only after the payload has been received and validated, and the
+verified absolute path is rendered into the unit as `BROKKR_ETHTOOL` (a user
+manager's `PATH` may lack `/usr/sbin`); the rollback output mentions the package
+side effect.
 
 `--apply` stages the payload, moves it to
 `~/.local/lib/brokkr/link-health/releases/<SHA>`, saves any existing units as
-`<unit>.previous-<SHA>`, renders the units into
+`<unit>.previous-<SHA>` (both backups exist before either unit is replaced), renders the units into
 `${XDG_CONFIG_HOME:-~/.config}/systemd/user/`, runs
 `systemctl --user daemon-reload` and `enable --now brokkr-link-health.timer`,
 then runs the service once and prints its result, the probe's detail line and
-the last log line. The user units drop `OnFailure=` (the failure-notification
+the last log line. A first run that does not leave a freshly written
+`~/.local/state/brokkr/link-health.json` counts as a failure. The user units drop `OnFailure=` (the failure-notification
 unit is system-scoped) and `SupplementaryGroups=` (invalid in user scope); the
 sandboxing options (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem`,
 `ProtectHome`) are kept, so a host that forbids user-namespace sandboxing fails

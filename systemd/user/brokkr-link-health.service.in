@@ -16,6 +16,8 @@ WorkingDirectory=%h/.local/lib/brokkr/link-health/releases/@REVISION@
 # Provides HEIMDALL_HUB_URL + HEIMDALL_FLEET_TOKEN; required (delivery is the point).
 EnvironmentFile=@DELIVERY_ENV@
 Environment=BROKKR_LINK_HEALTH_CONFIG=@LINK_CONFIG@
+# Absolute path verified at install time; the user manager PATH may lack /usr/sbin.
+Environment=BROKKR_ETHTOOL=@ETHTOOL@
 ExecStart=%h/.local/lib/brokkr/link-health/releases/@REVISION@/scripts/link-health-snapshot.sh
 NoNewPrivileges=yes
 PrivateTmp=yes

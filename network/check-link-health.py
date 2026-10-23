@@ -122,6 +122,11 @@ def load_config(path: str) -> tuple[list[dict[str, object]], dict[str, int]]:
     return links, thresholds
 
 
+def ethtool_binary() -> str:
+    """BROKKR_ETHTOOL pins an absolute path (a user manager's PATH may lack /usr/sbin)."""
+    return os.environ.get("BROKKR_ETHTOOL") or "ethtool"
+
+
 def run(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
     # Children get no inherited secrets (the unit's EnvironmentFile carries a token).
     env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
@@ -223,7 +228,7 @@ def ethtool_fields(output: str) -> dict[str, str]:
 
 
 def read_link(iface: str) -> dict[str, object]:
-    result = run(["ethtool", iface])
+    result = run([ethtool_binary(), iface])
     if result is None or result.returncode != 0:
         return {"error": "ethtool failed"}
     fields = ethtool_fields(result.stdout)
@@ -239,7 +244,7 @@ def read_link(iface: str) -> dict[str, object]:
 
 def read_counters(iface: str) -> dict[str, str] | None:
     """tx_errors/rx_errors from ethtool -S, else the kernel's generic sysfs counters."""
-    result = run(["ethtool", "-S", iface])
+    result = run([ethtool_binary(), "-S", iface])
     if result is not None and result.returncode == 0:
         counters = dict(re.findall(r"^\s+([A-Za-z0-9_]+):\s+([0-9]+)\s*$", result.stdout, re.MULTILINE))
         if "tx_errors" in counters and "rx_errors" in counters:

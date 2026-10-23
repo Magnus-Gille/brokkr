@@ -117,7 +117,16 @@ private_file "$LINK_CONFIG" "link config"
 for key in HEIMDALL_HUB_URL HEIMDALL_FLEET_TOKEN; do
   grep -Eq "^${key}=.+$" "$DELIVERY_ENV" || refuse "delivery env lacks a non-empty $key"
   if grep -Eq "^${key}=(''|\"\")$" "$DELIVERY_ENV"; then refuse "delivery env lacks a non-empty $key"; fi
+  [ "$(grep -Ec "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$DELIVERY_ENV")" = 1 ] \
+    || refuse "delivery env must define $key exactly once"
 done
+# systemd applies EnvironmentFile after Environment=, so this file (shared with other
+# brokkr units) must not be able to redirect what this unit runs or reads. Unrelated
+# keys are allowed.
+forbidden='PATH|HOME|BROKKR_LINK_HEALTH_CONFIG|BROKKR_STATE_DIR|BROKKR_ETHTOOL|BROKKR_NOW_EPOCH|BROKKR_SYSFS_NET|PYTHONPATH|PYTHONHOME|LD_PRELOAD|LD_LIBRARY_PATH'
+if bad_key=$(grep -Eo "^[[:space:]]*(export[[:space:]]+)?($forbidden)[[:space:]]*=" "$DELIVERY_ENV" | head -n 1) && [ -n "$bad_key" ]; then
+  refuse "delivery env must not set the probe-controlling variable ${bad_key%%=*}"
+fi
 command -v python3 >/dev/null 2>&1 || refuse "python3 is required"
 release_root=$HOME/.local/lib/brokkr/link-health
 release=$release_root/releases/$REVISION
@@ -129,7 +138,17 @@ for unit in brokkr-link-health.service brokkr-link-health.timer; do
     refuse "unit backup $unit.previous-$REVISION already exists"
   fi
 done
-have_ethtool() ( PATH="$PATH:${BROKKR_ETHTOOL_SEARCH_PATH:-/usr/sbin:/sbin}"; command -v ethtool >/dev/null 2>&1 )
+# Prints the absolute path of ethtool (the user manager's PATH may lack /usr/sbin, so
+# the verified path is rendered into the unit rather than trusted at run time).
+find_ethtool() { ( PATH="$PATH:${BROKKR_ETHTOOL_SEARCH_PATH:-/usr/sbin:/sbin}"; command -v ethtool 2>/dev/null ) || true; }
+resolve_ethtool() {
+  ethtool_path=$(find_ethtool)
+  case $ethtool_path in
+    '') return 1 ;;
+    /*) safe_path "$ethtool_path" || refuse "ethtool path is not a plain absolute path" ;;
+    *) refuse "ethtool resolved to a non-absolute command" ;;
+  esac
+}
 echo "preflight: runtime user $user (not root), user lingering enabled"
 echo "preflight: delivery env and link config are private regular files owned by $user"
 echo "preflight: delivery env has non-empty HEIMDALL_HUB_URL and HEIMDALL_FLEET_TOKEN"
@@ -145,8 +164,8 @@ if out=$(BROKKR_LINK_HEALTH_CONFIG="$LINK_CONFIG" python3 - --check-config); the
 else
   refuse "link config rejected by the shipped probe parser: $out"
 fi
-if have_ethtool; then
-  echo "preflight: ethtool present"
+if resolve_ethtool; then
+  echo "preflight: ethtool present at $ethtool_path"
 elif [ "$MODE" = dry-run ]; then
   echo "preflight: ethtool missing; --apply would install it with: sudo -n apt-get install -y --no-install-recommends ethtool"
 else
@@ -160,44 +179,58 @@ REMOTE
 
 # Apply tail: the payload tar arrives on stdin.
 IFS= read -r -d '' REMOTE_APPLY <<'REMOTE' || true
-if ! have_ethtool; then
-  command -v sudo >/dev/null 2>&1 || refuse "ethtool is missing and sudo is unavailable"
-  command -v apt-get >/dev/null 2>&1 || refuse "ethtool is missing and apt-get is unavailable"
-  echo "installing ethtool: sudo -n apt-get install -y --no-install-recommends ethtool"
-  # stdin carries the payload tar; the installer must never read it.
-  sudo -n apt-get install -y --no-install-recommends ethtool </dev/null || refuse "ethtool installation failed (sudo -n apt-get)"
-  have_ethtool || refuse "ethtool is still missing after installation"
-fi
 service_unit=brokkr-link-health.service
 timer_unit=brokkr-link-health.timer
-installed=0
+# Steps that actually completed; the exit trap prints a rollback matching exactly these.
+ethtool_installed=0
+release_moved=0
+service_replaced=0
+timer_replaced=0
+timer_enabled=0
+service_started=0
 stage=
-print_rollback() {
-  echo "Rollback (run on the target as $user):"
-  echo "  systemctl --user disable --now $timer_unit"
-  echo "  systemctl --user stop $service_unit"
+tmp_backups=
+cleanup_tmp_backups() {
+  for tmp in $tmp_backups; do rm -f "$tmp"; done
+  tmp_backups=
+}
+print_state() {
+  if [ "$ethtool_installed" = 0 ] && [ "$release_moved" = 0 ] && [ "$service_replaced" = 0 ] && [ "$timer_replaced" = 0 ]; then
+    echo "State: no release, installed unit, or package was changed on this node."
+  else
+    echo "Rollback (run on the target as $user; only steps this run started are listed):"
+  fi
+  if [ "$timer_enabled" = 1 ]; then echo "  systemctl --user disable --now $timer_unit"; fi
+  if [ "$service_started" = 1 ]; then echo "  systemctl --user stop $service_unit"; fi
   for unit in $service_unit $timer_unit; do
-    if [ -e "$unit_dir/$unit.previous-$REVISION" ]; then
-      echo "  mv -f $unit_dir/$unit.previous-$REVISION $unit_dir/$unit"
-    else
-      echo "  rm -f $unit_dir/$unit"
+    case $unit in "$service_unit") replaced=$service_replaced ;; *) replaced=$timer_replaced ;; esac
+    backup=$unit_dir/$unit.previous-$REVISION
+    if [ "$replaced" = 1 ]; then
+      if [ -e "$backup" ]; then echo "  mv -f $backup $unit_dir/$unit"; else echo "  rm -f $unit_dir/$unit"; fi
+    elif [ -e "$backup" ]; then
+      echo "  # $unit was left untouched; optional: rm -f $backup"
     fi
   done
-  echo "  systemctl --user daemon-reload"
-  if [ -e "$unit_dir/$timer_unit.previous-$REVISION" ]; then
-    echo "  systemctl --user enable --now $timer_unit   # restore the previous schedule"
+  if [ "$service_replaced" = 1 ] || [ "$timer_replaced" = 1 ]; then
+    echo "  systemctl --user daemon-reload"
+    if [ "$timer_replaced" = 1 ] && [ -e "$unit_dir/$timer_unit.previous-$REVISION" ]; then
+      echo "  systemctl --user enable --now $timer_unit   # restore the previous schedule"
+    fi
   fi
-  echo "  rm -rf $release   # optional; the probe never changes link settings"
+  if [ "$release_moved" = 1 ]; then echo "  rm -rf $release   # optional; the probe never changes link settings"; fi
+  if [ "$ethtool_installed" = 1 ]; then
+    echo "  # ethtool was installed by this run (package side effect); remove with: sudo apt-get remove ethtool (if desired)"
+  fi
 }
 on_exit() {
   rc=$?
+  cleanup_tmp_backups
   if [ -n "$stage" ]; then rm -rf "$stage"; fi
-  if [ "$installed" = 1 ]; then print_rollback; fi
+  print_state
   exit "$rc"
 }
 trap on_exit EXIT
-mkdir -p "$release_root/releases" "$unit_dir"
-[ -d "$state_dir" ] || mkdir -p "$state_dir"
+mkdir -p "$release_root/releases"
 stage=$(mktemp -d "$release_root/.stage.XXXXXX")
 tar -xf - -C "$stage" || refuse "payload extraction failed"
 for file in $EXPECTED_FILES; do
@@ -207,41 +240,79 @@ if [ -n "$(find "$stage" ! -type d ! -type f -print)" ]; then refuse "payload co
 [ "$(find "$stage" -type f | wc -l | tr -d ' ')" = "$EXPECTED_COUNT" ] || refuse "payload contains unexpected files"
 BROKKR_LINK_HEALTH_CONFIG="$LINK_CONFIG" python3 "$stage/network/check-link-health.py" --check-config >/dev/null \
   || refuse "link config rejected by the staged probe parser"
+# The payload is received and validated; only now change the node. ethtool comes first
+# because the rendered units embed its verified absolute path.
+if ! resolve_ethtool; then
+  command -v sudo >/dev/null 2>&1 || refuse "ethtool is missing and sudo is unavailable"
+  command -v apt-get >/dev/null 2>&1 || refuse "ethtool is missing and apt-get is unavailable"
+  echo "installing ethtool: sudo -n apt-get install -y --no-install-recommends ethtool"
+  sudo -n apt-get install -y --no-install-recommends ethtool </dev/null || refuse "ethtool installation failed (sudo -n apt-get)"
+  ethtool_installed=1
+  resolve_ethtool || refuse "ethtool is still missing after installation"
+fi
 render() {
-  sed -e "s|@REVISION@|$REVISION|g" -e "s|@DELIVERY_ENV@|$DELIVERY_ENV|g" -e "s|@LINK_CONFIG@|$LINK_CONFIG|g" "$1" >"$2"
+  sed -e "s|@REVISION@|$REVISION|g" -e "s|@DELIVERY_ENV@|$DELIVERY_ENV|g" -e "s|@LINK_CONFIG@|$LINK_CONFIG|g" \
+    -e "s|@ETHTOOL@|$ethtool_path|g" "$1" >"$2"
 }
 render "$stage/systemd/user/$service_unit.in" "$stage/$service_unit"
 cp "$stage/systemd/user/$timer_unit" "$stage/$timer_unit"
 if grep -Eq '@[A-Z_]+@' "$stage/$service_unit" "$stage/$timer_unit"; then refuse "unit template has an unrendered placeholder"; fi
 if [ -e "$release" ] || [ -L "$release" ]; then refuse "release already exists for revision $REVISION"; fi
-mv "$stage" "$release"
-stage=
-installed=1
-echo "installed release $release"
+mkdir -p "$unit_dir"
+[ -d "$state_dir" ] || mkdir -p "$state_dir"
+# Back up BOTH existing units to temporary names first, then rename them into place.
+# Until every backup exists nothing has been replaced, so a failure here leaves the
+# original units intact.
 for unit in $service_unit $timer_unit; do
   if [ -e "$unit_dir/$unit" ] || [ -L "$unit_dir/$unit" ]; then
-    cp -p "$unit_dir/$unit" "$unit_dir/$unit.previous-$REVISION"
-    echo "backed up existing $unit as $unit.previous-$REVISION"
+    tmp=$unit_dir/.$unit.backup-tmp.$$
+    tmp_backups="$tmp_backups $tmp"
+    cp -p "$unit_dir/$unit" "$tmp" || refuse "could not back up existing $unit; no unit was changed"
   fi
-  install -m 644 "$release/$unit" "$unit_dir/$unit"
 done
+for tmp in $tmp_backups; do
+  name=${tmp##*/.}
+  name=${name%.backup-tmp.*}
+  mv "$tmp" "$unit_dir/$name.previous-$REVISION" || refuse "could not finalize the backup of $name; no unit was changed"
+  echo "backed up existing $name as $name.previous-$REVISION"
+done
+tmp_backups=
+mv "$stage" "$release"
+stage=
+release_moved=1
+echo "installed release $release"
+service_replaced=1
+install -m 644 "$release/$service_unit" "$unit_dir/$service_unit"
+timer_replaced=1
+install -m 644 "$release/$timer_unit" "$unit_dir/$timer_unit"
 systemctl --user daemon-reload
+timer_enabled=1
 systemctl --user enable --now "$timer_unit"
-# Drop the previous observation so any snapshot found below belongs to this run.
-rm -f "$state_dir/link-health.json"
+snap=$state_dir/link-health.json
+start_epoch=$(date +%s)
+service_started=1
 if systemctl --user start "$service_unit"; then start_rc=0; else start_rc=$?; fi
 result=$(systemctl --user show "$service_unit" --property=Result --value 2>/dev/null || true)
 [ -n "$result" ] || result=unknown
 echo "service run: result: $result (start exit $start_rc)"
-detail=
-if [ -f "$state_dir/link-health.json" ]; then
-  detail=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["checks"][0]["detail"])' "$state_dir/link-health.json" 2>/dev/null) || detail=
+fresh=0
+if [ -f "$snap" ] && [ ! -L "$snap" ]; then
+  if ! snap_mtime=$(stat -c %Y "$snap" 2>/dev/null); then snap_mtime=$(stat -f %m "$snap" 2>/dev/null || echo 0); fi
+  if [ "$snap_mtime" -ge "$start_epoch" ]; then fresh=1; fi
 fi
-echo "probe: ${detail:-(no snapshot written by this run)}"
+detail=
+if [ "$fresh" = 1 ]; then
+  detail=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["checks"][0]["detail"])' "$snap" 2>/dev/null) || detail=
+fi
+echo "probe: ${detail:-(no fresh snapshot written by this run)}"
 last=$(journalctl --user _SYSTEMD_USER_UNIT="$service_unit" -n 1 -o cat --no-pager 2>/dev/null | tail -n 1 || true)
 echo "last log line: ${last:-(user journal unavailable or empty)}"
 if [ "$start_rc" -ne 0 ] || [ "$result" != success ]; then
   echo "FAILED: the first service run did not succeed; the timer stays enabled until rolled back" >&2
+  exit 3
+fi
+if [ "$fresh" != 1 ]; then
+  echo "FAILED: the first run did not write a fresh link-health snapshot (is BROKKR_STATE_DIR redirected?); the timer stays enabled until rolled back" >&2
   exit 3
 fi
 echo "OK: link-health probe installed and first run succeeded"

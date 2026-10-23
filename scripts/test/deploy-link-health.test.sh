@@ -54,7 +54,7 @@ FAKE
 cat >"$BIN/sudo" <<'FAKE'
 #!/usr/bin/env bash
 printf 'sudo %s\n' "$*" >>"$MOCK_CALLS"
-if [[ "${MOCK_sudo_DENY:-0}" == 1 ]]; then echo "sudo: a password is required" >&2; exit 1; fi
+if [[ "${MOCK_SUDO_DENY:-0}" == 1 ]]; then echo "sudo: a password is required" >&2; exit 1; fi
 if [[ "${1:-}" == -n && "${2:-}" == apt-get ]]; then shift 2; exec "$MOCK_BIN/apt-get" "$@"; fi
 echo "fake sudo: unexpected invocation" >&2; exit 99
 FAKE
@@ -75,7 +75,9 @@ printf 'systemctl %s\n' "$*" >>"$MOCK_CALLS"
 case " $* " in
   *" start "*)
     mkdir -p "$HOME/.local/state/brokkr"
-    printf '{"checks":[{"name":"link-health","status":"pass","detail":"OK: eth0 1000Mb/s, no drops"}]}\n' >"$HOME/.local/state/brokkr/link-health.json"
+    if [[ "${MOCK_NO_SNAPSHOT:-0}" != 1 ]]; then
+      printf '{"checks":[{"name":"link-health","status":"pass","detail":"OK: eth0 1000Mb/s, no drops"}]}\n' >"$HOME/.local/state/brokkr/link-health.json"
+    fi
     exit "${MOCK_START_RC:-0}" ;;
   *" show "*) printf '%s\n' "${MOCK_RESULT:-success}" ;;
 esac
@@ -85,6 +87,22 @@ cat >"$BIN/journalctl" <<'FAKE'
 #!/usr/bin/env bash
 printf 'journalctl %s\n' "$*" >>"$MOCK_CALLS"
 echo "brokkr push: 200 (state=pass)"
+FAKE
+# Fault injection: cp/mv fail when the destination matches, tar fails to extract on stdin.
+cat >"$BIN/cp" <<'FAKE'
+#!/usr/bin/env bash
+if [[ -n "${MOCK_CP_FAIL:-}" && "${!#}" == *"$MOCK_CP_FAIL"* ]]; then echo "cp: injected failure" >&2; exit 1; fi
+exec /bin/cp "$@"
+FAKE
+cat >"$BIN/mv" <<'FAKE'
+#!/usr/bin/env bash
+if [[ -n "${MOCK_MV_FAIL:-}" && "${!#}" == *"$MOCK_MV_FAIL"* ]]; then echo "mv: injected failure" >&2; exit 1; fi
+exec /bin/mv "$@"
+FAKE
+cat >"$BIN/tar" <<'FAKE'
+#!/usr/bin/env bash
+if [[ "${MOCK_TAR_FAIL:-0}" == 1 && "${1:-}" == -xf && "${2:-}" == - ]]; then echo "tar: injected extraction failure" >&2; exit 2; fi
+exec /usr/bin/tar "$@"
 FAKE
 chmod 755 "$BIN/"*
 
@@ -119,12 +137,16 @@ reset() {
   rm -rf "$HOME_DIR/.local" "$HOME_DIR/.config/systemd" "$HOME_DIR/.config/brokkr/other"
   rm -f "$BIN/ethtool" "$DELIVERY_ENV" "$CONFIG"
   : >"$CALLS"
-  unset MOCK_ID_ROOT MOCK_LINGER MOCK_sudo_DENY MOCK_APT_FAIL MOCK_START_RC MOCK_RESULT
+  unset MOCK_ID_ROOT MOCK_LINGER MOCK_SUDO_DENY MOCK_APT_FAIL MOCK_START_RC MOCK_RESULT
+  unset MOCK_CP_FAIL MOCK_MV_FAIL MOCK_TAR_FAIL MOCK_NO_SNAPSHOT
+  rm -f "$MOCK_NOSBIN/ethtool"
   export BROKKR_EXPECTED_COMMIT="$SHA" BROKKR_LINK_HEALTH_DELIVERY_ENV="$DELIVERY_ENV"
   unset BROKKR_LINK_HEALTH_CONFIG
   good_inputs
 }
 has_ethtool() { "$BIN/mk-ethtool"; }
+# Staging under the release root is allowed to leave the (empty) directory skeleton.
+no_release_or_units() { [[ ! -e "$RELEASE" && ! -e "$UNIT_DIR" && -z "$(find "$HOME_DIR/.local/lib" -name '.stage.*' 2>/dev/null)" ]]; }
 # No remote state, units, privileged calls, or systemd mutation happened.
 no_mutation() { [[ ! -e "$HOME_DIR/.local" && ! -e "$HOME_DIR/.config/systemd" ]] && ! grep -Eq '^(sudo|apt-get|systemctl)' "$CALLS"; }
 
@@ -233,12 +255,12 @@ run "$TARGET" --apply
 check "--apply installs missing ethtool via sudo -n apt-get" '[[ "$RC" -eq 0 ]] && grep -Fxq "sudo -n apt-get install -y --no-install-recommends ethtool" "$CALLS"'
 check "ethtool install happens before any systemd mutation" '[[ "$(line_of "^apt-get")" -lt "$(line_of "^systemctl --user daemon-reload")" ]]'
 
-reset; export MOCK_sudo_DENY=1
+reset; export MOCK_SUDO_DENY=1
 run "$TARGET" --apply
-check "--apply fails closed when sudo -n is denied" '[[ "$RC" -ne 0 && "$OUT" == *ethtool* ]] && [[ ! -e "$HOME_DIR/.local" && ! -e "$UNIT_DIR" ]] && ! grep -Eq "^(apt-get|systemctl)" "$CALLS"'
+check "--apply fails closed when sudo -n is denied" '[[ "$RC" -ne 0 && "$OUT" == *ethtool* ]] && no_release_or_units && ! grep -Eq "^(apt-get|systemctl)" "$CALLS"'
 reset; export MOCK_APT_FAIL=1
 run "$TARGET" --apply
-check "--apply fails closed when the apt install fails" '[[ "$RC" -ne 0 && "$OUT" == *ethtool* ]] && [[ ! -e "$HOME_DIR/.local" && ! -e "$UNIT_DIR" ]] && ! grep -q "^systemctl" "$CALLS"'
+check "--apply fails closed when the apt install fails" '[[ "$RC" -ne 0 && "$OUT" == *ethtool* ]] && no_release_or_units && ! grep -q "^systemctl" "$CALLS"'
 reset; has_ethtool
 run "$TARGET" --apply
 check "--apply does not touch sudo when ethtool is present" '[[ "$RC" -eq 0 ]] && ! grep -Eq "^(sudo|apt-get)" "$CALLS"'
@@ -278,7 +300,65 @@ reset; has_ethtool; export MOCK_START_RC=1 MOCK_RESULT=exit-code
 run "$TARGET" --apply
 check "a failing first run exits non-zero but still prints the rollback recipe" '[[ "$RC" -ne 0 && "$OUT" == *"result: exit-code"* && "$OUT" == *Rollback* ]]'
 
+# --- backup safety: originals stay intact until every backup exists ---------------------------
+seed_units() { mkdir -p "$UNIT_DIR"; printf 'OLD SERVICE\n' >"$UNIT_DIR/brokkr-link-health.service"; printf 'OLD TIMER\n' >"$UNIT_DIR/brokkr-link-health.timer"; }
+units_intact() { [[ "$(cat "$UNIT_DIR/brokkr-link-health.service")" == "OLD SERVICE" && "$(cat "$UNIT_DIR/brokkr-link-health.timer")" == "OLD TIMER" ]]; }
+no_backup_debris() { [[ -z "$(find "$UNIT_DIR" -name '.*backup-tmp*' -print)" ]]; }
+reset; has_ethtool; seed_units; export MOCK_CP_FAIL="service.backup-tmp"
+run "$TARGET" --apply
+check "a failed first backup leaves both original units untouched and installs nothing" '[[ "$RC" -ne 0 && "$OUT" == *"could not back up"* ]] && units_intact && no_backup_debris && [[ ! -e "$RELEASE" ]] && ! grep -q "^systemctl" "$CALLS"'
+check "a failed first backup prints no unit rollback steps" '[[ "$OUT" == *"no release, installed unit, or package was changed"* && "$OUT" != *"rm -f $UNIT_DIR"* && "$OUT" != *"mv -f"* ]]'
+reset; has_ethtool; seed_units; export MOCK_CP_FAIL="timer.backup-tmp"
+run "$TARGET" --apply
+check "a partial backup (second unit fails) leaves originals untouched and no temp files" '[[ "$RC" -ne 0 && "$OUT" == *"could not back up"* ]] && units_intact && no_backup_debris && [[ ! -e "$RELEASE" && ! -e "$UNIT_DIR/brokkr-link-health.service.previous-$SHA" ]] && ! grep -q "^systemctl" "$CALLS"'
+reset; has_ethtool; seed_units; export MOCK_MV_FAIL="timer.previous"
+run "$TARGET" --apply
+check "a failed backup finalize leaves originals untouched and the recipe only offers cleanup" '[[ "$RC" -ne 0 && "$OUT" == *"could not finalize"* ]] && units_intact && no_backup_debris && [[ ! -e "$RELEASE" ]] && ! grep -q "^systemctl" "$CALLS" && [[ "$OUT" != *"mv -f $UNIT_DIR"* ]]'
+
+# --- ethtool path is pinned in the unit -------------------------------------------------------
+reset; has_ethtool
+run "$TARGET" --apply
+check "the unit pins the verified absolute ethtool path" 'grep -Fxq "Environment=BROKKR_ETHTOOL=$BIN/ethtool" "$UNIT_DIR/brokkr-link-health.service"'
+reset; "$BIN/mk-ethtool"; mv "$BIN/ethtool" "$MOCK_NOSBIN/ethtool"
+run "$TARGET" --apply
+check "an ethtool found only in the sbin search path is pinned by absolute path" '[[ "$RC" -eq 0 ]] && grep -Fxq "Environment=BROKKR_ETHTOOL=$MOCK_NOSBIN/ethtool" "$UNIT_DIR/brokkr-link-health.service"'
+reset
+run "$TARGET" --apply
+check "an ethtool installed by apt is pinned and the package side effect is reported" '[[ "$RC" -eq 0 ]] && grep -Fxq "Environment=BROKKR_ETHTOOL=$BIN/ethtool" "$UNIT_DIR/brokkr-link-health.service" && [[ "$OUT" == *"sudo apt-get remove ethtool"* ]]'
+
+# --- payload is received and validated before any package is installed ------------------------
+reset; export MOCK_TAR_FAIL=1
+run "$TARGET" --apply
+check "payload extraction failure installs no ethtool and changes nothing" '[[ "$RC" -ne 0 && "$OUT" == *"payload extraction failed"* ]] && ! grep -Eq "^(sudo|apt-get|systemctl)" "$CALLS" && no_release_or_units && [[ "$OUT" == *"no release, installed unit, or package was changed"* ]]'
+
+# --- delivery env may not redirect the probe; shared unrelated keys are fine ------------------
+for forbidden in BROKKR_LINK_HEALTH_CONFIG BROKKR_STATE_DIR BROKKR_ETHTOOL PATH; do
+  reset; has_ethtool
+  printf 'HEIMDALL_HUB_URL=https://heimdall.example.invalid/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\n%s=/tmp/redirect\n' "$forbidden" >"$DELIVERY_ENV"
+  refuses "delivery env setting $forbidden refuses" "probe-controlling variable" "$TARGET"
+done
+reset; has_ethtool
+printf 'HEIMDALL_HUB_URL=https://heimdall.example.invalid/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\nexport BROKKR_STATE_DIR=/tmp/x\n' >"$DELIVERY_ENV"
+refuses "delivery env with an export-prefixed forbidden key refuses" "probe-controlling variable" "$TARGET"
+reset; has_ethtool
+printf 'HEIMDALL_HUB_URL=https://heimdall.example.invalid/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\nHEIMDALL_FLEET_TOKEN=other-secret\n' >"$DELIVERY_ENV"
+refuses "duplicate HEIMDALL_FLEET_TOKEN refuses" "exactly once" "$TARGET"
+reset; has_ethtool
+printf 'HEIMDALL_HUB_URL=https://heimdall.example.invalid/api/panels\nHEIMDALL_HUB_URL=https://other.example.invalid\nHEIMDALL_FLEET_TOKEN=secret-sentinel\n' >"$DELIVERY_ENV"
+refuses "duplicate HEIMDALL_HUB_URL refuses" "exactly once" "$TARGET"
+reset; has_ethtool
+printf 'HEIMDALL_HUB_URL=https://heimdall.example.invalid/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored\nSOMETHING_ELSE=1\n' >"$DELIVERY_ENV"
+run "$TARGET" --apply
+check "unrelated keys in a shared delivery env are accepted" '[[ "$RC" -eq 0 ]]'
+
+# --- the first run must write a fresh snapshot ---------------------------------------------
+reset; has_ethtool; export MOCK_NO_SNAPSHOT=1
+mkdir -p "$HOME_DIR/.local/state/brokkr"
+printf '{"checks":[{"name":"link-health","status":"pass","detail":"STALE"}]}\n' >"$HOME_DIR/.local/state/brokkr/link-health.json"
+touch -t 202001010000 "$HOME_DIR/.local/state/brokkr/link-health.json"
+run "$TARGET" --apply
+check "a stale snapshot is not accepted as the first run's output" '[[ "$RC" -ne 0 && "$OUT" == *"did not write a fresh link-health snapshot"* && "$OUT" != *"STALE"* && "$OUT" == *Rollback* ]]'
+
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]
-
