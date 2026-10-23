@@ -407,9 +407,23 @@ run_runner() {
   RC=$?
 }
 scenario incident-flapping; fresh_state; rm -f "$TMP/request.json"
-HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel run_runner
+HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel BROKKR_LINK_HEALTH_NODE=node-a run_runner
 check "runner delivers a failing link observation and exits 0" '[[ "$RC" -eq 0 && -f "$TMP/state/link-health.json" ]]'
-check "runner pushes the dedicated link-health panel" 'python3 -c '\''import json,sys; b=json.load(open(sys.argv[1])); assert b["panel"]=="link-health" and b["state"]=="fail" and "drops1h=12" in b["message"], b'\'' "$TMP/request.json"'
+check "runner pushes a per-node link-health panel" 'python3 -c '\''import json,sys; b=json.load(open(sys.argv[1])); assert b["panel"]=="link-health-node-a" and "node-a" in b["label"] and b["state"]=="fail" and "drops1h=12" in b["message"], b'\'' "$TMP/request.json"'
+
+# Two nodes must never share one panel: the last push would hide the other node.
+mkdir -p "$TMP/fakebin"; printf '#!/bin/sh\necho "Node_B.example.lan"\n' > "$TMP/fakebin/hostname"; chmod +x "$TMP/fakebin/hostname"
+fresh_state; rm -f "$TMP/request.json"
+PATH="$TMP/fakebin:$PATH" HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel run_runner
+check "runner derives a sanitised panel name from the short hostname" 'python3 -c '\''import json,sys; b=json.load(open(sys.argv[1])); assert b["panel"]=="link-health-node-b", b'\'' "$TMP/request.json"'
+fresh_state; rm -f "$TMP/request.json"
+HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel BROKKR_LINK_HEALTH_NODE='***' run_runner
+check "runner refuses a node name that sanitises to nothing" '[[ "$RC" -ne 0 && ! -e "$TMP/request.json" && "$OUT" == *"node name"* ]]'
+fresh_state; rm -f "$TMP/request.json"
+HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel BROKKR_LINK_HEALTH_NODE="$(printf 'n%.0s' {1..41})" run_runner
+check "runner refuses an over-long node name instead of truncating it into a collision" '[[ "$RC" -ne 0 && ! -e "$TMP/request.json" && "$OUT" == *"node name"* ]]'
+scenario incident-flapping; fresh_state; rm -f "$TMP/request.json"
+HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel BROKKR_LINK_HEALTH_NODE=node-a run_runner
 check "runner stamps delivery under its own prefix" '[[ -s "$TMP/state/link-health-last-push-success" ]]'
 check "the Heimdall token is not passed to probe child processes" '[[ ! -e "$MOCK_JOURNAL_ARGS.leak" ]]'
 OUT="$(env -u HEIMDALL_HUB_URL -u HEIMDALL_FLEET_TOKEN bash "$ROOT/scripts/link-health-snapshot.sh" 2>&1)"; RC=$?

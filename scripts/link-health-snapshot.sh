@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Brokkr · publish this host's wired-link health to Heimdall (`link-health` panel).
+# Brokkr · publish this host's wired-link health to Heimdall (`link-health-<node>` panel).
 #
 # For fleet nodes that do not run the NAS platform report (heimdall/report.sh, which
 # carries the same check as an optional row). Driven by brokkr-link-health.timer. The
@@ -16,6 +16,14 @@ STATE_DIR="${BROKKR_STATE_DIR:-${HOME:-/var/lib/brokkr}/.local/state/brokkr}"
 fail() { echo "brokkr link health: $1" >&2; exit 2; }
 
 [ -n "${HEIMDALL_HUB_URL:-}" ] && [ -n "${HEIMDALL_FLEET_TOKEN:-}" ] || fail "Heimdall delivery is not configured"
+# One Heimdall panel per node: a shared panel would let the last node to push hide
+# another node's failing link. The name defaults to the short hostname.
+node_raw="${BROKKR_LINK_HEALTH_NODE:-$(hostname -s 2>/dev/null || hostname 2>/dev/null)}"
+# Node names must be unique in the fleet (short hostnames are, on the tailnet).
+node="$(printf '%s' "${node_raw%%.*}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | tr -s '-' | sed 's/^-*//; s/-*$//')"
+[ -n "$node" ] || fail "cannot derive a node name for the Heimdall panel (set BROKKR_LINK_HEALTH_NODE)"
+# Refuse rather than truncate: truncation could merge two nodes into one panel.
+[ "${#node}" -le 40 ] || fail "node name longer than 40 characters (set a shorter BROKKR_LINK_HEALTH_NODE)"
 mkdir -p "$STATE_DIR" || fail "cannot create state directory"
 
 detail="$(BROKKR_STATE_DIR="$STATE_DIR" python3 "$HERE/network/check-link-health.py" 2>&1)"
@@ -41,8 +49,8 @@ mv "$tmp" "$snapshot" || fail "cannot publish snapshot"
 trap - EXIT
 echo "brokkr link health: $status → $snapshot"
 
-BROKKR_HEIMDALL_PANEL="link-health" \
-BROKKR_HEIMDALL_LABEL="Network Link Health" \
+BROKKR_HEIMDALL_PANEL="link-health-$node" \
+BROKKR_HEIMDALL_LABEL="Network Link Health ($node)" \
 BROKKR_HEIMDALL_STAMP_PREFIX="link-health-" \
 BROKKR_STATE_DIR="$STATE_DIR" \
   "$HERE/heimdall/push.sh" "$snapshot"
