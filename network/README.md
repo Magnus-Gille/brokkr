@@ -11,6 +11,13 @@ NAS health snapshot runs it every 15 minutes. Use the public, placeholder-only
 [`Tailscale authentication recovery runbook`](../runbooks/tailscale-auth-recovery.md)
 for an attended `NeedsLogin` recovery and post-reboot verification.
 
+The local [`check-link-health.py`](check-link-health.py) check watches each
+configured wired interface for a speed below its expected minimum, kernel link
+drops, PHY downshifts, and NIC error growth, so a flapping or negotiated-down
+link is reported even when a fallback route keeps services up. Start from
+[`link-health.example.conf`](link-health.example.conf); see
+[`../docs/link-health.md`](../docs/link-health.md).
+
 ## cloudflared
 
 Copy [`cloudflared/config.example.yml`](cloudflared/config.example.yml) to the

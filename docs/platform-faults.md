@@ -9,7 +9,9 @@ freshness, and one recovery owner.
 The first detectors cover the platform failures not represented by the existing
 disk-capacity/mount, failed-systemd-unit, and agent-watchdog checks: a mounted
 filesystem turning read-only, loss of time synchronisation, and a changed boot
-identity. They are read-only signal projections; production command details,
+identity. Wired-link flapping (critical) and a degraded link — below its
+expected speed, downshifted, or accumulating errors (warning) — come from
+`network/check-link-health.py --signals`; see [link health](link-health.md). They are read-only signal projections; production command details,
 hostnames, state locations, and incidents belong in an owner-only overlay.
 
 Before an agent is installed or upgraded, its `brokkr-node-agent-handshake/v1`

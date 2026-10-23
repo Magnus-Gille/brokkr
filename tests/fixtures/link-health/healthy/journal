@@ -1,0 +1,2 @@
+1792490400.000000 fixture-node kernel: usb 1-1: new high-speed USB device number 3 using xhci_hcd
+1792490401.000000 fixture-node kernel: audit: type=1400 audit(0.0:1): apparmor="STATUS" operation="profile_load"

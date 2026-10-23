@@ -19,6 +19,8 @@ const rules = {
   filesystem_read_only: ["filesystem-read-only", "critical", "brokkr"],
   clock_unsynchronised: ["clock-unsynchronised", "warning", "node-agent"],
   boot_identity_changed: ["boot-identity-changed", "warning", "operator"],
+  network_link_flapping: ["network-link-flapping", "critical", "operator"],
+  network_link_degraded: ["network-link-degraded", "warning", "operator"],
 };
 const faults = input.signals.filter(s => s && rules[s.name] && s.state === "fault").map((s, n) => {
   const [category, severity, owner] = rules[s.name];

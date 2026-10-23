@@ -1,0 +1,867 @@
+1792407600.000000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792411350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792411352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792411352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792411650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792411652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792411652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792411950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792411952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792411952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792412250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792412252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792412252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792412550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792412552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792412552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792412850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792412852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792412852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792413150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792413152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792413152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792413450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792413452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792413452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792413750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792413752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792413752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792414050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792414052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792414052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792414350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792414352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792414352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792414650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792414652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792414652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792414950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792414952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792414952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792415250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792415252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792415252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792415550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792415552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792415552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792415850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792415852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792415852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792416150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792416152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792416152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792416450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792416452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792416452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792416750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792416752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792416752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792417050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792417052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792417052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792417350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792417352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792417352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792417600.000000 fixture-node kernel: usb 1-1: new high-speed USB device number 3 using xhci_hcd
+1792417601.000000 fixture-node kernel: audit: type=1400 audit(0.0:1): apparmor="STATUS" operation="profile_load"
+1792417650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792417652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792417652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792417950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792417952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792417952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792418250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792418252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792418252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792418550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792418552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792418552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792418850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792418852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792418852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792419150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792419152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792419152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792419450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792419452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792419452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792419750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792419752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792419752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792420050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792420052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792420052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792420350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792420352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792420352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792420650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792420652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792420652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792420950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792420952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792420952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792421250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792421252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792421252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792421550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792421552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792421552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792421850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792421852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792421852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792422150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792422152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792422152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792422450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792422452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792422452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792422750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792422752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792422752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792423050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792423052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792423052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792423350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792423352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792423352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792423650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792423652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792423652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792423950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792423952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792423952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792424250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792424252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792424252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792424550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792424552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792424552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792424850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792424852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792424852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792425150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792425152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792425152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792425450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792425452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792425452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792425750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792425752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792425752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792426050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792426052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792426052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792426350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792426352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792426352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792426650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792426652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792426652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792426950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792426952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792426952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792427250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792427252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792427252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792427550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792427552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792427552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792427850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792427852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792427852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792428150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792428152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792428152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792428450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792428452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792428452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792428750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792428752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792428752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792429050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792429052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792429052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792429350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792429352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792429352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792429650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792429652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792429652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792429950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792429952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792429952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792430250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792430252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792430252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792430550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792430552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792430552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792430850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792430852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792430852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792431150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792431152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792431152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792431450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792431452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792431452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792431750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792431752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792431752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792432050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792432052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792432052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792432350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792432352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792432352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792432650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792432652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792432652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792432950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792432952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792432952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792433250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792433252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792433252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792433550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792433552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792433552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792433850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792433852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792433852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792434150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792434152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792434152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792434450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792434452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792434452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792434750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792434752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792434752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792435050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792435052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792435052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792435350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792435352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792435352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792435650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792435652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792435652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792435950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792435952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792435952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792436250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792436252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792436252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792436550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792436552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792436552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792436850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792436852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792436852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792437150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792437152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792437152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792437450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792437452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792437452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792437750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792437752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792437752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792438050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792438052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792438052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792438350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792438352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792438352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792438650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792438652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792438652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792438950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792438952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792438952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792439250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792439252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792439252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792439550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792439552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792439552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792439850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792439852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792439852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792440150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792440152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792440152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792440450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792440452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792440452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792440750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792440752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792440752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792441050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792441052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792441052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792441350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792441352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792441352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792441650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792441652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792441652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792441950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792441952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792441952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792442250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792442252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792442252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792442550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792442552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792442552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792442850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792442852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792442852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792443150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792443152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792443152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792443450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792443452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792443452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792443750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792443752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792443752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792444050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792444052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792444052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792444350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792444352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792444352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792444650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792444652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792444652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792444950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792444952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792444952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792445250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792445252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792445252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792445550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792445552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792445552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792445850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792445852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792445852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792446150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792446152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792446152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792446450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792446452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792446452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792446750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792446752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792446752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792447050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792447052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792447052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792447350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792447352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792447352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792447650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792447652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792447652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792447950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792447952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792447952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792448250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792448252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792448252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792448550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792448552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792448552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792448850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792448852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792448852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792449150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792449152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792449152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792449450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792449452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792449452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792449750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792449752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792449752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792450050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792450052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792450052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792450350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792450352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792450352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792450650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792450652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792450652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792450950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792450952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792450952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792451250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792451252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792451252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792451550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792451552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792451552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792451850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792451852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792451852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792452150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792452152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792452152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792452450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792452452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792452452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792452750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792452752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792452752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792453050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792453052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792453052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792453350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792453352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792453352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792453650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792453652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792453652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792453950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792453952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792453952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792454250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792454252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792454252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792454550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792454552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792454552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792454850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792454852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792454852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792455150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792455152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792455152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792455450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792455452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792455452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792455750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792455752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792455752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792456050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792456052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792456052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792456350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792456352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792456352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792456650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792456652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792456652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792456950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792456952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792456952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792457250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792457252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792457252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792457550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792457552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792457552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792457850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792457852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792457852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792458150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792458152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792458152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792458450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792458452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792458452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792458750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792458752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792458752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792459050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792459052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792459052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792459350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792459352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792459352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792459650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792459652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792459652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792459950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792459952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792459952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792460250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792460252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792460252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792460550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792460552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792460552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792460850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792460852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792460852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792461150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792461152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792461152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792461450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792461452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792461452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792461750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792461752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792461752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792462050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792462052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792462052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792462350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792462352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792462352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792462650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792462652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792462652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792462950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792462952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792462952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792463250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792463252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792463252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792463550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792463552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792463552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792463850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792463852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792463852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792464150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792464152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792464152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792464450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792464452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792464452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792464750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792464752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792464752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792465050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792465052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792465052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792465350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792465352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792465352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792465650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792465652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792465652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792465950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792465952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792465952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792466250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792466252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792466252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792466550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792466552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792466552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792466850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792466852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792466852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792467150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792467152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792467152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792467450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792467452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792467452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792467750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792467752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792467752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792468050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792468052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792468052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792468350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792468352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792468352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792468650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792468652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792468652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792468950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792468952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792468952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792469250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792469252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792469252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792469550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792469552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792469552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792469850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792469852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792469852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792470150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792470152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792470152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792470450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792470452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792470452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792470750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792470752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792470752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792471050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792471052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792471052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792471350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792471352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792471352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792471650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792471652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792471652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792471950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792471952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792471952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792472250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792472252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792472252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792472550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792472552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792472552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792472850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792472852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792472852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792473150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792473152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792473152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792473450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792473452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792473452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792473750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792473752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792473752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792474050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792474052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792474052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792474350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792474352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792474352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792474650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792474652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792474652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792474950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792474952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792474952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792475250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792475252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792475252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792475550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792475552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792475552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792475850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792475852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792475852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792476150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792476152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792476152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792476450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792476452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792476452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792476750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792476752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792476752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792477050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792477052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792477052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792477350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792477352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792477352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792477650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792477652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792477652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792477950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792477952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792477952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792478250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792478252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792478252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792478550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792478552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792478552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792478850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792478852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792478852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792479150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792479152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792479152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792479450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792479452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792479452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792479750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792479752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792479752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792480050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792480052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792480052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792480350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792480352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792480352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792480650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792480652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792480652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792480950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792480952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792480952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792481250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792481252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792481252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792481550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792481552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792481552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792481850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792481852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792481852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792482150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792482152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792482152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792482450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792482452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792482452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792482750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792482752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792482752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792483050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792483052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792483052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792483350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792483352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792483352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792483650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792483652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792483652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792483950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792483952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792483952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792484250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792484252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792484252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792484550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792484552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792484552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792484850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792484852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792484852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792485150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792485152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792485152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792485450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792485452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792485452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792485750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792485752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792485752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792486050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792486052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792486052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792486350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792486352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792486352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792486650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792486652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792486652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792486950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792486952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792486952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792487250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792487252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792487252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792487550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792487552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792487552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792487850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792487852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792487852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792488150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792488152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792488152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792488450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792488452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792488452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792488750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792488752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792488752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792489050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792489052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792489052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792489350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792489352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792489352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792489650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792489652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792489652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792489950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792489952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792489952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792490250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792490252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792490252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792490550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792490552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792490552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792490850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792490852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792490852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792491150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792491152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792491152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792491450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792491452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792491452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792491750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792491752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792491752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792492050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792492052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792492052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792492350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792492352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792492352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792492650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792492652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792492652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792492950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792492952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792492952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792493250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792493252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792493252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792493550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792493552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792493552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792493850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792493852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792493852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792494150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792494152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792494152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792494450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792494452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792494452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792494750.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792494752.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792494752.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792495050.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792495052.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792495052.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792495350.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792495352.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792495352.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792495650.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792495652.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792495652.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792495950.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792495952.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792495952.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792496250.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792496252.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792496252.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792496550.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792496552.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792496552.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792496850.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792496852.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792496852.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792497150.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792497152.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792497152.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx
+1792497450.412000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down
+1792497452.101000 fixture-node kernel: r8169-0-100:00: Downshift occurred from negotiated speed 2.5Gbps to actual speed 1Gbps, check cabling!
+1792497452.377000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full - flow control rx/tx

@@ -7,7 +7,7 @@
   "properties": {
     "kind": {"const": "brokkr-platform-fault"}, "schema_version": {"const": "v1"},
     "fault_id": {"type": "string", "pattern": "^fault-[a-z0-9-]+-[0-9]+$"},
-    "category": {"enum": ["filesystem-read-only", "clock-unsynchronised", "boot-identity-changed"]},
+    "category": {"enum": ["filesystem-read-only", "clock-unsynchronised", "boot-identity-changed", "network-link-flapping", "network-link-degraded"]},
     "severity": {"enum": ["warning", "critical"]},
     "node_substrate_ref": {"type": "object", "additionalProperties": false, "required": ["contract", "node_id", "observation_evidence_id"], "properties": {"contract": {"const": "grimnir.node-substrate/v1"}, "node_id": {"type": "string"}, "observation_evidence_id": {"type": "string"}}},
     "evidence": {"type": "object", "additionalProperties": false, "required": ["provenance", "assertion"], "properties": {"provenance": {"type": "string", "minLength": 1}, "assertion": {"type": "string"}}},
