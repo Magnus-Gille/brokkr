@@ -1,0 +1,28 @@
+# Brokkr · wired-link health snapshot (oneshot, driven by brokkr-link-health.timer).
+# User unit for fleet nodes outside the NAS platform report. Rendered and installed
+# by scripts/deploy-link-health.sh; do not copy this template by hand.
+[Unit]
+Description=Brokkr wired-link health snapshot
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/link-health.md
+# No OnFailure=: brokkr-systemd-failure@.service is a system unit and does not
+# exist in user scope. A failed run stays visible in the service state and as a
+# stale Heimdall link-health panel.
+
+[Service]
+Type=oneshot
+# Rendered by deploy-link-health.sh with an exact full revision and the
+# operator's protected-file paths.
+WorkingDirectory=%h/.local/lib/brokkr/link-health/releases/@REVISION@
+# Provides HEIMDALL_HUB_URL + HEIMDALL_FLEET_TOKEN; required (delivery is the point).
+EnvironmentFile=@DELIVERY_ENV@
+Environment=BROKKR_LINK_HEALTH_CONFIG=@LINK_CONFIG@
+# Absolute path verified at install time; the user manager PATH may lack /usr/sbin.
+Environment=BROKKR_ETHTOOL=@ETHTOOL@
+ExecStart=%h/.local/lib/brokkr/link-health/releases/@REVISION@/scripts/link-health-snapshot.sh
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+# The probe writes only its error-counter baseline, snapshot, and delivery stamps.
+ReadWritePaths=%h/.local/state/brokkr
+TimeoutStartSec=90

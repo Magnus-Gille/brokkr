@@ -277,6 +277,49 @@ settled
 run_probe
 check "comments and blank lines are allowed" '[[ "$RC" -eq 0 ]]'
 
+# --check-config validates the protected config with the probe's own parser and
+# reads no NIC or journal (the mocks would fail loudly if it did).
+write_config 'LINK=enp1s0,2500,r8169-0-100:00'
+rm -f "$MOCK_JOURNAL_ARGS"
+OUT="$(python3 "$PROBE" --check-config 2>&1)"; RC=$?
+check "--check-config accepts a valid config and prints no detail beyond a count" '[[ "$RC" -eq 0 && "$OUT" == "OK: link-health config valid (1 link)" ]]'
+check "--check-config does not read the journal or NIC" '[[ ! -e "$MOCK_JOURNAL_ARGS" ]]'
+write_config 'LINK=enp1s0,2500' 'SURPRISE=1'
+OUT="$(python3 "$PROBE" --check-config 2>&1)"; RC=$?
+check "--check-config rejects an invalid config with exit 2" '[[ "$RC" -eq 2 && "$OUT" == FAIL:*config* ]]'
+write_config 'LINK=enp1s0,2500'
+chmod 640 "$BROKKR_LINK_HEALTH_CONFIG"
+OUT="$(python3 "$PROBE" --check-config 2>&1)"; RC=$?
+check "--check-config rejects a group-readable config" '[[ "$RC" -eq 2 && "$OUT" == FAIL:*config* ]]'
+chmod 600 "$BROKKR_LINK_HEALTH_CONFIG"
+OUT="$(python3 "$PROBE" --check-config --signals 2>&1)"; RC=$?
+check "--check-config cannot be combined with other modes" '[[ "$RC" -eq 64 ]]'
+OUT="$(python3 - --check-config < "$PROBE" 2>&1)"; RC=$?
+check "--check-config works when the probe is piped on stdin" '[[ "$RC" -eq 0 && "$OUT" == OK:* ]]'
+write_config 'LINK=enp1s0,2500'
+
+# BROKKR_ETHTOOL pins the absolute ethtool path (the user manager's PATH may lack
+# /usr/sbin); ethtool must not be looked up on PATH when it is set.
+mkdir -p "$TMP/alt"
+cat > "$TMP/alt/ethtool-alt" <<'EOF'
+#!/usr/bin/env bash
+echo used >> "$MOCK_ALT_USED"
+exec "$MOCK_ETHTOOL_REAL" "$@"
+EOF
+chmod +x "$TMP/alt/ethtool-alt"
+export MOCK_ALT_USED="$TMP/alt-used" MOCK_ETHTOOL_REAL="$TMP/bin/ethtool"
+scenario healthy; fresh_state; rm -f "$MOCK_ALT_USED"
+write_config 'LINK=enp1s0,2500'
+BROKKR_ETHTOOL="$TMP/alt/ethtool-alt" run_probe
+check "BROKKR_ETHTOOL selects the ethtool binary" '[[ -s "$MOCK_ALT_USED" && "$OUT" != *"ethtool failed"* ]]'
+rm -f "$MOCK_ALT_USED"
+mv "$TMP/bin/ethtool" "$TMP/bin/ethtool.real"; MOCK_ETHTOOL_REAL="$TMP/bin/ethtool.real" BROKKR_ETHTOOL="$TMP/alt/ethtool-alt" run_probe
+check "with BROKKR_ETHTOOL set, ethtool need not be on PATH" '[[ -s "$MOCK_ALT_USED" && "$OUT" != *"ethtool failed"* ]]'
+mv "$TMP/bin/ethtool.real" "$TMP/bin/ethtool"
+BROKKR_ETHTOOL="$TMP/alt/missing-ethtool" run_probe
+check "a bad BROKKR_ETHTOOL path is reported as unknown, not ok" '[[ "$RC" -eq 1 && "$OUT" == *"ethtool failed"* ]]'
+write_config 'LINK=enp1s0,2500'
+
 # --- platform-fault signals -----------------------------------------------------
 observation() { # signals JSON on stdin -> observation file $1
   python3 -c 'import json,sys; sig=json.load(sys.stdin); json.dump({"kind":"brokkr-platform-observation","schema_version":"v1","now":"2026-10-20T12:00:00Z","observed_at":"2026-10-20T11:59:00Z","valid_until":"2026-10-20T12:14:00Z","node_substrate_ref":{"contract":"grimnir.node-substrate/v1","node_id":"fixture-node","observation_evidence_id":"obs-fixture-001"},"signals":sig}, open(sys.argv[1],"w"))' "$1"
