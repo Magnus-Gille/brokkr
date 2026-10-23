@@ -19,8 +19,11 @@ fail() { echo "brokkr link health: $1" >&2; exit 2; }
 # One Heimdall panel per node: a shared panel would let the last node to push hide
 # another node's failing link. The name defaults to the short hostname.
 node_raw="${BROKKR_LINK_HEALTH_NODE:-$(hostname -s 2>/dev/null || hostname 2>/dev/null)}"
-node="$(printf '%s' "${node_raw%%.*}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | tr -s '-' | sed 's/^-*//; s/-*$//' | cut -c1-40)"
+# Node names must be unique in the fleet (short hostnames are, on the tailnet).
+node="$(printf '%s' "${node_raw%%.*}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | tr -s '-' | sed 's/^-*//; s/-*$//')"
 [ -n "$node" ] || fail "cannot derive a node name for the Heimdall panel (set BROKKR_LINK_HEALTH_NODE)"
+# Refuse rather than truncate: truncation could merge two nodes into one panel.
+[ "${#node}" -le 40 ] || fail "node name longer than 40 characters (set a shorter BROKKR_LINK_HEALTH_NODE)"
 mkdir -p "$STATE_DIR" || fail "cannot create state directory"
 
 detail="$(BROKKR_STATE_DIR="$STATE_DIR" python3 "$HERE/network/check-link-health.py" 2>&1)"

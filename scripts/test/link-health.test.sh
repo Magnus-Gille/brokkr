@@ -419,6 +419,9 @@ check "runner derives a sanitised panel name from the short hostname" 'python3 -
 fresh_state; rm -f "$TMP/request.json"
 HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel BROKKR_LINK_HEALTH_NODE='***' run_runner
 check "runner refuses a node name that sanitises to nothing" '[[ "$RC" -ne 0 && ! -e "$TMP/request.json" && "$OUT" == *"node name"* ]]'
+fresh_state; rm -f "$TMP/request.json"
+HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel BROKKR_LINK_HEALTH_NODE="$(printf 'n%.0s' {1..41})" run_runner
+check "runner refuses an over-long node name instead of truncating it into a collision" '[[ "$RC" -ne 0 && ! -e "$TMP/request.json" && "$OUT" == *"node name"* ]]'
 scenario incident-flapping; fresh_state; rm -f "$TMP/request.json"
 HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-sentinel BROKKR_LINK_HEALTH_NODE=node-a run_runner
 check "runner stamps delivery under its own prefix" '[[ -s "$TMP/state/link-health-last-push-success" ]]'
