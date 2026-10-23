@@ -46,6 +46,7 @@ POSITIVE = re.compile(r"^[1-9][0-9]{0,6}$")
 JOURNAL_RECORD = re.compile(r"^([0-9]{1,12})(?:\.[0-9]{1,9})?\s+\S+\s+(.*)$")
 BOOT_SEPARATOR = re.compile(r"^-- .* --$")
 DOWNSHIFT = re.compile(r"Downshift occurred from negotiated speed (\S+) to actual speed ([^\s,]+)")
+SECRET_ENV = re.compile(r"HEIMDALL|TOKEN|SECRET|PASSWORD|CREDENTIAL|KEY", re.IGNORECASE)
 JOURNAL_ACCESS_HINTS = ("not seeing messages from other users and the system", "insufficient permissions")
 
 
@@ -120,7 +121,9 @@ def load_config(path: str) -> tuple[list[dict[str, object]], dict[str, int]]:
 
 
 def run(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
-    env = dict(os.environ, LC_ALL="C")
+    # Children get no inherited secrets (the unit's EnvironmentFile carries a token).
+    env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
+    env["LC_ALL"] = "C"
     try:
         return subprocess.run(argv, check=False, capture_output=True, text=True,
                               timeout=COMMAND_TIMEOUT_SECS, env=env)
@@ -130,15 +133,16 @@ def run(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
 
 def read_journal(now: int) -> tuple[list[tuple[int, str]] | None, str | None]:
     """Return kernel records from the last 24 h, or (None, reason) when unknown."""
-    base = ["journalctl", "-k", "-q", "--no-pager", "-o", "short-unix"]
+    base = ["journalctl", "-q", "--no-pager", "-o", "short-unix"]
     # An unprivileged reader sees an empty kernel journal with exit 0. Require a
     # current-boot kernel record first so "no records" cannot mean "no access".
-    proof = run(base + ["-b", "-n", "1"])
+    proof = run(base + ["-k", "-b", "-n", "1"])
     if proof is None or proof.returncode != 0:
         return None, "journalctl failed"
     if any(hint in proof.stderr for hint in JOURNAL_ACCESS_HINTS) or not proof.stdout.strip():
         return None, "kernel journal unreadable"
-    result = run(base + ["--since", f"@{now - DAY}"])
+    # Not -k: it implies -b and would hide drops from before a reboot in the window.
+    result = run(base + ["--since", f"@{now - DAY}", "_TRANSPORT=kernel"])
     if result is None or result.returncode != 0:
         return None, "journalctl failed"
     if any(hint in result.stderr for hint in JOURNAL_ACCESS_HINTS):
@@ -209,14 +213,33 @@ def read_link(iface: str) -> dict[str, object]:
     }
 
 
+def read_counters(iface: str) -> dict[str, str] | None:
+    """tx_errors/rx_errors from ethtool -S, else the kernel's generic sysfs counters."""
+    result = run(["ethtool", "-S", iface])
+    if result is not None and result.returncode == 0:
+        counters = dict(re.findall(r"^\s+([A-Za-z0-9_]+):\s+([0-9]+)\s*$", result.stdout, re.MULTILINE))
+        if "tx_errors" in counters and "rx_errors" in counters:
+            return counters
+    # Not every driver names these in ethtool -S; every netdev exposes them in sysfs.
+    sysfs = os.path.join(os.environ.get("BROKKR_SYSFS_NET") or "/sys/class/net", iface, "statistics")
+    counters = {}
+    for name in ("tx_errors", "rx_errors"):
+        try:
+            with open(os.path.join(sysfs, name), encoding="ascii") as fh:
+                value = fh.read().strip()
+        except (OSError, UnicodeError):
+            return None
+        if not re.fullmatch(r"[0-9]+", value):
+            return None
+        counters[name] = value
+    return counters
+
+
 def error_delta(iface: str, now: int, state_dir: str) -> tuple[str, int | None, str | None]:
     """Return (label, delta, unknown_reason) for tx_errors + rx_errors since the last run."""
-    result = run(["ethtool", "-S", iface])
-    if result is None or result.returncode != 0:
-        return "unknown", None, "ethtool -S failed"
-    counters = dict(re.findall(r"^\s+([A-Za-z0-9_]+):\s+([0-9]+)\s*$", result.stdout, re.MULTILINE))
-    if "tx_errors" not in counters or "rx_errors" not in counters:
-        return "unknown", None, "tx_errors/rx_errors not reported"
+    counters = read_counters(iface)
+    if counters is None:
+        return "unknown", None, "tx/rx error counters unavailable"
     current = {"epoch": now, "tx_errors": int(counters["tx_errors"]), "rx_errors": int(counters["rx_errors"])}
 
     path = os.path.join(state_dir, "link-health", f"{iface}.json")

@@ -29,10 +29,17 @@ other end has stopped offering the expected rate.
 
 The journal is only trusted after a current-boot kernel record has been read,
 so a reader without journal access cannot mistake an empty result for zero
-drops. Error-counter deltas use a per-interface baseline in
+drops. The 24 h query matches `_TRANSPORT=kernel` rather than using
+`journalctl -k`, which implies `-b` and would hide drops from before a reboot
+inside the window (with a volatile journal those are lost anyway). A boot or
+resume can log one `Link is Down`, which is why the 24 h warning starts at two. Error-counter deltas use a per-interface baseline in
 `$BROKKR_STATE_DIR/link-health/`; the first run, a counter reset (reboot or
 driver reload), or a baseline older than 24 h records a new baseline
-(`errors=baseline`) without alerting.
+(`errors=baseline`) without alerting. Counters come from `ethtool -S`, falling
+back to the generic `/sys/class/net/<iface>/statistics` counters for drivers
+that do not name `tx_errors`/`rx_errors`. The error check compares one run
+with the next, so a slow steady error rate below `ERRORS_WARN` per interval
+does not alert.
 
 ## Configuration
 
@@ -49,7 +56,12 @@ interface names and PHY identifiers stay in the untracked host copy.
 
 - **NAS platform report.** When `BROKKR_LINK_HEALTH_CONFIG` names the config,
   [`heimdall/report.sh`](../heimdall/report.sh) adds a `link-health` row to the
-  `hw-health` panel. Without it, the report is unchanged.
+  `hw-health` panel. Without it, the report is unchanged. The tracked
+  `brokkr-health.service` sets neither that variable nor journal access, so
+  enabling the row needs a drop-in (`systemctl edit brokkr-health.service`)
+  adding `Environment=BROKKR_LINK_HEALTH_CONFIG=/home/brokkr/.config/brokkr/link-health.conf`
+  and `SupplementaryGroups=systemd-journal`; without the group the row stays at
+  `WARN: unknown: kernel journal unreadable`.
 - **Other fleet nodes.** [`scripts/link-health-snapshot.sh`](../scripts/link-health-snapshot.sh)
   publishes a dedicated `link-health` Heimdall panel, driven every 15 minutes by
   [`systemd/brokkr-link-health.timer`](../systemd/brokkr-link-health.timer). The
@@ -62,7 +74,9 @@ interface names and PHY identifiers stay in the untracked host copy.
   `brokkr-platform-observation`. [`platform-fault-detector.mjs`](../scripts/platform-fault-detector.mjs)
   maps them to `network-link-flapping` (critical) and `network-link-degraded`
   (warning) faults owned by the operator. Missing evidence is signalled as
-  `unknown`, never `ok`.
+  `unknown`, never `ok`; the detector, like its other signals, emits faults
+  only for `fault`, so a consumer must treat an `unknown` signal as an alert
+  in its own right rather than read an empty fault batch as healthy.
 
 Run only one of these per host: they share the error-counter baseline, so two
 consumers would each see part of the delta.

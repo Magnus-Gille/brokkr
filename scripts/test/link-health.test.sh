@@ -20,6 +20,7 @@ cat > "$TMP/bin/ethtool" <<'EOF'
 #!/usr/bin/env bash
 [ "${MOCK_ETHTOOL_RC:-0}" = 0 ] || { echo "mock ethtool failure" >&2; exit "$MOCK_ETHTOOL_RC"; }
 if [ "${1:-}" = -S ] && [ "$#" -eq 2 ]; then
+  [ "${MOCK_STATS_RC:-0}" = 0 ] || exit "$MOCK_STATS_RC"
   exec cat "$MOCK_NIC_DIR/$2.stats"
 elif [ "$#" -eq 1 ]; then
   exec cat "$MOCK_NIC_DIR/$1.link"
@@ -29,6 +30,7 @@ EOF
 cat > "$TMP/bin/journalctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_JOURNAL_ARGS"
+[ -z "${HEIMDALL_FLEET_TOKEN:-}" ] || echo leaked >> "$MOCK_JOURNAL_ARGS.leak"
 case " $* " in
   *" -n 1 "*)
     # Readability proof: the newest kernel record of the current boot.
@@ -45,6 +47,7 @@ export PATH="$TMP/bin:$PATH"
 export BROKKR_NOW_EPOCH=1792497600 BROKKR_STATE_DIR="$TMP/state"
 export MOCK_NIC_DIR="$TMP/nic" MOCK_JOURNAL_ARGS="$TMP/journal-args"
 export BROKKR_LINK_HEALTH_CONFIG="$TMP/link-health.conf"
+export BROKKR_SYSFS_NET="$TMP/sysfs"  # empty unless a test creates counters; never the host's
 
 PASS=0
 FAIL=0
@@ -81,7 +84,8 @@ fresh_state
 run_probe
 check "healthy 2.5G link with no events passes" '[[ "$RC" -eq 0 && "$OUT" == OK:* ]]'
 check "first run records a counter baseline without claiming an error rate" '[[ "$OUT" == *"errors=baseline"* && -f "$TMP/state/link-health/enp1s0.json" ]]'
-check "journal is queried for the kernel ring over 24 h" 'grep -q -- "-k" "$MOCK_JOURNAL_ARGS" && grep -q -- "--since @1792411200" "$MOCK_JOURNAL_ARGS"'
+check "kernel records are queried across boots over 24 h (not -k, which implies -b)" 'grep -- "--since @1792411200" "$MOCK_JOURNAL_ARGS" | grep -q "_TRANSPORT=kernel" && ! grep -- "--since" "$MOCK_JOURNAL_ARGS" | grep -q -- " -k "'
+check "journal readability is proven from the current boot" 'grep -q -- "-k -b -n 1" "$MOCK_JOURNAL_ARGS"'
 BROKKR_NOW_EPOCH=1792498500 run_probe
 check "second healthy run reports a zero error delta over its interval" '[[ "$RC" -eq 0 && "$OUT" == *"errors=+0/900s"* ]]'
 
@@ -147,6 +151,33 @@ scenario healthy
 sed -i.bak '/tx_errors/d' "$TMP/nic/enp1s0.stats"
 run_probe
 check "a missing error counter is unknown, not zero" '[[ "$RC" -eq 1 && "$OUT" == *"errors=unknown"* ]]'
+mkdir -p "$TMP/sysfs/enp1s0/statistics"
+printf '0\n' > "$TMP/sysfs/enp1s0/statistics/tx_errors"
+printf '0\n' > "$TMP/sysfs/enp1s0/statistics/rx_errors"
+fresh_state
+run_probe
+check "generic sysfs error counters back up a driver without them in ethtool -S" '[[ "$RC" -eq 0 && "$OUT" == *"errors=baseline"* ]]'
+printf 'garbage\n' > "$TMP/sysfs/enp1s0/statistics/rx_errors"
+run_probe
+check "an unparsable sysfs counter is unknown" '[[ "$RC" -eq 1 && "$OUT" == *"errors=unknown"* ]]'
+rm -rf "$TMP/sysfs"
+
+# --- driver wording, name prefixes, and window edges -----------------------------
+scenario healthy
+cp "$FIX/healthy/enp1s0.link" "$TMP/nic/eth1.link"
+cp "$FIX/healthy/enp1s0.stats" "$TMP/nic/eth1.stats"
+cat > "$TMP/edges.journal" <<'EOF'
+1792411199.999999 fixture-node kernel: e1000e: eth1 NIC Link is Down
+1792411200.000000 fixture-node kernel: e1000e: eth1 NIC Link is Down
+1792494000.000000 fixture-node kernel: igb 0000:03:00.0 eth1: igb: eth1 NIC Link is Down
+1792497000.000000 fixture-node kernel: r8169 0000:02:00.0 eth10: Link is Down
+1792497001.000000 fixture-node kernel: r8169 0000:02:00.0 eth1.10: Link is Down
+1792497002.000000 fixture-node kernel: r8169 0000:02:00.0 veth1: Link is Down
+EOF
+write_config 'LINK=eth1,2500' 'DROPS_24H_WARN=100'
+MOCK_JOURNAL_FILE="$TMP/edges.journal" run_probe
+check "e1000e/igb wording counts once per record; eth10, eth1.10, veth1 are not eth1" '[[ "$OUT" == *"drops1h=1 "* && "$OUT" == *"drops24h=2 "* ]]'
+write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 
 # --- error-counter deltas -------------------------------------------------------
 scenario healthy
@@ -226,6 +257,12 @@ MOCK_JOURNAL_RC=1 MOCK_ETHTOOL_RC=75 python3 "$PROBE" --signals > "$TMP/signals.
 check "missing evidence is signalled unknown, never ok" '[[ "$(signal_state "$TMP/signals.json")" == "network_link_flapping=unknown,network_link_degraded=unknown" ]]'
 python3 "$PROBE" --signals > "$TMP/signals.json"
 check "a healthy link signals ok" '[[ "$(signal_state "$TMP/signals.json")" == "network_link_flapping=ok,network_link_degraded=ok" ]]'
+MOCK_STATS_RC=75 python3 "$PROBE" --signals > "$TMP/signals.json"
+check "missing error counters leave degraded unknown without hiding flapping evidence" '[[ "$(signal_state "$TMP/signals.json")" == "network_link_flapping=ok,network_link_degraded=unknown" ]]'
+write_config 'LINK=enp1s0,2500' 'SURPRISE=1'
+python3 "$PROBE" --signals > "$TMP/signals.json" 2> "$TMP/signals.err"; RC=$?
+check "--signals with a bad config exits 2 and emits no signals" '[[ "$RC" -eq 2 && ! -s "$TMP/signals.json" ]] && grep -q config "$TMP/signals.err"'
+write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 
 # --- Heimdall report row (optional) ---------------------------------------------
 mkdir -p "$TMP/mount"
@@ -285,6 +322,7 @@ HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN=secret-
 check "runner delivers a failing link observation and exits 0" '[[ "$RC" -eq 0 && -f "$TMP/state/link-health.json" ]]'
 check "runner pushes the dedicated link-health panel" 'python3 -c '\''import json,sys; b=json.load(open(sys.argv[1])); assert b["panel"]=="link-health" and b["state"]=="fail" and "drops1h=12" in b["message"], b'\'' "$TMP/request.json"'
 check "runner stamps delivery under its own prefix" '[[ -s "$TMP/state/link-health-last-push-success" ]]'
+check "the Heimdall token is not passed to probe child processes" '[[ ! -e "$MOCK_JOURNAL_ARGS.leak" ]]'
 OUT="$(env -u HEIMDALL_HUB_URL -u HEIMDALL_FLEET_TOKEN bash "$ROOT/scripts/link-health-snapshot.sh" 2>&1)"; RC=$?
 check "runner without Heimdall delivery fails instead of silently skipping" '[[ "$RC" -ne 0 && "$OUT" == *"not configured"* ]]'
 
