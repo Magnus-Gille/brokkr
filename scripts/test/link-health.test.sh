@@ -271,7 +271,11 @@ write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 # --- kernel carrier counters cross-check the journal ------------------------------
 # carrier_down_count is kept by the kernel itself, so drops that journald never
 # ingested still show up as a counter delta between runs.
-set_carrier() { mkdir -p "$TMP/sysfs/enp1s0"; printf '%s\n' "$1" > "$TMP/sysfs/enp1s0/carrier_down_count"; }
+set_carrier() {
+  mkdir -p "$TMP/sysfs/enp1s0"
+  printf '%s\n' "$1" > "$TMP/sysfs/enp1s0/carrier_down_count"
+  [[ -f "$TMP/sysfs/enp1s0/ifindex" ]] || printf '2\n' > "$TMP/sysfs/enp1s0/ifindex"
+}
 scenario healthy
 fresh_state
 run_probe
@@ -360,10 +364,25 @@ check "a sample just over an hour old counts toward 24 h only" '[[ "$RC" -eq 1 &
 set_carrier 1; fresh_state; baseline_at 1800; set_carrier 2
 printf '00000000-0000-4000-8000-000000000002\n' > "$BROKKR_BOOT_ID_FILE"
 MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH - 900)) run_probe
-check "a new boot id resets the carrier baseline instead of reporting missed drops" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=baseline"* && "$OUT" == *"unknown: carrier counter reset (reboot)"* && "$OUT" != *"carrier went down"* ]]'
+check "a new boot id resets the carrier baseline instead of reporting missed drops" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=baseline"* && "$OUT" == *"unknown: carrier counter generation changed"* && "$OUT" != *"carrier went down"* ]]'
 MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
 check "the run after a reboot reset compares within the new boot" '[[ "$RC" -eq 0 && "$OUT" == *"carrier-down=+0/900s"* ]]'
 printf '00000000-0000-4000-8000-000000000001\n' > "$BROKKR_BOOT_ID_FILE"
+# Regression (review): a driver reload or re-created interface restarts the count
+# without a reboot, and unlogged drops can bring it back to or above the old
+# value. A new ifindex must reset the carrier baseline, never compare as +0.
+for after in 5 7; do
+  set_carrier 5; fresh_state; baseline_at 900
+  printf '3\n' > "$TMP/sysfs/enp1s0/ifindex"; set_carrier "$after"
+  MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+  check "a re-created interface (count $after after 5) is unknown, never ok" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=baseline"* && "$OUT" == *"unknown: carrier counter generation changed"* && "$OUT" != *"carrier went down"* ]]'
+  rm -f "$TMP/sysfs/enp1s0/ifindex"
+done
+set_carrier 5; fresh_state; baseline_at 900
+printf 'garbage\n' > "$TMP/sysfs/enp1s0/ifindex"
+run_probe
+check "an unparsable ifindex leaves the carrier check unknown" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=unknown"* && "$OUT" == *"unknown: interface ifindex"* ]]'
+rm -f "$TMP/sysfs/enp1s0/ifindex"
 # Regression (review): unreadable tx/rx counters must not stop the carrier baseline.
 scenario healthy; set_carrier 5; fresh_state
 MOCK_STATS_RC=1 baseline_at 900

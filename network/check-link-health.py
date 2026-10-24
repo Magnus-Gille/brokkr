@@ -328,6 +328,18 @@ def read_carrier_downs(iface: str) -> tuple[int | None, str | None]:
     return int(value), None
 
 
+def read_ifindex(iface: str) -> tuple[int | None, str | None]:
+    """The interface index, which changes when the netdev is re-created (driver reload)."""
+    try:
+        with open(os.path.join(sysfs_net(), iface, "ifindex"), encoding="ascii") as fh:
+            value = fh.read().strip()
+    except (OSError, UnicodeError):
+        return None, "interface ifindex unreadable"
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        return None, "interface ifindex unparsable"
+    return int(value), None
+
+
 BOOT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -345,6 +357,11 @@ def is_count(value: object) -> bool:
     return type(value) is int and value >= 0
 
 
+def is_generation(value: object) -> bool:
+    return (isinstance(value, dict) and set(value) == {"boot_id", "ifindex"} and is_count(value["ifindex"])
+            and (value["boot_id"] is None or isinstance(value["boot_id"], str) and bool(BOOT_ID.match(value["boot_id"]))))
+
+
 def counter_deltas(iface: str, now: int, state_dir: str) -> dict[str, object]:
     """Compare tx/rx error and carrier-down counters with earlier runs' baselines.
 
@@ -356,6 +373,12 @@ def counter_deltas(iface: str, now: int, state_dir: str) -> dict[str, object]:
     """
     counters = read_counters(iface)
     carrier, carrier_reason = read_carrier_downs(iface)
+    ifindex = None
+    if carrier is not None:
+        # Without the netdev's identity a count cannot be compared across a reload.
+        ifindex, ifindex_reason = read_ifindex(iface)
+        if ifindex is None:
+            carrier, carrier_reason = None, ifindex_reason
     unknown: list[str] = []
     out: dict[str, object] = {
         "errors_label": "unknown", "errors": None,
@@ -405,32 +428,33 @@ def counter_deltas(iface: str, now: int, state_dir: str) -> dict[str, object]:
                 out["errors"], out["errors_label"] = delta, f"+{delta}/{now - previous['epoch']}s"
 
     stored = loaded.get("carrier_samples")
-    stored_boot = loaded.get("boot_id")
-    boot_id = read_boot_id()
+    stored_generation = loaded.get("carrier_generation")
     samples: list[list[int]] = []
     if (isinstance(stored, list) and all(isinstance(x, list) and len(x) == 2 and is_count(x[0]) and is_count(x[1]) for x in stored)
-            and (stored_boot is None or isinstance(stored_boot, str) and BOOT_ID.match(stored_boot))):
+            and is_generation(stored_generation)):
         samples = sorted((x for x in stored if now - DAY <= x[0] < now), key=lambda x: x[0])
     elif carrier is not None and baseline is None:
         unknown.append("carrier baseline unreadable" if stored is not None
                        else "carrier baseline recorded (previous run had no carrier count)")
-    # A new boot restarts the count, and boot-time carrier events that log nothing
-    # could otherwise read as missed drops against the previous boot's samples.
-    rebooted = bool(samples) and boot_id is not None and stored_boot != boot_id
+    # A reboot, driver reload or re-created interface restarts the count, and
+    # unlogged drops (or boot-time carrier events that log nothing) can bring it
+    # back to or above the old value. Only a changed generation shows that.
+    generation = {"boot_id": read_boot_id(), "ifindex": ifindex}
+    reset = None
+    if carrier is not None and samples and stored_generation != generation:
+        reset, samples = "carrier counter generation changed (reboot, driver reload or re-created interface)", []
     if carrier is not None:
         out["carrier_label"] = "baseline"
-        if rebooted:
-            unknown.append("carrier counter reset (reboot)")
-            samples = []
+        if reset:
+            unknown.append(reset)
         elif samples and samples[-1][1] > carrier:
             unknown.append("carrier counter reset (reboot or driver reload)")
         elif samples:
             out["carrier_label"] = f"+{carrier - samples[-1][1]}/{now - samples[-1][0]}s"
         elif isinstance(stored, list):
             unknown.append("carrier baseline stale")
-        # Older samples at or below the current count still give lower bounds,
-        # even across a reboot boot_id could not show: every loss counted since
-        # boot came later.
+        # Older samples at or below the current count still give lower bounds:
+        # every loss counted since the restart came after them.
         samples = [x for x in samples if x[1] <= carrier]
         if samples:
             out["carrier_windows"] = [(epoch, carrier - before) for epoch, before in samples]
@@ -443,10 +467,9 @@ def counter_deltas(iface: str, now: int, state_dir: str) -> dict[str, object]:
     current: dict[str, object] = {k: loaded[k] for k in ("epoch", "tx_errors", "rx_errors") if previous is not None and counters is None}
     if counters is not None:
         current.update({"epoch": now, "tx_errors": int(counters["tx_errors"]), "rx_errors": int(counters["rx_errors"])})
-    if samples and not (rebooted and carrier is None):
+    if samples:
         current["carrier_samples"] = samples
-        if boot_id is not None:
-            current["boot_id"] = boot_id
+        current["carrier_generation"] = generation if carrier is not None else stored_generation
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)

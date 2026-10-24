@@ -70,18 +70,22 @@ Error-counter and carrier deltas use a per-interface baseline in
 `$BROKKR_STATE_DIR/link-health/`; the detail line shows both deltas against the
 previous run. The first run, an unreadable baseline, a counter reset (reboot or
 driver reload), and a baseline older than 24 h or from a later clock all record
-a new baseline (`errors=baseline`, `carrier-down=baseline`; a changed kernel
-`boot_id` also resets the carrier samples) and report the affected check as
-unknown (WARN) for that one run, because there is no comparison yet; the
-flapping signal is then `unknown` too. A baseline written before the
-carrier count was recorded (an upgrade), or a negative or non-integer value in
-it, is unknown in the same way. Counters come from `ethtool -S`, falling back
-to the generic `/sys/class/net/<iface>/statistics` counters for drivers that do
-not name `tx_errors`/`rx_errors`. When neither source is readable, the error
-baseline is left untouched, so the next run compares over the longer interval,
-and the carrier samples are still recorded. The error check compares one run
-with the next, so a slow steady error rate below `ERRORS_WARN` per interval
-does not alert.
+a new baseline (`errors=baseline`, `carrier-down=baseline`) and report the
+affected check as unknown (WARN) for that one run, because there is no
+comparison yet; the flapping signal is then `unknown` too. Carrier samples are
+also tied to the kernel `boot_id` and the interface's `ifindex`: a reboot,
+driver reload or re-created interface restarts the count, and unlogged drops can
+bring it back to or above the old value, so a changed `boot_id` or `ifindex` is
+a reset even when the count did not fall. A carrier count whose `ifindex` cannot
+be read is `unknown`. A baseline written before the carrier count was recorded
+(an upgrade), or a negative or non-integer value in it, is unknown in the same
+way. Counters come from `ethtool -S`, falling back to the generic
+`/sys/class/net/<iface>/statistics` counters for drivers that do not name
+`tx_errors`/`rx_errors`. When neither source is readable, the error baseline is
+left untouched, so the next run compares over the longer interval, and the
+carrier samples are still recorded. The error check compares one run with the
+next, so a slow steady error rate below `ERRORS_WARN` per interval does not
+alert.
 
 ## Configuration
 
