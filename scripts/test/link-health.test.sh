@@ -61,6 +61,7 @@ echo "# /etc/systemd/journald.conf"
 echo "[Journal]"
 echo "#ReadKMsg=yes"
 [ -z "${MOCK_READKMSG:-}" ] || { echo "# /etc/systemd/journald.conf.d/50-test.conf"; echo "[Journal]"; echo "ReadKMsg=$MOCK_READKMSG"; }
+[ -z "${MOCK_ANALYZE_EXTRA:-}" ] || printf '%b\n' "$MOCK_ANALYZE_EXTRA"
 EOF
 chmod +x "$TMP/bin/ethtool" "$TMP/bin/journalctl" "$TMP/bin/systemd-analyze"
 export PATH="$TMP/bin:$PATH"
@@ -230,7 +231,7 @@ check "a partial count that already crosses a threshold still fails" '[[ "$RC" -
 MOCK_NO_HISTORY=1 python3 "$PROBE" --signals > "$TMP/partial-signals.json"
 check "partial history leaves the flapping signal unknown, not ok" 'grep -q "\"network_link_flapping\", \"state\": \"unknown\"" "$TMP/partial-signals.json"'
 # --- quiet kernel: no kernel record for days, but the journal covers the window --
-# Regression (huginmunin, 2026-10-24): coverage proven only by an old *kernel*
+# Regression (a fleet node, 2026-10-24): coverage proven only by an old *kernel*
 # record made a healthy, quiet host report "covers only Ns of 24h" forever.
 scenario volatile-after-reboot
 write_config 'LINK=enp1s0,2500,r8169-0-100:00'
@@ -250,6 +251,15 @@ check "journald not reading kernel messages is unknown, never a clean zero" '[[ 
 settled
 MOCK_READKMSG=yes MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
 check "an explicit ReadKMsg=yes drop-in keeps the clean count" '[[ "$RC" -eq 0 ]]'
+settled
+MOCK_READKMSG=no MOCK_ANALYZE_EXTRA='# /etc/systemd/journald.conf.d/90-other.conf\n[Other]\nReadKMsg=yes' MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "ReadKMsg outside [Journal] cannot re-enable kernel ingestion" '[[ "$RC" -eq 1 && "$OUT" == *"kernel messages"* ]]'
+settled
+MOCK_ANALYZE_EXTRA='# /etc/systemd/journald.conf.d/90-bad.conf\n[Journal]\nReadKMsg=perhaps' MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "an invalid ReadKMsg value is unknown, never assumed on" '[[ "$RC" -eq 1 && "$OUT" == *"unknown"* ]]'
+settled
+MOCK_ANALYZE_EXTRA='# /etc/systemd/journald.conf.d/90-ok.conf\n[Journal]\n  readkmsg = Yes  ' MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "case and whitespace in a valid ReadKMsg are accepted" '[[ "$RC" -eq 0 ]]'
 settled
 MOCK_ANALYZE_RC=1 MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
 check "unverifiable kernel ingestion is unknown, never a clean zero" '[[ "$RC" -eq 1 && "$OUT" == *"unknown"* ]]'

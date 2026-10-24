@@ -151,6 +151,7 @@ def parse_records(output: str) -> list[tuple[int, str]] | None:
 
 
 FALSE_WORDS = {"no", "false", "0", "off"}
+TRUE_WORDS = {"yes", "true", "1", "on"}
 
 
 def kernel_ingestion_unknown() -> str | None:
@@ -163,10 +164,20 @@ def kernel_ingestion_unknown() -> str | None:
     if result is None or result.returncode != 0:
         return "cannot verify that journald reads kernel messages"
     value = "yes"  # journald's default; later drop-ins override earlier lines
+    section = None
     for line in result.stdout.splitlines():
-        match = re.match(r"^\s*ReadKMsg\s*=\s*(\S*)\s*$", line)
-        if match:
+        stripped = line.strip()
+        if not stripped or stripped[0] in "#;":
+            continue
+        header = re.fullmatch(r"\[([^\]]+)\]", stripped)
+        if header:
+            section = header.group(1)
+            continue
+        match = re.fullmatch(r"ReadKMsg\s*=\s*(\S*)", stripped)
+        if match and section == "Journal":
             value = match.group(1).lower()
+            if value not in FALSE_WORDS | TRUE_WORDS:
+                return f"journald ReadKMsg value {value!r} is not a boolean"
     if value in FALSE_WORDS:
         return "journald does not read kernel messages (ReadKMsg)"
     return None

@@ -35,7 +35,10 @@ inside the window. Coverage is proven by any system-journal record from
 before the window, not only a kernel one: a healthy kernel can stay silent for
 days. That proof only stands while journald reads kernel messages: if the
 effective `ReadKMsg=` is off, or `systemd-analyze cat-config` cannot show it,
-the counts are `unknown`. When no such record exists (a volatile or vacuumed journal after a
+the counts are `unknown` (only `[Journal]` assignments count, and a non-boolean
+value is `unknown`). The configuration shows the current state only: a window in
+which kernel ingestion was off and later re-enabled without a journald restart is
+not detected. When no such record exists (a volatile or vacuumed journal after a
 reboot), the counts are lower bounds,
 shown as `drops24h>=N`. Unless they already cross a threshold, the result is
 `unknown: kernel journal covers only …`, never a clean zero. Records stamped
