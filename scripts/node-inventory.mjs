@@ -171,7 +171,7 @@ if (!positive(memory)) {
 if (!positive(memory)) failures.push("memory");
 
 const archRes = probe("uname", ["-m"]);
-const architecture = archRes.out === "aarch64" || archRes.out === "arm64" ? "arm64" : archRes.out === "x86_64" ? "x86_64" : "unknown";
+const architecture = archRes.out === "aarch64" || archRes.out === "arm64" ? "arm64" : archRes.out === "armv7l" ? "armv7l" : archRes.out === "x86_64" ? "x86_64" : "unknown";
 if (architecture === "unknown") failures.push("architecture");
 
 let serviceManager = "unknown";

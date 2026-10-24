@@ -195,8 +195,21 @@ printf '3: wlan0: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN mode DEFA
 EOF
   mock tailscale <<'EOF'
 #!/bin/sh
-echo '{"BackendState":"Running","Self":{"Online":true}}'
+  echo '{"BackendState":"Running","Self":{"Online":true}}'
 EOF
+}
+
+pi_zero_mocks() {
+  nas_mocks
+  mock uname <<'EOF'
+#!/bin/sh
+echo armv7l
+EOF
+  mock ip <<'EOF'
+#!/bin/sh
+printf '2: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT group default qlen 1000\n'
+EOF
+  rm -f "$MOCK/tailscale"
 }
 
 write_overlay() { # path, then JSON on stdin
@@ -236,6 +249,28 @@ grep -q 'units=mimir.service\[active/running\],tunnel.service\[active/running\],
 grep -q 'workloads=mimir' "$TMP/nas.err"
 grep -q 'backup-roles=consumer,producer' "$TMP/nas.err"
 grep -q 'all probes collected' "$TMP/nas.err"
+
+# --- 4b. Legacy Raspberry Pi Zero architecture remains explicit and known.
+pi_zero_mocks
+PI_ZERO_OVERLAY="$TMP/pi-zero-overlay.json"
+write_overlay "$PI_ZERO_OVERLAY" <<'EOF'
+{
+  "uptime_class": "best_effort",
+  "deployment_mechanisms": ["systemd"],
+  "health_reporting": "supported",
+  "workloads": ["munin-memory"]
+}
+EOF
+run_inventory BROKKR_NODE_ID=node-munin-zero BROKKR_INVENTORY_NOW=2026-08-12T15:00:00Z \
+  BROKKR_INVENTORY_OVERLAY="$PI_ZERO_OVERLAY" >"$TMP/pi-zero.json" 2>"$TMP/pi-zero.err"
+check record "$TMP/pi-zero.json"
+check assert "$TMP/pi-zero.json" \
+  'r.capability_status === "known"' \
+  'r.architecture === "armv7l"' \
+  '!r.extensions.some((e) => e.id === "probe-failed-architecture")' \
+  'JSON.stringify(r.network_capabilities) === JSON.stringify(["wifi"])' \
+  'r.extensions.map((e) => e.id).join(",") === "workload-munin-memory"'
+grep -q 'all probes collected' "$TMP/pi-zero.err"
 
 # The optional detail record preserves stdout as exactly the normative v1
 # record while making installed/active unit state and overlay observations
