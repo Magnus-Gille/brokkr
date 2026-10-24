@@ -31,15 +31,21 @@ cat > "$TMP/bin/journalctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_JOURNAL_ARGS"
 [ -z "${HEIMDALL_FLEET_TOKEN:-}" ] || echo leaked >> "$MOCK_JOURNAL_ARGS.leak"
+# MOCK_QUIET_KERNEL=1: the kernel logged nothing for days, but the system journal
+# itself (other transports) does reach back before the window.
 case " $* " in
   *" --until "*)
-    # Newest kernel record before the 24 h window: proves history covers it.
-    [ "${MOCK_NO_HISTORY:-0}" = 1 ] || echo "1792400000.000000 fixture-node kernel: older history"
+    # Newest record before the 24 h window: proves history covers it.
+    [ "${MOCK_NO_HISTORY:-0}" = 1 ] && exit 0
+    case " $* " in *" _TRANSPORT=kernel "*) [ "${MOCK_QUIET_KERNEL:-0}" = 1 ] && exit 0 ;; esac
+    echo "1792400000.000000 fixture-node systemd[1]: older history"
     exit 0
     ;;
   *" -n 1 "*)
-    # Readability proof: the newest kernel record of the current boot.
-    [ "${MOCK_JOURNAL_PROOF_EMPTY:-0}" = 1 ] || echo "1792497000.000000 fixture-node kernel: proof"
+    # Readability proof: the newest record visible to this reader.
+    [ "${MOCK_JOURNAL_PROOF_EMPTY:-0}" = 1 ] && exit 0
+    case " $* " in *" -k "*) [ "${MOCK_QUIET_KERNEL:-0}" = 1 ] && exit 0 ;; esac
+    echo "1792497000.000000 fixture-node systemd[1]: proof"
     exit 0
     ;;
 esac
@@ -47,7 +53,17 @@ esac
 [ "${MOCK_JOURNAL_RC:-0}" = 0 ] || exit "$MOCK_JOURNAL_RC"
 exec cat "$MOCK_JOURNAL_FILE"
 EOF
-chmod +x "$TMP/bin/ethtool" "$TMP/bin/journalctl"
+cat > "$TMP/bin/systemd-analyze" <<'EOF'
+#!/usr/bin/env bash
+# MOCK_READKMSG: effective ReadKMsg= value ("" = only the commented default).
+[ "${MOCK_ANALYZE_RC:-0}" = 0 ] || exit "$MOCK_ANALYZE_RC"
+echo "# /etc/systemd/journald.conf"
+echo "[Journal]"
+echo "#ReadKMsg=yes"
+[ -z "${MOCK_READKMSG:-}" ] || { echo "# /etc/systemd/journald.conf.d/50-test.conf"; echo "[Journal]"; echo "ReadKMsg=$MOCK_READKMSG"; }
+[ -z "${MOCK_ANALYZE_EXTRA:-}" ] || printf '%b\n' "$MOCK_ANALYZE_EXTRA"
+EOF
+chmod +x "$TMP/bin/ethtool" "$TMP/bin/journalctl" "$TMP/bin/systemd-analyze"
 export PATH="$TMP/bin:$PATH"
 export BROKKR_NOW_EPOCH=1792497600 BROKKR_STATE_DIR="$TMP/state"
 export MOCK_NIC_DIR="$TMP/nic" MOCK_JOURNAL_ARGS="$TMP/journal-args"
@@ -94,7 +110,7 @@ fresh_state
 run_probe
 check "first run records a counter baseline and reports the error check unknown" '[[ "$RC" -eq 1 && "$OUT" == *"errors=baseline"* && "$OUT" == *"unknown: error baseline recorded"* && -f "$TMP/state/link-health/enp1s0.json" ]]'
 check "kernel records are queried across boots over 24 h (not -k, which implies -b)" 'grep -- "--since @1792411200" "$MOCK_JOURNAL_ARGS" | grep -q "_TRANSPORT=kernel" && ! grep -- "--since" "$MOCK_JOURNAL_ARGS" | grep -q -- " -k "'
-check "journal readability is proven from the current boot" 'grep -q -- "-k -b -n 1" "$MOCK_JOURNAL_ARGS"'
+check "journal readability is proven from the system journal" 'grep -q -- "--system -n 1" "$MOCK_JOURNAL_ARGS"'
 check "journal history before the window is probed" 'grep -q -- "--until @1792411200" "$MOCK_JOURNAL_ARGS"'
 BROKKR_NOW_EPOCH=1792498500 run_probe
 check "healthy 2.5G link with no events passes once a baseline exists" '[[ "$RC" -eq 0 && "$OUT" == OK:* && "$OUT" == *"errors=+0/900s"* ]]'
@@ -214,6 +230,39 @@ MOCK_NO_HISTORY=1 MOCK_JOURNAL_FILE="$TMP/flap-after-boot.journal" run_probe
 check "a partial count that already crosses a threshold still fails" '[[ "$RC" -eq 2 && "$OUT" == *"drops1h>=5"* ]]'
 MOCK_NO_HISTORY=1 python3 "$PROBE" --signals > "$TMP/partial-signals.json"
 check "partial history leaves the flapping signal unknown, not ok" 'grep -q "\"network_link_flapping\", \"state\": \"unknown\"" "$TMP/partial-signals.json"'
+# --- quiet kernel: no kernel record for days, but the journal covers the window --
+# Regression (a fleet node, 2026-10-24): coverage proven only by an old *kernel*
+# record made a healthy, quiet host report "covers only Ns of 24h" forever.
+scenario volatile-after-reboot
+write_config 'LINK=enp1s0,2500,r8169-0-100:00'
+settled
+MOCK_QUIET_KERNEL=1 run_probe
+check "a quiet kernel with older non-kernel journal history is a clean count" '[[ "$RC" -eq 0 && "$OUT" == *"drops24h=1 "* && "$OUT" != *"covers only"* ]]'
+settled
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/recent.journal" run_probe
+check "a quiet kernel does not make the journal look unreadable" '[[ "$OUT" != *"unreadable"* ]]'
+: > "$TMP/empty.journal"
+settled
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "no kernel record at all, but older history and kernel ingestion on, is a clean zero" '[[ "$RC" -eq 0 && "$OUT" == *"drops24h=0 "* ]]'
+settled
+MOCK_READKMSG=no MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "journald not reading kernel messages is unknown, never a clean zero" '[[ "$RC" -eq 1 && "$OUT" == *"unknown"* && "$OUT" == *"kernel messages"* ]]'
+settled
+MOCK_READKMSG=yes MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "an explicit ReadKMsg=yes drop-in keeps the clean count" '[[ "$RC" -eq 0 ]]'
+settled
+MOCK_READKMSG=no MOCK_ANALYZE_EXTRA='# /etc/systemd/journald.conf.d/90-other.conf\n[Other]\nReadKMsg=yes' MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "ReadKMsg outside [Journal] cannot re-enable kernel ingestion" '[[ "$RC" -eq 1 && "$OUT" == *"kernel messages"* ]]'
+settled
+MOCK_ANALYZE_EXTRA='# /etc/systemd/journald.conf.d/90-bad.conf\n[Journal]\nReadKMsg=perhaps' MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "an invalid ReadKMsg value is unknown, never assumed on" '[[ "$RC" -eq 1 && "$OUT" == *"unknown"* ]]'
+settled
+MOCK_ANALYZE_EXTRA='# /etc/systemd/journald.conf.d/90-ok.conf\n[Journal]\n  readkmsg = Yes  ' MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "case and whitespace in a valid ReadKMsg are accepted" '[[ "$RC" -eq 0 ]]'
+settled
+MOCK_ANALYZE_RC=1 MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "unverifiable kernel ingestion is unknown, never a clean zero" '[[ "$RC" -eq 1 && "$OUT" == *"unknown"* ]]'
 scenario healthy
 write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 
