@@ -23,6 +23,6 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=read-only
-# The probe writes only its error-counter baseline, snapshot, and delivery stamps.
+# The probe writes only its counter baseline, snapshot, and delivery stamps.
 ReadWritePaths=%h/.local/state/brokkr
 TimeoutStartSec=90

@@ -20,6 +20,7 @@ link itself. For each configured wired interface it reports:
 | Kernel `Link is Down` events, last 24 h | `journalctl -k` | WARN at ≥ 2, FAIL at ≥ 24 |
 | PHY `Downshift occurred` events, last 24 h | `journalctl -k` | WARN at ≥ 1 |
 | Growth of `tx_errors + rx_errors` since the previous run | `ethtool -S <iface>` | WARN at ≥ 10 |
+| More carrier losses than logged drops since a sample in the last 24 h | `/sys/class/net/<iface>/carrier_down_count` | `unknown: carrier went down …`; the excess counts toward the drop thresholds |
 | Any of the above unavailable or unparsable | — | WARN (`unknown: …`), never OK |
 
 The speed check is what catches the stable-but-slow state: once a port has
@@ -36,22 +37,49 @@ before the window, not only a kernel one: a healthy kernel can stay silent for
 days. That proof only stands while journald reads kernel messages: if the
 effective `ReadKMsg=` is off, or `systemd-analyze cat-config` cannot show it,
 the counts are `unknown` (only `[Journal]` assignments count, and a non-boolean
-value is `unknown`). The configuration shows the current state only: a window in
-which kernel ingestion was off and later re-enabled without a journald restart is
-not detected. When no such record exists (a volatile or vacuumed journal after a
-reboot), the counts are lower bounds,
+value is `unknown`). The configuration shows the current state only, which is why
+the carrier cross-check below exists. When no such record exists (a volatile or
+vacuumed journal after a reboot), the counts are lower bounds,
 shown as `drops24h>=N`. Unless they already cross a threshold, the result is
 `unknown: kernel journal covers only …`, never a clean zero. Records stamped
 after the observation time (a clock correction) are ignored. A boot or resume
 can log one `Link is Down`, which is why the 24 h warning starts at two.
 
-Error-counter deltas use a per-interface baseline in
-`$BROKKR_STATE_DIR/link-health/`. The first run, an unreadable baseline, a
-counter reset (reboot or driver reload), and a baseline older than 24 h or from
-a later clock all record a new baseline (`errors=baseline`) and report the error
-check as unknown (WARN) for that one run, because there is no comparison yet. Counters come from `ethtool -S`, falling
-back to the generic `/sys/class/net/<iface>/statistics` counters for drivers
-that do not name `tx_errors`/`rx_errors`. The error check compares one run
+The kernel counts every carrier loss in `carrier_down_count` itself, independent
+of journald, so it cross-checks the journal. Each run records a carrier sample,
+and the baseline keeps the samples from the last 24 h. More carrier losses since
+any of those samples than `Link is Down` records since that sample prove the
+journal incomplete: for example, kernel ingestion was off earlier in the window
+and re-enabled without a journald restart, or the driver logs link loss in
+wording the probe does not recognise. The result is then
+`unknown: carrier went down Nx in Ts but the kernel journal shows M`, and the
+drop counts become lower bounds that include the N − M missing drops. Those
+can cross the thresholds on their own: with the default `DROPS_1H_FAIL=3`, three
+unlogged losses between two runs 15 minutes apart fail the 1 h check. Only
+samples at most an hour old count toward the 1 h window. Because every sample in
+the window is compared, the missing drops stay counted, and the result stays at
+least WARN, until the sample before them is 24 h old. A record that reaches the
+journal late reconciles on the next run. When the journal is unreadable, the
+carrier delta alone is the lower bound. A carrier loss that the driver does not
+log also counts as a missing drop for 24 h: for example an administrative
+`ip link set down` or a suspend. Kernels before Linux 4.16 have no
+`carrier_down_count`; the detail line then shows `carrier-down=unavailable`, the
+other checks are unchanged, and a past ingestion gap there is not detected.
+
+Error-counter and carrier deltas use a per-interface baseline in
+`$BROKKR_STATE_DIR/link-health/`; the detail line shows both deltas against the
+previous run. The first run, an unreadable baseline, a counter reset (reboot or
+driver reload), and a baseline older than 24 h or from a later clock all record
+a new baseline (`errors=baseline`, `carrier-down=baseline`; a changed kernel
+`boot_id` also resets the carrier samples) and report the affected check as
+unknown (WARN) for that one run, because there is no comparison yet; the
+flapping signal is then `unknown` too. A baseline written before the
+carrier count was recorded (an upgrade), or a negative or non-integer value in
+it, is unknown in the same way. Counters come from `ethtool -S`, falling back
+to the generic `/sys/class/net/<iface>/statistics` counters for drivers that do
+not name `tx_errors`/`rx_errors`. When neither source is readable, the error
+baseline is left untouched, so the next run compares over the longer interval,
+and the carrier samples are still recorded. The error check compares one run
 with the next, so a slow steady error rate below `ERRORS_WARN` per interval
 does not alert.
 
@@ -98,7 +126,7 @@ interface names and PHY identifiers stay in the untracked host copy.
   only for `fault`, so a consumer must treat an `unknown` signal as an alert
   in its own right rather than read an empty fault batch as healthy.
 
-Run only one of these per host: they share the error-counter baseline, so two
+Run only one of these per host: they share the counter baseline, so two
 consumers would each see part of the delta.
 
 ## Install and rollback
