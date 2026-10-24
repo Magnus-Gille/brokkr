@@ -150,6 +150,28 @@ def parse_records(output: str) -> list[tuple[int, str]] | None:
     return records
 
 
+FALSE_WORDS = {"no", "false", "0", "off"}
+
+
+def kernel_ingestion_unknown() -> str | None:
+    """Return a reason when journald's kernel-message collection is off or unverifiable.
+
+    Coverage is proven from system-journal records of any transport, so it must
+    not stand in for kernel evidence when journald does not read kernel messages.
+    """
+    result = run(["systemd-analyze", "cat-config", "systemd/journald.conf"])
+    if result is None or result.returncode != 0:
+        return "cannot verify that journald reads kernel messages"
+    value = "yes"  # journald's default; later drop-ins override earlier lines
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\s*ReadKMsg\s*=\s*(\S*)\s*$", line)
+        if match:
+            value = match.group(1).lower()
+    if value in FALSE_WORDS:
+        return "journald does not read kernel messages (ReadKMsg)"
+    return None
+
+
 def read_journal(now: int) -> tuple[list[tuple[int, str]] | None, str | None, int | None]:
     """Return (records from the last 24 h, unknown reason, history start).
 
@@ -167,6 +189,9 @@ def read_journal(now: int) -> tuple[list[tuple[int, str]] | None, str | None, in
         return None, "journalctl failed", None
     if any(hint in proof.stderr for hint in JOURNAL_ACCESS_HINTS) or not proof.stdout.strip():
         return None, "kernel journal unreadable", None
+    ingestion = kernel_ingestion_unknown()
+    if ingestion is not None:
+        return None, ingestion, None
     # Not -k: it implies -b and would hide drops from before a reboot in the window.
     result = run(base + ["--since", f"@{now - DAY}", "_TRANSPORT=kernel"])
     if result is None or result.returncode != 0:

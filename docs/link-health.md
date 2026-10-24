@@ -33,7 +33,9 @@ drops. The 24 h query matches `_TRANSPORT=kernel` rather than using
 `journalctl -k`, which implies `-b` and would hide drops from before a reboot
 inside the window. Coverage is proven by any system-journal record from
 before the window, not only a kernel one: a healthy kernel can stay silent for
-days. When no such record exists (a volatile or vacuumed journal after a
+days. That proof only stands while journald reads kernel messages: if the
+effective `ReadKMsg=` is off, or `systemd-analyze cat-config` cannot show it,
+the counts are `unknown`. When no such record exists (a volatile or vacuumed journal after a
 reboot), the counts are lower bounds,
 shown as `drops24h>=N`. Unless they already cross a threshold, the result is
 `unknown: kernel journal covers only …`, never a clean zero. Records stamped

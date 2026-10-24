@@ -53,7 +53,16 @@ esac
 [ "${MOCK_JOURNAL_RC:-0}" = 0 ] || exit "$MOCK_JOURNAL_RC"
 exec cat "$MOCK_JOURNAL_FILE"
 EOF
-chmod +x "$TMP/bin/ethtool" "$TMP/bin/journalctl"
+cat > "$TMP/bin/systemd-analyze" <<'EOF'
+#!/usr/bin/env bash
+# MOCK_READKMSG: effective ReadKMsg= value ("" = only the commented default).
+[ "${MOCK_ANALYZE_RC:-0}" = 0 ] || exit "$MOCK_ANALYZE_RC"
+echo "# /etc/systemd/journald.conf"
+echo "[Journal]"
+echo "#ReadKMsg=yes"
+[ -z "${MOCK_READKMSG:-}" ] || { echo "# /etc/systemd/journald.conf.d/50-test.conf"; echo "[Journal]"; echo "ReadKMsg=$MOCK_READKMSG"; }
+EOF
+chmod +x "$TMP/bin/ethtool" "$TMP/bin/journalctl" "$TMP/bin/systemd-analyze"
 export PATH="$TMP/bin:$PATH"
 export BROKKR_NOW_EPOCH=1792497600 BROKKR_STATE_DIR="$TMP/state"
 export MOCK_NIC_DIR="$TMP/nic" MOCK_JOURNAL_ARGS="$TMP/journal-args"
@@ -231,6 +240,19 @@ check "a quiet kernel with older non-kernel journal history is a clean count" '[
 settled
 MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/recent.journal" run_probe
 check "a quiet kernel does not make the journal look unreadable" '[[ "$OUT" != *"unreadable"* ]]'
+: > "$TMP/empty.journal"
+settled
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "no kernel record at all, but older history and kernel ingestion on, is a clean zero" '[[ "$RC" -eq 0 && "$OUT" == *"drops24h=0 "* ]]'
+settled
+MOCK_READKMSG=no MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "journald not reading kernel messages is unknown, never a clean zero" '[[ "$RC" -eq 1 && "$OUT" == *"unknown"* && "$OUT" == *"kernel messages"* ]]'
+settled
+MOCK_READKMSG=yes MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "an explicit ReadKMsg=yes drop-in keeps the clean count" '[[ "$RC" -eq 0 ]]'
+settled
+MOCK_ANALYZE_RC=1 MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "unverifiable kernel ingestion is unknown, never a clean zero" '[[ "$RC" -eq 1 && "$OUT" == *"unknown"* ]]'
 scenario healthy
 write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 
