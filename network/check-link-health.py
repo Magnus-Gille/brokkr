@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Report wired-link health: negotiated speed, kernel link drops, PHY downshifts,
-and NIC error-counter deltas for each configured interface.
+and NIC error-counter deltas for each configured interface. The kernel's own
+carrier-down counter cross-checks the journal, so drops journald never ingested
+still count.
 
 A wired link can flap or fall back to a lower speed while every service stays
 up, because another route (for example wifi) carries the traffic. This probe
@@ -35,6 +37,7 @@ COMMAND_TIMEOUT_SECS = 15
 MAX_CONFIG_BYTES = 16384
 MAX_LINKS = 8
 MAX_THRESHOLD = 1_000_000
+MAX_CARRIER_SAMPLES = 512  # 24 h of runs every 3 minutes
 DEFAULT_THRESHOLDS = {
     "DROPS_1H_FAIL": 3,
     "DROPS_24H_WARN": 2,
@@ -239,6 +242,7 @@ def journal_events(records: list[tuple[int, str]], now: int, link: dict[str, obj
     # phylib logs downshifts under the PHY device name, not the interface name.
     downshift_owner = re.compile(names(iface, link["phy"]).pattern + r":")
     drops_1h = drops_24h = downshifts = 0
+    drop_stamps: list[int] = []
     last_downshift = None
     for stamp, message in records:
         if stamp < now - DAY or stamp > now:
@@ -247,11 +251,13 @@ def journal_events(records: list[tuple[int, str]], now: int, link: dict[str, obj
             drops_24h += 1
             if stamp >= now - HOUR:
                 drops_1h += 1
+            drop_stamps.append(stamp)
         shift = DOWNSHIFT.search(message)
         if shift and downshift_owner.search(message):
             downshifts += 1
             last_downshift = f"{shift.group(1)}->{shift.group(2)}"
-    return {"drops_1h": drops_1h, "drops_24h": drops_24h, "downshifts": downshifts, "last_downshift": last_downshift}
+    return {"drops_1h": drops_1h, "drops_24h": drops_24h, "drop_stamps": drop_stamps,
+            "downshifts": downshifts, "last_downshift": last_downshift}
 
 
 def ethtool_fields(output: str) -> dict[str, str]:
@@ -282,6 +288,10 @@ def read_link(iface: str) -> dict[str, object]:
     }
 
 
+def sysfs_net() -> str:
+    return os.environ.get("BROKKR_SYSFS_NET") or "/sys/class/net"
+
+
 def read_counters(iface: str) -> dict[str, str] | None:
     """tx_errors/rx_errors from ethtool -S, else the kernel's generic sysfs counters."""
     result = run([ethtool_binary(), "-S", iface])
@@ -290,7 +300,7 @@ def read_counters(iface: str) -> dict[str, str] | None:
         if "tx_errors" in counters and "rx_errors" in counters:
             return counters
     # Not every driver names these in ethtool -S; every netdev exposes them in sysfs.
-    sysfs = os.path.join(os.environ.get("BROKKR_SYSFS_NET") or "/sys/class/net", iface, "statistics")
+    sysfs = os.path.join(sysfs_net(), iface, "statistics")
     counters = {}
     for name in ("tx_errors", "rx_errors"):
         try:
@@ -304,40 +314,169 @@ def read_counters(iface: str) -> dict[str, str] | None:
     return counters
 
 
-def error_delta(iface: str, now: int, state_dir: str) -> tuple[str, int | None, str | None]:
-    """Return (label, delta, unknown_reason) for tx_errors + rx_errors since the last run."""
-    counters = read_counters(iface)
-    if counters is None:
-        return "unknown", None, "tx/rx error counters unavailable"
-    current = {"epoch": now, "tx_errors": int(counters["tx_errors"]), "rx_errors": int(counters["rx_errors"])}
+def read_carrier_downs(iface: str) -> tuple[int | None, str | None]:
+    """Return (carrier_down_count, unknown reason); (None, None) when the kernel lacks it."""
+    try:
+        with open(os.path.join(sysfs_net(), iface, "carrier_down_count"), encoding="ascii") as fh:
+            value = fh.read().strip()
+    except FileNotFoundError:
+        return None, None  # before Linux 4.16: the cross-check is unavailable
+    except (OSError, UnicodeError):
+        return None, "carrier_down_count unreadable"
+    if not re.fullmatch(r"[0-9]+", value):
+        return None, "carrier_down_count unparsable"
+    return int(value), None
 
-    # Without a valid earlier sample there is no error evidence yet: record a new
-    # baseline but report the check unknown until the next run can compare.
+
+def read_ifindex(iface: str) -> tuple[int | None, str | None]:
+    """The interface index, which changes when the netdev is re-created (driver reload)."""
+    try:
+        with open(os.path.join(sysfs_net(), iface, "ifindex"), encoding="ascii") as fh:
+            value = fh.read().strip()
+    except (OSError, UnicodeError):
+        return None, "interface ifindex unreadable"
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        return None, "interface ifindex unparsable"
+    return int(value), None
+
+
+BOOT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def read_boot_id() -> str | None:
+    """The kernel's per-boot UUID, or None where it cannot be read."""
+    try:
+        with open(os.environ.get("BROKKR_BOOT_ID_FILE") or "/proc/sys/kernel/random/boot_id", encoding="ascii") as fh:
+            value = fh.read().strip()
+    except (OSError, UnicodeError):
+        return None
+    return value if BOOT_ID.match(value) else None
+
+
+def is_count(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def is_generation(value: object) -> bool:
+    return (isinstance(value, dict) and set(value) == {"boot_id", "ifindex"} and is_count(value["ifindex"])
+            and (value["boot_id"] is None or isinstance(value["boot_id"], str) and bool(BOOT_ID.match(value["boot_id"]))))
+
+
+def counter_deltas(iface: str, now: int, state_dir: str) -> dict[str, object]:
+    """Compare tx/rx error and carrier-down counters with earlier runs' baselines.
+
+    The error delta is against the previous run. Carrier counts are kept as a
+    rolling 24 h list of samples, so a carrier loss the journal missed stays
+    visible for the whole window. A delta is None unless a valid earlier sample
+    exists; every such case adds an unknown reason, except a kernel without
+    carrier_down_count ("unavailable").
+    """
+    counters = read_counters(iface)
+    carrier, carrier_reason = read_carrier_downs(iface)
+    ifindex = None
+    if carrier is not None:
+        # Without the netdev's identity a count cannot be compared across a reload.
+        ifindex, ifindex_reason = read_ifindex(iface)
+        if ifindex is None:
+            carrier, carrier_reason = None, ifindex_reason
+    unknown: list[str] = []
+    out: dict[str, object] = {
+        "errors_label": "unknown", "errors": None,
+        "carrier_label": "unavailable" if carrier is None and carrier_reason is None else "unknown",
+        "carrier_windows": None, "unknown": unknown,
+    }
+    if counters is None:
+        unknown.append("tx/rx error counters unavailable")
+    if carrier_reason:
+        unknown.append(carrier_reason)
+
+    # Without a valid earlier sample there is no counter evidence yet: record a new
+    # baseline but report the checks unknown until a later run can compare.
     path = os.path.join(state_dir, "link-health", f"{iface}.json")
-    previous = None
+    loaded: dict[str, object] = {}
+    baseline = None
     try:
         with open(path, encoding="utf-8") as fh:
             loaded = json.load(fh)
-        if isinstance(loaded, dict) and all(isinstance(loaded.get(k), int) for k in current):
-            previous = loaded
-        else:
-            baseline = "error baseline unreadable"
+        if not isinstance(loaded, dict):
+            loaded, baseline = {}, "counter baseline unreadable"
     except FileNotFoundError:
-        baseline = "error baseline recorded (first run)"
+        baseline = "counter baseline recorded (first run)"
     except (OSError, ValueError):
-        baseline = "error baseline unreadable"
+        baseline = "counter baseline unreadable"
+    if baseline and (counters is not None or carrier is not None):
+        unknown.append(baseline)
 
-    label, delta = "baseline", None
-    if previous is not None:
-        if not 0 < now - previous["epoch"] <= DAY:
-            baseline = "error baseline stale"
-        elif current["tx_errors"] < previous["tx_errors"] or current["rx_errors"] < previous["rx_errors"]:
-            baseline = "error counters reset (reboot or driver reload)"
-        else:
-            delta = (current["tx_errors"] - previous["tx_errors"]) + (current["rx_errors"] - previous["rx_errors"])
-            label = f"+{delta}/{now - previous['epoch']}s"
-            baseline = None
+    previous = None
+    if baseline is None:
+        if all(is_count(loaded.get(k)) for k in ("epoch", "tx_errors", "rx_errors")):
+            previous = loaded
+        elif counters is not None:
+            unknown.append("counter baseline unreadable" if any(k in loaded for k in ("epoch", "tx_errors", "rx_errors"))
+                           else "error baseline recorded (previous run had no error counters)")
+    if previous is not None and not 0 < now - previous["epoch"] <= DAY:
+        previous = None
+        if counters is not None:
+            unknown.append("counter baseline stale")
+    if counters is not None:
+        out["errors_label"] = "baseline"
+        if previous is not None:
+            if int(counters["tx_errors"]) < previous["tx_errors"] or int(counters["rx_errors"]) < previous["rx_errors"]:
+                unknown.append("error counters reset (reboot or driver reload)")
+            else:
+                delta = (int(counters["tx_errors"]) - previous["tx_errors"]) + (int(counters["rx_errors"]) - previous["rx_errors"])
+                out["errors"], out["errors_label"] = delta, f"+{delta}/{now - previous['epoch']}s"
 
+    stored = loaded.get("carrier_samples")
+    stored_generation = loaded.get("carrier_generation")
+    samples: list[list[int]] = []
+    later_clock = False
+    if (isinstance(stored, list) and all(isinstance(x, list) and len(x) == 2 and is_count(x[0]) and is_count(x[1]) for x in stored)
+            and is_generation(stored_generation)):
+        # A sample from a later clock hides the carrier changes since it: comparing
+        # with an older sample would read them as unlogged drops. Rebaseline instead.
+        later_clock = any(x[0] > now for x in stored)
+        if not later_clock:
+            samples = sorted((x for x in stored if now - DAY <= x[0] < now), key=lambda x: x[0])
+    elif carrier is not None and baseline is None:
+        unknown.append("carrier baseline unreadable" if stored is not None
+                       else "carrier baseline recorded (previous run had no carrier count)")
+    # A reboot, driver reload or re-created interface restarts the count, and
+    # unlogged drops (or boot-time carrier events that log nothing) can bring it
+    # back to or above the old value. Only a changed generation shows that.
+    generation = {"boot_id": read_boot_id(), "ifindex": ifindex}
+    reset = None
+    if later_clock:
+        reset = "carrier baseline from a later clock (clock moved backwards)"
+    elif carrier is not None and samples and stored_generation != generation:
+        reset, samples = "carrier counter generation changed (reboot, driver reload or re-created interface)", []
+    if carrier is not None:
+        out["carrier_label"] = "baseline"
+        if reset:
+            unknown.append(reset)
+        elif samples and samples[-1][1] > carrier:
+            unknown.append("carrier counter reset (reboot or driver reload)")
+        elif samples:
+            out["carrier_label"] = f"+{carrier - samples[-1][1]}/{now - samples[-1][0]}s"
+        elif isinstance(stored, list):
+            unknown.append("carrier baseline stale")
+        # Older samples at or below the current count still give lower bounds:
+        # every loss counted since the restart came after them.
+        samples = [x for x in samples if x[1] <= carrier]
+        if samples:
+            out["carrier_windows"] = [(epoch, carrier - before) for epoch, before in samples]
+        samples = (samples + [[now, carrier]])[-MAX_CARRIER_SAMPLES:]
+
+    # Nothing new to record: keep the old baseline so the next run compares over
+    # the longer interval instead of losing it.
+    if counters is None and carrier is None:
+        return out
+    current: dict[str, object] = {k: loaded[k] for k in ("epoch", "tx_errors", "rx_errors") if previous is not None and counters is None}
+    if counters is not None:
+        current.update({"epoch": now, "tx_errors": int(counters["tx_errors"]), "rx_errors": int(counters["rx_errors"])})
+    if samples:
+        current["carrier_samples"] = samples
+        current["carrier_generation"] = generation if carrier is not None else stored_generation
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
@@ -349,9 +488,8 @@ def error_delta(iface: str, now: int, state_dir: str) -> tuple[str, int | None, 
             os.unlink(tmp)
         except OSError:
             pass
-        reason = f"counter baseline not recorded ({error.strerror})"
-        return label, delta, f"{baseline}; {reason}" if baseline else reason
-    return label, delta, baseline
+        unknown.append(f"counter baseline not recorded ({error.strerror})")
+    return out
 
 
 def assess(link: dict[str, object], thresholds: dict[str, int], journal: tuple, now: int, state_dir: str) -> dict[str, object]:
@@ -379,6 +517,8 @@ def assess(link: dict[str, object], thresholds: dict[str, int], journal: tuple, 
         elif state["speed"] < min_mbps:
             degraded.append(f"speed {state['speed']}Mb/s < {min_mbps}Mb/s")
 
+    counter = counter_deltas(iface, now, state_dir)
+    windows = counter["carrier_windows"]
     events = None
     if records is None:
         unknown.append(str(journal_unknown))
@@ -387,20 +527,49 @@ def assess(link: dict[str, object], thresholds: dict[str, int], journal: tuple, 
             # Partial counts are lower bounds: they can still cross a threshold.
             unknown.append(f"kernel journal covers only {now - history_start}s of 24h")
         events = journal_events(records, now, link)
-        if events["drops_1h"] >= thresholds["DROPS_1H_FAIL"]:
-            flapping.append(f"{events['drops_1h']} drops in 1h")
-        if events["drops_24h"] >= thresholds["DROPS_24H_FAIL"]:
-            flapping.append(f"{events['drops_24h']} drops in 24h")
-        elif events["drops_24h"] >= thresholds["DROPS_24H_WARN"]:
-            degraded.append(f"{events['drops_24h']} drops in 24h")
-        if events["downshifts"] >= thresholds["DOWNSHIFTS_24H_WARN"]:
-            degraded.append(f"downshift {events['last_downshift']} x{events['downshifts']} in 24h")
+    drops_1h = events["drops_1h"] if events else None
+    drops_24h = events["drops_24h"] if events else None
 
-    errors_label, delta, errors_unknown = error_delta(iface, now, state_dir)
-    if errors_unknown:
-        unknown.append(errors_unknown)
-    if delta is not None and delta >= thresholds["ERRORS_WARN"]:
-        degraded.append(f"{delta} new tx/rx errors")
+    # The kernel counts every carrier loss itself, whether or not journald ingested
+    # (or the driver logged) a "Link is Down" line. More carrier losses since an
+    # earlier sample than logged drops since then prove the journal incomplete; the
+    # excess is a lower bound on the missing drops and can cross the thresholds on
+    # its own. Each sample within 24 h is compared, so a missed drop stays counted
+    # for the whole window and a record that reaches the journal late reconciles.
+    if windows is not None:
+        stamps = events["drop_stamps"] if events else []
+        worst = None
+        excess_1h = excess_24h = 0
+        for start, carrier_downs in windows:
+            # Whole-second stamps: a record in the sample's own second counts as
+            # logged, so the boundary can only hide a mismatch, never invent one.
+            logged = sum(1 for stamp in stamps if stamp >= start)
+            excess = carrier_downs - logged
+            if excess > excess_24h:
+                excess_24h, worst = excess, (carrier_downs, now - start, logged)
+            if now - start <= HOUR:
+                excess_1h = max(excess_1h, excess)
+        if worst is not None:
+            if events is not None:
+                unknown.append(f"carrier went down {worst[0]}x in {worst[1]}s but the kernel journal shows {worst[2]}")
+            partial_1h = partial_24h = True
+            drops_24h = (drops_24h or 0) + excess_24h
+            if excess_1h or drops_1h is not None:
+                drops_1h = (drops_1h or 0) + excess_1h
+
+    if drops_1h is not None and drops_1h >= thresholds["DROPS_1H_FAIL"]:
+        flapping.append(f"{drops_1h} drops in 1h")
+    if drops_24h is not None:
+        if drops_24h >= thresholds["DROPS_24H_FAIL"]:
+            flapping.append(f"{drops_24h} drops in 24h")
+        elif drops_24h >= thresholds["DROPS_24H_WARN"]:
+            degraded.append(f"{drops_24h} drops in 24h")
+    if events and events["downshifts"] >= thresholds["DOWNSHIFTS_24H_WARN"]:
+        degraded.append(f"downshift {events['last_downshift']} x{events['downshifts']} in 24h")
+
+    unknown.extend(counter["unknown"])
+    if counter["errors"] is not None and counter["errors"] >= thresholds["ERRORS_WARN"]:
+        degraded.append(f"{counter['errors']} new tx/rx errors")
 
     # Severity: drops or a down link fail; a slow, downshifted, or erroring link
     # warns; any missing evidence keeps the result at least WARN.
@@ -410,7 +579,7 @@ def assess(link: dict[str, object], thresholds: dict[str, int], journal: tuple, 
     def show(value: object, suffix: str = "") -> str:
         return "unknown" if value is None else f"{value}{suffix}"
 
-    counts = events or {"drops_1h": None, "drops_24h": None, "downshifts": None}
+    counts = {"drops_1h": drops_1h, "drops_24h": drops_24h, "downshifts": events["downshifts"] if events else None}
 
     def count(key: str, partial: bool) -> str:
         value = counts[key]
@@ -424,10 +593,12 @@ def assess(link: dict[str, object], thresholds: dict[str, int], journal: tuple, 
         f"drops1h{count('drops_1h', partial_1h)}",
         f"drops24h{count('drops_24h', partial_24h)}",
         f"downshifts24h{count('downshifts', partial_24h)}",
-        f"errors={errors_label}",
+        f"errors={counter['errors_label']}",
+        f"carrier-down={counter['carrier_label']}",
     ])
 
-    flapping_evidence_missing = records is None or partial_24h or state["detected"] is None
+    carrier_missing = counter["carrier_label"] in ("unknown", "baseline")
+    flapping_evidence_missing = records is None or partial_24h or carrier_missing or state["detected"] is None
     degraded_evidence_missing = bool(unknown)
     provenance = f"ethtool+journalctl-k:{iface}"
     signals = [

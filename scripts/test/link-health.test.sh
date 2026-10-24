@@ -69,6 +69,8 @@ export BROKKR_NOW_EPOCH=1792497600 BROKKR_STATE_DIR="$TMP/state"
 export MOCK_NIC_DIR="$TMP/nic" MOCK_JOURNAL_ARGS="$TMP/journal-args"
 export BROKKR_LINK_HEALTH_CONFIG="$TMP/link-health.conf"
 export BROKKR_SYSFS_NET="$TMP/sysfs"  # empty unless a test creates counters; never the host's
+export BROKKR_BOOT_ID_FILE="$TMP/boot_id"  # never the host's
+printf '00000000-0000-4000-8000-000000000001\n' > "$BROKKR_BOOT_ID_FILE"
 
 PASS=0
 FAIL=0
@@ -108,7 +110,7 @@ write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 scenario healthy
 fresh_state
 run_probe
-check "first run records a counter baseline and reports the error check unknown" '[[ "$RC" -eq 1 && "$OUT" == *"errors=baseline"* && "$OUT" == *"unknown: error baseline recorded"* && -f "$TMP/state/link-health/enp1s0.json" ]]'
+check "first run records a counter baseline and reports the error check unknown" '[[ "$RC" -eq 1 && "$OUT" == *"errors=baseline"* && "$OUT" == *"unknown: counter baseline recorded"* && -f "$TMP/state/link-health/enp1s0.json" ]]'
 check "kernel records are queried across boots over 24 h (not -k, which implies -b)" 'grep -- "--since @1792411200" "$MOCK_JOURNAL_ARGS" | grep -q "_TRANSPORT=kernel" && ! grep -- "--since" "$MOCK_JOURNAL_ARGS" | grep -q -- " -k "'
 check "journal readability is proven from the system journal" 'grep -q -- "--system -n 1" "$MOCK_JOURNAL_ARGS"'
 check "journal history before the window is probed" 'grep -q -- "--until @1792411200" "$MOCK_JOURNAL_ARGS"'
@@ -266,6 +268,138 @@ check "unverifiable kernel ingestion is unknown, never a clean zero" '[[ "$RC" -
 scenario healthy
 write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 
+# --- kernel carrier counters cross-check the journal ------------------------------
+# carrier_down_count is kept by the kernel itself, so drops that journald never
+# ingested still show up as a counter delta between runs.
+set_carrier() {
+  mkdir -p "$TMP/sysfs/enp1s0"
+  printf '%s\n' "$1" > "$TMP/sysfs/enp1s0/carrier_down_count"
+  [[ -f "$TMP/sysfs/enp1s0/ifindex" ]] || printf '2\n' > "$TMP/sysfs/enp1s0/ifindex"
+}
+scenario healthy
+fresh_state
+run_probe
+check "without carrier_down_count the cross-check is unavailable, not ok" '[[ "$OUT" == *"carrier-down=unavailable"* ]]'
+settled
+run_probe
+check "without carrier_down_count the other checks are unchanged" '[[ "$RC" -eq 0 && "$OUT" == OK:* && "$OUT" == *"errors=+0/900s"* && "$OUT" == *"drops24h=0 "* && "$OUT" == *"carrier-down=unavailable"* ]]'
+set_carrier 5
+settled
+run_probe
+check "equal carrier and journal counts pass" '[[ "$RC" -eq 0 && "$OUT" == OK:* && "$OUT" == *"carrier-down=+0/900s"* ]]'
+set_carrier 5; settled; set_carrier 6
+printf '%s\n' "1792497000.000000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down" > "$TMP/one-drop.journal"
+MOCK_JOURNAL_FILE="$TMP/one-drop.journal" run_probe
+check "a carrier drop matched by a logged drop passes" '[[ "$RC" -eq 0 && "$OUT" == *"drops24h=1 "* && "$OUT" == *"carrier-down=+1/900s"* ]]'
+set_carrier 5; settled; set_carrier 6
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "a carrier drop missing from the journal is not ok" '[[ "$RC" -eq 1 && "$OUT" == *"drops24h>=1"* && "$OUT" == *"unknown: carrier went down 1x"*"journal shows 0"* ]]'
+set_carrier 5; settled; set_carrier 6
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" python3 "$PROBE" --signals > "$TMP/carrier-signals.json"
+check "an incomplete journal leaves the flapping signal unknown" 'grep -q "\"network_link_flapping\", \"state\": \"unknown\"" "$TMP/carrier-signals.json"'
+set_carrier 5; settled; set_carrier 9
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "unlogged carrier drops within an hour cross the 1 h fail threshold" '[[ "$RC" -eq 2 && "$OUT" == FAIL:* && "$OUT" == *"drops1h>=4"* && "$OUT" == *"carrier went down 4x"* ]]'
+set_carrier 5; settled; set_carrier 9
+MOCK_JOURNAL_FILE="$TMP/one-drop.journal" run_probe
+check "the excess over logged drops is added to the journal count" '[[ "$RC" -eq 2 && "$OUT" == *"drops1h>=4"* && "$OUT" == *"drops24h>=4"* && "$OUT" == *"journal shows 1"* ]]'
+set_carrier 5; settled; set_carrier 9
+MOCK_JOURNAL_RC=1 run_probe
+check "carrier drops cross thresholds even when the journal is unreadable" '[[ "$RC" -eq 2 && "$OUT" == *"drops1h>=4"* && "$OUT" == *"unknown: journalctl failed"* ]]'
+set_carrier 5; fresh_state
+BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH - 7200)) python3 "$PROBE" > /dev/null 2>&1
+set_carrier 9
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "carrier drops over a 2 h interval count toward 24 h only" '[[ "$RC" -eq 1 && "$OUT" == *"drops1h>=0 "* && "$OUT" == *"drops24h>=4"* && "$OUT" == *"4 drops in 24h"* ]]'
+set_carrier 5; settled; set_carrier 2
+run_probe
+check "a carrier counter reset is unknown, not ok" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=baseline"* && "$OUT" == *"unknown: carrier counter reset"* ]]'
+set_carrier garbage
+run_probe
+check "an unparsable carrier counter is unknown" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=unknown"* && "$OUT" == *"unknown: carrier_down_count"* ]]'
+rm -rf "$TMP/sysfs"; settled; set_carrier 5
+run_probe
+check "a baseline without a carrier count (upgrade) is unknown, not ok" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=baseline"* && "$OUT" == *"unknown: carrier baseline recorded"* ]]'
+rm -rf "$TMP/sysfs"; settled; set_carrier 5
+python3 "$PROBE" --signals > "$TMP/carrier-signals.json"
+check "a missing carrier baseline leaves the flapping signal unknown" 'grep -q "\"network_link_flapping\", \"state\": \"unknown\"" "$TMP/carrier-signals.json"'
+settled
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["carrier_samples"]="5"; json.dump(d,open(sys.argv[1],"w"))' "$TMP/state/link-health/enp1s0.json"
+run_probe
+check "a corrupt carrier baseline is unknown, not ok" '[[ "$RC" -eq 1 && "$OUT" == *"unknown: carrier baseline unreadable"* ]]'
+settled
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["carrier_samples"][0][1]=-3; json.dump(d,open(sys.argv[1],"w"))' "$TMP/state/link-health/enp1s0.json"
+run_probe
+check "a negative carrier baseline is unknown, not a large delta" '[[ "$RC" -eq 1 && "$OUT" == *"unknown: carrier baseline unreadable"* && "$OUT" != *"drops in"* ]]'
+if [[ "$(id -u)" -ne 0 ]]; then
+  chmod 000 "$TMP/sysfs/enp1s0/carrier_down_count"
+  run_probe
+  check "an unreadable carrier counter is unknown" '[[ "$RC" -eq 1 && "$OUT" == *"unknown: carrier_down_count unreadable"* ]]'
+  chmod 600 "$TMP/sysfs/enp1s0/carrier_down_count"
+fi
+baseline_at() { BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH - $1)) python3 "$PROBE" > /dev/null 2>&1; }
+# Regression (review): the excess counted for one run only, so drops the journal
+# missed read as a clean zero 15 minutes later.
+set_carrier 5; fresh_state; baseline_at 1800; set_carrier 7
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH - 900)) run_probe
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "unlogged carrier drops stay counted on later runs within 24 h" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=+0/900s"* && "$OUT" == *"drops24h>=2"* && "$OUT" == *"2 drops in 24h"* && "$OUT" == *"carrier went down 2x in 1800s"* ]]'
+set_carrier 5; fresh_state; baseline_at 1800; set_carrier 6
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH - 900)) run_probe
+printf '%s\n' "1792496400.000000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down" > "$TMP/late.journal"
+MOCK_JOURNAL_FILE="$TMP/late.journal" run_probe
+check "a journal record that arrives late reconciles the carrier count" '[[ "$RC" -eq 0 && "$OUT" == *"drops24h=1 "* ]]'
+set_carrier 5; fresh_state; baseline_at 900; set_carrier 6
+printf '%s\n' "1792496700.000000 fixture-node kernel: r8169 0000:01:00.0 enp1s0: Link is Down" > "$TMP/same-second.journal"
+MOCK_JOURNAL_FILE="$TMP/same-second.journal" run_probe
+check "a record in the baseline's own second counts as logged" '[[ "$RC" -eq 0 && "$OUT" == *"carrier-down=+1/900s"* ]]'
+set_carrier 5; fresh_state; baseline_at 3600; set_carrier 8
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "a sample exactly an hour old counts toward the 1 h window" '[[ "$RC" -eq 2 && "$OUT" == *"3 drops in 1h"* ]]'
+set_carrier 5; fresh_state; baseline_at 3601; set_carrier 8
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "a sample just over an hour old counts toward 24 h only" '[[ "$RC" -eq 1 && "$OUT" != *"drops in 1h"* && "$OUT" == *"3 drops in 24h"* ]]'
+# A reboot restarts the count; boot-time carrier events that log nothing must not
+# read as missed drops against the previous boot's samples.
+set_carrier 1; fresh_state; baseline_at 1800; set_carrier 2
+printf '00000000-0000-4000-8000-000000000002\n' > "$BROKKR_BOOT_ID_FILE"
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH - 900)) run_probe
+check "a new boot id resets the carrier baseline instead of reporting missed drops" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=baseline"* && "$OUT" == *"unknown: carrier counter generation changed"* && "$OUT" != *"carrier went down"* ]]'
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "the run after a reboot reset compares within the new boot" '[[ "$RC" -eq 0 && "$OUT" == *"carrier-down=+0/900s"* ]]'
+printf '00000000-0000-4000-8000-000000000001\n' > "$BROKKR_BOOT_ID_FILE"
+# Regression (review): a driver reload or re-created interface restarts the count
+# without a reboot, and unlogged drops can bring it back to or above the old
+# value. A new ifindex must reset the carrier baseline, never compare as +0.
+for after in 5 7; do
+  set_carrier 5; fresh_state; baseline_at 900
+  printf '3\n' > "$TMP/sysfs/enp1s0/ifindex"; set_carrier "$after"
+  MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+  check "a re-created interface (count $after after 5) is unknown, never ok" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=baseline"* && "$OUT" == *"unknown: carrier counter generation changed"* && "$OUT" != *"carrier went down"* ]]'
+  rm -f "$TMP/sysfs/enp1s0/ifindex"
+done
+set_carrier 5; fresh_state; baseline_at 900
+printf 'garbage\n' > "$TMP/sysfs/enp1s0/ifindex"
+run_probe
+check "an unparsable ifindex leaves the carrier check unknown" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=unknown"* && "$OUT" == *"unknown: interface ifindex"* ]]'
+rm -f "$TMP/sysfs/enp1s0/ifindex"
+# Regression (review): after a clock step backwards, samples dated after now were
+# dropped silently and the count compared with an older sample, so carrier
+# changes from the excluded period read as unlogged drops (a false FAIL).
+set_carrier 5; fresh_state; baseline_at 900
+BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH + 900)) python3 "$PROBE" > /dev/null 2>&1
+set_carrier 8
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "carrier samples from a later clock are unknown and rebaselined, not compared" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=baseline"* && "$OUT" == *"unknown: carrier baseline from a later clock"* && "$OUT" != *"drops in"* && "$OUT" != *"carrier went down"* ]]'
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH + 900)) run_probe
+check "the run after a clock rebaseline compares cleanly" '[[ "$RC" -eq 0 && "$OUT" == *"carrier-down=+0/900s"* ]]'
+# Regression (review): unreadable tx/rx counters must not stop the carrier baseline.
+scenario healthy; set_carrier 5; fresh_state
+MOCK_STATS_RC=1 baseline_at 900
+MOCK_STATS_RC=1 python3 "$PROBE" --signals > "$TMP/carrier-signals.json"
+check "carrier evidence is kept when the error counters are unreadable" 'grep -q "\"network_link_flapping\", \"state\": \"ok\"" "$TMP/carrier-signals.json" && grep -q "carrier-down=+0/900s" "$TMP/carrier-signals.json"'
+rm -rf "$TMP/sysfs"
+
 # --- error-counter deltas -------------------------------------------------------
 scenario healthy
 fresh_state
@@ -287,11 +421,11 @@ check "an error delta at a configured threshold warns" '[[ "$RC" -eq 1 && "$OUT"
 write_config 'LINK=enp1s0,2500,r8169-0-100:00'
 printf '{broken' > "$TMP/state/link-health/enp1s0.json"
 BROKKR_NOW_EPOCH=1792499400 run_probe
-check "an unreadable counter baseline rebaselines as unknown instead of crashing" '[[ "$RC" -eq 1 && "$OUT" == *"errors=baseline"* && "$OUT" == *"unknown: error baseline unreadable"* ]]'
+check "an unreadable counter baseline rebaselines as unknown instead of crashing" '[[ "$RC" -eq 1 && "$OUT" == *"errors=baseline"* && "$OUT" == *"unknown: counter baseline unreadable"* ]]'
 BROKKR_NOW_EPOCH=$((1792499400 + 86401)) run_probe
-check "a baseline older than 24 h is stale, not a clean comparison" '[[ "$RC" -eq 1 && "$OUT" == *"unknown: error baseline stale"* ]]'
+check "a baseline older than 24 h is stale, not a clean comparison" '[[ "$RC" -eq 1 && "$OUT" == *"unknown: counter baseline stale"* ]]'
 BROKKR_NOW_EPOCH=1792499400 run_probe
-check "a clock step backwards is stale, not a clean comparison" '[[ "$RC" -eq 1 && "$OUT" == *"unknown: error baseline stale"* ]]'
+check "a clock step backwards is stale, not a clean comparison" '[[ "$RC" -eq 1 && "$OUT" == *"unknown: counter baseline stale"* ]]'
 BROKKR_NOW_EPOCH=1792500300 run_probe
 check "the run after a rebaseline compares cleanly again" '[[ "$RC" -eq 0 && "$OUT" == *"errors=+0/900s"* ]]'
 
