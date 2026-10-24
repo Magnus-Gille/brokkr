@@ -430,9 +430,14 @@ def counter_deltas(iface: str, now: int, state_dir: str) -> dict[str, object]:
     stored = loaded.get("carrier_samples")
     stored_generation = loaded.get("carrier_generation")
     samples: list[list[int]] = []
+    later_clock = False
     if (isinstance(stored, list) and all(isinstance(x, list) and len(x) == 2 and is_count(x[0]) and is_count(x[1]) for x in stored)
             and is_generation(stored_generation)):
-        samples = sorted((x for x in stored if now - DAY <= x[0] < now), key=lambda x: x[0])
+        # A sample from a later clock hides the carrier changes since it: comparing
+        # with an older sample would read them as unlogged drops. Rebaseline instead.
+        later_clock = any(x[0] > now for x in stored)
+        if not later_clock:
+            samples = sorted((x for x in stored if now - DAY <= x[0] < now), key=lambda x: x[0])
     elif carrier is not None and baseline is None:
         unknown.append("carrier baseline unreadable" if stored is not None
                        else "carrier baseline recorded (previous run had no carrier count)")
@@ -441,7 +446,9 @@ def counter_deltas(iface: str, now: int, state_dir: str) -> dict[str, object]:
     # back to or above the old value. Only a changed generation shows that.
     generation = {"boot_id": read_boot_id(), "ifindex": ifindex}
     reset = None
-    if carrier is not None and samples and stored_generation != generation:
+    if later_clock:
+        reset = "carrier baseline from a later clock (clock moved backwards)"
+    elif carrier is not None and samples and stored_generation != generation:
         reset, samples = "carrier counter generation changed (reboot, driver reload or re-created interface)", []
     if carrier is not None:
         out["carrier_label"] = "baseline"

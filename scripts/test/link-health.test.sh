@@ -383,6 +383,16 @@ printf 'garbage\n' > "$TMP/sysfs/enp1s0/ifindex"
 run_probe
 check "an unparsable ifindex leaves the carrier check unknown" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=unknown"* && "$OUT" == *"unknown: interface ifindex"* ]]'
 rm -f "$TMP/sysfs/enp1s0/ifindex"
+# Regression (review): after a clock step backwards, samples dated after now were
+# dropped silently and the count compared with an older sample, so carrier
+# changes from the excluded period read as unlogged drops (a false FAIL).
+set_carrier 5; fresh_state; baseline_at 900
+BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH + 900)) python3 "$PROBE" > /dev/null 2>&1
+set_carrier 8
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" run_probe
+check "carrier samples from a later clock are unknown and rebaselined, not compared" '[[ "$RC" -eq 1 && "$OUT" == *"carrier-down=baseline"* && "$OUT" == *"unknown: carrier baseline from a later clock"* && "$OUT" != *"drops in"* && "$OUT" != *"carrier went down"* ]]'
+MOCK_QUIET_KERNEL=1 MOCK_JOURNAL_FILE="$TMP/empty.journal" BROKKR_NOW_EPOCH=$((BROKKR_NOW_EPOCH + 900)) run_probe
+check "the run after a clock rebaseline compares cleanly" '[[ "$RC" -eq 0 && "$OUT" == *"carrier-down=+0/900s"* ]]'
 # Regression (review): unreadable tx/rx counters must not stop the carrier baseline.
 scenario healthy; set_carrier 5; fresh_state
 MOCK_STATS_RC=1 baseline_at 900
