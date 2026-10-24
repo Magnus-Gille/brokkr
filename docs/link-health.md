@@ -27,12 +27,14 @@ settled at a lower speed there are no further drops to count. The detail line
 includes the link partner's highest advertised speed, which shows whether the
 other end has stopped offering the expected rate.
 
-The journal is only trusted after a current-boot kernel record has been read,
+The journal is only trusted after a system-journal record has been read,
 so a reader without journal access cannot mistake an empty result for zero
 drops. The 24 h query matches `_TRANSPORT=kernel` rather than using
 `journalctl -k`, which implies `-b` and would hide drops from before a reboot
-inside the window. When no kernel record exists from before the window (a
-volatile or vacuumed journal after a reboot), the counts are lower bounds,
+inside the window. Coverage is proven by any system-journal record from
+before the window, not only a kernel one: a healthy kernel can stay silent for
+days. When no such record exists (a volatile or vacuumed journal after a
+reboot), the counts are lower bounds,
 shown as `drops24h>=N`. Unless they already cross a threshold, the result is
 `unknown: kernel journal covers only …`, never a clean zero. Records stamped
 after the observation time (a clock correction) are ignored. A boot or resume

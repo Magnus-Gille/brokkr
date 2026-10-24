@@ -153,14 +153,16 @@ def parse_records(output: str) -> list[tuple[int, str]] | None:
 def read_journal(now: int) -> tuple[list[tuple[int, str]] | None, str | None, int | None]:
     """Return (records from the last 24 h, unknown reason, history start).
 
-    History start is None when kernel records exist from before the window, so
-    the counts are complete; otherwise it is the earliest record seen, and any
-    count over a window that starts earlier is only a lower bound.
+    History start is None when the system journal reaches back before the
+    window, so the counts are complete; otherwise it is the earliest kernel
+    record seen, and any count over a window that starts earlier is only a
+    lower bound.
     """
     base = ["journalctl", "-q", "--no-pager", "-o", "short-unix"]
-    # An unprivileged reader sees an empty kernel journal with exit 0. Require a
-    # current-boot kernel record first so "no records" cannot mean "no access".
-    proof = run(base + ["-k", "-b", "-n", "1"])
+    # An unprivileged reader sees an empty system journal with exit 0. Require a
+    # system-journal record first so "no records" cannot mean "no access". Any
+    # transport counts: a healthy kernel can stay silent for days.
+    proof = run(base + ["--system", "-n", "1"])
     if proof is None or proof.returncode != 0:
         return None, "journalctl failed", None
     if any(hint in proof.stderr for hint in JOURNAL_ACCESS_HINTS) or not proof.stdout.strip():
@@ -175,8 +177,10 @@ def read_journal(now: int) -> tuple[list[tuple[int, str]] | None, str | None, in
     if records is None:
         return None, "unparsable journal record", None
     # A volatile or vacuumed journal can begin inside the window (for example after
-    # a reboot). Only a kernel record from before the window proves full coverage.
-    before = run(base + ["--until", f"@{now - DAY}", "-n", "1", "_TRANSPORT=kernel"])
+    # a reboot). Any system-journal record from before the window proves the kernel
+    # records in it are complete; requiring a *kernel* record there made quiet,
+    # healthy hosts report partial coverage forever.
+    before = run(base + ["--system", "--until", f"@{now - DAY}", "-n", "1"])
     if before is None or before.returncode != 0:
         return None, "journalctl failed", None
     earlier = parse_records(before.stdout)
