@@ -21,7 +21,13 @@ fi
 TMP="$(fixture_cleanup_alloc)" || { echo "not ok - cannot allocate a test fixture" >&2; exit 1; }
 [ -n "$TMP" ] && [ -d "$TMP" ] || { echo "not ok - fixture allocation returned no directory" >&2; exit 1; }
 # fixture_cleanup_on_exit reads the test status from $?, so restore it after the chmod.
-trap 'status=$?; chmod -R u+w "$TMP" 2>/dev/null; (exit "$status"); fixture_cleanup_on_exit "$TMP"' EXIT
+on_exit() {
+  local status=$?
+  chmod -R u+w "$TMP" 2>/dev/null
+  (exit "$status")
+  fixture_cleanup_on_exit "$TMP"
+}
+trap on_exit EXIT
 for name in $(compgen -e | grep '^RCLONE_' || true); do unset "$name"; done
 export HOME="$TMP/home" RCLONE_CONFIG="$TMP/rclone.conf" BROKKR_STATE_DIR="$TMP/state"
 export ARCHIVE_RCLONE="$R" ARCHIVE_LOG="$TMP/log" ARCHIVE_NODE=node-a
