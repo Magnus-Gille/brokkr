@@ -7,6 +7,7 @@ lives — run under **launchd** instead. This dir holds those, version-controlle
 | Agent | What it does | Schedule |
 |-------|--------------|----------|
 | `io.grimnir.brokkr.offsite-photos.plist` | Encrypted offsite backup of the Photos originals to the cloud crypt remote (`scripts/offsite-photos-backup.sh`). See `../docs/offsite-photos-backup.md`. | Daily 04:15 local |
+| `io.grimnir.brokkr.agent-cli-update.plist` | Keeps the claude, codex, pi and opencode CLIs at their latest release, each through its own install method (`scripts/agent-cli-update.sh`). Installed with `install-agent-cli-update.sh`. See `../docs/agent-cli-update.md`. | 04:17, 10:17, 16:17, 22:17 local |
 
 ## Why LaunchAgent, not LaunchDaemon
 
@@ -31,6 +32,11 @@ machine-specific absolute paths). `install.sh` renders them and manages the agen
 deprecated `load -w`), and `bootout`s before re-`bootstrap`ing so a re-run always picks up
 plist edits.
 
+The agent CLI updater has its own installer with the same commands
+(`./launchd/install-agent-cli-update.sh [install|run|status|uninstall]`; or
+`make agent-cli-update-install`). `run` starts an update without `-k`, so an update that is
+already running is not killed halfway through an install.
+
 ## Notes
 
 - **`RunAtLoad` is false** — installing/reloading the agent must not start a large upload on
@@ -42,3 +48,9 @@ plist edits.
   captured stdout/stderr is `~/Library/Logs/brokkr/offsite-photos.launchd.log`.
 - Secrets (the Heimdall token) are **not** in the plist — the script sources them from
   `~/.config/brokkr/offsite-photos.env` if present. See the doc's setup step 5.
+- The agent-cli-update agent has **no secrets** and `RunAtLoad` false. Its PATH puts the per-user
+  install locations (`~/.local/bin`, `~/.opencode/bin`) before Homebrew, and its log is
+  `~/Library/Logs/brokkr/agent-cli-update.launchd.log`; the machine-readable result is
+  `~/.local/state/brokkr/agent-cli-update.json`.
+- Both agents run from this repo checkout (`__BROKKR_DIR__`), so a moved checkout or one left
+  on an unfinished branch changes what the agent runs; re-run the installer after moving it.
