@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -f "$APT_DIR/20auto-upgrades" && -f "$APT_DIR/50unattended-upgrades" ]] || {
+[[ -f "$APT_DIR/20auto-upgrades" && -f "$APT_DIR/50unattended-upgrades" && -f "$APT_DIR/51brokkr-claude-code" ]] || {
   echo -e "${RED}Missing apt config under $APT_DIR${NC}" >&2; exit 1; }
 
 # ─── Derive unique deploy hosts from services.json ───────────────────────────
@@ -91,7 +91,7 @@ for host in "${HOSTS[@]}"; do
 
   if $DRY_RUN; then
     echo "  would: apt-get install -y unattended-upgrades"
-    echo "  would: push 20auto-upgrades + 50unattended-upgrades to /etc/apt/apt.conf.d/"
+    echo "  would: push 20auto-upgrades + 50unattended-upgrades + 51brokkr-claude-code to /etc/apt/apt.conf.d/"
     echo "  would: enable apt-daily.timer apt-daily-upgrade.timer; validate with --dry-run"
     results+=("${YELLOW}?${NC} $host (dry-run)")
     continue
@@ -114,7 +114,8 @@ for host in "${HOSTS[@]}"; do
   # 2. Push the version-controlled config (cat → sudo tee, NOPASSWD).
   echo "  syncing apt config…"
   if ! ssh "$remote" "sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null" < "$APT_DIR/20auto-upgrades" \
-     || ! ssh "$remote" "sudo tee /etc/apt/apt.conf.d/50unattended-upgrades >/dev/null" < "$APT_DIR/50unattended-upgrades"; then
+     || ! ssh "$remote" "sudo tee /etc/apt/apt.conf.d/50unattended-upgrades >/dev/null" < "$APT_DIR/50unattended-upgrades" \
+     || ! ssh "$remote" "sudo tee /etc/apt/apt.conf.d/51brokkr-claude-code >/dev/null" < "$APT_DIR/51brokkr-claude-code"; then
     echo -e "  ${RED}failed to write apt config${NC}"
     results+=("${RED}✗${NC} $host (config push)")
     fail_count=$((fail_count + 1))

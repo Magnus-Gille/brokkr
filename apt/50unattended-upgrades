@@ -10,15 +10,9 @@
 //   * NO automatic reboot. A kernel/libc patch that needs a reboot is
 //     surfaced by grimnir-maintenance-os (reboot-required → Munin + Telegram);
 //     The operator schedules reboots when convenient.
-//   * ONE non-Debian origin: the Claude Code apt repository, so an apt-installed
-//     claude-code package stays current (see below and docs/agent-cli-update.md).
 
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
-        // The Claude Code apt repository publishes Release Origin/Label "Anthropic"
-        // and codename "stable". This lets unattended-upgrades keep an apt-installed
-        // claude-code current; scripts/agent-cli-update.sh leaves apt-owned installs alone.
-        "origin=Anthropic,label=Anthropic,codename=stable";
 };
 
 // No packages held back.
