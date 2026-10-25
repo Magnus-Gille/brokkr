@@ -197,10 +197,25 @@ whatever is newest, on its own schedule, with no regard for release age. A host
 that relies on the cooldown must therefore pin or disable those updaters so
 that this script is the only thing that moves a version. Set, per tool:
 
-- claude: `TODO(conductor): exact key`
-- codex: `TODO(conductor): exact key`
-- pi: `TODO(conductor): exact key`
-- opencode: `TODO(conductor): exact key`
+- **claude (native installer):** set `"autoUpdatesChannel": "stable"` in
+  `~/.claude/settings.json`. The background updater stays on, but the stable
+  channel serves a version that is typically about a week old and skips
+  releases with major regressions, which already exceeds the cooldown; this
+  script installs the same `stable` dist-tag. An apt-installed claude follows
+  the repository's channel (`…/claude-code/apt/stable`) instead and is updated
+  by unattended-upgrades (see `../apt/README.md`), not by this script.
+- **codex (standalone):** the app-server daemon runs its own updater loop that
+  installs the latest release every hour. Disable it with
+  `{"updater": {"autoUpdateEnabled": false}}` in
+  `~/.codex/app-server-daemon/settings.json` (merge with existing keys); the
+  loop re-reads the file and exits, no restart needed. The CLI's
+  `check_for_update_on_startup` only shows a notice and can stay on. A Homebrew
+  codex is only upgraded by `brew upgrade`.
+- **pi:** has no background updater; `pi update self` is manual only.
+- **opencode:** 2.x defaults to `autoupdate: "notify"` (a notice, never an
+  install). The legacy 1.x line installs updates itself by default and can jump
+  to 2.x, so set `"autoupdate": false` in `~/.config/opencode/opencode.json(c)`
+  on hosts that must stay on 1.x.
 
 ## Busy guard
 
@@ -340,10 +355,12 @@ example `npm install -g --prefix <prefix> <package>@<version>`. On the Mac,
 - **No Heimdall panel yet.** Results live in the state file, the journal and
   the launchd log; nothing reports a stale or failed updater to the dashboard.
 - **apt-managed `claude` is not updated here.** It is reported `external`. The
-  Claude Code apt repository is allowed in
-  [`apt/50unattended-upgrades`](../apt/50unattended-upgrades), so
+  Claude Code apt repository is allowed by the drop-in
+  [`apt/51brokkr-claude-code`](../apt/51brokkr-claude-code), so
   unattended-upgrades keeps an apt-installed `claude-code` current on hosts
-  that have that repository configured.
+  that have that repository configured. `make patching` installs it on the Pi
+  hosts; on another Debian/Ubuntu host copy it to `/etc/apt/apt.conf.d/` and
+  confirm with `sudo unattended-upgrade --dry-run -d | grep 'Allowed origins'`.
 - **The cooldown is a delay, not a scan.** It trusts the publish time that the
   npm registry or GitHub reports and does nothing about a release that is bad
   from the start and stays up; it buys time for upstream to notice and pull one.

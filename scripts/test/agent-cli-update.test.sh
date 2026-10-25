@@ -243,9 +243,11 @@ npm_meta() {
 }
 # latest PACKAGE VERSION : a long-published release, so the default cooldown never gates it.
 latest() { npm_meta "$1" "latest=$2" "$2=1000"; }
-# gh_releases OWNER/REPO TAG=AGE[:draft|:pre]... : the releases list the GitHub API returns.
+# gh_releases OWNER/REPO TAG=AGE[:draft|:pre]... : what the GitHub API returns for the repo — the
+# short releases list, each release by tag, and releases/latest (the youngest non-draft,
+# non-prerelease release, as GitHub defines it).
 gh_releases() {
-  local repo=$1 out='' sep='' pair tag rest flag draft pre
+  local repo=$1 out='' sep='' pair tag rest flag draft pre obj latest='' latest_age='' age_s
   shift
   for pair; do
     tag=${pair%%=*}; rest=${pair#*=}; flag=
@@ -253,10 +255,17 @@ gh_releases() {
     draft=false; pre=false
     if [[ "$flag" == draft ]]; then draft=true; fi
     if [[ "$flag" == pre ]]; then pre=true; fi
-    out="$out$sep{\"tag_name\": \"$tag\", \"published_at\": \"$(age_ts "$rest")\", \"draft\": $draft, \"prerelease\": $pre}"
+    obj="{\"tag_name\": \"$tag\", \"published_at\": \"$(age_ts "$rest")\", \"draft\": $draft, \"prerelease\": $pre}"
+    printf '%s\n' "$obj" | web_put "$GH_API/repos/$repo/releases/tags/$tag"
+    case $rest in *s) age_s=${rest%s} ;; *) age_s=$((rest * 3600)) ;; esac
+    if [[ "$draft" == false && "$pre" == false ]] && { [[ -z "$latest_age" ]] || [[ "$age_s" -lt "$latest_age" ]]; }; then
+      latest=$obj; latest_age=$age_s
+    fi
+    out="$out$sep$obj"
     sep=", "
   done
-  printf '[%s]\n' "$out" | web_put "$GH_API/repos/$repo/releases?per_page=50"
+  printf '[%s]\n' "$out" | web_put "$GH_API/repos/$repo/releases?per_page=10"
+  if [[ -n "$latest" ]]; then printf '%s\n' "$latest" | web_put "$GH_API/repos/$repo/releases/latest"; fi
 }
 curl_calls() { grep -c '^curl ' "$CALLS" || true; }
 mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
@@ -863,7 +872,7 @@ standalone_codex 0.5.0 0.6.0
 codex_release 0.6.0
 run
 check "codex standalone: runs codex update and verifies the version it gated" '[[ "$RC" -eq 0 && "$OUT" == *"codex codex-standalone 0.5.0 -> 0.6.0 updated"* ]] && grep -Fxq "codex update" "$CALLS" && no_stdin_leak'
-check "codex standalone: reads the openai/codex release list" 'grep -Fxq "curl -fsSL --proto =https --max-time 60 $GH_API/repos/openai/codex/releases?per_page=50" "$CALLS"'
+check "codex standalone: reads only releases/latest, not the whole release list" 'grep -Fxq "curl -fsSL --proto =https --max-time 60 $GH_API/repos/openai/codex/releases/latest" "$CALLS"'
 
 reset
 standalone_codex 0.5.0 0.6.0
@@ -885,9 +894,21 @@ check "codex standalone: the target is the newest PUBLISHED release, which is wh
 
 reset
 standalone_codex 0.5.0 0.6.0
-gh_releases openai/codex "rust-v0.6.0=100" "rust-v0.7.0=1:pre" "rust-v0.7.1=1:draft" "rust-v0.8.0-alpha.1=1" "v0.9.0=1" "rust-v0.5.0=900"
+gh_releases openai/codex "rust-v0.6.0=100" "rust-v0.7.0=1:pre" "rust-v0.7.1=1:draft" "rust-v0.5.0=900"
 run
-check "codex standalone: prereleases, drafts, suffixed versions and other tags never become the target" '[[ "$OUT" == *"codex codex-standalone 0.5.0 -> 0.6.0 updated"* ]]'
+check "codex standalone: prereleases and drafts never become the target" '[[ "$OUT" == *"codex codex-standalone 0.5.0 -> 0.6.0 updated"* ]]'
+
+reset
+standalone_codex 0.5.0 0.8.0
+gh_releases openai/codex "rust-v0.6.0=100" "rust-v0.8.0-alpha.1=60"
+run
+check "codex standalone: a latest release with a suffixed version is held, never installed" '[[ "$RC" -eq 0 && "$OUT" == *"codex codex-standalone"*held* ]] && no_mutation'
+
+reset
+standalone_codex 0.5.0 0.9.0
+gh_releases openai/codex "rust-v0.6.0=100" "v0.9.0=60"
+run
+check "codex standalone: a latest release outside the rust-v tag scheme is held" '[[ "$RC" -eq 0 && "$OUT" == *"codex codex-standalone"*held* ]] && no_mutation'
 
 reset
 standalone_codex 0.5.0 0.7.0
@@ -907,6 +928,23 @@ only_path
 run
 check "codex standalone: with neither python3 nor node the tool is held" '[[ "$RC" -eq 0 && "$OUT" == *"codex codex-standalone"*held*"cannot evaluate release age"* ]] && no_mutation'
 unset PATH_ONLY
+
+# A python3 that exists but cannot run (the macOS stub without Command Line Tools) must not hold
+# every tool when node can read the metadata instead.
+REAL_NODE="$(command -v node 2>/dev/null || true)"
+if [[ -z "$REAL_NODE" ]]; then
+  skip "python3 that fails falls back to node (no real node available)"
+else
+  reset
+  standalone_codex 0.5.0 0.6.0
+  codex_release 0.6.0
+  mkdir -p "$TMP/py-broken"
+  printf '#!/bin/sh\necho "xcode-select: no developer tools" >&2\nexit 1\n' >"$TMP/py-broken/python3"
+  chmod 755 "$TMP/py-broken/python3"
+  ln -sf "$REAL_NODE" "$TMP/py-broken/node"
+  PATH_PRE="$TMP/py-broken" run
+  check "a python3 that fails falls back to node for the release metadata" '[[ "$RC" -eq 0 && "$OUT" == *"codex codex-standalone 0.5.0 -> 0.6.0 updated"* ]]'
+fi
 
 reset
 standalone_codex 0.5.0 0.6.0
@@ -980,7 +1018,7 @@ brew_cask codex 0.5.0 0.6.0
 brew_info cask codex 0.6.0
 codex_release 0.6.0
 run
-check "brew cask codex: the Homebrew version is age-checked against its GitHub release, then brew upgrade --cask" '[[ "$RC" -eq 0 && "$OUT" == *"codex brew 0.5.0 -> 0.6.0 updated"* ]] && grep -Fxq "brew info --json=v2 --cask codex" "$CALLS" && grep -Fxq "brew upgrade --cask codex" "$CALLS" && grep -Fq "$GH_API/repos/openai/codex/releases?per_page=50" "$CALLS" && no_stdin_leak'
+check "brew cask codex: the Homebrew version is age-checked against its GitHub release, then brew upgrade --cask" '[[ "$RC" -eq 0 && "$OUT" == *"codex brew 0.5.0 -> 0.6.0 updated"* ]] && grep -Fxq "brew info --json=v2 --cask codex" "$CALLS" && grep -Fxq "brew upgrade --cask codex" "$CALLS" && grep -Fq "$GH_API/repos/openai/codex/releases/tags/rust-v0.6.0" "$CALLS" && no_stdin_leak'
 
 reset
 brew_cask codex 0.5.0 0.6.0
@@ -1066,7 +1104,7 @@ pi_release 0.3.0
 run --tool pi
 check "pi-release update: installs the aged release and reports method, before and after" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.2.0 -> 0.3.0 updated"* ]]'
 check "pi-release update: the symlink now points at the new version and the old directory is kept" 'pi_target_is 0.3.0 && [[ -x "$PIROOT/0.3.0/pi/pi" && -x "$PIROOT/0.2.0/pi/pi" ]] && [[ "$(pi_dirs)" == "0.2.0 0.3.0 " ]]'
-check "pi-release update: the release list, archive and checksums are fetched over https with the bounded curl" 'grep -Fxq "curl -fsSL --proto =https --max-time 60 $GH_API/repos/earendil-works/pi/releases?per_page=50" "$CALLS" && grep -Eq "^curl -fsSL --proto =https --max-time 600 -o $PIROOT/\.stage\.[A-Za-z0-9]+/pi-linux-x64\.tar\.gz $GH_DL/earendil-works/pi/releases/download/v0\.3\.0/pi-linux-x64\.tar\.gz\$" "$CALLS" && grep -Eq "^curl -fsSL --proto =https --max-time 600 -o $PIROOT/\.stage\.[A-Za-z0-9]+/SHA256SUMS $GH_DL/earendil-works/pi/releases/download/v0\.3\.0/SHA256SUMS\$" "$CALLS"'
+check "pi-release update: the release list, archive and checksums are fetched over https with the bounded curl" 'grep -Fxq "curl -fsSL --proto =https --max-time 60 $GH_API/repos/earendil-works/pi/releases?per_page=10" "$CALLS" && grep -Eq "^curl -fsSL --proto =https --max-time 600 -o $PIROOT/\.stage\.[A-Za-z0-9]+/pi-linux-x64\.tar\.gz $GH_DL/earendil-works/pi/releases/download/v0\.3\.0/pi-linux-x64\.tar\.gz\$" "$CALLS" && grep -Eq "^curl -fsSL --proto =https --max-time 600 -o $PIROOT/\.stage\.[A-Za-z0-9]+/SHA256SUMS $GH_DL/earendil-works/pi/releases/download/v0\.3\.0/SHA256SUMS\$" "$CALLS"'
 check "pi-release update: downloads land in a private stage directory that is cleaned up" '[[ "$(grep "^outdir-mode" "$CALLS" | sort -u)" == "outdir-mode drwx------" ]] && ! stage_left'
 check "pi-release update: the extracted files keep the archive modes" '[[ "$(mode_of "$PIROOT/0.3.0/pi/pi")" == 755 && "$(mode_of "$PIROOT/0.3.0/pi/README.txt")" == 644 ]]'
 check "pi-release update: the stage held only the archive contents, not the downloads" '[[ "$(ls -A "$PIROOT/0.3.0")" == pi ]]'
@@ -1401,7 +1439,7 @@ npm_tool pi @earendil-works/pi-coding-agent 0.1.0
 gh_releases earendil-works/pi "v0.4.0=5" "v0.3.0=100"
 pi_release 0.3.0; pi_release 0.4.0
 run --dry-run --adopt pi
-check "--dry-run --adopt pi: reports the plan, reads only the release list, downloads no tarball and creates nothing" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.1.0 -> 0.3.0 would-update"*"would install pi 0.3.0"* ]] && no_tarball && [[ ! -e "$HOME_DIR/.local/bin" && ! -e "$HOME_DIR/.local/lib" && ! -e "$STATE" ]] && grep -Fq "$GH_API/repos/earendil-works/pi/releases?per_page=50" "$CALLS"'
+check "--dry-run --adopt pi: reports the plan, reads only the release list, downloads no tarball and creates nothing" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.1.0 -> 0.3.0 would-update"*"would install pi 0.3.0"* ]] && no_tarball && [[ ! -e "$HOME_DIR/.local/bin" && ! -e "$HOME_DIR/.local/lib" && ! -e "$STATE" ]] && grep -Fq "$GH_API/repos/earendil-works/pi/releases?per_page=10" "$CALLS"'
 
 reset
 gh_releases earendil-works/pi "v0.3.0=100"

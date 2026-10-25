@@ -369,7 +369,8 @@ if kind == "npm":
         if good(k) and good(v):
             print("t", k, v)
 elif kind == "github":
-    for r in data:
+    # A releases list, or one release object (releases/latest, releases/tags/<tag>).
+    for r in (data if isinstance(data, list) else [data]):
         e = epoch(r["published_at"])
         if r["draft"] is False and r["prerelease"] is False and good(r["tag_name"]) and e is not None:
             print("v", r["tag_name"], e)
@@ -405,7 +406,7 @@ if (kind === "npm") {
     if (good(k) && good(data["dist-tags"][k])) out.push("t " + k + " " + data["dist-tags"][k]);
   }
 } else if (kind === "github") {
-  for (const r of data) {
+  for (const r of (Array.isArray(data) ? data : [data])) {
     const e = epoch(r.published_at);
     if (r.draft === false && r.prerelease === false && good(r.tag_name) && e !== null) out.push("v " + r.tag_name + " " + e);
   }
@@ -418,12 +419,17 @@ if (kind === "npm") {
 if (out.length > 0) process.stdout.write(out.join("\n") + "\n");
 '
 have_json_reader() { command -v python3 >/dev/null 2>&1 || command -v node >/dev/null 2>&1; }
+# node is tried when python3 is missing or fails (the macOS python3 stub without Command Line Tools
+# exits non-zero); the output is buffered so a reader that fails half-way contributes nothing.
 json_reader() { # kind ; metadata on stdin
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -I -c "$JSON_PY" "$1"
-  else
-    node -e "$JSON_JS" "$1"
+  local doc out
+  doc=$(cat)
+  if command -v python3 >/dev/null 2>&1 && out=$(printf '%s' "$doc" | python3 -I -c "$JSON_PY" "$1"); then
+    printf '%s\n' "$out"; return 0
   fi
+  command -v node >/dev/null 2>&1 || return 1
+  out=$(printf '%s' "$doc" | node -e "$JSON_JS" "$1") || return 1
+  printf '%s\n' "$out"
 }
 
 # Release data read by load_releases: versions with their publish time, and npm dist-tags.
@@ -731,7 +737,9 @@ update_brew() { # tool
   fi
   if [ -n "$T_BEFORE" ] && ! ver_gt "$target" "$T_BEFORE"; then T_ACTION=current; T_AFTER=$T_BEFORE; return 0; fi
   if [ "$MIN_AGE_HOURS" -gt 0 ]; then
-    if ! load_releases github "$GITHUB_API/repos/openai/codex/releases?per_page=50" rust-v; then hold_unknown "$LOAD_ERR"; return 0; fi
+    # Only the release Homebrew offers: openai/codex publishes many large prereleases, so the full
+    # list is tens of megabytes.
+    if ! load_releases github "$GITHUB_API/repos/openai/codex/releases/tags/rust-v$target" rust-v; then hold_unknown "$LOAD_ERR"; return 0; fi
     tepoch=$(epoch_of "$target") || tepoch=
   fi
   gate_target "$target" "$tepoch" "$T_BEFORE" || return 0
@@ -755,10 +763,12 @@ update_native() { # tool
 }
 
 # codex update cannot be pinned, so it runs only when the newest published release has cleared the
-# cooldown, and the version it leaves behind must be that release.
+# cooldown, and the version it leaves behind must be that release. GitHub's releases/latest is
+# exactly that release (newest non-draft, non-prerelease) and avoids the multi-megabyte full list;
+# a latest release whose tag is not a plain rust-v version is held.
 update_codex_standalone() { # tool
   local target tepoch
-  if ! load_releases github "$GITHUB_API/repos/openai/codex/releases?per_page=50" rust-v; then hold_unknown "$LOAD_ERR"; return 0; fi
+  if ! load_releases github "$GITHUB_API/repos/openai/codex/releases/latest" rust-v; then hold_unknown "$LOAD_ERR"; return 0; fi
   if ! pick_newest_published; then hold_unknown "no stable release found"; return 0; fi
   target=$PICK_VER; tepoch=$PICK_EPOCH
   gate_target "$target" "$tepoch" "$T_BEFORE" || return 0
@@ -989,7 +999,7 @@ update_pi_release() {
   if ! pi_link_in_tree; then
     fail "pi runs from the pi-release tree but $(safe_text "$PI_LINK") is not the symlink to it"; return 0
   fi
-  if ! load_releases github "$GITHUB_API/repos/earendil-works/pi/releases?per_page=50" v; then hold_unknown "$LOAD_ERR"; return 0; fi
+  if ! load_releases github "$GITHUB_API/repos/earendil-works/pi/releases?per_page=10" v; then hold_unknown "$LOAD_ERR"; return 0; fi
   pick_highest "$installed"
   case "$PICK" in
     none) T_ACTION=current; T_AFTER=$T_BEFORE; return 0 ;;
@@ -1024,7 +1034,7 @@ adopt_pi() {
     fail "$(safe_text "$PI_LINK") is not a symlink into the pi-release tree; remove the existing pi install first (e.g. npm uninstall -g --prefix $ptxt @earendil-works/pi-coding-agent)"
     return 0
   fi
-  if ! load_releases github "$GITHUB_API/repos/earendil-works/pi/releases?per_page=50" v; then hold_unknown "$LOAD_ERR"; return 0; fi
+  if ! load_releases github "$GITHUB_API/repos/earendil-works/pi/releases?per_page=10" v; then hold_unknown "$LOAD_ERR"; return 0; fi
   pick_highest "$installed"
   case "$PICK" in
     none)
