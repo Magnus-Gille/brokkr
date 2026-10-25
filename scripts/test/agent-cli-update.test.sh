@@ -11,7 +11,15 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=scripts/test/lib/fixture-cleanup.sh
 source "$HERE/lib/fixture-cleanup.sh"
 TMP="$(fixture_cleanup_alloc)"
-trap 'chmod -R u+rwX "$TMP" 2>/dev/null; fixture_cleanup_on_exit "$TMP"' EXIT
+# fixture_cleanup_on_exit reads the test status from $?, so restore it after the chmod that
+# makes the read-only fixtures removable.
+cleanup_fixture() {
+  local test_rc=$?
+  chmod -R u+rwX "$TMP" 2>/dev/null
+  (exit "$test_rc")
+  fixture_cleanup_on_exit "$TMP"
+}
+trap cleanup_fixture EXIT
 # Tool paths are compared after symlink resolution (macOS /var is a symlink).
 TMP="$(cd "$TMP" && pwd -P)"
 
@@ -351,14 +359,24 @@ check "a failed run records result failed in the state file" 'state_has "\"resul
 reset
 npm_tool claude @anthropic-ai/claude-code 1.0.0
 latest @anthropic-ai/claude-code 1.1.0
-mv "$BIN/npm" "$BIN/npm.off"
-run
-check "npm missing from PATH: failed without crashing" '[[ "$RC" -eq 1 && "$OUT" == *"claude npm"*"failed npm not found"* ]] && no_mutation'
-mv "$BIN/npm.off" "$BIN/npm"
-mv "$BIN/node" "$BIN/node.off"
-run
-check "node missing from PATH: failed without crashing" '[[ "$RC" -eq 1 && "$OUT" == *"claude npm"*"failed node not found"* ]] && no_mutation'
-mv "$BIN/node.off" "$BIN/node"
+# A real npm/node in /usr/bin:/bin (common on Linux) would be found instead of the missing
+# stub, and the run would reach the real registry; skip rather than leave the sandbox.
+if PATH=/usr/bin:/bin command -v npm >/dev/null 2>&1; then
+  skip "npm missing from PATH (a real npm exists in /usr/bin:/bin)"
+else
+  mv "$BIN/npm" "$BIN/npm.off"
+  run
+  check "npm missing from PATH: failed without crashing" '[[ "$RC" -eq 1 && "$OUT" == *"claude npm"*"failed npm not found"* ]] && no_mutation'
+  mv "$BIN/npm.off" "$BIN/npm"
+fi
+if PATH=/usr/bin:/bin command -v node >/dev/null 2>&1; then
+  skip "node missing from PATH (a real node exists in /usr/bin:/bin)"
+else
+  mv "$BIN/node" "$BIN/node.off"
+  run
+  check "node missing from PATH: failed without crashing" '[[ "$RC" -eq 1 && "$OUT" == *"claude npm"*"failed node not found"* ]] && no_mutation'
+  mv "$BIN/node.off" "$BIN/node"
+fi
 
 # --- npm: smoke check and rollback --------------------------------------------------------------
 reset
@@ -434,6 +452,15 @@ reset
 brew_formula opencode 1.0.0 1.0.0
 run
 check "brew formula: runs brew upgrade <name>; unchanged version is current" '[[ "$RC" -eq 0 && "$OUT" == *"opencode brew 1.0.0 -> 1.0.0 current"* ]] && grep -Fxq "brew upgrade opencode" "$CALLS"'
+
+# Node-based formulae live under Cellar/<name>/<ver>/libexec/lib/node_modules; npm must never
+# install into the Cellar behind Homebrew's back.
+reset
+write_tool_stub "$BREW/Cellar/opencode/1.0.0/libexec/lib/node_modules/opencode-ai/bin/opencode" opencode
+ln -s "$BREW/Cellar/opencode/1.0.0/libexec/lib/node_modules/opencode-ai/bin/opencode" "$TOOLBIN/opencode"
+echo 1.0.0 >"$VERDIR/opencode"; echo 1.1.0 >"$VERDIR/opencode.next"
+run
+check "brew formula with libexec node_modules: brew, not npm" '[[ "$RC" -eq 0 && "$OUT" == *"opencode brew 1.0.0 -> 1.1.0 updated"* ]] && grep -Fxq "brew upgrade opencode" "$CALLS" && ! grep -q "^npm install" "$CALLS"'
 
 # --- apt-owned and unknown installs ------------------------------------------------------------
 reset

@@ -237,8 +237,9 @@ classify() { # tool real-path -> T_METHOD
   local tool=$1 real=$2 rest
   T_METHOD=unknown
   if [ "$tool" = claude ] && under_home "$real" .local/share/claude/versions; then T_METHOD=native; return 0; fi
+  # Homebrew first: node-based formulae keep a private lib/node_modules under
+  # Cellar/<name>/<ver>/libexec, and npm must never install into the Cellar.
   case "$real" in
-    */lib/node_modules/*) T_METHOD=npm; return 0 ;;
     */Caskroom/*/*)
       rest=${real#*/Caskroom/}
       BREW_KIND=cask; BREW_NAME=${rest%%/*}; T_METHOD=brew
@@ -247,6 +248,7 @@ classify() { # tool real-path -> T_METHOD
       rest=${real#*/Cellar/}
       BREW_KIND=formula; BREW_NAME=${rest%%/*}; T_METHOD=brew
       return 0 ;;
+    */lib/node_modules/*) T_METHOD=npm; return 0 ;;
   esac
   if [ "$tool" = codex ] && under_home "$real" .codex/packages/standalone; then T_METHOD=codex-standalone; return 0; fi
   if [ "$tool" = opencode ] && under_home "$real" .opencode; then T_METHOD=opencode-installer; return 0; fi
