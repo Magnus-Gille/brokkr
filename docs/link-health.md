@@ -7,7 +7,8 @@ checks notice. In one fleet incident a faulty Ethernet cable caused hundreds of
 two-second link drops per week for four weeks, after which the router held
 the port at 100 Mb/s on a 2.5 Gb/s NIC: stable, 25 times slower, and unalerted
 until someone copied a large archive. The fault followed the cable when it was
-swapped.
+swapped. Energy Efficient Ethernet was switched off during that diagnosis and
+did not help; it stays off by choice, not as the fix (see [EEE off](eee-off.md)).
 
 [`network/check-link-health.py`](../network/check-link-health.py) looks at the
 link itself. For each configured wired interface it reports:

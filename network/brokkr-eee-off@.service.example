@@ -1,0 +1,25 @@
+# Brokkr · keep Energy Efficient Ethernet (EEE) off on one wired interface.
+#
+# Systemd template: the instance name is the interface, so this file carries no
+# host data. scripts/deploy-eee-off.sh fills in the ETHTOOL placeholder (the
+# verified absolute ethtool path on the node) and the REVISION placeholder,
+# installs the result as
+# /etc/systemd/system/brokkr-eee-off@.service, and enables
+# brokkr-eee-off@<iface>.service. The interface's device unit pulls it in, so EEE
+# is switched off again whenever the device appears (boot, driver reload).
+#
+# EEE was NOT the cause of the link flapping that prompted this; see
+# docs/eee-off.md for why it stays off anyway.
+[Unit]
+Description=Brokkr: keep Energy Efficient Ethernet off on %i (revision @REVISION@)
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/eee-off.md
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@ETHTOOL@ --set-eee %i eee off
+
+[Install]
+WantedBy=sys-subsystem-net-devices-%i.device
