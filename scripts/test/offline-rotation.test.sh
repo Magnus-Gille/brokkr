@@ -150,6 +150,16 @@ if [ -n "${MOCK_RSYNC_CORRUPT:-}" ] && [ -f "$dst/$MOCK_RSYNC_CORRUPT" ]; then
 fi
 exit "${MOCK_RSYNC_RC:-0}"
 MOCK
+# mkdir pass-through; with MOCK_MKDIR_SIGNAL=1 it sends TERM to the script right after
+# creating the run lock, to hit the window before the script records owning it.
+cat >"$TMP/bin/mkdir" <<'MOCK'
+#!/usr/bin/env bash
+/bin/mkdir "$@"; rc=$?
+if [ "${MOCK_MKDIR_SIGNAL:-}" = 1 ] && [ "$rc" = 0 ]; then
+  case "${!#}" in *brokkr-offline-rotation.lock) kill -TERM "$PPID" ;; esac
+fi
+exit "$rc"
+MOCK
 chmod +x "$TMP/bin/"*
 
 # Build a fresh fixture: sources, manifest, fake device, by-uuid link, prepared disk.
@@ -344,6 +354,10 @@ run_rotation
 check "a concurrent run holding the lock is refused" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"another offline rotation"* ]]'
 check "a refused concurrent run neither opens nor closes the mapping" 'not_called "cryptsetup open" && not_called "cryptsetup luksClose"'
 check "a refused concurrent run leaves the other run's lock in place" '[ -d "$F/lock/brokkr-offline-rotation.lock" ]'
+
+setup
+MOCK_MKDIR_SIGNAL=1 run_rotation
+check "a signal while taking the run lock cannot leave a stale lock" 'dir_empty "$F/lock" && closed_cleanly'
 
 setup
 printf 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -\n' >>"$F/archive.sha256"

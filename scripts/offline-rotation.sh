@@ -87,10 +87,13 @@ release_local() {
   HELD_LOCK=0
 }
 trap release_local EXIT
+# Ignore INT/TERM between creating the lock and recording ownership, so a signal in
+# that window cannot exit with the lock created but HELD_LOCK still 0.
+trap '' INT TERM
+if mkdir "$LOCK" 2>/dev/null; then HELD_LOCK=1; fi
 trap 'exit 130' INT TERM
-mkdir "$LOCK" 2>/dev/null \
+[ "$HELD_LOCK" = 1 ] \
   || die "another offline rotation holds $LOCK; if none is running, remove it by hand"
-HELD_LOCK=1
 
 # Validate a private snapshot of the manifest and verify against that same snapshot
 # later, so a manifest replaced during the hours-long copy is never used unchecked.
