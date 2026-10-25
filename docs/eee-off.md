@@ -62,11 +62,20 @@ than prompt. Before changing anything it refuses when:
 - passwordless `sudo -n` is unavailable;
 - the interface does not exist, `ethtool` is missing (the deploy never installs
   packages), or `ethtool --show-eee` reports that the interface does not support EEE;
-- `<iface>-eee-off.service` exists but is a symlink or does not run
-  `ethtool --set-eee <iface> eee off`;
-- any other unit in the unit directory already sets EEE on that interface, which
-  would leave two owners of one setting;
+- `<iface>-eee-off.service` exists but is not exactly the supported shape. It
+  must be a regular file with no drop-in directory and exactly one `Exec*` line,
+  `ExecStart=/<path>/ethtool --set-eee <iface> eee off`, and it must be `enabled`
+  or `disabled`. Anything else is adopted by hand, because the deploy deletes the
+  unit it adopts;
+- any other unit or drop-in in the unit directory sets EEE on that interface, to
+  any value, or an enabled instance of another template does, which would leave
+  two owners of one setting;
+- a drop-in directory overrides the managed template or instance, or the instance
+  is in a state other than enabled, disabled or absent;
 - a backup for this revision already exists.
+
+Only `/etc/systemd/system` is scanned. Units under `/run` or `/usr/lib` and other
+tools such as NetworkManager are out of scope.
 
 The dry-run prints the current EEE status and exactly what `--apply` would back
 up, install, and adopt.
@@ -91,9 +100,12 @@ same revision on a node that is already in place changes nothing.
 ### Rollback
 
 Every `--apply` that changed something prints a rollback recipe listing only the
-steps that run completed: disable the managed instance if this run enabled it,
-remove the template or restore its previous version, restore and re-enable the
-ad-hoc unit, and reload systemd. Disabling or removing a unit does not change the
+steps that run completed. It disables the managed instance if this run enabled it
+and stops it if it was inactive before. It removes the template or restores the
+previous version, then restarts the instance only if it was active before. It
+restores and re-enables the ad-hoc unit and reloads systemd. The tests run the
+printed recipe against stateful fakes and check that unit files, enablement and
+activity match the state before the deploy. Disabling or removing a unit does not change the
 live setting. EEE stays off until the next boot or driver reload unless it is
 turned on explicitly with `ethtool --set-eee <iface> eee on`, which goes against
 the tracked decision.

@@ -139,7 +139,8 @@ managed=$unit_dir/$template_name
 legacy_name=$IFACE-eee-off.service
 legacy=$unit_dir/$legacy_name
 iface_re=$(printf '%s' "$IFACE" | sed 's/[.]/[.]/g')
-set_re="--set-eee[[:space:]]+$iface_re[[:space:]]+eee[[:space:]]+off([[:space:]]|\$)"
+# Any EEE change on this interface, whatever value it sets.
+any_set_re="--set-eee[[:space:]]+$iface_re([[:space:]]|\$)"
 
 # The committed template must be the one this script expects, then it is rendered.
 [ "$(grep -Fxc 'ExecStart=@ETHTOOL@ --set-eee %i eee off' "$work/template")" = 1 ] \
@@ -151,19 +152,40 @@ legacy_present=0
 legacy_enabled=
 if [ -e "$legacy" ] || [ -L "$legacy" ]; then
   [ -f "$legacy" ] && [ ! -L "$legacy" ] || refuse "$legacy_name is not a regular non-symlink file; inspect it manually"
-  grep -Eq -e "^ExecStart=.*$set_re" "$legacy" \
-    || refuse "$legacy_name is not the ad-hoc EEE-off unit (no ExecStart running ethtool --set-eee $IFACE eee off); inspect it manually"
+  [ ! -e "$legacy.d" ] && [ ! -L "$legacy.d" ] || refuse "$legacy_name has a drop-in directory; adopt it manually"
+  # Only the exact shape this deploy replaces is adopted, because the unit is then
+  # deleted: one Exec directive, which runs ethtool by absolute path with exactly
+  # these arguments.
+  [ "$(grep -Ec '^[[:space:]]*Exec[A-Za-z]*[[:space:]]*=' "$legacy")" = 1 ] \
+    && grep -Eq -e "^ExecStart=/([A-Za-z0-9._-]+/)*ethtool[[:space:]]+--set-eee[[:space:]]+$iface_re[[:space:]]+eee[[:space:]]+off[[:space:]]*\$" "$legacy" \
+    || refuse "$legacy_name is not the ad-hoc EEE-off unit (exactly one Exec line, ExecStart=/.../ethtool --set-eee $IFACE eee off); inspect it manually"
   legacy_present=1
   legacy_enabled=$(systemctl is-enabled "$legacy_name" 2>/dev/null || true)
-  [ -n "$legacy_enabled" ] || legacy_enabled=unknown
+  case $legacy_enabled in
+    enabled|disabled) ;;
+    *) refuse "$legacy_name is ${legacy_enabled:-in an unknown state}; only an enabled or disabled ad-hoc unit is adopted" ;;
+  esac
 fi
-# Any other unit that already sets EEE on this interface would make two owners.
-for f in "$unit_dir"/*.service; do
+for d in "$unit_dir/$template_name.d" "$unit_dir/$instance.d"; do
+  [ ! -e "$d" ] && [ ! -L "$d" ] || refuse "${d##*/} is a drop-in directory that overrides the managed unit; remove it first"
+done
+# Any other unit or drop-in that already sets EEE on this interface, to any value,
+# would make two owners of one setting.
+for f in "$unit_dir"/*.service "$unit_dir"/*.service.d/*.conf; do
+  [ -e "$f" ] || [ -L "$f" ] || continue
+  name=${f#"$unit_dir"/}
+  case $name in "$legacy_name"|"$template_name") continue ;; esac
+  if grep -Eq -e "$any_set_re" "$f" 2>/dev/null; then
+    refuse "$name also sets EEE on $IFACE; adopt or remove it manually so that only one unit owns this setting"
+  fi
+done
+# An enabled instance of another template whose command sets EEE on its instance.
+for f in "$unit_dir"/*.wants/*@"$IFACE".service "$unit_dir"/*.requires/*@"$IFACE".service; do
   [ -e "$f" ] || [ -L "$f" ] || continue
   name=${f##*/}
-  case $name in "$legacy_name"|"$template_name") continue ;; esac
-  if grep -Eq -e "$set_re" "$f" 2>/dev/null; then
-    refuse "$name also sets EEE on $IFACE; adopt or remove it manually so that only one unit owns this setting"
+  [ "$name" != "$instance" ] || continue
+  if grep -Eq -e '--set-eee[[:space:]]+%[iI]([[:space:]]|$)' "$f" 2>/dev/null; then
+    refuse "$name is enabled and also sets EEE on $IFACE; disable it manually so that only one unit owns this setting"
   fi
 done
 managed_present=0
@@ -172,6 +194,10 @@ if [ -e "$managed" ] || [ -L "$managed" ]; then
   managed_present=1
 fi
 instance_enabled=$(systemctl is-enabled "$instance" 2>/dev/null || true)
+case $instance_enabled in
+  enabled|disabled|'') ;;
+  *) refuse "$instance is $instance_enabled; only an enabled, disabled, or absent instance is managed" ;;
+esac
 instance_active=$(systemctl is-active "$instance" 2>/dev/null || true)
 
 echo "preflight: runtime user $user (not root); passwordless sudo available"
@@ -217,6 +243,7 @@ legacy_backed_up=0
 managed_backed_up=0
 managed_installed=0
 instance_newly_enabled=0
+instance_restarted=0
 legacy_disabled=0
 legacy_removed=0
 tmp_backups=
@@ -227,15 +254,21 @@ print_state() {
     return 0
   fi
   echo "Rollback (run on the target as $user; only steps this run completed are listed):"
-  if [ "$instance_newly_enabled" = 1 ]; then echo "  sudo systemctl disable $instance"; fi
+  if [ "$instance_newly_enabled" = 1 ]; then
+    if [ "$instance_active" = active ]; then echo "  sudo systemctl disable $instance"; else echo "  sudo systemctl disable --now $instance"; fi
+  fi
   if [ "$managed_installed" = 1 ]; then
     if [ "$managed_backed_up" = 1 ]; then echo "  sudo mv -f $managed.previous-$REVISION $managed"; else echo "  sudo rm -f $managed"; fi
   fi
   if [ "$legacy_removed" = 1 ]; then echo "  sudo mv -f $legacy.previous-$REVISION $legacy"; fi
   echo "  sudo systemctl daemon-reload"
   if [ "$legacy_disabled" = 1 ] && [ "$legacy_enabled" = enabled ]; then echo "  sudo systemctl enable $legacy_name"; fi
-  if [ "$managed_backed_up" = 1 ] && [ "$instance_newly_enabled" = 0 ]; then
-    echo "  sudo systemctl restart $instance   # re-run the previous template"
+  if [ "$instance_newly_enabled" = 0 ] && [ "$instance_restarted" = 1 ]; then
+    if [ "$instance_active" != active ]; then
+      echo "  sudo systemctl stop $instance   # it was inactive before this run"
+    elif [ "$managed_backed_up" = 1 ]; then
+      echo "  sudo systemctl restart $instance   # re-run the previous template"
+    fi
   fi
   if [ "$legacy_backed_up" = 1 ] && [ "$legacy_removed" = 0 ]; then
     echo "  # $legacy_name was left in place; optional: sudo rm -f $legacy.previous-$REVISION"
@@ -269,6 +302,7 @@ if [ "$instance_enabled" != enabled ]; then
   instance_newly_enabled=1
   sudo -n systemctl enable "$instance" </dev/null
 fi
+instance_restarted=1
 if ! sudo -n systemctl restart "$instance" </dev/null; then
   echo "FAILED: the first run of $instance did not succeed; the ad-hoc unit was left in charge" >&2
   exit 3
