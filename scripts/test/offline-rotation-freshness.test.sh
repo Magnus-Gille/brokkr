@@ -4,7 +4,9 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/../offline-rotation-freshness.sh"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/brokkr-offline-fresh.XXXXXX")"
+# Every fixture path is built under $TMP, so stop before anything else if it is unusable.
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/brokkr-offline-fresh.XXXXXX")" || exit 1
+[ -n "$TMP" ] && [ -d "$TMP" ] || { echo "cannot create test workspace" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/state"
 

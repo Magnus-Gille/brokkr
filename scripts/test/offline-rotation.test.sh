@@ -6,7 +6,9 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/../offline-rotation.sh"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/brokkr-offline-rotation-test.XXXXXX")"
+# Every fixture path is built under $TMP, so stop before anything else if it is unusable.
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/brokkr-offline-rotation-test.XXXXXX")" || exit 1
+[ -n "$TMP" ] && [ -d "$TMP" ] || { echo "cannot create test workspace" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 
 UUID=0f1e2d3c-4b5a-4968-8776-655443322110
@@ -33,6 +35,9 @@ case "$1" in
     for arg in "$@"; do
       case "$arg" in --key-file=*) cat "${arg#--key-file=}" >/dev/null || exit 2 ;; esac
     done
+    # MOCK_CS_OPEN_LEAK: the mapping exists but the caller saw a failure (for example a
+    # signal between the command finishing and the script recording it).
+    [ "${MOCK_CS_OPEN_LEAK:-}" != 1 ] || { : >"$MOCK_STATE/open"; exit 1; }
     [ "${MOCK_CS_OPEN_RC:-0}" = 0 ] || exit "$MOCK_CS_OPEN_RC"
     : >"$MOCK_STATE/open" ;;
   luksClose)
@@ -49,6 +54,7 @@ mnt="${!#}"
 [ -e "$MOCK_STATE/open" ] || exit 32
 [ "${MOCK_MOUNT_RC:-0}" = 0 ] || exit "$MOCK_MOUNT_RC"
 rmdir "$mnt" && mv "$MOCK_DISK" "$mnt" && printf '%s\n' "$mnt" >"$MOCK_STATE/mounted"
+[ "${MOCK_MOUNT_LEAK:-}" != 1 ] || exit 1
 MOCK
 
 cat >"$TMP/bin/umount" <<'MOCK'
@@ -87,12 +93,18 @@ case "$3" in
     fi ;;
   -l)
     echo 'Num  Test_Description    Status                  Remaining  LifeTime(hours)  LBA_of_first_error'
+    if [ "${MOCK_SMART_CMD_FAIL:-}" = -l ]; then
+      echo '# 1  Short offline       Completed without error       00%        31         -'; exit 4
+    fi
     if [ "${MOCK_SMART_RESULT:-pass}" = pass ]; then
       echo '# 1  Short offline       Completed without error       00%        31         -'
     else
       echo '# 1  Short offline       Completed: read failure       90%        31         123456'
     fi ;;
   -H)
+    if [ "${MOCK_SMART_CMD_FAIL:-}" = -H ]; then
+      echo 'SMART overall-health self-assessment test result: PASSED'; exit 2
+    fi
     if [ "${MOCK_SMART_HEALTH:-PASSED}" = PASSED ]; then
       echo 'SMART overall-health self-assessment test result: PASSED'
     else
@@ -101,8 +113,10 @@ case "$3" in
 esac
 MOCK
 
-# rsync mock: copies regular files, honours --ignore-existing, and fails hard on any
-# deletion flag so a test cannot pass while the script asks rsync to delete.
+# rsync mock: copies regular files and symlinks (as links, like -a), honours
+# --ignore-existing, creates only the last destination component (like real rsync
+# without --mkpath), and fails hard on any deletion flag so a test cannot pass while
+# the script asks rsync to delete.
 cat >"$TMP/bin/rsync" <<'MOCK'
 #!/usr/bin/env bash
 printf 'rsync %s\n' "$*" >>"$MOCK_CALLS"
@@ -117,12 +131,17 @@ for arg in "$@"; do
   esac
 done
 src="${args[0]%/}"; dst="${args[1]%/}"
-mkdir -p "$dst"
-(cd "$src" && find . -type f) | while IFS= read -r rel; do
+[ -d "$(dirname "$dst")" ] || { echo "mock rsync: mkdir $dst failed: No such file or directory" >&2; exit 11; }
+[ -d "$dst" ] || mkdir "$dst" || exit 11
+(cd "$src" && find . \( -type f -o -type l \)) | while IFS= read -r rel; do
   rel="${rel#./}"
-  if [ "$ignore" = 1 ] && [ -e "$dst/$rel" ]; then continue; fi
+  if [ "$ignore" = 1 ] && { [ -e "$dst/$rel" ] || [ -L "$dst/$rel" ]; }; then continue; fi
   mkdir -p "$(dirname "$dst/$rel")"
-  cp -p "$src/$rel" "$dst/$rel"
+  if [ -L "$src/$rel" ]; then
+    ln -s "$(readlink "$src/$rel")" "$dst/$rel"
+  else
+    cp -p "$src/$rel" "$dst/$rel"
+  fi
 done
 if [ -n "${MOCK_RSYNC_CORRUPT:-}" ] && [ -f "$dst/$MOCK_RSYNC_CORRUPT" ]; then
   echo corrupted >>"$dst/$MOCK_RSYNC_CORRUPT"
@@ -178,8 +197,11 @@ run_rotation() {
 called() { grep -q -- "$1" "$F/calls"; }
 not_called() { ! grep -q -- "$1" "$F/calls"; }
 closed_cleanly() { [ ! -e "$F/state/open" ] && [ ! -e "$F/state/mounted" ] && [ -d "$F/disk" ]; }
+dir_empty() { local listing; listing="$(ls -A "$1")" || return 1; [ -z "$listing" ]; }
 no_receipts() {
-  [ -z "$(ls -A "$F/receipts")" ] && [ ! -d "$F/disk/receipts" ] || [ -z "$(ls -A "$F/disk/receipts")" ]
+  dir_empty "$F/receipts" || return 1
+  [ -d "$F/disk" ] || return 1
+  [ ! -e "$F/disk/receipts" ] || dir_empty "$F/disk/receipts"
 }
 completed() { [[ "$OUT" == *"offline rotation complete: safe to unplug"* ]]; }
 first_index() { grep -n -- "$1" "$F/calls" | head -n 1 | cut -d: -f1; }
@@ -327,6 +349,34 @@ printf 'tampered\n' >"$F/disk/archive/two.jpg"
 run_rotation
 check "a differing copy already on disk is not overwritten" '[ "$(cat "$F/disk/archive/two.jpg")" = "tampered" ]'
 check "the differing copy fails verification" '[ "$RC" -ne 0 ] && no_receipts'
+
+setup
+mv "$F/archive/two.jpg" "$F/live-two.jpg"
+ln -s "$F/live-two.jpg" "$F/archive/two.jpg"
+run_rotation
+check "a symlink in the archive cannot satisfy verification from live data" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"symlink"* ]] && no_receipts && closed_cleanly'
+
+setup
+mkdir "$F/live-2019" && mv "$F/archive/2019/one.jpg" "$F/live-2019/" && rmdir "$F/archive/2019"
+ln -s "$F/live-2019" "$F/archive/2019"
+run_rotation
+check "a symlinked archive directory is refused" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"symlink"* ]] && no_receipts'
+
+setup
+MOCK_CS_OPEN_LEAK=1 run_rotation
+check "a mapping that appears despite a failed open is still closed" '[ "$RC" -ne 0 ] && closed_cleanly && no_receipts'
+
+setup
+MOCK_MOUNT_LEAK=1 run_rotation
+check "a mount that appears despite a failed mount is still unmounted and closed" '[ "$RC" -ne 0 ] && closed_cleanly && no_receipts'
+
+setup
+MOCK_SMART_CMD_FAIL=-l run_rotation
+check "a failed self-test-log query is not trusted even with passing output" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"SMART"* ]] && no_receipts'
+
+setup
+MOCK_SMART_CMD_FAIL=-H run_rotation
+check "a failed health query is not trusted even with PASSED output" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"SMART"* ]] && no_receipts'
 
 setup
 MOCK_RSYNC_RC=23 run_rotation

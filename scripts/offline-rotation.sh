@@ -134,21 +134,27 @@ PARENT="$(lsblk -ndo PKNAME "$DEV" 2>/dev/null | head -n 1 || true)"
 if [ -n "$PARENT" ]; then SMART_DEV="/dev/$PARENT"; else SMART_DEV="$DEV"; fi
 
 # ---- Open, mount, and always close on the way out ---------------------------
-OPENED=0
-MOUNTED=0
+# Cleanup reads live state rather than flags set after each command: a signal can
+# land after `cryptsetup open` or `mount` succeeds but before a flag is recorded.
+# The preflight proved the mapping inactive and the mount point unused, so once an
+# attempt was made, an active mapping or mount at those names is this run's.
+OPEN_ATTEMPTED=0
+MOUNT_ATTEMPTED=0
 COMPLETE=0
+is_open() { cryptsetup status "$MAPPER" >/dev/null 2>&1; }
 finish() {
-  local rc=$?
+  local rc=$? mounted=0 opened=0
   trap - EXIT INT TERM
   [ "$COMPLETE" = 1 ] && exit 0
-  if [ "$MOUNTED" = 1 ]; then
+  if [ "$MOUNT_ATTEMPTED" = 1 ] && mountpoint -q "$MNT"; then
     sync || true
-    if umount "$MNT"; then MOUNTED=0; fi
+    umount "$MNT" || mounted=1
   fi
-  if [ "$MOUNTED" = 0 ] && [ "$OPENED" = 1 ]; then
-    if cryptsetup luksClose "$MAPPER"; then OPENED=0; fi
+  if [ "$OPEN_ATTEMPTED" = 1 ] && [ "$mounted" = 0 ] && is_open; then
+    cryptsetup luksClose "$MAPPER" || opened=1
   fi
-  if [ "$MOUNTED" = 1 ] || [ "$OPENED" = 1 ]; then
+  if [ "$OPEN_ATTEMPTED" = 1 ] && [ "$mounted" = 1 ]; then opened=1; fi
+  if [ "$mounted" = 1 ] || [ "$opened" = 1 ]; then
     log "offline rotation FAILED and the disk is still open — do NOT unplug; unmount $MNT and luksClose $MAPPER by hand"
   elif [ "$rc" -ne 0 ]; then
     log "offline rotation FAILED; disk unmounted and closed (safe to unplug), but no valid receipt was recorded"
@@ -160,10 +166,10 @@ trap finish EXIT
 trap 'exit 130' INT TERM
 
 log "opening LUKS2 disk $UUID (${KEYFILE:+keyfile}${KEYFILE:-terminal prompt})"
+OPEN_ATTEMPTED=1
 cryptsetup open --type luks2 ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} "$DEV" "$MAPPER" || die "cryptsetup open failed"
-OPENED=1
+MOUNT_ATTEMPTED=1
 mount -o nodev,nosuid,noexec "/dev/mapper/$MAPPER" "$MNT" || die "mount failed"
-MOUNTED=1
 mountpoint -q "$MNT" || die "$MNT is not a mount point after mounting"
 [ -f "$MNT/$MARKER" ] && [ ! -L "$MNT/$MARKER" ] && grep -qxF "luks_uuid=$UUID" "$MNT/$MARKER" \
   || die "disk lacks the $MARKER marker for UUID $UUID — not a prepared rotation disk"
@@ -176,6 +182,10 @@ done
 # ---- Archive: copy without overwrite or delete, then verify -----------------
 log "copying archive (no overwrite, no delete) — slow over USB 2 is expected"
 rsync -a --ignore-existing "$ARCHIVE_SRC/" "$MNT/archive/" || die "archive rsync failed"
+# rsync -a keeps symlinks as links, and sha256sum -c would follow one back to the
+# live source, so a link anywhere in the disk archive would prove nothing.
+link="$(find "$MNT/archive" -type l -print -quit)" || die "cannot scan the disk archive for symlinks"
+[ -z "$link" ] || die "disk archive contains a symlink (${link#"$MNT"/}); verification would read outside the disk"
 cp "$MANIFEST" "$MNT/manifests/.$STAMP-archive.sha256.tmp"
 mv "$MNT/manifests/.$STAMP-archive.sha256.tmp" "$MNT/manifests/$STAMP-archive.sha256"
 log "verifying $ARCHIVE_COUNT archive files against the sha256 manifest"
@@ -195,6 +205,8 @@ if [ "${#SERVICE_NAMES[@]}" -gt 0 ]; then
     | LC_ALL=C sort | tail -n 1)"
   PARTIAL="$MNT/services/.partial-$STAMP"
   [ ! -e "$PARTIAL" ] || die "leftover partial service tree exists: $PARTIAL"
+  # rsync creates only the last destination component.
+  mkdir "$PARTIAL" || die "cannot create $PARTIAL"
   SVC_MANIFEST="$MNT/manifests/.$STAMP-services.sha256.tmp"
   : >"$SVC_MANIFEST"
   i=0
@@ -239,12 +251,13 @@ while :; do
   waited=$((waited + SMART_POLL + 1))
 done
 [ "$seen_running" = 1 ] || die "SMART short test was never observed running — result not trusted"
-latest="$(smart -l selftest | grep -E '^# *1 ' || true)"
+selftest_log="$(smart -l selftest)" || die "SMART self-test log query failed"
+latest="$(printf '%s\n' "$selftest_log" | grep -E '^# *1 ' || true)"
 case "$latest" in
   *"Short offline"*"Completed without error"*) ;;
   *) die "SMART short test did not pass: ${latest:-no self-test log entry}" ;;
 esac
-health="$(smart -H || true)"
+health="$(smart -H)" || die "SMART health query failed"
 case "$health" in
   *"test result: PASSED"*) ;;
   *) die "SMART overall health is not PASSED — replace this disk" ;;
@@ -270,9 +283,7 @@ write_receipt() {
 write_receipt "$MNT/receipts/$STAMP.receipt" || die "cannot write the disk receipt"
 sync
 umount "$MNT" || die "umount failed"
-MOUNTED=0
 cryptsetup luksClose "$MAPPER" || die "luksClose failed"
-OPENED=0
 
 mkdir -p "$RECEIPT_DIR" || die "cannot create local receipt dir $RECEIPT_DIR"
 write_receipt "$RECEIPT_DIR/$STAMP.receipt" || die "cannot write the local receipt"

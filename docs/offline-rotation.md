@@ -36,9 +36,11 @@ The disk holds two kinds of data:
 5. **Never deletes.** The archive is copied with `rsync -a --ignore-existing`, without
    `--delete`. A changed, truncated or ransomware-encrypted source file therefore cannot
    overwrite the good copy on the disk. The `sha256sum -c --strict` check of the disk copy
-   then fails loudly. Service snapshots are written to a new
-   `services/<UTC stamp>/` tree, hard-linked against the previous one (`--link-dest`). The
-   tree only gets its final name after it has been verified.
+   then fails loudly. The run also refuses if the disk archive contains any symlink,
+   because `sha256sum -c` would follow it to the live source. Service snapshots are
+   written to a new `services/<UTC stamp>/` tree, hard-linked against the previous one
+   (`--link-dest`). The tree only gets its final name after it has been verified.
+   Symlinks inside service snapshots are kept as links and are not checksummed.
 6. Runs a SMART short self-test with `smartctl -d sat` on the parent disk. The run passes
    only if the test was observed running, the newest self-test log entry is
    `Completed without error`, and overall health is `PASSED`.
@@ -167,18 +169,20 @@ keep them.
 
 ## Restore
 
-Restore to a separate scratch destination first, never over live data:
+Restore to a separate scratch destination first, never over live data. The disk's
+filesystem root is mode 0700 and root-owned, so run the steps in a root shell
+(`sudo -i`). Use absolute paths throughout:
 
 ```bash
-sudo cryptsetup open --type luks2 --readonly "/dev/disk/by-uuid/$UUID" brokkr-offline
-sudo mount -o ro,nodev,nosuid,noexec /dev/mapper/brokkr-offline /mnt/brokkr-offline
-cd /mnt/brokkr-offline
-ls receipts/ manifests/ services/            # pick the newest <stamp>
-(cd archive && sha256sum -c --strict --quiet "../manifests/<stamp>-archive.sha256")
-(cd services/<stamp> && sha256sum -c --strict --quiet "../../manifests/<stamp>-services.sha256")
-sudo rsync -a archive/<path>/ /restore-scratch/archive/<path>/
-sudo rsync -a services/<stamp>/<name>/ /restore-scratch/<name>/
-cd / && sudo umount /mnt/brokkr-offline && sudo cryptsetup luksClose brokkr-offline
+D=/mnt/brokkr-offline
+cryptsetup open --type luks2 --readonly "/dev/disk/by-uuid/$UUID" brokkr-offline
+mount -o ro,nodev,nosuid,noexec /dev/mapper/brokkr-offline "$D"
+ls "$D/receipts" "$D/manifests" "$D/services"     # pick the newest <stamp>
+(cd "$D/archive" && sha256sum -c --strict --quiet "$D/manifests/<stamp>-archive.sha256")
+(cd "$D/services/<stamp>" && sha256sum -c --strict --quiet "$D/manifests/<stamp>-services.sha256")
+rsync -a "$D/archive/<path>/" "/restore-scratch/archive/<path>/"
+rsync -a "$D/services/<stamp>/<name>/" "/restore-scratch/<name>/"
+umount "$D" && cryptsetup luksClose brokkr-offline
 ```
 
 Open and validate the restored files (photos open, service dumps load in the owning
