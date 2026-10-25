@@ -179,6 +179,27 @@ fi
 for d in "$unit_dir/$template_name.d" "$unit_dir/$instance.d"; do
   [ ! -e "$d" ] && [ ! -L "$d" ] || refuse "${d##*/} is a drop-in directory that overrides the managed unit; remove it first"
 done
+# systemd also applies drop-ins named after every dash-separated prefix of a unit
+# name, and the top-level service.d. Any of them could reset ExecStart or add a
+# condition, so the managed and the adopted unit must have none.
+for d in "$unit_dir/service.d" "$unit_dir/brokkr-.service.d" "$unit_dir/brokkr-eee-.service.d"; do
+  [ ! -e "$d" ] && [ ! -L "$d" ] || refuse "${d##*/} is an inherited drop-in directory that applies to the managed unit; remove it first"
+done
+# The interface name has no dash, so these are all the prefixes of <iface>-eee-off.
+for d in "$unit_dir/$IFACE-.service.d" "$unit_dir/$IFACE-eee-.service.d"; do
+  [ ! -e "$d" ] && [ ! -L "$d" ] || refuse "${d##*/} is an inherited drop-in directory that applies to $legacy_name; remove it first"
+done
+if [ "$legacy_present" = 1 ]; then
+  # Disabling removes every link to the unit, but the rollback can only recreate the
+  # device dependency its [Install] section declares, so no other link may exist.
+  wanted_link=$unit_dir/sys-subsystem-net-devices-$IFACE.device.wants/$legacy_name
+  for f in $(find "$unit_dir" -type l 2>/dev/null); do
+    target=$(readlink "$f" 2>/dev/null) || continue
+    [ "${target##*/}" = "$legacy_name" ] || [ "${f##*/}" = "$legacy_name" ] || continue
+    [ "$f" = "$wanted_link" ] \
+      || refuse "${f#"$unit_dir"/} links to $legacy_name beyond its device dependency; remove it or adopt the unit manually"
+  done
+fi
 # Any other unit or drop-in that already sets EEE on this interface, to any value,
 # would make two owners of one setting.
 for f in "$unit_dir"/*.service "$unit_dir"/*.service.d/*.conf; do

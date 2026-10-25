@@ -280,6 +280,15 @@ for mode in dry-run apply; do
   refuses "$mode: an ad-hoc unit with Also= refuses" "unsupported directive Also" "${args[@]}"
   reset; seed_legacy; sed -i.bak 's|^WantedBy=.*|WantedBy=multi-user.target|' "$LEGACY"; rm -f "$LEGACY.bak"
   refuses "$mode: an ad-hoc unit not wanted by the interface device refuses" "WantedBy" "${args[@]}"
+  for inherited in brokkr-.service.d brokkr-eee-.service.d service.d eth0-.service.d eth0-eee-.service.d; do
+    reset; seed_legacy; mkdir -p "$UNIT_DIR/$inherited"; printf '[Unit]\nConditionPathExists=/nonexistent\n' >"$UNIT_DIR/$inherited/x.conf"
+    refuses "$mode: an inherited drop-in $inherited refuses" "$inherited" "${args[@]}"
+  done
+  reset; seed_legacy; mkdir -p "$UNIT_DIR/critical.target.requires"
+  ln -s "$LEGACY" "$UNIT_DIR/critical.target.requires/eth0-eee-off.service"
+  refuses "$mode: an ad-hoc unit with an extra dependency link refuses" "critical.target.requires" "${args[@]}"
+  reset; seed_legacy; ln -s "$LEGACY" "$UNIT_DIR/eee-alias.service"
+  refuses "$mode: an alias of the ad-hoc unit refuses" "eee-alias.service" "${args[@]}"
   reset; seed_legacy; echo enabled-runtime >"$STATE/enabled.eth0-eee-off.service"
   refuses "$mode: an ad-hoc unit in an unsupported enablement state refuses" "enabled-runtime" "${args[@]}"
 done

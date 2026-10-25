@@ -78,6 +78,13 @@ than prompt. Before changing anything it refuses when:
 - a concrete `brokkr-eee-off@<iface>.service` file would shadow the template, a
   drop-in directory overrides the managed template or instance, or the instance
   is in a state other than enabled, disabled or absent;
+- an inherited drop-in directory applies to either unit: the top-level
+  `service.d/` or a dash-prefix directory such as `brokkr-eee-.service.d/` or
+  `<iface>-eee-.service.d/`. Any of them could reset `ExecStart` or add a
+  condition;
+- the ad-hoc unit has a link other than its device dependency, such as an alias
+  or a `.requires/` link. Disabling it would remove that link and the rollback
+  could not recreate it;
 - a backup for this revision already exists.
 
 Only `/etc/systemd/system` is scanned. Units under `/run` or `/usr/lib` and other
