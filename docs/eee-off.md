@@ -85,6 +85,11 @@ than prompt. Before changing anything it refuses when:
 - the ad-hoc unit has a link other than its device dependency, such as an alias
   or a `.requires/` link. Disabling it would remove that link and the rollback
   could not recreate it;
+- the managed instance reports `enabled` but has no
+  `sys-subsystem-net-devices-<iface>.device.wants/` link, which is what re-applies
+  the setting when the interface comes back;
+- the operator cannot read every file and directory in the unit directory. systemd
+  reads them as root, so an unreadable file could still set EEE;
 - a backup for this revision already exists.
 
 Only `/etc/systemd/system` is scanned. Units under `/run` or `/usr/lib` and other

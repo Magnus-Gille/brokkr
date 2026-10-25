@@ -141,6 +141,18 @@ legacy=$unit_dir/$legacy_name
 iface_re=$(printf '%s' "$IFACE" | sed 's/[.]/[.]/g')
 # Any EEE change on this interface, whatever value it sets.
 any_set_re="--set-eee[[:space:]]+$iface_re([[:space:]]|\$)"
+instance_link=$unit_dir/sys-subsystem-net-devices-$IFACE.device.wants/$instance
+# grep for the scans below. systemd reads unit files as root, so a file the operator
+# cannot read, or a read error, refuses instead of counting as "no match".
+scan_has() { # extended-regex file
+  [ -r "$2" ] || refuse "cannot read ${2#"$unit_dir"/} as $user; inspect it as root"
+  if grep -Eq -e "$1" "$2"; then return 0; else rc=$?; fi
+  [ "$rc" = 1 ] || refuse "could not scan ${2#"$unit_dir"/} (grep exit $rc)"
+  return 1
+}
+# Every directory must be readable, or a glob below could silently skip it.
+find "$unit_dir" >/dev/null 2>&1 \
+  || refuse "could not read every directory under $unit_dir as $user; inspect it as root"
 
 # The committed template must be the one this script expects, then it is rendered.
 [ "$(grep -Fxc 'ExecStart=@ETHTOOL@ --set-eee %i eee off' "$work/template")" = 1 ] \
@@ -193,7 +205,8 @@ if [ "$legacy_present" = 1 ]; then
   # Disabling removes every link to the unit, but the rollback can only recreate the
   # device dependency its [Install] section declares, so no other link may exist.
   wanted_link=$unit_dir/sys-subsystem-net-devices-$IFACE.device.wants/$legacy_name
-  for f in $(find "$unit_dir" -type l 2>/dev/null); do
+  links=$(find "$unit_dir" -type l) || refuse "could not list the links under $unit_dir"
+  for f in $links; do
     target=$(readlink "$f" 2>/dev/null) || continue
     [ "${target##*/}" = "$legacy_name" ] || [ "${f##*/}" = "$legacy_name" ] || continue
     [ "$f" = "$wanted_link" ] \
@@ -206,7 +219,7 @@ for f in "$unit_dir"/*.service "$unit_dir"/*.service.d/*.conf; do
   [ -e "$f" ] || [ -L "$f" ] || continue
   name=${f#"$unit_dir"/}
   case $name in "$legacy_name"|"$template_name") continue ;; esac
-  if grep -Eq -e "$any_set_re" "$f" 2>/dev/null; then
+  if scan_has "$any_set_re" "$f"; then
     refuse "$name also sets EEE on $IFACE; adopt or remove it manually so that only one unit owns this setting"
   fi
 done
@@ -217,7 +230,7 @@ for f in "$unit_dir"/*.wants/*@"$IFACE".service "$unit_dir"/*.requires/*@"$IFACE
   [ "$name" != "$instance" ] || continue
   for g in "$f" "$unit_dir/${name%%@*}@.service" "$unit_dir/${name%%@*}@.service.d"/*.conf "$unit_dir/$name.d"/*.conf; do
     [ -e "$g" ] || continue
-    if grep -Eq -e '--set-eee[[:space:]]+%[iI]([[:space:]]|$)' -e "$any_set_re" "$g" 2>/dev/null; then
+    if scan_has "--set-eee[[:space:]]+(%[iI]|$iface_re)([[:space:]]|\$)" "$g"; then
       refuse "$name is enabled and also sets EEE on $IFACE; disable it manually so that only one unit owns this setting"
     fi
   done
@@ -232,6 +245,11 @@ case $instance_enabled in
   enabled|disabled|'') ;;
   *) refuse "$instance is $instance_enabled; only an enabled, disabled, or absent instance is managed" ;;
 esac
+# is-enabled reports any wants link; only the device dependency re-applies the
+# setting when the interface comes back.
+if [ "$instance_enabled" = enabled ] && [ ! -L "$instance_link" ]; then
+  refuse "$instance is enabled without its device dependency (${instance_link#"$unit_dir"/}); disable it first"
+fi
 instance_active=$(systemctl is-active "$instance" 2>/dev/null || true)
 
 echo "preflight: runtime user $user (not root); passwordless sudo available"
@@ -332,6 +350,10 @@ sudo -n systemctl daemon-reload </dev/null
 if [ "$instance_enabled" != enabled ]; then
   instance_newly_enabled=1
   sudo -n systemctl enable "$instance" </dev/null
+fi
+if [ ! -L "$instance_link" ]; then
+  echo "FAILED: $instance has no device dependency link after enable; the ad-hoc unit was left in charge" >&2
+  exit 3
 fi
 instance_restarted=1
 if ! sudo -n systemctl restart "$instance" </dev/null; then

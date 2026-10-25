@@ -78,8 +78,14 @@ start_unit() {
 }
 case "${1:-}" in
   daemon-reload) exit 0 ;;
-  enable) touch "$st/enabled.$2" ;;
-  disable) if [[ "$2" == --now ]]; then rm -f "$st/enabled.$3" "$st/active.$3"; else rm -f "$st/enabled.$2"; fi ;;
+  enable)
+    touch "$st/enabled.$2"
+    case $2 in *@*.service) inst=${2#*@}; inst=${inst%.service}; tpl="$MOCK_UNIT_DIR/${2%%@*}@.service" ;; *) inst=; tpl="$MOCK_UNIT_DIR/$2" ;; esac
+    wb=$(sed -n 's/^WantedBy=//p' "$tpl"); wb=${wb//%i/$inst}
+    if [[ -n "$wb" ]]; then mkdir -p "$MOCK_UNIT_DIR/$wb.wants"; ln -sfn "$tpl" "$MOCK_UNIT_DIR/$wb.wants/$2"; fi ;;
+  disable)
+    u=$2; [[ "$u" == --now ]] && { u=$3; rm -f "$st/active.$u"; }
+    rm -f "$st/enabled.$u"; find "$MOCK_UNIT_DIR" -path "*.wants/$u" -type l -exec rm -f {} + ;;
   stop) rm -f "$st/active.$2" ;;
   start) start_unit "$2" || exit 1 ;;
   restart) rm -f "$st/active.$2"; start_unit "$2" || exit 1 ;;
@@ -146,6 +152,8 @@ ExecStart=/usr/sbin/ethtool --set-eee eth0 eee off
 WantedBy=sys-subsystem-net-devices-eth0.device
 UNIT
   touch "$STATE/enabled.eth0-eee-off.service" "$STATE/active.eth0-eee-off.service"
+  mkdir -p "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants"
+  ln -s "$LEGACY" "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/eth0-eee-off.service"
 }
 has_ethtool() { cp "$STORE/ethtool" "$BIN/ethtool"; }
 reset() {
@@ -172,6 +180,7 @@ run_rollback() {
 unit_state() { # files, contents, and enablement/activity, excluding this run's backups
   {
     find "$UNIT_DIR" -type f ! -name '*.previous-*' -exec cksum {} + | sort
+    find "$UNIT_DIR" -type l | sort
     find "$STATE" -name 'active.*' | sort
     for f in "$STATE"/enabled.*; do [[ -e "$f" ]] && printf '%s=%s\n' "${f##*/}" "$(cat "$f")"; done
   } | cksum
@@ -289,6 +298,17 @@ for mode in dry-run apply; do
   refuses "$mode: an ad-hoc unit with an extra dependency link refuses" "critical.target.requires" "${args[@]}"
   reset; seed_legacy; ln -s "$LEGACY" "$UNIT_DIR/eee-alias.service"
   refuses "$mode: an alias of the ad-hoc unit refuses" "eee-alias.service" "${args[@]}"
+  reset; seed_legacy; touch "$STATE/enabled.$INSTANCE"
+  refuses "$mode: an instance enabled without its device dependency refuses" "without its device dependency" "${args[@]}"
+  # Inspection must be complete: systemd reads these as root, the operator may not.
+  if [[ "$(/usr/bin/id -u)" != 0 ]]; then
+    reset; seed_legacy; printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee eth0 eee on\n' >"$UNIT_DIR/secret.service"; chmod 000 "$UNIT_DIR/secret.service"
+    refuses "$mode: an unreadable unit file refuses" "cannot read secret.service" "${args[@]}"
+    chmod 644 "$UNIT_DIR/secret.service"
+    reset; seed_legacy; mkdir -p "$UNIT_DIR/locked.target.wants"; chmod 000 "$UNIT_DIR/locked.target.wants"
+    refuses "$mode: an unreadable unit directory refuses" "could not read every directory" "${args[@]}"
+    chmod 755 "$UNIT_DIR/locked.target.wants"
+  fi
   reset; seed_legacy; echo enabled-runtime >"$STATE/enabled.eth0-eee-off.service"
   refuses "$mode: an ad-hoc unit in an unsupported enablement state refuses" "enabled-runtime" "${args[@]}"
 done
@@ -301,6 +321,8 @@ check "apply with the ad-hoc unit present succeeds" '[[ "$RC" -eq 0 && "$OUT" ==
 check "the managed template is installed with the pinned ethtool and revision" 'grep -Fxq "ExecStart=$BIN/ethtool --set-eee %i eee off" "$MANAGED" && grep -q "$SHA" "$MANAGED" && ! grep -Eq "@[A-Z_]+@" "$MANAGED"'
 check "the managed template is wanted by the interface device" 'grep -Fxq "WantedBy=sys-subsystem-net-devices-%i.device" "$MANAGED"'
 check "the managed instance is enabled and active" '[[ -e "$STATE/enabled.$INSTANCE" && -e "$STATE/active.$INSTANCE" ]]'
+check "the managed instance is wanted by the interface device" '[[ -L "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/$INSTANCE" ]]'
+check "the ad-hoc unit's device link is gone" '[[ ! -e "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/eth0-eee-off.service" && ! -L "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/eth0-eee-off.service" ]]'
 check "the unit itself turned EEE off through ethtool" '[[ "$(cat "$STATE/eee.eth0")" == disabled ]] && [[ "$OUT" == *"EEE status: disabled"* ]]'
 check "the ad-hoc unit is disabled and removed" '[[ ! -e "$LEGACY" && ! -e "$STATE/enabled.eth0-eee-off.service" ]]'
 check "the ad-hoc unit is backed up verbatim" '[[ "$(cat "$LEGACY.previous-$SHA")" == "$LEGACY_BEFORE" ]]'
@@ -348,7 +370,7 @@ git -C "$REPO" reset -q --hard "$SHA"
 
 # A previously active but disabled instance whose restart fails is restarted on the
 # previous template by the rollback, not left stopped.
-reset; run "$TARGET" eth0 --apply; rm -f "$STATE/enabled.$INSTANCE"
+reset; run "$TARGET" eth0 --apply; systemctl disable "$INSTANCE" >/dev/null
 echo "fourth revision" >>"$REPO/README.md"; git -C "$REPO" commit -qam fourth
 SHA4="$(git -C "$REPO" rev-parse HEAD)"
 PRE_STATE="$(unit_state)"; MANAGED_BEFORE="$(cat "$MANAGED")"
