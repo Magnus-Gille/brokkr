@@ -223,8 +223,9 @@ echo "agent-cli-update.test.sh (bash: $("$BASH_BIN" -c 'echo $BASH_VERSION'))"
 # --- static gates: portable to bash 3.2, no process inspection ---------------------------------
 check "script exists and is executable" '[[ -x "$SCRIPT" ]]'
 check "script parses under the bash being tested" '"$BASH_BIN" -n "$SCRIPT"'
-check "script avoids bash 4+ constructs" '! grep -Eq "(declare|local|typeset) -[a-zA-Z]*[An]|mapfile|readarray|wait -n|\$\{[A-Za-z_0-9]+(,,|\^\^)\}|\[-[0-9]+\]" "$SCRIPT"'
-check "script never inspects other processes" '! grep -Eq "(^|[[:space:];|&(])(ps|pgrep|pkill)[[:space:]]|/proc/" "$SCRIPT"'
+CODE_ONLY="$(grep -v '^[[:space:]]*#' "$SCRIPT" 2>/dev/null)"
+check "script avoids bash 4+ constructs" '! printf "%s\n" "$CODE_ONLY" | grep -Eq "(declare|local|typeset) -[a-zA-Z]*[An]|mapfile|readarray|wait -n|\$\{[A-Za-z_0-9]+(,,|\^\^)\}|\[-[0-9]+\]"'
+check "script never inspects other processes" '! printf "%s\n" "$CODE_ONLY" | grep -Eq "(^|[[:space:];|&(])(ps|pgrep|pkill)[[:space:]]|/proc/"'
 check "script runs with strict mode" 'grep -Fxq "set -euo pipefail" "$SCRIPT"'
 
 # --- usage and configuration errors --------------------------------------------------------
@@ -245,7 +246,7 @@ BROKKR_AGENT_CLI_TOOLS="" run
 check "an empty tool list exits 64" '[[ "$RC" -eq 64 ]]'
 BROKKR_STATE_DIR="relative/dir" run --tool claude
 check "a relative state directory exits 64" '[[ "$RC" -eq 64 ]]'
-for unit in 'evil;touch.service' 'hugin' 'hugin.timer' '../x.service' '$(id).service' '*.service' 'a/b.service'; do
+for unit in 'evil;touch.service' 'hugin' 'hugin.timer' '-x.service' '../x.service' '$(id).service' '*.service' 'a/b.service'; do
   BROKKR_AGENT_CLI_BUSY_UNITS="hugin.service $unit" run
   check "invalid busy unit '$unit' exits 64 before touching anything" '[[ "$RC" -eq 64 ]] && [[ ! -s "$CALLS" ]]'
 done
@@ -375,7 +376,7 @@ latest @anthropic-ai/claude-code 2.0.0
 touch "$VERDIR/claude.noversion"
 echo 1.0.0 >"$VERDIR/npm-install-fail-ver"
 run
-check "smoke check needs a semver in the output; a failed rollback is a failure, not rolled-back" '[[ "$RC" -eq 1 && "$OUT" == *"claude npm"*failed* && "$OUT" != *rolled-back* ]]'
+check "smoke check needs a semver in the output; a failed rollback is a failure, not rolled-back" '[[ "$RC" -eq 1 && "$OUT" == *"claude npm"*failed* ]] && ! printf "%s\n" "$OUT" | grep -Eq "^claude .* rolled-back( |\$)"'
 
 # --- native, standalone, installer, brew ------------------------------------------------------------
 reset
@@ -614,25 +615,28 @@ chmod 755 "$STATE_DIR"
 
 # --- timeouts ---------------------------------------------------------------------------------------
 reset
-npm_tool claude @anthropic-ai/claude-code 1.0.0
-latest @anthropic-ai/claude-code 1.0.0
+native_claude 2.0.0 2.0.1
+npm_tool codex @openai/codex 0.9.0
+latest @openai/codex 0.9.0
 write_timeout timeout
-run --tool claude
-check "version probes run under timeout when it exists" '[[ "$RC" -eq 0 ]] && grep -Eq "^timeout [0-9]+ claude --version\$" "$CALLS"'
+run
+check "version probes and update commands run under timeout when it exists" '[[ "$RC" -eq 0 ]] && grep -Eq "^timeout [0-9]+ claude --version\$" "$CALLS" && grep -Eq "^timeout [0-9]+ claude update\$" "$CALLS"'
+check "the npm latest-version lookup runs under timeout too" 'grep -Eq "^timeout [0-9]+ npm view @openai/codex version\$" "$CALLS"'
 rm -f "$BIN/timeout"
 if PATH=/usr/bin:/bin command -v timeout >/dev/null 2>&1; then
   skip "gtimeout fallback (a real timeout exists in /usr/bin:/bin)"
 else
+  reset
+  native_claude 2.0.0 2.0.1
   write_timeout gtimeout
   run --tool claude
   check "version probes fall back to gtimeout" '[[ "$RC" -eq 0 ]] && grep -Eq "^gtimeout [0-9]+ claude --version\$" "$CALLS"'
 fi
 rm -f "$BIN/gtimeout"
 reset
-npm_tool claude @anthropic-ai/claude-code 1.0.0
-latest @anthropic-ai/claude-code 1.0.0
+native_claude 2.0.0 2.0.1
 run --tool claude
-check "without any timeout command the probes still run" '[[ "$RC" -eq 0 && "$OUT" == *"claude npm 1.0.0 -> 1.0.0 current"* ]]'
+check "without any timeout command the probes and update still run" '[[ "$RC" -eq 0 && "$OUT" == *"claude native 2.0.0 -> 2.0.1 updated"* ]]'
 
 # --- real node reads the real package.json ----------------------------------------------------------
 reset
