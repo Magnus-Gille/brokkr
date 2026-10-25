@@ -1,0 +1,32 @@
+# Brokkr · keep the coding-agent CLIs (claude, codex, pi, opencode) current (oneshot,
+# driven by brokkr-agent-cli-update.timer). User unit for fleet nodes. Rendered and
+# installed by scripts/deploy-agent-cli-update.sh; do not copy this template by hand.
+[Unit]
+Description=Brokkr agent CLI updater
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/agent-cli-update.md
+# No OnFailure=: brokkr-systemd-failure@.service is a system unit and does not
+# exist in user scope. A failed run stays visible in the service state, the journal
+# and ~/.local/state/brokkr/agent-cli-update.json.
+
+[Service]
+Type=oneshot
+# Rendered by deploy-agent-cli-update.sh with an exact full revision.
+WorkingDirectory=%h/.local/lib/brokkr/agent-cli-update/releases/@REVISION@
+# The user manager's PATH is minimal. These are the places the agent CLIs and npm live
+# for a non-root user; the updater classifies each tool from its resolved path.
+Environment=PATH=%h/.local/bin:%h/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+# Space-separated systemd user units (for example hugin.service). While one is active
+# and has spawned work, the whole run is deferred to the next timer firing instead of
+# replacing a CLI under a running agent task. Empty disables the guard. Quoted so the
+# spaces survive systemd's Environment= parsing.
+Environment="BROKKR_AGENT_CLI_BUSY_UNITS=@BUSY_UNITS@"
+ExecStart=%h/.local/lib/brokkr/agent-cli-update/releases/@REVISION@/scripts/agent-cli-update.sh
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+# No ProtectHome=/ProtectSystem=: the updater must write ~/.local, ~/.npm, ~/.codex and
+# ~/.opencode, wherever each CLI was installed. NoNewPrivileges keeps it from gaining
+# more than the login user already has; root-managed installs are reported, never changed.
+# A slow registry can take a while; the updater bounds each child itself.
+TimeoutStartSec=30min

@@ -149,7 +149,7 @@ ln -s "$DEPLOY" "$REPO/scripts/deploy-via-link.sh"
 OUT="$(cd "$REPO" && bash "$REPO/scripts/deploy-via-link.sh" "$TARGET" 2>&1)"; RC=$?
 check "symlinked entry script refuses before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"must not contain symlinks"* ]] && ! grep -q ssh "$CALLS"'
 rm -f "$REPO/scripts/deploy-via-link.sh"
-for unit in 'bad' 'x;y.service' 'a.timer' '../x.service' '$(id).service' '*.service'; do
+for unit in 'bad' 'x;y.service' 'a.timer' '-x.service' '../x.service' '$(id).service' '*.service'; do
   BROKKR_AGENT_CLI_BUSY_UNITS="hugin.service $unit" run "$TARGET"
   check "invalid busy unit '$unit' refuses before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"invalid BROKKR_AGENT_CLI_BUSY_UNITS"* ]] && ! grep -q ssh "$CALLS"'
 done
@@ -197,19 +197,21 @@ refuses() { # name expected-text [args...]
   check "$name (--apply)" '[[ "$RC" -ne 0 && "$OUT" == *"$text"* ]] && $MUT'
 }
 MUT=no_mutation
+no_installs() { [[ ! -e "$UNIT_DIR" ]] && ! grep -q "^systemctl" "$CALLS"; }
+no_unit_changes() { [[ ! -e "$RELEASE" ]] && ! grep -q "^systemctl" "$CALLS"; }
 reset; export MOCK_ID_ROOT=1
 refuses "root runtime user refuses" "must not be root" "$TARGET"
 reset; export MOCK_LINGER=no
 refuses "disabled user lingering refuses" "linger" "$TARGET"
 reset
 mkdir -p "$RELEASE"; echo precious >"$RELEASE/marker"
-MUT='[[ ! -e "$UNIT_DIR" ]] && ! grep -q "^systemctl" "$CALLS"'
+MUT=no_installs
 refuses "existing release directory refuses" "release already exists" "$TARGET"
 MUT=no_mutation
 check "existing release directory is left untouched" '[[ "$(cat "$RELEASE/marker")" == precious && "$(find "$RELEASE" -type f | wc -l | tr -d " ")" -eq 1 ]]'
 reset
 mkdir -p "$UNIT_DIR"; echo precious >"$SERVICE.previous-$SHA"
-MUT='[[ ! -e "$RELEASE" ]] && ! grep -q "^systemctl" "$CALLS"'
+MUT=no_unit_changes
 refuses "an existing unit backup for this revision refuses" "unit backup brokkr-agent-cli-update.service.previous-$SHA already exists" "$TARGET"
 MUT=no_mutation
 
