@@ -62,7 +62,12 @@ FAKE
 cat >"$BIN/systemctl" <<'FAKE'
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >>"$MOCK_CALLS"
-exit 0
+# State queries answer like systemd for a previously installed timer (default: absent).
+case "$2" in
+  is-enabled) echo "${MOCK_TIMER_ENABLED:-not-found}"; [ "${MOCK_TIMER_ENABLED:-}" = enabled ] ;;
+  is-active) echo "${MOCK_TIMER_ACTIVE:-inactive}"; [ "${MOCK_TIMER_ACTIVE:-}" = active ] ;;
+  *) exit 0 ;;
+esac
 FAKE
 cat >"$BIN/journalctl" <<'FAKE'
 #!/usr/bin/env bash
@@ -103,7 +108,15 @@ echo "fake rclone: unexpected invocation" >&2; exit 99
 FAKE
 
 export MOCK_CALLS="$CALLS" MOCK_BIN="$BIN" MOCK_REMOTE_HOME="$HOME_DIR" MOCK_RCBIN="$RCBIN"
-export MOCK_REMOTE_PATH="$BIN:$PYBIN:/usr/bin:/bin"
+# The simulated remote sees the system tools through symlinks that leave out rclone: CI
+# installs a real rclone in /usr/bin, which would otherwise satisfy the "missing" cases.
+mkdir -p "$TMP/sysbin"
+for tool in /bin/* /usr/bin/*; do
+  name=${tool##*/}
+  [[ "$name" != rclone && -x "$tool" && ! -e "$TMP/sysbin/$name" ]] || continue
+  ln -s "$tool" "$TMP/sysbin/$name"
+done
+export MOCK_REMOTE_PATH="$BIN:$PYBIN:$TMP/sysbin"
 export PATH="$BIN:$PATH" TMPDIR="$TMP/payload-tmp"
 # The fixture itself may live under /tmp (Linux CI); PrivateTmp roots are set per case.
 export BROKKR_ARCHIVE_PRIVATE_TMP_ROOTS=/nonexistent-private-tmp
@@ -331,7 +344,20 @@ units_intact() { [[ "$(cat "$SERVICE")" == "OLD SERVICE" && "$(cat "$TIMER")" ==
 no_backup_debris() { [[ -z "$(find "$UNIT_DIR" -name '.*backup-tmp*' -print)" ]]; }
 reset; seed_units
 run "$TARGET" --apply
-check "both pre-existing units are backed up as .previous-<SHA>" '[[ "$RC" -eq 0 && "$(cat "$SERVICE.previous-$SHA")" == "OLD SERVICE" && "$(cat "$TIMER.previous-$SHA")" == "OLD TIMER" && "$OUT" == *"enable --now brokkr-archive-verify.timer   # restore the previous schedule"* ]]'
+check "both pre-existing units are backed up as .previous-<SHA>" '[[ "$RC" -eq 0 && "$(cat "$SERVICE.previous-$SHA")" == "OLD SERVICE" && "$(cat "$TIMER.previous-$SHA")" == "OLD TIMER" ]]'
+# The rollback restores the timer's recorded state, never a schedule that was off.
+rollback_tail() { printf '%s\n' "$OUT" | sed -n '/^Rollback/,$p'; }
+reset; seed_units
+MOCK_TIMER_ENABLED=disabled MOCK_TIMER_ACTIVE=inactive run "$TARGET" --apply
+check "rollback over a disabled, inactive timer records that state" '[[ "$RC" -eq 0 && "$(rollback_tail)" == *"timer before this run: disabled, inactive"* ]]'
+check "rollback over a disabled, inactive timer never re-enables or starts it" '! rollback_tail | grep -Eq "systemctl --user (enable|start)"'
+reset; seed_units
+MOCK_TIMER_ENABLED=enabled MOCK_TIMER_ACTIVE=active run "$TARGET" --apply
+check "rollback over an enabled, active timer re-enables and restarts it" '[[ "$RC" -eq 0 && "$(rollback_tail)" == *"systemctl --user enable $(basename "$TIMER")"* && "$(rollback_tail)" == *"systemctl --user start $(basename "$TIMER")"* ]]'
+check "rollback restores the timer files before its state" '[[ "$(rollback_tail | grep -n "mv -f $TIMER.previous" | cut -d: -f1)" -lt "$(rollback_tail | grep -n "systemctl --user enable" | cut -d: -f1)" ]]'
+reset; seed_units
+MOCK_TIMER_ENABLED=enabled MOCK_TIMER_ACTIVE=inactive run "$TARGET" --apply
+check "rollback over an enabled, inactive timer re-enables without starting" '[[ "$(rollback_tail)" == *"systemctl --user enable $(basename "$TIMER")"* ]] && ! rollback_tail | grep -q "systemctl --user start"'
 reset; seed_units; export MOCK_CP_FAIL="service.backup-tmp"
 run "$TARGET" --apply
 check "a failed first backup leaves both original units untouched and installs nothing" '[[ "$RC" -ne 0 && "$OUT" == *"could not back up"* ]] && units_intact && no_backup_debris && [[ ! -e "$RELEASE" ]] && ! grep -q "^systemctl" "$CALLS"'

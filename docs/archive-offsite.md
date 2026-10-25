@@ -61,7 +61,9 @@ its release directory.
 The manifest is `sha256sum` output generated from inside the archive directory, so its
 paths are relative: `(cd "$ARCHIVE_SRC" && find . -type f -print0 | sort -z | xargs -0 sha256sum) >"$ARCHIVE_MANIFEST"`.
 GNU-escaped names (lines starting with `\`) and binary-mode `*` separators are understood.
-Every mode refuses when the archive's file count differs from the manifest's line count.
+Every mode refuses when the archive's file count differs from the manifest's line count,
+and when the archive is empty: cryptcheck prints no "matching files" notice for zero
+matches, so an empty archive could never produce completion evidence.
 
 ## Modes
 
@@ -77,7 +79,7 @@ scripts/archive-offsite.sh --config ~/.config/brokkr/archive-offsite.conf --veri
 |---|---|
 | `--validate` | Guard and archive/manifest count only |
 | `--dry-run` | `rclone copy --dry-run`; writes nothing remotely |
-| `--push` | `copy --immutable` of the archive, `copyto --immutable` of the manifest to `<remote>:<name>.sha256`, then `cryptcheck --one-way` |
+| `--push` | `copy --immutable` of the archive, `copyto --immutable` of the manifest to `<remote>:<name>.sha256`, then `cryptcheck --one-way` and a byte comparison of the remote manifest (copyto skips an existing object of the same size and mtime) |
 | `--check` | `cryptcheck --one-way` and a byte comparison of the remote manifest |
 | `--verify` | The monthly re-proof below, delivered to Heimdall |
 
@@ -106,8 +108,9 @@ following the levels in [backup-evidence.md](backup-evidence.md):
 rclone lists an object whose stored hash is empty as a match and still exits 0. It
 reports such objects only in its "N hashes could not be checked" notice. Every mode
 that runs cryptcheck (`--push`, `--check`, `--verify`) therefore reads rclone's summary
-notices from a fresh log. It requires "N matching files" to equal the manifest count
-and no unchecked hashes. The per-file report is not parsed, because names containing a
+notices from a fresh log. It requires rclone's closing "N differences found" notice
+and "N matching files" equal to the manifest count, with no unchecked hashes. A log
+without those notices, even after exit 0, is "no cryptcheck summary" and fails. The per-file report is not parsed, because names containing a
 newline would split its records.
 
 The panel state is the worst row. The panel message starts with every row's status,
@@ -196,6 +199,8 @@ ticket, log, or this repository.
 
 The verifier only reads, so rolling it back means removing the schedule:
 `systemctl --user disable --now brokkr-archive-verify.timer`. The deploy script prints
-the exact unit-restore recipe for the steps it completed. Off-site objects are never
+the exact unit-restore recipe for the steps it completed. It records the timer's
+enabled and active state before changing any unit, and the recipe restores exactly
+that state. A timer that was disabled before the deploy is never re-enabled or started. Off-site objects are never
 deleted by this tooling. Removing a pushed archive from the cloud is a deliberate
 manual operation outside it.

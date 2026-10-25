@@ -217,6 +217,10 @@ release_moved=0
 service_replaced=0
 timer_replaced=0
 timer_enabled=0
+# The timer's state before this run, recorded before any unit changes, so the rollback
+# restores exactly that state and never starts a schedule that was off.
+prev_timer_enabled=unknown
+prev_timer_active=unknown
 stage=
 tmp_backups=
 cleanup_tmp_backups() {
@@ -241,9 +245,11 @@ print_state() {
   done
   if [ "$service_replaced" = 1 ] || [ "$timer_replaced" = 1 ]; then
     echo "  systemctl --user daemon-reload"
-    if [ "$timer_replaced" = 1 ] && [ -e "$unit_dir/$timer_unit.previous-$REVISION" ]; then
-      echo "  systemctl --user enable --now $timer_unit   # restore the previous schedule"
-    fi
+  fi
+  if [ "$timer_enabled" = 1 ]; then
+    echo "  # timer before this run: $prev_timer_enabled, $prev_timer_active"
+    if [ "$prev_timer_enabled" = enabled ]; then echo "  systemctl --user enable $timer_unit"; fi
+    if [ "$prev_timer_active" = active ]; then echo "  systemctl --user start $timer_unit"; fi
   fi
   if [ "$release_moved" = 1 ]; then echo "  rm -rf $release   # optional; the verifier never changes the archive or the remote copy"; fi
 }
@@ -294,6 +300,12 @@ for tmp in $tmp_backups; do
   echo "backed up existing $name as $name.previous-$REVISION"
 done
 tmp_backups=
+# Queries only; an absent unit reports not-found / inactive and a non-zero status.
+prev_timer_enabled=$(systemctl --user is-enabled "$timer_unit" 2>/dev/null || true)
+prev_timer_active=$(systemctl --user is-active "$timer_unit" 2>/dev/null || true)
+prev_timer_enabled=${prev_timer_enabled:-not-found}
+prev_timer_active=${prev_timer_active:-inactive}
+echo "timer before this run: $prev_timer_enabled, $prev_timer_active"
 mv "$stage" "$release"
 stage=
 release_moved=1

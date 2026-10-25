@@ -97,6 +97,9 @@ preflight_archive() {
   files=$(find "$SRC" -type f -print0 | tr -dc '\0' | wc -c | tr -d ' ')
   mlines=$(wc -l <"$MAN" | tr -d ' ')
   [ "$files" -eq "$mlines" ] || { echo "archive has $files files but manifest has $mlines lines"; return 1; }
+  # rclone prints no "matching files" notice for zero matches, so an empty archive could
+  # never show completion evidence.
+  [ "$files" -gt 0 ] || { echo "archive is empty: nothing to copy or verify"; return 1; }
   echo "$files"
 }
 
@@ -146,20 +149,33 @@ print("underlying: %s type=%s drive_type=%s drive_id=%s" % (base or "(local path
 ' "$REMOTE" 2>&1
 }
 
-# cryptcheck --one-way into a fresh log; sets CC_RC, CC_MATCH and CC_UNCHECKED. Counts
-# come from rclone's own summary notices, not from per-file reports, whose unescaped
-# names would split on a newline. An object whose stored hash is empty is reported as a
-# match and still exits 0; only the "N hashes could not be checked" notice shows it.
+# cryptcheck --one-way into a fresh log; sets CC_RC, CC_SUMMARY, CC_MATCH and
+# CC_UNCHECKED. Counts come from rclone's own summary notices, not from per-file
+# reports, whose unescaped names would split on a newline. An object whose stored hash
+# is empty is reported as a match and still exits 0; only the "N hashes could not be
+# checked" notice shows it. rclone always ends a check with "N differences found" and,
+# for a non-empty archive, "N matching files"; without both there is no evidence at all.
 run_cryptcheck() { # log-file
+  local differ
   if "$RCLONE" cryptcheck --one-way --log-file "$1" --log-level NOTICE "$SRC" "$REMOTE:$NAME" >/dev/null 2>&1
   then CC_RC=0; else CC_RC=$?; fi
   cat "$1" >>"$LOG" 2>/dev/null || true
+  differ=$(sed -n 's/.*: \([0-9][0-9]*\) differences found$/\1/p' "$1" 2>/dev/null | tail -n 1)
   CC_MATCH=$(sed -n 's/.*: \([0-9][0-9]*\) matching files$/\1/p' "$1" 2>/dev/null | tail -n 1)
   CC_UNCHECKED=$(sed -n 's/.*: \([0-9][0-9]*\) hashes could not be checked$/\1/p' "$1" 2>/dev/null | tail -n 1)
+  if [ -n "$differ" ] && [ -n "$CC_MATCH" ]; then CC_SUMMARY=1; else CC_SUMMARY=0; fi
   CC_MATCH=${CC_MATCH:-0} CC_UNCHECKED=${CC_UNCHECKED:-0}
 }
-cryptcheck_ok() { [ "$CC_RC" = 0 ] && [ "$CC_MATCH" = "$files" ] && [ "$CC_UNCHECKED" = 0 ]; }
-cryptcheck_detail() { echo "cryptcheck exit $CC_RC: $CC_MATCH/$files matched, $CC_UNCHECKED hashes unchecked"; }
+cryptcheck_ok() {
+  [ "$CC_RC" = 0 ] && [ "$CC_SUMMARY" = 1 ] && [ "$CC_MATCH" = "$files" ] && [ "$CC_UNCHECKED" = 0 ]
+}
+cryptcheck_detail() {
+  if [ "$CC_SUMMARY" = 1 ]; then
+    echo "cryptcheck exit $CC_RC: $CC_MATCH/$files matched, $CC_UNCHECKED hashes unchecked"
+  else
+    echo "cryptcheck exit $CC_RC: no cryptcheck summary in its log, so nothing is verified"
+  fi
+}
 
 # A push and a verify must not interleave: a half-pushed archive would fail cryptcheck.
 if [ "$MODE" != --validate ] && command -v flock >/dev/null 2>&1; then
@@ -191,7 +207,9 @@ if [ "$MODE" != --verify ]; then
       note "push complete; running cryptcheck"
       run_cryptcheck "$cclog"
       cryptcheck_ok || die "$(cryptcheck_detail)"
-      note "cryptcheck OK ($CC_MATCH/$files matched)" ;;
+      # copyto skips an existing object of the same size and mtime, so compare the bytes.
+      "$RCLONE" cat "$REMOTE:$NAME.sha256" | cmp -s - "$MAN" || die "remote manifest is missing or differs from $MAN"
+      note "cryptcheck OK ($CC_MATCH/$files matched; remote manifest byte-identical)" ;;
     --check)
       run_cryptcheck "$cclog"
       cryptcheck_ok || die "$(cryptcheck_detail)"

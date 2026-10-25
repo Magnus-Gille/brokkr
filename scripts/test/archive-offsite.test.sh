@@ -212,6 +212,18 @@ expect 0 "push + cryptcheck ok"           "${G[@]}" --push
 check "no plaintext names in store" '! find "$TMP/store" | grep -qE "x\.jpg|big\.nef|slash|a b|photos"'
 expect 0 "check ok"                       "${G[@]}" --check
 expect 0 "re-push idempotent"             "${G[@]}" --push
+# A remote manifest with the same size and mtime but different bytes is skipped by
+# copyto, so push itself must compare it.
+python3 -I -c 'import sys; d=open(sys.argv[1],"rb").read(); sys.stdout.buffer.write(d[:5] + (b"0" if d[5:6] != b"0" else b"1") + d[6:])' \
+  "$ARCHIVE_MANIFEST" >"$TMP/manifest.corrupt"
+"$R" deletefile good:photos.sha256
+"$R" rcat good:photos.sha256 <"$TMP/manifest.corrupt"
+touch -r "$ARCHIVE_MANIFEST" "$(find "$TMP/store" -maxdepth 1 -type f)"
+expect 1 "push fails when the remote manifest differs at the same size and mtime" "${G[@]}" --push
+check "push names the differing remote manifest" '[[ "$OUT" == *"remote manifest is missing or differs"* ]]'
+"$R" deletefile good:photos.sha256
+"$R" copyto "$ARCHIVE_MANIFEST" good:photos.sha256
+expect 0 "push passes again once the remote manifest matches" "${G[@]}" --push
 printf two >"$SRC/a b/x.jpg"
 expect 1 "changed file not overwritten"   "${G[@]}" --push
 check "remote still has original" '[ "$("$R" cat "good:photos/a b/x.jpg")" = one ]'
@@ -348,6 +360,35 @@ check "unchecked cryptcheck hashes fail integrity" '[ "$RC" = 1 ] && [[ "$(row i
 expect 1 "manual --check fails on unchecked hashes" env MOCK_REAL_RCLONE="$R" ARCHIVE_RCLONE="$TMP/bin/rclone-nohash" "${G[@]}" --check
 check "manual --check names the unchecked hashes" '[[ "$OUT" == *"1 hashes unchecked"* ]]'
 expect 1 "manual --push fails on unchecked hashes" env MOCK_REAL_RCLONE="$R" ARCHIVE_RCLONE="$TMP/bin/rclone-nohash" "${G[@]}" --push
+
+# Absent cryptcheck evidence must never read as zero problems: the wrapper replaces
+# cryptcheck with an exit-0 run that writes an empty or unparseable log, or a failing
+# run with no diagnostics.
+cat >"$TMP/bin/rclone-cc" <<'FAKE'
+#!/usr/bin/env bash
+[ "$1" = cryptcheck ] || exec "$MOCK_REAL_RCLONE" "$@"
+prev=; for arg in "$@"; do [ "$prev" != --log-file ] || log=$arg; prev=$arg; done
+case "$MOCK_CC_MODE" in
+  empty) : >"$log"; exit 0 ;;
+  garbage) printf 'something rclone never prints\n' >"$log"; exit 0 ;;
+  silent-fail) : >"$log"; exit 3 ;;
+esac
+exit 99
+FAKE
+chmod 755 "$TMP/bin/rclone-cc"
+for mode in empty garbage; do
+  expect 1 "manual --check fails on an exit-0 cryptcheck with a $mode log" \
+    env MOCK_REAL_RCLONE="$R" MOCK_CC_MODE=$mode ARCHIVE_RCLONE="$TMP/bin/rclone-cc" "${G[@]}" --check
+  check "--check names the missing cryptcheck summary ($mode log)" '[[ "$OUT" == *"no cryptcheck summary"* ]]'
+  verify MOCK_REAL_RCLONE="$R" MOCK_CC_MODE=$mode ARCHIVE_RCLONE="$TMP/bin/rclone-cc"
+  check "verify fails integrity on an exit-0 cryptcheck with a $mode log" '[ "$RC" = 1 ] && [[ "$(row integrity)" == *"no cryptcheck summary"* ]]'
+done
+expect 1 "a failing cryptcheck without diagnostics fails --check" \
+  env MOCK_REAL_RCLONE="$R" MOCK_CC_MODE=silent-fail ARCHIVE_RCLONE="$TMP/bin/rclone-cc" "${G[@]}" --check
+check "the silent failure reports its exit code" '[[ "$OUT" == *"cryptcheck exit 3"* ]]'
+mkdir -p "$TMP/empty-archive"; : >"$TMP/empty.sha256"
+expect 1 "an empty archive is refused" env ARCHIVE_SRC="$TMP/empty-archive" ARCHIVE_MANIFEST="$TMP/empty.sha256" "${G[@]}" --validate
+check "empty archive refusal is for the stated reason" '[[ "$OUT" == *"archive is empty"* ]]'
 verify MOCK_RM_FAIL=1
 check "failed scratch removal is delivered as a restore failure" '[ "$RC" = 1 ] && [[ "$(row restore)" == "fail restored 3/3 sampled files but could not remove the scratch copy" ]] && [ "$(panel)" = "archive-verify-node-a fail" ]'
 check "the work directory is still removed afterwards" '[ -z "$(find "$TMP/state" -name ".archive-verify.*")" ]'
