@@ -2,7 +2,7 @@ BROKKR_SSH_TARGET ?= brokkr@control-node
 BROKKR_REMOTE_DIR ?= /opt/brokkr
 export OVERLAY COMMIT
 
-.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight systemd-supervision-audit m5-network-render m5-network-preflight test shellcheck
+.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install agent-cli-update agent-cli-update-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight systemd-supervision-audit m5-network-render m5-network-preflight test shellcheck
 
 patching: ## Install/refresh unattended-upgrades on all Pi hosts (ARGS="--dry-run" or a host)
 	@./scripts/setup-host-patching.sh $(ARGS)
@@ -15,6 +15,12 @@ offsite-photos-dryrun: ## Dry-run the offsite Photos backup (touches nothing)
 
 offsite-photos-install: ## Install/refresh the offsite-photos LaunchAgent (daily 04:15)
 	@./launchd/install.sh
+
+agent-cli-update: ## Update the claude/codex/pi/opencode CLIs on this host now (ARGS="--dry-run" or "--tool codex")
+	@./scripts/agent-cli-update.sh $(ARGS)
+
+agent-cli-update-install: ## Install/refresh the agent CLI updater LaunchAgent (04:17, 10:17, 16:17, 22:17)
+	@./launchd/install-agent-cli-update.sh
 
 deploy-control-node: ## Deploy from an owner-only overlay (OVERLAY=/absolute/file COMMIT=full-sha)
 	@test -n "$$OVERLAY" || { echo "OVERLAY=/absolute/owner-only-overlay.json is required" >&2; exit 64; }
