@@ -29,6 +29,8 @@ case "$1" in
     exit "${MOCK_CS_ISLUKS_RC:-0}" ;;
   luksUUID) printf '%s\n' "${MOCK_CS_UUID:-}" ;;
   status)
+    # MOCK_CS_STATUS_ERR_AFTER_OPEN: the query itself fails (not "inactive") once open.
+    if [ "${MOCK_CS_STATUS_ERR_AFTER_OPEN:-}" = 1 ] && [ -e "$MOCK_STATE/open" ]; then exit 2; fi
     if [ -e "$MOCK_STATE/open" ] || [ "${MOCK_CS_ACTIVE:-}" = 1 ]; then exit 0; fi
     exit 4 ;;
   open)
@@ -39,9 +41,11 @@ case "$1" in
     # signal between the command finishing and the script recording it).
     [ "${MOCK_CS_OPEN_LEAK:-}" != 1 ] || { : >"$MOCK_STATE/open"; exit 1; }
     [ "${MOCK_CS_OPEN_RC:-0}" = 0 ] || exit "$MOCK_CS_OPEN_RC"
-    : >"$MOCK_STATE/open" ;;
+    : >"$MOCK_STATE/open"
+    if [ "${MOCK_SIGNAL_AFTER:-}" = open ]; then kill -"$MOCK_SIGNAL" "$PPID"; fi ;;
   luksClose)
     [ ! -e "$MOCK_STATE/mounted" ] || exit 5
+    [ "${MOCK_CS_CLOSE_RC:-0}" = 0 ] || exit "$MOCK_CS_CLOSE_RC"
     rm -f "$MOCK_STATE/open" ;;
   *) exit 64 ;;
 esac
@@ -54,6 +58,7 @@ mnt="${!#}"
 [ -e "$MOCK_STATE/open" ] || exit 32
 [ "${MOCK_MOUNT_RC:-0}" = 0 ] || exit "$MOCK_MOUNT_RC"
 rmdir "$mnt" && mv "$MOCK_DISK" "$mnt" && printf '%s\n' "$mnt" >"$MOCK_STATE/mounted"
+if [ "${MOCK_SIGNAL_AFTER:-}" = mount ]; then kill -"$MOCK_SIGNAL" "$PPID"; fi
 [ "${MOCK_MOUNT_LEAK:-}" != 1 ] || exit 1
 MOCK
 
@@ -67,8 +72,14 @@ MOCK
 
 cat >"$TMP/bin/mountpoint" <<'MOCK'
 #!/usr/bin/env bash
+# util-linux contract: 0 = mount point, 32 = not a mount point, anything else = error.
 [ "${1:-}" = -q ] && shift
-[ -e "$MOCK_STATE/mounted" ] && [ "$(cat "$MOCK_STATE/mounted")" = "$1" ]
+[ "${MOCK_MOUNTPOINT_ERR:-}" != 1 ] || exit 1
+if [ -e "$MOCK_STATE/mounted" ] && [ "$(cat "$MOCK_STATE/mounted")" = "$1" ]; then
+  [ "${MOCK_MOUNTPOINT_ERR_AFTER_MOUNT:-}" != 1 ] || exit 1
+  exit 0
+fi
+exit 32
 MOCK
 
 cat >"$TMP/bin/lsblk" <<'MOCK'
@@ -131,6 +142,12 @@ for arg in "$@"; do
   esac
 done
 src="${args[0]%/}"; dst="${args[1]%/}"
+# MOCK_RSYNC_LINKIFY: a hashed regular source file becomes a symlink to a live copy
+# just before this copy runs.
+if [ -n "${MOCK_RSYNC_LINKIFY:-}" ] && [ -f "$src/$MOCK_RSYNC_LINKIFY" ] && [ ! -L "$src/$MOCK_RSYNC_LINKIFY" ]; then
+  mv "$src/$MOCK_RSYNC_LINKIFY" "$MOCK_STATE/live-target"
+  ln -s "$MOCK_STATE/live-target" "$src/$MOCK_RSYNC_LINKIFY"
+fi
 [ -d "$(dirname "$dst")" ] || { echo "mock rsync: mkdir $dst failed: No such file or directory" >&2; exit 11; }
 [ -d "$dst" ] || mkdir "$dst" || exit 11
 (cd "$src" && find . \( -type f -o -type l \)) | while IFS= read -r rel; do
@@ -380,6 +397,37 @@ if [ "$(id -u)" -ne 0 ]; then
   check "a service file that cannot be checksummed fails the rotation" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"checksum service source"* ]] && no_receipts'
   chmod 0600 "$F/svc/alpha/a-unreadable"
 fi
+
+# ── signals after open/mount run the cleanup path ──────────────────────────
+for sig in HUP QUIT TERM INT; do
+  for after in open mount; do
+    setup
+    MOCK_SIGNAL="$sig" MOCK_SIGNAL_AFTER="$after" run_rotation
+    check "$sig after $after unmounts, closes and releases the lock" '[ "$RC" -ne 0 ] && closed_cleanly && dir_empty "$F/lock" && no_receipts && ! completed'
+  done
+done
+
+# ── unknown state is never reported as safe ────────────────────────────────
+setup
+MOCK_MOUNTPOINT_ERR=1 run_rotation
+check "a failing mount-point query refuses before opening" '[ "$RC" -ne 0 ] && not_called "cryptsetup open"'
+
+setup
+MOCK_CS_STATUS_ERR_AFTER_OPEN=1 MOCK_CS_CLOSE_RC=5 MOCK_RSYNC_RC=23 run_rotation
+check "unknown mapping state after a failure says do NOT unplug" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"do NOT unplug"* ]] && [[ "$OUT" != *"(safe to unplug)"* ]]'
+
+setup
+MOCK_MOUNTPOINT_ERR_AFTER_MOUNT=1 MOCK_UMOUNT_RC=32 run_rotation
+check "unknown mount state after a failure says do NOT unplug" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"do NOT unplug"* ]] && [[ "$OUT" != *"(safe to unplug)"* ]]'
+
+setup
+MOCK_MOUNTPOINT_ERR_AFTER_MOUNT=1 run_rotation
+check "an unknown mount state is still unmounted and closed when that succeeds" '[ "$RC" -ne 0 ] && closed_cleanly && no_receipts'
+
+# ── service verification never follows links ───────────────────────────────
+setup
+MOCK_RSYNC_LINKIFY=db/dump.sql run_rotation
+check "a service file swapped for a symlink before the copy fails verification" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"service snapshot verification failed"* ]] && no_receipts && closed_cleanly'
 
 # ── failures after opening still close the disk and write no receipt ───────
 setup

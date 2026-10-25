@@ -29,13 +29,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/private-env.sh
 . "$HERE/lib/private-env.sh"
+# shellcheck source=scripts/lib/offline-disk.sh
+. "$HERE/lib/offline-disk.sh"
 
 MAPPER=brokkr-offline
 MARKER=BROKKR-OFFLINE-DISK
 RECEIPT_FORMAT=brokkr-offline-rotation-receipt-v1
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-log() { echo "$(ts) $*" >&2; }
+# A hung-up terminal makes writes fail; logging must never abort cleanup.
+log() { echo "$(ts) $*" >&2 || true; }
 die() { log "ERROR: $*"; exit 1; }
 
 case "${1:-}" in
@@ -87,11 +90,13 @@ release_local() {
   HELD_LOCK=0
 }
 trap release_local EXIT
-# Ignore INT/TERM between creating the lock and recording ownership, so a signal in
-# that window cannot exit with the lock created but HELD_LOCK still 0.
-trap '' INT TERM
+# Every catchable terminating signal exits through the EXIT trap (and so through
+# cleanup). They are ignored between creating the lock and recording ownership, so a
+# signal in that window cannot exit with the lock created but HELD_LOCK still 0.
+on_signals() { trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 131' QUIT; trap 'exit 143' TERM; }
+trap '' HUP INT QUIT TERM
 if mkdir "$LOCK" 2>/dev/null; then HELD_LOCK=1; fi
-trap 'exit 130' INT TERM
+on_signals
 [ "$HELD_LOCK" = 1 ] \
   || die "another offline rotation holds $LOCK; if none is running, remove it by hand"
 
@@ -141,7 +146,11 @@ elif [ ! -t 0 ]; then
 fi
 
 [ -d "$MNT" ] || die "mount point is not a directory: $MNT"
-! mountpoint -q "$MNT" || die "mount point is already in use: $MNT"
+case "$(mount_state "$MNT")" in
+  unmounted) ;;
+  mounted) die "mount point is already in use: $MNT" ;;
+  *) die "cannot determine whether $MNT is a mount point" ;;
+esac
 [ -z "$(ls -A "$MNT")" ] || die "mount point is not empty: $MNT"
 
 # ---- Identify the disk by LUKS UUID -----------------------------------------
@@ -152,9 +161,11 @@ cryptsetup isLuks --type luks2 "$DEV" || die "device for UUID $UUID is not LUKS2
 HEADER_UUID="$(cryptsetup luksUUID "$DEV" | tr '[:upper:]' '[:lower:]')" \
   || die "cannot read the LUKS UUID from $DEV"
 [ "$HEADER_UUID" = "$UUID" ] || die "LUKS UUID mismatch on $DEV: header reports '$HEADER_UUID'"
-if cryptsetup status "$MAPPER" >/dev/null 2>&1; then
-  die "mapping $MAPPER is already active; close it deliberately before rotating"
-fi
+case "$(map_state "$MAPPER")" in
+  inactive) ;;
+  active) die "mapping $MAPPER is already active; close it deliberately before rotating" ;;
+  *) die "cannot determine whether mapping $MAPPER is active" ;;
+esac
 PARENT="$(lsblk -ndo PKNAME "$DEV" 2>/dev/null | head -n 1 || true)"
 if [ -n "$PARENT" ]; then SMART_DEV="/dev/$PARENT"; else SMART_DEV="$DEV"; fi
 
@@ -166,21 +177,28 @@ if [ -n "$PARENT" ]; then SMART_DEV="/dev/$PARENT"; else SMART_DEV="$DEV"; fi
 OPEN_ATTEMPTED=0
 MOUNT_ATTEMPTED=0
 COMPLETE=0
-is_open() { cryptsetup status "$MAPPER" >/dev/null 2>&1; }
+# The disk counts as closed only when unmount and close are confirmed: by the probe
+# reporting unmounted/inactive, or by umount/luksClose succeeding. An unknown probe
+# result triggers the close attempt and, if that fails, the do-NOT-unplug message.
 finish() {
-  local rc=$? mounted=0 opened=0
-  trap - EXIT INT TERM
+  local rc=$? unmounted=1 closed=1
+  set +e
+  trap - EXIT
+  trap '' HUP INT QUIT TERM
   if [ "$COMPLETE" = 1 ]; then release_local; exit 0; fi
-  if [ "$MOUNT_ATTEMPTED" = 1 ] && mountpoint -q "$MNT"; then
-    sync || true
-    umount "$MNT" || mounted=1
+  if [ "$MOUNT_ATTEMPTED" = 1 ] && [ "$(mount_state "$MNT")" != unmounted ]; then
+    sync
+    umount "$MNT" || unmounted=0
   fi
-  if [ "$OPEN_ATTEMPTED" = 1 ] && [ "$mounted" = 0 ] && is_open; then
-    cryptsetup luksClose "$MAPPER" || opened=1
+  if [ "$OPEN_ATTEMPTED" = 1 ]; then
+    if [ "$unmounted" = 0 ]; then
+      closed=0
+    elif [ "$(map_state "$MAPPER")" != inactive ]; then
+      cryptsetup luksClose "$MAPPER" || closed=0
+    fi
   fi
-  if [ "$OPEN_ATTEMPTED" = 1 ] && [ "$mounted" = 1 ]; then opened=1; fi
-  if [ "$mounted" = 1 ] || [ "$opened" = 1 ]; then
-    log "offline rotation FAILED and the disk is still open — do NOT unplug; unmount $MNT and luksClose $MAPPER by hand"
+  if [ "$unmounted" = 0 ] || [ "$closed" = 0 ]; then
+    log "offline rotation FAILED and the disk may still be open — do NOT unplug; unmount $MNT and luksClose $MAPPER by hand"
   elif [ "$rc" -ne 0 ]; then
     log "offline rotation FAILED; disk unmounted and closed (safe to unplug), but no valid receipt was recorded"
   fi
@@ -189,14 +207,14 @@ finish() {
   exit "$rc"
 }
 trap finish EXIT
-trap 'exit 130' INT TERM
+on_signals
 
 log "opening LUKS2 disk $UUID (${KEYFILE:+keyfile}${KEYFILE:-terminal prompt})"
 OPEN_ATTEMPTED=1
 cryptsetup open --type luks2 ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} "$DEV" "$MAPPER" || die "cryptsetup open failed"
 MOUNT_ATTEMPTED=1
 mount -o nodev,nosuid,noexec "/dev/mapper/$MAPPER" "$MNT" || die "mount failed"
-mountpoint -q "$MNT" || die "$MNT is not a mount point after mounting"
+[ "$(mount_state "$MNT")" = mounted ] || die "$MNT is not confirmed as a mount point after mounting"
 [ -f "$MNT/$MARKER" ] && [ ! -L "$MNT/$MARKER" ] && grep -qxF "luks_uuid=$UUID" "$MNT/$MARKER" \
   || die "disk lacks the $MARKER marker for UUID $UUID — not a prepared rotation disk"
 
@@ -247,10 +265,18 @@ if [ "${#SERVICE_NAMES[@]}" -gt 0 ]; then
     rsync -a ${LINK_ARGS[@]+"${LINK_ARGS[@]}"} "$src/" "$PARTIAL/$name/" || die "service rsync failed: $name"
   done
   SERVICE_FILES="$(grep -c . "$SVC_MANIFEST" || true)"
-  if [ "$SERVICE_FILES" -gt 0 ]; then
-    (cd "$PARTIAL" && sha256sum -c --strict --quiet "$SVC_MANIFEST") \
-      || die "service snapshot verification failed on the disk copy"
-  fi
+  # Verify by walking the disk copy the same non-following way (find -type f never
+  # follows a link) and comparing manifests; `sha256sum -c` would follow a symlink
+  # that replaced a hashed file back to live data. Links are kept but not verified.
+  DEST_MANIFEST="$MNT/manifests/.$STAMP-services-disk.sha256.tmp"
+  : >"$DEST_MANIFEST"
+  for name in "${SERVICE_NAMES[@]}"; do
+    service_manifest "$PARTIAL/$name" | sed "s|  \./|  $name/|" >>"$DEST_MANIFEST" \
+      || die "cannot checksum the disk copy of service $name"
+  done
+  cmp -s "$SVC_MANIFEST" "$DEST_MANIFEST" \
+    || die "service snapshot verification failed on the disk copy"
+  rm -f "$DEST_MANIFEST"
   mv "$SVC_MANIFEST" "$MNT/manifests/$STAMP-services.sha256"
   mv "$PARTIAL" "$MNT/services/$STAMP"
 fi

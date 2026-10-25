@@ -51,7 +51,7 @@ required to run or understand Brokkr.
 | `apt/` | Security-only unattended-upgrade policy examples |
 | `disk/`, `timemachine/`, `samba/` | Storage, capacity, Time Machine, and share checks; [NAS share retirement](docs/nas-samba-retirement.md) |
 | `scripts/offsite-photos-backup.sh` | Fail-closed `rclone crypt` backup with deletion gates |
-| `scripts/offline-rotation.sh` | Owner-attended, never-deleting copy to a LUKS2 [offline rotation disk](docs/offline-rotation.md), with sha256, SMART and freshness checks |
+| `scripts/offline-rotation.sh` | Owner-attended, never-deleting copy to a LUKS2 [offline rotation disk](docs/offline-rotation.md), with sha256, SMART and freshness checks; `offline-rotation-format.sh` is the guarded one-time format ceremony |
 | `scripts/memory-cgroup-preflight.py` | Read-only [Pi/Linux memory-controller gate and approved bounded-unit verification](docs/pi-memory-cgroups.md) |
 | `scripts/m5-fde-preflight.sh` | Read-only M5 LUKS/Secure Boot/TPM and backup-evidence ceremony gate |
 | `scripts/m5-network-profile.py` | Default-deny M5 UFW plus pre-INPUT tailnet/SSH/Samba/inference transaction with timed rollback and independent confirmation |

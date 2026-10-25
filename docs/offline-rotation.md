@@ -44,7 +44,10 @@ The disk holds two kinds of data:
    because `sha256sum -c` would follow it to the live source. Service snapshots are
    written to a new `services/<UTC stamp>/` tree, hard-linked against the previous one
    (`--link-dest`). The tree only gets its final name after it has been verified.
-   Symlinks inside service snapshots are kept as links and are not checksummed.
+   Verification walks the disk copy without following links and compares the resulting
+   manifest with the one built from the source. A file that turned into a symlink
+   therefore fails the check. Symlinks inside service snapshots are kept as links and
+   are not checksummed.
 7. Runs a SMART short self-test with `smartctl -d sat` on the parent disk. The run passes
    only if the test was observed running, the newest self-test log entry is
    `Completed without error`, and overall health is `PASSED`.
@@ -52,7 +55,10 @@ The disk holds two kinds of data:
    receipt. `offline rotation complete: safe to unplug` is printed only after all of
    that.
 9. On any failure it still tries to unmount and close the disk, and writes no receipt.
-   It prints `do NOT unplug` if the disk could not be closed.
+   This includes HUP (a closed terminal), INT, QUIT and TERM, which all run the same
+   cleanup. The disk counts as closed only when `mountpoint` and `cryptsetup status`
+   confirm it, or when `umount` and `luksClose` succeed. An error from those tools is
+   unknown state, never success. In that case the script prints `do NOT unplug`.
 
 A receipt is integrity evidence (see [backup evidence](backup-evidence.md)): it proves
 the stored copy matched the manifests at that moment. It does not prove a restore or key
@@ -76,8 +82,19 @@ or secrets.
 ## One-time format ceremony (owner-attended)
 
 This wipes the disk. Run it only after confirming that its old contents have
-independently verified copies elsewhere. Run every command by hand and read its output
-before running the next. No script performs these steps.
+independently verified copies elsewhere. The destructive steps run through
+`scripts/offline-rotation-format.sh`, which stops at the first failure. Each guard runs
+before the step it protects:
+
+- The disk must be named by its `/dev/disk/by-id` link and be a whole USB disk, with
+  nothing mounted and no active holders.
+- You must type `ERASE` after seeing the disk's size and model.
+- The `brokkr-offline` mapping must be inactive, and the helper takes the same lock as
+  the rotation.
+- The new partition must belong to that disk.
+- Immediately before `mkfs.ext4`, the open mapping must be backed by that partition and
+  carry the LUKS UUID just created. Otherwise nothing is formatted, and the mapping is
+  left open for inspection.
 
 1. Generate a long random passphrase in the password manager. Create an entry for the
    rotation disk.
@@ -90,39 +107,30 @@ before running the next. No script performs these steps.
 
    Confirm the model and size, then set `DISK=/dev/disk/by-id/usb-<model>_<serial>-0:0`
    for this shell. Do not paste the serial into tickets or this repository.
-3. Partition the disk and format LUKS2. `luksFormat` prompts for the passphrase; paste it
-   from the password manager:
+3. Run the format helper. It wipes and partitions the disk, then runs LUKS2 `luksFormat`.
+   Paste the passphrase from the password manager at cryptsetup's prompt; it asks twice.
+   The helper then writes the LUKS header backup, creates the ext4 filesystem, the marker
+   and the layout, and closes the disk:
 
    ```bash
-   sudo wipefs --all "$DISK"
-   sudo parted --script "$DISK" mklabel gpt mkpart brokkr-offline 1MiB 100%
-   sudo cryptsetup luksFormat --type luks2 "${DISK}-part1"
-   UUID="$(sudo cryptsetup luksUUID "${DISK}-part1")"; echo "$UUID"
-   ```
-
-   Record the LUKS UUID in the password manager entry and in
-   `/etc/brokkr/offline-rotation.env` as `OFFLINE_LUKS_UUID`.
-4. Back up the LUKS header. A damaged header makes the disk unreadable, even with the
-   passphrase. Store the backup as an attachment on the password manager entry, then
-   remove the temporary file (`sudo shred -u /root/offline-header.img`):
-
-   ```bash
-   sudo cryptsetup luksHeaderBackup "${DISK}-part1" --header-backup-file /root/offline-header.img
-   ```
-
-5. Create the filesystem and the layout. The UUID used here must be the one recorded
-   above:
-
-   ```bash
-   sudo cryptsetup open --type luks2 "/dev/disk/by-uuid/$UUID" brokkr-offline
-   sudo mkfs.ext4 -L brokkr-offline -m 0 /dev/mapper/brokkr-offline
    sudo install -d -m 0700 /mnt/brokkr-offline
-   sudo mount -o nodev,nosuid,noexec /dev/mapper/brokkr-offline /mnt/brokkr-offline
-   printf 'luks_uuid=%s\n' "$UUID" | sudo tee /mnt/brokkr-offline/BROKKR-OFFLINE-DISK
-   sudo chmod 0700 /mnt/brokkr-offline
-   sudo umount /mnt/brokkr-offline
-   sudo cryptsetup luksClose brokkr-offline
+   sudo ./scripts/offline-rotation-format.sh --i-understand-this-erases "$DISK" \
+     --header-backup /root/brokkr-offline-header.img
    ```
+
+   Record the printed `OFFLINE_LUKS_UUID=` value in the password manager entry and in
+   `/etc/brokkr/offline-rotation.env`.
+
+4. Attach the LUKS header backup to the password manager entry. A damaged header makes
+   the disk unreadable, even with the passphrase. Then remove the local copy with
+   `sudo shred -u /root/brokkr-offline-header.img`.
+
+   The helper refuses to run if anything is mounted, the mapping is already active, the
+   partition does not appear, or the mapping is backed by the wrong device. If it stops
+   partway, read the error. It reports `do NOT unplug` whenever it cannot confirm the
+   disk is closed. Once nothing is open, re-run it from the start.
+5. `--key-file FILE` is optional and uses the file's exact bytes as the key. Rotations
+   must then use the same file as `OFFLINE_KEYFILE`. The prompt is recommended.
 
 6. Key-recovery check: re-open the disk with the passphrase copied from the password
    manager, not from shell history, then close it again. Record this as key-recovery
