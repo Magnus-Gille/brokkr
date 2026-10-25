@@ -159,6 +159,14 @@ if [ -e "$legacy" ] || [ -L "$legacy" ]; then
   [ "$(grep -Ec '^[[:space:]]*Exec[A-Za-z]*[[:space:]]*=' "$legacy")" = 1 ] \
     && grep -Eq -e "^ExecStart=/([A-Za-z0-9._-]+/)*ethtool[[:space:]]+--set-eee[[:space:]]+$iface_re[[:space:]]+eee[[:space:]]+off[[:space:]]*\$" "$legacy" \
     || refuse "$legacy_name is not the ad-hoc EEE-off unit (exactly one Exec line, ExecStart=/.../ethtool --set-eee $IFACE eee off); inspect it manually"
+  # Disabling a unit acts on everything its [Install] section names (Also=, Alias=),
+  # so only directives without side effects on other units are accepted.
+  allowed='Description|Documentation|After|Before|BindsTo|Requires|Wants|PartOf|Type|RemainAfterExit|ExecStart|WantedBy'
+  if bad=$(grep -Ev '^[[:space:]]*($|[#;]|\[)' "$legacy" | grep -Ev "^($allowed)=" | head -n 1) && [ -n "$bad" ]; then
+    refuse "$legacy_name is not the ad-hoc EEE-off unit (unsupported directive ${bad%%=*}); inspect it manually"
+  fi
+  [ "$(grep -Ec '^WantedBy=' "$legacy")" = 1 ] && grep -Fxq "WantedBy=sys-subsystem-net-devices-$IFACE.device" "$legacy" \
+    || refuse "$legacy_name is not the ad-hoc EEE-off unit (it must have exactly WantedBy=sys-subsystem-net-devices-$IFACE.device); inspect it manually"
   legacy_present=1
   legacy_enabled=$(systemctl is-enabled "$legacy_name" 2>/dev/null || true)
   case $legacy_enabled in
@@ -166,6 +174,8 @@ if [ -e "$legacy" ] || [ -L "$legacy" ]; then
     *) refuse "$legacy_name is ${legacy_enabled:-in an unknown state}; only an enabled or disabled ad-hoc unit is adopted" ;;
   esac
 fi
+[ ! -e "$unit_dir/$instance" ] && [ ! -L "$unit_dir/$instance" ] \
+  || refuse "$instance exists as its own unit file and shadows the managed template; remove it first"
 for d in "$unit_dir/$template_name.d" "$unit_dir/$instance.d"; do
   [ ! -e "$d" ] && [ ! -L "$d" ] || refuse "${d##*/} is a drop-in directory that overrides the managed unit; remove it first"
 done
@@ -184,9 +194,12 @@ for f in "$unit_dir"/*.wants/*@"$IFACE".service "$unit_dir"/*.requires/*@"$IFACE
   [ -e "$f" ] || [ -L "$f" ] || continue
   name=${f##*/}
   [ "$name" != "$instance" ] || continue
-  if grep -Eq -e '--set-eee[[:space:]]+%[iI]([[:space:]]|$)' "$f" 2>/dev/null; then
-    refuse "$name is enabled and also sets EEE on $IFACE; disable it manually so that only one unit owns this setting"
-  fi
+  for g in "$f" "$unit_dir/${name%%@*}@.service" "$unit_dir/${name%%@*}@.service.d"/*.conf "$unit_dir/$name.d"/*.conf; do
+    [ -e "$g" ] || continue
+    if grep -Eq -e '--set-eee[[:space:]]+%[iI]([[:space:]]|$)' -e "$any_set_re" "$g" 2>/dev/null; then
+      refuse "$name is enabled and also sets EEE on $IFACE; disable it manually so that only one unit owns this setting"
+    fi
+  done
 done
 managed_present=0
 if [ -e "$managed" ] || [ -L "$managed" ]; then
@@ -254,21 +267,18 @@ print_state() {
     return 0
   fi
   echo "Rollback (run on the target as $user; only steps this run completed are listed):"
-  if [ "$instance_newly_enabled" = 1 ]; then
-    if [ "$instance_active" = active ]; then echo "  sudo systemctl disable $instance"; else echo "  sudo systemctl disable --now $instance"; fi
+  if [ "$instance_restarted" = 1 ] && [ "$instance_active" != active ]; then
+    echo "  sudo systemctl stop $instance   # it was inactive before this run"
   fi
+  if [ "$instance_newly_enabled" = 1 ]; then echo "  sudo systemctl disable $instance"; fi
   if [ "$managed_installed" = 1 ]; then
     if [ "$managed_backed_up" = 1 ]; then echo "  sudo mv -f $managed.previous-$REVISION $managed"; else echo "  sudo rm -f $managed"; fi
   fi
   if [ "$legacy_removed" = 1 ]; then echo "  sudo mv -f $legacy.previous-$REVISION $legacy"; fi
   echo "  sudo systemctl daemon-reload"
   if [ "$legacy_disabled" = 1 ] && [ "$legacy_enabled" = enabled ]; then echo "  sudo systemctl enable $legacy_name"; fi
-  if [ "$instance_newly_enabled" = 0 ] && [ "$instance_restarted" = 1 ]; then
-    if [ "$instance_active" != active ]; then
-      echo "  sudo systemctl stop $instance   # it was inactive before this run"
-    elif [ "$managed_backed_up" = 1 ]; then
-      echo "  sudo systemctl restart $instance   # re-run the previous template"
-    fi
+  if [ "$instance_restarted" = 1 ] && [ "$instance_active" = active ] && [ "$managed_backed_up" = 1 ]; then
+    echo "  sudo systemctl restart $instance   # it was active before this run; re-run the previous template"
   fi
   if [ "$legacy_backed_up" = 1 ] && [ "$legacy_removed" = 0 ]; then
     echo "  # $legacy_name was left in place; optional: sudo rm -f $legacy.previous-$REVISION"

@@ -64,13 +64,19 @@ than prompt. Before changing anything it refuses when:
   packages), or `ethtool --show-eee` reports that the interface does not support EEE;
 - `<iface>-eee-off.service` exists but is not exactly the supported shape. It
   must be a regular file with no drop-in directory and exactly one `Exec*` line,
-  `ExecStart=/<path>/ethtool --set-eee <iface> eee off`, and it must be `enabled`
-  or `disabled`. Anything else is adopted by hand, because the deploy deletes the
-  unit it adopts;
+  `ExecStart=/<path>/ethtool --set-eee <iface> eee off`. Its only `WantedBy=` must
+  be the interface's device unit, and it may use only unit-local directives
+  (`Description`, `Documentation`, `After`, `Before`, `BindsTo`, `Requires`,
+  `Wants`, `PartOf`, `Type`, `RemainAfterExit`, `ExecStart`, `WantedBy`).
+  `Also=` or `Alias=` would make disabling it act on other units. It must be
+  `enabled` or `disabled`. Anything else is adopted by hand, because the deploy
+  deletes the unit it adopts;
 - any other unit or drop-in in the unit directory sets EEE on that interface, to
-  any value, or an enabled instance of another template does, which would leave
-  two owners of one setting;
-- a drop-in directory overrides the managed template or instance, or the instance
+  any value, or an enabled instance of another template does through its
+  template, its template's drop-ins or its own drop-ins, which would leave two
+  owners of one setting;
+- a concrete `brokkr-eee-off@<iface>.service` file would shadow the template, a
+  drop-in directory overrides the managed template or instance, or the instance
   is in a state other than enabled, disabled or absent;
 - a backup for this revision already exists.
 
@@ -100,10 +106,11 @@ same revision on a node that is already in place changes nothing.
 ### Rollback
 
 Every `--apply` that changed something prints a rollback recipe listing only the
-steps that run completed. It disables the managed instance if this run enabled it
-and stops it if it was inactive before. It removes the template or restores the
-previous version, then restarts the instance only if it was active before. It
-restores and re-enables the ad-hoc unit and reloads systemd. The tests run the
+steps that run completed. It first stops the managed instance if it was inactive
+before, and disables it if this run enabled it. It removes the template or
+restores the previous version, restores and re-enables the ad-hoc unit, and
+reloads systemd. Last, it restarts the instance on the previous template if the
+instance was active before. Activity and enablement are restored independently. The tests run the
 printed recipe against stateful fakes and check that unit files, enablement and
 activity match the state before the deploy. Disabling or removing a unit does not change the
 live setting. EEE stays off until the next boot or driver reload unless it is

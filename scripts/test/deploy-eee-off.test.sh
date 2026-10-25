@@ -81,7 +81,8 @@ case "${1:-}" in
   enable) touch "$st/enabled.$2" ;;
   disable) if [[ "$2" == --now ]]; then rm -f "$st/enabled.$3" "$st/active.$3"; else rm -f "$st/enabled.$2"; fi ;;
   stop) rm -f "$st/active.$2" ;;
-  start|restart) start_unit "$2" || exit 1 ;;
+  start) start_unit "$2" || exit 1 ;;
+  restart) rm -f "$st/active.$2"; start_unit "$2" || exit 1 ;;
   # An enabled.* file may hold a non-default state such as enabled-runtime.
   is-enabled)
     if [[ -e "$st/enabled.$2" ]]; then state=$(cat "$st/enabled.$2"); echo "${state:-enabled}"
@@ -268,6 +269,17 @@ for mode in dry-run apply; do
   refuses "$mode: an ad-hoc unit with two ExecStart lines refuses" "not the ad-hoc EEE-off unit" "${args[@]}"
   reset; seed_legacy; mkdir -p "$LEGACY.d"; printf '[Service]\nExecStartPost=/bin/true\n' >"$LEGACY.d/x.conf"
   refuses "$mode: an ad-hoc unit with drop-ins refuses" "drop-in" "${args[@]}"
+  reset; seed_legacy; printf '[Service]\nExecStart=/usr/bin/true\n' >"$UNIT_DIR/other-eee@.service"
+  mkdir -p "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants" "$UNIT_DIR/other-eee@.service.d"
+  printf '[Service]\nExecStartPost=/usr/sbin/ethtool --set-eee %%i eee on\n' >"$UNIT_DIR/other-eee@.service.d/eee.conf"
+  ln -s "$UNIT_DIR/other-eee@.service" "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/other-eee@eth0.service"
+  refuses "$mode: an enabled instance whose template drop-in sets EEE refuses" "other-eee@eth0.service" "${args[@]}"
+  reset; seed_legacy; printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee %%i eee off\nExecStartPost=/usr/bin/logger x\n' >"$UNIT_DIR/$INSTANCE"
+  refuses "$mode: a concrete managed instance file shadowing the template refuses" "shadows the managed template" "${args[@]}"
+  reset; seed_legacy; printf 'Also=ssh.service\n' >>"$LEGACY"
+  refuses "$mode: an ad-hoc unit with Also= refuses" "unsupported directive Also" "${args[@]}"
+  reset; seed_legacy; sed -i.bak 's|^WantedBy=.*|WantedBy=multi-user.target|' "$LEGACY"; rm -f "$LEGACY.bak"
+  refuses "$mode: an ad-hoc unit not wanted by the interface device refuses" "WantedBy" "${args[@]}"
   reset; seed_legacy; echo enabled-runtime >"$STATE/enabled.eth0-eee-off.service"
   refuses "$mode: an ad-hoc unit in an unsupported enablement state refuses" "enabled-runtime" "${args[@]}"
 done
@@ -285,7 +297,7 @@ check "the ad-hoc unit is disabled and removed" '[[ ! -e "$LEGACY" && ! -e "$STA
 check "the ad-hoc unit is backed up verbatim" '[[ "$(cat "$LEGACY.previous-$SHA")" == "$LEGACY_BEFORE" ]]'
 check "exactly one loadable unit sets EEE on eth0 afterwards" '[[ "$(grep -l -- "--set-eee" "$UNIT_DIR"/*.service | wc -l | tr -d " ")" == 1 ]]'
 check "the managed instance is enabled and verified before the ad-hoc unit is disabled" '[[ "$(line_of "systemctl restart $INSTANCE")" -lt "$(line_of "systemctl disable eth0-eee-off.service")" ]]'
-check "the rollback recipe restores the ad-hoc unit and removes the managed one" '[[ "$OUT" == *"mv -f $LEGACY.previous-$SHA $LEGACY"* && "$OUT" == *"systemctl enable eth0-eee-off.service"* && "$OUT" == *"systemctl disable --now $INSTANCE"* && "$OUT" == *"rm -f $MANAGED"* ]]'
+check "the rollback recipe restores the ad-hoc unit and removes the managed one" '[[ "$OUT" == *"mv -f $LEGACY.previous-$SHA $LEGACY"* && "$OUT" == *"systemctl enable eth0-eee-off.service"* && "$OUT" == *"systemctl stop $INSTANCE"* && "$OUT" == *"systemctl disable $INSTANCE"* && "$OUT" == *"rm -f $MANAGED"* ]]'
 check "the rollback recipe says stopping does not turn EEE back on" '[[ "$OUT" == *"--set-eee eth0 eee on"* ]]'
 ADOPT_OUT="$OUT"
 check "apply payload parent is cleaned" '[[ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -print)" ]]'
@@ -293,8 +305,8 @@ check "apply payload parent is cleaned" '[[ -z "$(find "$TMPDIR" -mindepth 1 -ma
 # Executing the printed recipe restores the pre-deploy files, enablement, and activity.
 reset; seed_legacy; PRE_STATE="$(unit_state)"
 run "$TARGET" eth0 --apply
-run_rollback
-check "the adoption rollback recipe restores the exact pre-deploy unit state" '[[ "$(unit_state)" == "$PRE_STATE" && "$(cat "$LEGACY")" == "$LEGACY_BEFORE" ]]'
+DEPLOY_RC=$RC; run_rollback; RB=$?
+check "the adoption rollback recipe restores the exact pre-deploy unit state" '[[ "$DEPLOY_RC" -eq 0 && "$OUT" == *"OK: EEE is off"* && "$OUT" == *Rollback* && "$RB" -eq 0 && "$(unit_state)" == "$PRE_STATE" && "$(cat "$LEGACY")" == "$LEGACY_BEFORE" ]]'
 reset; seed_legacy
 run "$TARGET" eth0 --apply
 OUT="$ADOPT_OUT"
@@ -311,8 +323,8 @@ MANAGED_BEFORE="$(cat "$MANAGED")"
 BROKKR_EXPECTED_COMMIT="$SHA2" run "$TARGET" eth0 --apply
 check "a later revision replaces the managed template" '[[ "$RC" -eq 0 ]] && grep -q "$SHA2" "$MANAGED" && [[ "$(cat "$MANAGED.previous-$SHA2")" == "$MANAGED_BEFORE" ]]'
 check "a later revision's rollback restores the previous template without disabling" '[[ "$OUT" == *"mv -f $MANAGED.previous-$SHA2 $MANAGED"* && "$OUT" != *"systemctl disable"*"$INSTANCE"* ]]'
-run_rollback
-check "a later revision's rollback recipe restores the previous template, still enabled and active" '[[ "$(cat "$MANAGED")" == "$MANAGED_BEFORE" && -e "$STATE/enabled.$INSTANCE" && -e "$STATE/active.$INSTANCE" ]]'
+run_rollback; RB=$?
+check "a later revision's rollback recipe restores the previous template, still enabled and active" '[[ "$RB" -eq 0 && "$(cat "$MANAGED")" == "$MANAGED_BEFORE" && -e "$STATE/enabled.$INSTANCE" && -e "$STATE/active.$INSTANCE" ]]'
 git -C "$REPO" reset -q --hard "$SHA"
 
 # A previously enabled but inactive instance is not left active by the rollback.
@@ -321,8 +333,19 @@ echo "third revision" >>"$REPO/README.md"; git -C "$REPO" commit -qam third
 SHA3="$(git -C "$REPO" rev-parse HEAD)"
 PRE_STATE="$(unit_state)"; MANAGED_BEFORE="$(cat "$MANAGED")"
 BROKKR_EXPECTED_COMMIT="$SHA3" run "$TARGET" eth0 --apply
-run_rollback
-check "rollback of an upgrade over an inactive instance restores it inactive" '[[ "$RC" -eq 0 && "$(unit_state)" == "$PRE_STATE" && "$(cat "$MANAGED")" == "$MANAGED_BEFORE" ]]'
+DEPLOY_RC=$RC; run_rollback; RB=$?
+check "rollback of an upgrade over an inactive instance restores it inactive" '[[ "$DEPLOY_RC" -eq 0 && "$OUT" == *"systemctl stop $INSTANCE"* && "$RB" -eq 0 && "$(unit_state)" == "$PRE_STATE" && "$(cat "$MANAGED")" == "$MANAGED_BEFORE" ]]'
+git -C "$REPO" reset -q --hard "$SHA"
+
+# A previously active but disabled instance whose restart fails is restarted on the
+# previous template by the rollback, not left stopped.
+reset; run "$TARGET" eth0 --apply; rm -f "$STATE/enabled.$INSTANCE"
+echo "fourth revision" >>"$REPO/README.md"; git -C "$REPO" commit -qam fourth
+SHA4="$(git -C "$REPO" rev-parse HEAD)"
+PRE_STATE="$(unit_state)"; MANAGED_BEFORE="$(cat "$MANAGED")"
+MOCK_START_FAIL=1 BROKKR_EXPECTED_COMMIT="$SHA4" run "$TARGET" eth0 --apply
+DEPLOY_RC=$RC; run_rollback; RB=$?
+check "rollback after a failed restart of an active, disabled instance restores it active and disabled" '[[ "$DEPLOY_RC" -ne 0 && "$OUT" == *"did not succeed"* && "$RB" -eq 0 && "$(unit_state)" == "$PRE_STATE" && "$(cat "$MANAGED")" == "$MANAGED_BEFORE" ]]'
 git -C "$REPO" reset -q --hard "$SHA"
 
 # --- apply: fresh host, no ad-hoc unit -----------------------------------------------------
@@ -338,8 +361,8 @@ check "a failed first run keeps the ad-hoc unit enabled and in place" '[[ "$RC" 
 check "a failed first run prints a rollback for the managed unit only" '[[ "$OUT" == *Rollback* && "$OUT" == *"rm -f $MANAGED"* && "$OUT" != *"mv -f $LEGACY.previous"* ]]'
 reset; seed_legacy; export MOCK_ETHTOOL_NOOP=1; PRE_STATE="$(unit_state)"
 run "$TARGET" eth0 --apply
-run_rollback
-check "a failed verification's rollback recipe restores the exact pre-deploy unit state" '[[ "$RC" -ne 0 && "$(unit_state)" == "$PRE_STATE" ]]'
+DEPLOY_RC=$RC; run_rollback; RB=$?
+check "a failed verification's rollback recipe restores the exact pre-deploy unit state" '[[ "$DEPLOY_RC" -ne 0 && "$OUT" == *"EEE is still not disabled"* && "$OUT" == *Rollback* && "$RB" -eq 0 && "$(unit_state)" == "$PRE_STATE" ]]'
 reset; seed_legacy; export MOCK_ETHTOOL_NOOP=1
 run "$TARGET" eth0 --apply
 check "EEE still on after the run fails verification and keeps the ad-hoc unit" '[[ "$RC" -ne 0 && "$OUT" == *"EEE is still not disabled"* && -f "$LEGACY" && -e "$STATE/enabled.eth0-eee-off.service" && "$OUT" == *Rollback* ]]'
