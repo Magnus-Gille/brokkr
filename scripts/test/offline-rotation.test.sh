@@ -143,6 +143,8 @@ src="${args[0]%/}"; dst="${args[1]%/}"
     cp -p "$src/$rel" "$dst/$rel"
   fi
 done
+# MOCK_RSYNC_SWAP_FROM/TO: replace a file mid-run (for example the source manifest).
+if [ -n "${MOCK_RSYNC_SWAP_FROM:-}" ]; then cp "$MOCK_RSYNC_SWAP_FROM" "$MOCK_RSYNC_SWAP_TO"; fi
 if [ -n "${MOCK_RSYNC_CORRUPT:-}" ] && [ -f "$dst/$MOCK_RSYNC_CORRUPT" ]; then
   echo corrupted >>"$dst/$MOCK_RSYNC_CORRUPT"
 fi
@@ -154,7 +156,7 @@ chmod +x "$TMP/bin/"*
 setup() {
   rm -rf "$TMP/case"
   F="$TMP/case"
-  mkdir -p "$F/state" "$F/dev" "$F/by-uuid" "$F/disk" "$F/mnt" "$F/receipts" \
+  mkdir -p "$F/state" "$F/dev" "$F/by-uuid" "$F/disk" "$F/mnt" "$F/receipts" "$F/lock" \
     "$F/archive/2019" "$F/svc/alpha/db" "$F/svc/beta"
   printf 'photo one\n' >"$F/archive/2019/one.jpg"
   printf 'photo two\n' >"$F/archive/two.jpg"
@@ -179,6 +181,7 @@ OFFLINE_MOUNT_POINT='$F/mnt'
 BROKKR_OFFLINE_RECEIPT_DIR='$F/receipts'
 BROKKR_OFFLINE_BY_UUID_DIR='$F/by-uuid'
 BROKKR_OFFLINE_SMART_POLL_SECONDS=0
+BROKKR_OFFLINE_LOCK_DIR='$F/lock'
 EOF
   chmod 0600 "$F/env"
 }
@@ -329,6 +332,40 @@ check "non-empty mount point is refused before opening" '[ "$RC" -ne 0 ] && [[ "
 setup
 run_rotation --bogus
 check "unknown argument is a usage error" '[ "$RC" -eq 64 ] && not_called "cryptsetup"'
+
+# ── concurrency and time-of-check guards ───────────────────────────────────
+setup
+run_rotation
+check "the run lock is released after a successful rotation" '[ "$RC" -eq 0 ] && dir_empty "$F/lock"'
+
+setup
+mkdir "$F/lock/brokkr-offline-rotation.lock"
+run_rotation
+check "a concurrent run holding the lock is refused" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"another offline rotation"* ]]'
+check "a refused concurrent run neither opens nor closes the mapping" 'not_called "cryptsetup open" && not_called "cryptsetup luksClose"'
+check "a refused concurrent run leaves the other run's lock in place" '[ -d "$F/lock/brokkr-offline-rotation.lock" ]'
+
+setup
+printf 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -\n' >>"$F/archive.sha256"
+run_rotation
+check "a manifest entry naming stdin is refused" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"manifest"* ]] && not_called "cryptsetup"'
+
+setup
+printf 'live secret\n' >"$F/live-secret"
+cp "$F/archive.sha256" "$F/swapped.sha256"
+sha256sum "$F/live-secret" >>"$F/swapped.sha256"
+MOCK_RSYNC_SWAP_FROM="$F/swapped.sha256" MOCK_RSYNC_SWAP_TO="$F/archive.sha256" run_rotation
+check "a manifest replaced mid-run is not the one verified" '! grep -qF "$F/live-secret" "$F/disk/manifests/2026-10-26T073320Z-archive.sha256"'
+check "the validated manifest snapshot still verifies the archive" '[ "$RC" -eq 0 ] && grep -qx "archive_files_verified=2" "$F/receipts/2026-10-26T073320Z.receipt"'
+
+if [ "$(id -u)" -ne 0 ]; then
+  setup
+  printf 'unreadable\n' >"$F/svc/alpha/a-unreadable"
+  chmod 0000 "$F/svc/alpha/a-unreadable"
+  run_rotation
+  check "a service file that cannot be checksummed fails the rotation" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"checksum service source"* ]] && no_receipts'
+  chmod 0600 "$F/svc/alpha/a-unreadable"
+fi
 
 # ── failures after opening still close the disk and write no receipt ───────
 setup

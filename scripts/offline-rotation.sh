@@ -75,18 +75,40 @@ done
 [ -n "$ARCHIVE_SRC" ] && [ -d "$ARCHIVE_SRC" ] || die "OFFLINE_ARCHIVE_SRC is not a directory: ${ARCHIVE_SRC:-unset}"
 [ -n "$MANIFEST" ] && [ -f "$MANIFEST" ] || die "OFFLINE_ARCHIVE_MANIFEST is not a file: ${MANIFEST:-unset}"
 
-# Every manifest line must be "<sha256>  <relative path>" with no absolute path and no
-# '..' component, so `sha256sum -c` can only ever read inside the copied archive.
+# ---- One run at a time ---------------------------------------------------------
+# The lock makes "the mapping was inactive at preflight" mean "any mapping this run
+# later finds is its own". mkdir is atomic; a lock left by a crash is removed by hand.
+LOCK="${BROKKR_OFFLINE_LOCK_DIR:-/run/lock}/brokkr-offline-rotation.lock"
+HELD_LOCK=0
+MANIFEST_SNAPSHOT=""
+release_local() {
+  [ -z "$MANIFEST_SNAPSHOT" ] || rm -f "$MANIFEST_SNAPSHOT"
+  if [ "$HELD_LOCK" = 1 ]; then rmdir "$LOCK" 2>/dev/null || log "WARN: cannot remove lock $LOCK"; fi
+  HELD_LOCK=0
+}
+trap release_local EXIT
+trap 'exit 130' INT TERM
+mkdir "$LOCK" 2>/dev/null \
+  || die "another offline rotation holds $LOCK; if none is running, remove it by hand"
+HELD_LOCK=1
+
+# Validate a private snapshot of the manifest and verify against that same snapshot
+# later, so a manifest replaced during the hours-long copy is never used unchecked.
+# Every line must be "<sha256>  <relative path>": no absolute path, no '..' component
+# and not '-' (stdin), so `sha256sum -c` can only ever read inside the copied archive.
+MANIFEST_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/brokkr-offline-manifest.XXXXXX")" \
+  || die "cannot create a private manifest snapshot"
+cp "$MANIFEST" "$MANIFEST_SNAPSHOT" || die "cannot snapshot the archive manifest: $MANIFEST"
 ARCHIVE_COUNT="$(awk '
   { line = $0 }
   line !~ /^[0-9a-f]{64} [ *]./ { bad = 1; exit }
   { path = substr(line, 67) }
-  path ~ /^\// || path ~ /(^|\/)\.\.(\/|$)/ { bad = 1; exit }
+  path == "-" || path ~ /^\// || path ~ /(^|\/)\.\.(\/|$)/ { bad = 1; exit }
   { n++ }
   END { if (bad || n == 0) print "bad"; else print n }
-' "$MANIFEST")"
+' "$MANIFEST_SNAPSHOT")"
 [ "$ARCHIVE_COUNT" != bad ] \
-  || die "archive manifest has an empty, malformed, absolute or '..' entry: $MANIFEST"
+  || die "archive manifest has an empty, malformed, absolute, '..' or '-' entry: $MANIFEST"
 
 SERVICE_DIRS=()
 SERVICE_NAMES=()
@@ -136,8 +158,8 @@ if [ -n "$PARENT" ]; then SMART_DEV="/dev/$PARENT"; else SMART_DEV="$DEV"; fi
 # ---- Open, mount, and always close on the way out ---------------------------
 # Cleanup reads live state rather than flags set after each command: a signal can
 # land after `cryptsetup open` or `mount` succeeds but before a flag is recorded.
-# The preflight proved the mapping inactive and the mount point unused, so once an
-# attempt was made, an active mapping or mount at those names is this run's.
+# Under the run lock, the preflight proved the mapping inactive and the mount point
+# unused, so once an attempt was made, an active mapping or mount there is this run's.
 OPEN_ATTEMPTED=0
 MOUNT_ATTEMPTED=0
 COMPLETE=0
@@ -145,7 +167,7 @@ is_open() { cryptsetup status "$MAPPER" >/dev/null 2>&1; }
 finish() {
   local rc=$? mounted=0 opened=0
   trap - EXIT INT TERM
-  [ "$COMPLETE" = 1 ] && exit 0
+  if [ "$COMPLETE" = 1 ]; then release_local; exit 0; fi
   if [ "$MOUNT_ATTEMPTED" = 1 ] && mountpoint -q "$MNT"; then
     sync || true
     umount "$MNT" || mounted=1
@@ -159,6 +181,7 @@ finish() {
   elif [ "$rc" -ne 0 ]; then
     log "offline rotation FAILED; disk unmounted and closed (safe to unplug), but no valid receipt was recorded"
   fi
+  release_local
   [ "$rc" -ne 0 ] || rc=1
   exit "$rc"
 }
@@ -186,7 +209,7 @@ rsync -a --ignore-existing "$ARCHIVE_SRC/" "$MNT/archive/" || die "archive rsync
 # live source, so a link anywhere in the disk archive would prove nothing.
 link="$(find "$MNT/archive" -type l -print -quit)" || die "cannot scan the disk archive for symlinks"
 [ -z "$link" ] || die "disk archive contains a symlink (${link#"$MNT"/}); verification would read outside the disk"
-cp "$MANIFEST" "$MNT/manifests/.$STAMP-archive.sha256.tmp"
+cp "$MANIFEST_SNAPSHOT" "$MNT/manifests/.$STAMP-archive.sha256.tmp"
 mv "$MNT/manifests/.$STAMP-archive.sha256.tmp" "$MNT/manifests/$STAMP-archive.sha256"
 log "verifying $ARCHIVE_COUNT archive files against the sha256 manifest"
 (cd "$MNT/archive" && sha256sum -c --strict --quiet "$MNT/manifests/$STAMP-archive.sha256") \
@@ -195,8 +218,9 @@ MANIFEST_SHA="$(sha256sum "$MNT/manifests/$STAMP-archive.sha256" | awk '{print $
 
 # ---- Service snapshots: new dated tree, verified against the source ---------
 service_manifest() {
+  # Called inside `|| die`, where errexit is off, so each failure must exit explicitly.
   (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | while IFS= read -r -d '' f; do
-    sha256sum "$f"
+    sha256sum "$f" || exit 1
   done)
 }
 SERVICE_FILES=0

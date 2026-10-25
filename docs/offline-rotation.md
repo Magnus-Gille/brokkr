@@ -21,19 +21,23 @@ The disk holds two kinds of data:
 1. Sources its config from a private env file, default `/etc/brokkr/offline-rotation.env`.
    The file must be regular, not a symlink, owned by the account running the script, and
    have no group/other permissions (0600). It is checked before it is parsed.
-2. Identifies the disk only by its LUKS UUID, through `/dev/disk/by-uuid`. It refuses
+2. Holds an exclusive run lock (`/run/lock/brokkr-offline-rotation.lock`, a
+   directory). It validates a private snapshot of the archive manifest and later
+   verifies against that same snapshot. Manifest entries must be relative, with no `..`
+   component, and no entry may be `-`.
+3. Identifies the disk only by its LUKS UUID, through `/dev/disk/by-uuid`. It refuses
    to continue unless all of these hold:
    - the header is LUKS2;
    - `cryptsetup luksUUID` reports the same UUID;
    - the `brokkr-offline` mapping is not already active;
    - the mount point is empty and unmounted.
-3. Opens the disk with cryptsetup's own passphrase prompt, or with an owner-only keyfile
+4. Opens the disk with cryptsetup's own passphrase prompt, or with an owner-only keyfile
    named in the env file. The script never reads, stores or prints the passphrase.
    Without a keyfile it refuses to run unless stdin is a terminal, so cryptsetup cannot
    read a passphrase from a pipe.
-4. Mounts with `nodev,nosuid,noexec` and requires the `BROKKR-OFFLINE-DISK` marker
+5. Mounts with `nodev,nosuid,noexec` and requires the `BROKKR-OFFLINE-DISK` marker
    written at the format ceremony.
-5. **Never deletes.** The archive is copied with `rsync -a --ignore-existing`, without
+6. **Never deletes.** The archive is copied with `rsync -a --ignore-existing`, without
    `--delete`. A changed, truncated or ransomware-encrypted source file therefore cannot
    overwrite the good copy on the disk. The `sha256sum -c --strict` check of the disk copy
    then fails loudly. The run also refuses if the disk archive contains any symlink,
@@ -41,13 +45,13 @@ The disk holds two kinds of data:
    written to a new `services/<UTC stamp>/` tree, hard-linked against the previous one
    (`--link-dest`). The tree only gets its final name after it has been verified.
    Symlinks inside service snapshots are kept as links and are not checksummed.
-6. Runs a SMART short self-test with `smartctl -d sat` on the parent disk. The run passes
+7. Runs a SMART short self-test with `smartctl -d sat` on the parent disk. The run passes
    only if the test was observed running, the newest self-test log entry is
    `Completed without error`, and overall health is `PASSED`.
-7. Writes a receipt on the disk, syncs, unmounts, `luksClose`s, and then writes the local
+8. Writes a receipt on the disk, syncs, unmounts, `luksClose`s, and then writes the local
    receipt. `offline rotation complete: safe to unplug` is printed only after all of
    that.
-8. On any failure it still tries to unmount and close the disk, and writes no receipt.
+9. On any failure it still tries to unmount and close the disk, and writes no receipt.
    It prints `do NOT unplug` if the disk could not be closed.
 
 A receipt is integrity evidence (see [backup evidence](backup-evidence.md)): it proves
