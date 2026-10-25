@@ -112,6 +112,8 @@ expect 1 "missing archive settings refused" env -u ARCHIVE_SRC ARCHIVE_REMOTE=go
 expect 1 "rclone config override in env refused" env RCLONE_CONFIG_GOOD_FILENAME_ENCRYPTION=off "${G[@]}" --validate
 expect 1 "rclone flag override in env refused" env RCLONE_DRY_RUN=true "${G[@]}" --push
 expect 0 "valid crypt accepted"           "${G[@]}" --validate
+check "validate writes no state directory or log" '[ ! -e "$TMP/state" ] && [ ! -e "$TMP/log" ]'
+expect 0 "validate runs when piped to bash -s" sh -c 'ARCHIVE_REMOTE=good bash -s -- --validate <"$1"' _ "$SCRIPT"
 expect 0 "dry-run ok"                     "${G[@]}" --dry-run
 check "dry-run wrote nothing" '[ -z "$(ls -A "$TMP/store")" ]'
 expect 0 "push + cryptcheck ok"           "${G[@]}" --push

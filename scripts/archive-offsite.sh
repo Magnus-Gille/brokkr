@@ -11,7 +11,7 @@
 # remote that is not crypt with encrypted names, a salt, and base32768 names.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 STATE_DIR="${BROKKR_STATE_DIR:-${HOME:-/var/lib/brokkr}/.local/state/brokkr}"
 
 die() { echo "brokkr archive-offsite: $*" >&2; exit 2; }
@@ -79,7 +79,8 @@ BWLIMIT="${ARCHIVE_BWLIMIT:-}"
 [[ "$REMOTE" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || die "ARCHIVE_REMOTE must be a plain rclone remote name"
 [[ "$NAME" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || die "ARCHIVE_NAME must be a plain name"
 [ -n "$RCLONE" ] && [ -x "$RCLONE" ] || die "rclone not found (set ARCHIVE_RCLONE)"
-mkdir -p "$STATE_DIR" "$(dirname "$LOG")"
+# --validate writes no state or log: the deploy preflight runs it on the node in a dry run.
+if [ "$MODE" = --validate ]; then LOG=/dev/null; else mkdir -p "$STATE_DIR" "$(dirname "$LOG")"; fi
 
 note() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
 
