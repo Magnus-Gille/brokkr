@@ -133,7 +133,14 @@ while [ $# -gt 0 ]; do
 done
 key=$(printf '%s' "$url" | sed 's|^https://||' | tr -c 'A-Za-z0-9._-' '_')
 [ -f "$MOCK_WEB/$key" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
-if [ -n "$out" ]; then cat "$MOCK_WEB/$key" >"$out"; else cat "$MOCK_WEB/$key"; fi
+if [ -n "$out" ]; then
+  # Where a download lands matters: log the mode of its directory, and stall when asked to.
+  printf 'outdir-mode %s\n' "$(ls -ld "$(dirname "$out")" | cut -c1-10)" >>"$MOCK_CALLS"
+  if [ -f "$MOCK_WEB/.hold" ]; then : >"$MOCK_WEB/.held"; sleep 3; fi
+  cat "$MOCK_WEB/$key" >"$out"
+else
+  cat "$MOCK_WEB/$key"
+fi
 FAKE
 # MOCK_UNAME_S/MOCK_UNAME_M fake the platform; every other query reaches the real uname.
 {
@@ -202,7 +209,8 @@ reset() {
   [[ -x "$BIN/node" ]] || mv "$BIN/node.off" "$BIN/node" 2>/dev/null || true
   : >"$CALLS"
   unset BROKKR_AGENT_CLI_TOOLS BROKKR_AGENT_CLI_BUSY_UNITS BROKKR_STATE_DIR XDG_STATE_HOME RUN_HOME PATH_PRE PATH_ONLY
-  unset BROKKR_AGENT_CLI_MIN_AGE_HOURS MOCK_UNAME_S MOCK_UNAME_M
+  unset BROKKR_AGENT_CLI_MIN_AGE_HOURS
+  export MOCK_UNAME_S=Linux MOCK_UNAME_M=x86_64
 }
 mutations() { grep -E '^(npm install |brew upgrade|(claude|codex|pi|opencode) (update|upgrade|install))' "$CALLS" || true; }
 no_mutation() { [[ -z "$(mutations)" ]]; }
@@ -323,12 +331,85 @@ only_path() { # extra-utility...
   local u p
   rm -rf "$TMP/only"; mkdir -p "$TMP/only"
   for p in "$BIN"/*; do [[ "$p" == "$BIN/node" ]] || ln -s "$p" "$TMP/only/${p##*/}"; done
-  for u in awk basename cat chmod cp cut date dirname env find grep head hostname id ln mkdir mktemp mv readlink rm sed sh sleep sort stat tail tar tee tr wc "$@"; do
+  for u in awk basename cat chmod cp cut date dirname env find grep head hostname id ln ls mkdir mktemp mv readlink rm sed sh sleep sort stat tail tar tee tr wc "$@"; do
     p=$(type -P "$u") || continue
     [[ -e "$TMP/only/$u" ]] || ln -s "$p" "$TMP/only/$u"
   done
   PATH_ONLY="$TMP/only:$HOME_DIR/.local/bin:$HOME_DIR/.opencode/bin:$TOOLBIN"
 }
+
+# --- pi release fixtures -------------------------------------------------------------------------
+# The pi stub: prints its version, logs the call, and (outside the staging directory) crashes when
+# $MOCK_VER_DIR/pi.broken-at names its version, so a smoke failure can follow a good staging check.
+cat >"$TMP/pi-stub.sh" <<'FAKE'
+#!/bin/sh
+printf 'pi %s\n' "$*" >>"$MOCK_CALLS"
+case "$0" in
+  *.stage.*) ;;
+  *) if [ "$(cat "$MOCK_VER_DIR/pi.broken-at" 2>/dev/null)" = __VERSION__ ]; then echo "pi: crashed" >&2; exit 1; fi ;;
+esac
+echo "pi-cli __VERSION__ (build 9.9.9)"
+FAKE
+# Builds a release tarball: a top-level pi/ with the pi stub, a regular file, and optionally one
+# bad member (dotdot, abs, symlink, hardlink, device, toplevel) or a bad pi (nobinary, wrongver).
+cat >"$TMP/mk-pi-tar.py" <<'FAKE'
+import io, sys, tarfile
+out, ver, mode, template = sys.argv[1:5]
+body = open(template).read().replace("__VERSION__", "9.9.9" if mode == "wrongver" else ver).encode()
+def add(tar, name, data=None, perm=0o644, kind=tarfile.REGTYPE, link=""):
+    info = tarfile.TarInfo(name)
+    info.type, info.mode, info.mtime, info.linkname = kind, perm, 0, link
+    if data is None:
+        tar.addfile(info)
+    else:
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+with tarfile.open(out, "w:gz") as tar:
+    add(tar, "pi/", kind=tarfile.DIRTYPE, perm=0o755)
+    if mode != "nobinary":
+        add(tar, "pi/pi", body, 0o755)
+    add(tar, "pi/README.txt", b"pi release " + ver.encode() + b"\n")
+    if mode == "dotdot":
+        add(tar, "pi/../evil", b"x")
+    elif mode == "abs":
+        add(tar, "/tmp/evil", b"x")
+    elif mode == "symlink":
+        add(tar, "pi/link", kind=tarfile.SYMTYPE, link="/etc/passwd")
+    elif mode == "hardlink":
+        add(tar, "pi/hard", kind=tarfile.LNKTYPE, link="pi/pi")
+    elif mode == "device":
+        add(tar, "pi/null", kind=tarfile.CHRTYPE)
+    elif mode == "toplevel":
+        add(tar, "other/file", b"x")
+FAKE
+sha256_of() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
+PIROOT="$HOME_DIR/.local/lib/brokkr/agent-cli/pi"; PILINK="$HOME_DIR/.local/bin/pi"
+# pi_release VERSION [MODE] : the platform archives and SHA256SUMS of release v<VERSION> (built
+# once per version and mode; every platform gets the same bytes).
+pi_release() {
+  local ver=$1 mode=${2:-good} base="$GH_DL/earendil-works/pi/releases/download/v$1" cache p
+  cache="$TMP/pifix/$ver-$mode.tar.gz"
+  mkdir -p "$TMP/pifix"
+  [[ -f "$cache" ]] || python3 -I "$TMP/mk-pi-tar.py" "$cache" "$ver" "$mode" "$TMP/pi-stub.sh"
+  : >"$TMP/sums"
+  for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+    cp "$cache" "$WEB/$(web_key "$base/pi-$p.tar.gz")"
+    printf '%s  pi-%s.tar.gz\n' "$(sha256_of "$cache")" "$p" >>"$TMP/sums"
+  done
+  web_put "$base/SHA256SUMS" <"$TMP/sums"
+}
+# pi_installed VERSION : an existing pi-release install, reached through ~/.local/bin/pi
+pi_installed() {
+  local dir="$PIROOT/$1/pi"
+  mkdir -p "$dir" "$HOME_DIR/.local/bin"
+  sed "s/__VERSION__/$1/" "$TMP/pi-stub.sh" >"$dir/pi"
+  chmod 755 "$dir/pi"
+  ln -sfn "$dir/pi" "$PILINK"
+}
+pi_dirs() { ls -A "$PIROOT" 2>/dev/null | sort | tr '\n' ' '; }
+stage_left() { local d; for d in "$PIROOT"/.stage.*; do [[ -e "$d" ]] && return 0; done; return 1; }
+no_tarball() { ! grep -q 'tar\.gz' "$CALLS"; }
+pi_target_is() { [[ "$(readlink "$PILINK" 2>/dev/null)" == "$PIROOT/$1/pi/pi" ]]; }
 
 echo "agent-cli-update.test.sh (bash: $("$BASH_BIN" -c 'echo $BASH_VERSION'))"
 
@@ -973,6 +1054,368 @@ echo 1.0.0 >"$VERDIR/opencode"; echo 1.1.0 >"$VERDIR/opencode.next"
 latest opencode-ai 1.1.0
 run
 check "brew formula with libexec node_modules, not codex: held as a Homebrew package, npm untouched" '[[ "$RC" -eq 0 && "$OUT" == *"opencode brew 1.0.0 -> 1.0.0 held"* ]] && ! grep -q "^npm install" "$CALLS" && no_mutation'
+
+# --- pi-release: checksum-verified release binaries, swapped in through ~/.local/bin/pi ---------------
+if ! have_python; then
+  skip "pi-release tests (python3 is needed to build the archive fixtures)"
+else
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100" "v0.2.0=900"
+pi_release 0.3.0
+run --tool pi
+check "pi-release update: installs the aged release and reports method, before and after" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.2.0 -> 0.3.0 updated"* ]]'
+check "pi-release update: the symlink now points at the new version and the old directory is kept" 'pi_target_is 0.3.0 && [[ -x "$PIROOT/0.3.0/pi/pi" && -x "$PIROOT/0.2.0/pi/pi" ]] && [[ "$(pi_dirs)" == "0.2.0 0.3.0 " ]]'
+check "pi-release update: the release list, archive and checksums are fetched over https with the bounded curl" 'grep -Fxq "curl -fsSL --proto =https --max-time 60 $GH_API/repos/earendil-works/pi/releases?per_page=50" "$CALLS" && grep -Eq "^curl -fsSL --proto =https --max-time 600 -o $PIROOT/\.stage\.[A-Za-z0-9]+/pi-linux-x64\.tar\.gz $GH_DL/earendil-works/pi/releases/download/v0\.3\.0/pi-linux-x64\.tar\.gz\$" "$CALLS" && grep -Eq "^curl -fsSL --proto =https --max-time 600 -o $PIROOT/\.stage\.[A-Za-z0-9]+/SHA256SUMS $GH_DL/earendil-works/pi/releases/download/v0\.3\.0/SHA256SUMS\$" "$CALLS"'
+check "pi-release update: downloads land in a private stage directory that is cleaned up" '[[ "$(grep "^outdir-mode" "$CALLS" | sort -u)" == "outdir-mode drwx------" ]] && ! stage_left'
+check "pi-release update: the extracted files keep the archive modes" '[[ "$(mode_of "$PIROOT/0.3.0/pi/pi")" == 755 && "$(mode_of "$PIROOT/0.3.0/pi/README.txt")" == 644 ]]'
+check "pi-release update: the stage held only the archive contents, not the downloads" '[[ "$(ls -A "$PIROOT/0.3.0")" == pi ]]'
+check "pi-release update: the smoke check ran pi --version through PATH after the swap" '[[ "$(cat "$CALLS" | grep -c "^pi --version")" -ge 3 ]]'
+check "pi-release update: the state file records the method" 'state_has "\"method\": \"pi-release\"" && state_has "\"after\": \"0.3.0\"" && json_ok "$STATE"'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.4.0=5" "v0.3.0=100" "v0.2.0=900"
+pi_release 0.3.0; pi_release 0.4.0
+run --tool pi
+check "pi-release cooldown: the newest AGED release is installed, not the newest" '[[ "$OUT" == *"pi pi-release 0.2.0 -> 0.3.0 updated"* ]] && pi_target_is 0.3.0 && [[ ! -e "$PIROOT/0.4.0" ]]'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.4.0=5" "v0.3.0=30"
+pi_release 0.3.0; pi_release 0.4.0
+run --tool pi
+check "pi-release cooldown: every newer release too young: held, exit 0, no download, symlink untouched" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.2.0 -> 0.2.0 held"*"0.4.0"*"5h"* ]] && no_tarball && pi_target_is 0.2.0 && [[ "$(pi_dirs)" == "0.2.0 " ]]'
+
+reset
+pi_installed 0.2.0
+run --tool pi
+check "pi-release: a release-list fetch failure is held" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release"*held*"cannot evaluate release age"* ]] && no_tarball && pi_target_is 0.2.0'
+
+reset
+pi_installed 0.3.0
+gh_releases earendil-works/pi "v0.3.0=100" "v0.2.0=900"
+run --tool pi
+check "pi-release: nothing newer is current, nothing is downloaded" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.3.0 -> 0.3.0 current"* ]] && no_tarball'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100" "v0.5.0=1:pre" "v0.6.0=1:draft" "v0.7.0-rc.1=900" "0.9.0=900" "rust-v0.8.0=900"
+pi_release 0.3.0
+run --tool pi
+check "pi-release: prereleases, drafts, suffixed versions and tags without the v prefix are never candidates" '[[ "$OUT" == *"pi pi-release 0.2.0 -> 0.3.0 updated"* ]]'
+
+reset
+pi_installed 0.9.0
+gh_releases earendil-works/pi "v0.10.0=100" "v0.9.5=100" "v0.2.0=900"
+pi_release 0.10.0
+run --tool pi
+check "pi-release: versions compare numerically, 0.10.0 beats 0.9.5" '[[ "$OUT" == *"pi pi-release 0.9.0 -> 0.10.0 updated"* ]]'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=1" "v0.2.0=900"
+pi_release 0.3.0
+BROKKR_AGENT_CLI_MIN_AGE_HOURS=0 run --tool pi
+check "pi-release: a cooldown of 0 installs a brand new release" '[[ "$OUT" == *"pi pi-release 0.2.0 -> 0.3.0 updated"* ]]'
+
+# --- pi-release: platform map -------------------------------------------------------------------------
+for plat in "Darwin arm64 darwin-arm64" "Darwin x86_64 darwin-x64" "Linux x86_64 linux-x64" "Linux aarch64 linux-arm64" "Linux arm64 linux-arm64"; do
+  read -r plat_s plat_m plat_a <<<"$plat"
+  reset
+  pi_installed 0.2.0
+  gh_releases earendil-works/pi "v0.3.0=100"
+  pi_release 0.3.0
+  MOCK_UNAME_S=$plat_s MOCK_UNAME_M=$plat_m run --tool pi
+  check "pi-release platform $plat_s $plat_m downloads pi-$plat_a.tar.gz" '[[ "$OUT" == *"0.2.0 -> 0.3.0 updated"* ]] && [[ "$(grep -c "tar\.gz" "$CALLS")" -eq 1 ]] && grep -Fq "/v0.3.0/pi-$plat_a.tar.gz" "$CALLS"'
+done
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+MOCK_UNAME_S=FreeBSD MOCK_UNAME_M=amd64 run --tool pi
+check "pi-release: an unknown platform is failed, nothing downloaded or changed" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*"unsupported platform"*FreeBSD* ]] && no_tarball && pi_target_is 0.2.0'
+MOCK_UNAME_S=Linux MOCK_UNAME_M=riscv64 run --tool pi
+check "pi-release: an unknown architecture is failed too" '[[ "$RC" -eq 1 && "$OUT" == *"unsupported platform"* ]] && no_tarball'
+
+# --- pi-release: verification refuses a bad archive before anything changes ---------------------------
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+printf '%064d  pi-linux-x64.tar.gz\n' 0 | web_put "$GH_DL/earendil-works/pi/releases/download/v0.3.0/SHA256SUMS"
+run --tool pi
+check "pi-release: a checksum mismatch is failed, no swap, no new version directory, no stage left" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*checksum* ]] && pi_target_is 0.2.0 && [[ "$(pi_dirs)" == "0.2.0 " ]]'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+printf '%s  pi-darwin-arm64.tar.gz\n' "$(sha256_of "$TMP/pifix/0.3.0-good.tar.gz")" | web_put "$GH_DL/earendil-works/pi/releases/download/v0.3.0/SHA256SUMS"
+run --tool pi
+check "pi-release: SHA256SUMS without a line for the asset is failed" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*SHA256SUMS* ]] && pi_target_is 0.2.0 && [[ "$(pi_dirs)" == "0.2.0 " ]]'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+sum=$(sha256_of "$TMP/pifix/0.3.0-good.tar.gz")
+printf '%s  pi-linux-x64.tar.gz\n%s  pi-linux-x64.tar.gz\n' "$sum" "$sum" | web_put "$GH_DL/earendil-works/pi/releases/download/v0.3.0/SHA256SUMS"
+run --tool pi
+check "pi-release: an asset listed twice in SHA256SUMS is failed" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*SHA256SUMS* ]] && pi_target_is 0.2.0'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+printf '%s  pi-linux-x64.tar.gz\n' "${sum:0:63}" | web_put "$GH_DL/earendil-works/pi/releases/download/v0.3.0/SHA256SUMS"
+run --tool pi
+check "pi-release: a digest that is not 64 hex digits is failed" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*SHA256SUMS* ]] && pi_target_is 0.2.0'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+printf '%s *pi-linux-x64.tar.gz\n' "$(sha256_of "$TMP/pifix/0.3.0-good.tar.gz" | tr a-f A-F)" | web_put "$GH_DL/earendil-works/pi/releases/download/v0.3.0/SHA256SUMS"
+run --tool pi
+check "pi-release: the binary-mode marker and upper-case digits in SHA256SUMS are accepted" '[[ "$OUT" == *"pi pi-release 0.2.0 -> 0.3.0 updated"* ]]'
+
+for bad in dotdot abs symlink hardlink device toplevel; do
+  reset
+  pi_installed 0.2.0
+  gh_releases earendil-works/pi "v0.3.0=100"
+  pi_release 0.3.0 "$bad"
+  run --tool pi
+  check "pi-release: an archive with a $bad member is refused before extraction, nothing changes" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*archive* ]] && pi_target_is 0.2.0 && [[ "$(pi_dirs)" == "0.2.0 " ]]'
+done
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0 nobinary
+run --tool pi
+check "pi-release: an archive without pi/pi is failed" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed* ]] && pi_target_is 0.2.0 && [[ "$(pi_dirs)" == "0.2.0 " ]]'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0 wrongver
+run --tool pi
+check "pi-release: a pi that does not report the released version is failed before the swap" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*"9.9.9"*"0.3.0"* ]] && pi_target_is 0.2.0 && [[ "$(pi_dirs)" == "0.2.0 " ]]'
+
+# --- pi-release: smoke failure puts the symlink back --------------------------------------------------
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+echo 0.3.0 >"$VERDIR/pi.broken-at"
+run --tool pi
+check "pi-release smoke failure: the symlink is restored to the previous target and reported rolled-back" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release 0.2.0 -> 0.2.0 rolled-back"* ]] && pi_target_is 0.2.0 && state_has "\"action\": \"rolled-back\"" && state_has "\"result\": \"failed\""'
+check "pi-release smoke failure: no stray temporary link is left in ~/.local/bin" '[[ "$(ls -A "$HOME_DIR/.local/bin")" == pi ]]'
+
+# --- pi-release: pruning ---------------------------------------------------------------------------------
+reset
+pi_installed 0.2.0
+for v in 0.1.0 0.3.0 0.4.0; do mkdir -p "$PIROOT/$v/pi"; done
+mkdir -p "$PIROOT/notes" "$PIROOT/1.0.0-rc.1"
+gh_releases earendil-works/pi "v0.5.0=100"
+pi_release 0.5.0
+run --tool pi
+check "pi-release pruning: the 3 newest versions and the previous target are kept, older ones removed, foreign entries untouched" '[[ "$OUT" == *"0.2.0 -> 0.5.0 updated"* ]] && [[ "$(pi_dirs)" == "0.2.0 0.3.0 0.4.0 0.5.0 1.0.0-rc.1 notes " ]]'
+
+reset
+pi_installed 0.1.0
+for v in 0.2.0 0.3.0 0.4.0 0.5.0; do mkdir -p "$PIROOT/$v/pi"; done
+gh_releases earendil-works/pi "v0.6.0=100"
+pi_release 0.6.0
+run --tool pi
+check "pi-release pruning: with many old versions only the 3 newest and the previous target survive" '[[ "$OUT" == *"0.1.0 -> 0.6.0 updated"* ]] && [[ "$(pi_dirs)" == "0.1.0 0.4.0 0.5.0 0.6.0 " ]]'
+
+reset
+pi_installed 0.2.0
+echo 0.3.0 >"$VERDIR/pi.broken-at"
+for v in 0.1.0 0.0.9 0.0.8; do mkdir -p "$PIROOT/$v/pi"; done
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --tool pi
+check "pi-release pruning: nothing is pruned when the update is rolled back" '[[ "$OUT" == *rolled-back* ]] && [[ "$(pi_dirs)" == "0.0.8 0.0.9 0.1.0 0.2.0 0.3.0 " ]]'
+
+# --- pi-release: an existing version directory is reused only if it is the right pi ----------------------
+reset
+pi_installed 0.2.0
+mkdir -p "$PIROOT/0.3.0/pi"; sed "s/__VERSION__/0.3.0/" "$TMP/pi-stub.sh" >"$PIROOT/0.3.0/pi/pi"; chmod 755 "$PIROOT/0.3.0/pi/pi"
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --tool pi
+check "pi-release: an existing version directory whose pi reports the version is reused" '[[ "$OUT" == *"pi pi-release 0.2.0 -> 0.3.0 updated"* ]] && pi_target_is 0.3.0 && ! stage_left'
+
+reset
+pi_installed 0.2.0
+mkdir -p "$PIROOT/0.3.0/pi"; sed "s/__VERSION__/9.9.9/" "$TMP/pi-stub.sh" >"$PIROOT/0.3.0/pi/pi"; chmod 755 "$PIROOT/0.3.0/pi/pi"
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --tool pi
+check "pi-release: an existing version directory with the wrong pi is failed, not overwritten" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed* ]] && pi_target_is 0.2.0 && grep -Fq 9.9.9 "$PIROOT/0.3.0/pi/pi" && ! stage_left'
+
+# --- pi-release: detection and layout ----------------------------------------------------------------------
+reset
+pi_installed 0.2.0
+rm "$PILINK"
+ln -s "$PIROOT/0.2.0/pi/pi" "$TOOLBIN/pi"
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --tool pi
+check "pi-release: a pi found through another link while ~/.local/bin/pi is not the pi-release symlink is failed, nothing changed" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*".local/bin/pi"* ]] && no_tarball'
+
+reset
+pi_installed 0.2.0
+ln -s "$HOME_DIR" "$TMP/home-link"
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+RUN_HOME="$TMP/home-link" run --tool pi
+check "pi-release: a HOME that is itself a symlink still matches the resolved install path" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.2.0 -> 0.3.0 updated"* ]]'
+
+reset
+pi_installed 0.2.0
+mv "$PIROOT/0.2.0" "$PIROOT/latest"
+ln -sfn "$PIROOT/latest/pi/pi" "$PILINK"
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --tool pi
+check "pi-release: a version directory that is not plain semver is failed" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed* ]] && no_tarball'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --dry-run --tool pi
+check "pi-release dry-run: would-update, only the release list is read, nothing is downloaded or changed" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.2.0 -> 0.3.0 would-update"*"would install pi 0.3.0"* ]] && no_tarball && pi_target_is 0.2.0 && [[ "$(pi_dirs)" == "0.2.0 " ]]'
+
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --tool pi --tool claude
+check "pi-release: other tools in the same run are processed independently" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.2.0 -> 0.3.0 updated"* && "$OUT" == *"claude - - -> - absent"* ]]'
+
+# --- pi-release: the stage is removed on a signal --------------------------------------------------------------
+reset
+pi_installed 0.2.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+: >"$WEB/.hold"
+HOME="$HOME_DIR" PATH="$BIN:$HOME_DIR/.local/bin:/usr/bin:/bin" "$BASH_BIN" "$SCRIPT" --tool pi >"$TMP/bg.out" 2>&1 <"$STDIN_FILE" &
+bg=$!
+n=0
+while [[ ! -e "$WEB/.held" && "$n" -lt 100 ]]; do sleep 0.1; n=$((n + 1)); done
+kill -TERM "$bg" 2>/dev/null
+wait "$bg" 2>/dev/null
+bg_rc=$?
+check "pi-release: SIGTERM during the download removes the stage directory and changes nothing" '[[ -e "$WEB/.held" ]] && [[ "$bg_rc" -ne 0 ]] && ! stage_left && pi_target_is 0.2.0 && [[ "$(pi_dirs)" == "0.2.0 " ]]'
+rm -f "$WEB/.hold"
+fi
+
+# --- --adopt pi: migrate to the release binary ---------------------------------------------------------------
+reset
+run --adopt bogus
+check "--adopt with anything but pi exits 64 before touching anything" '[[ "$RC" -eq 64 && "$OUT" == *bogus* ]] && [[ ! -s "$CALLS" ]]'
+run --adopt
+check "--adopt without a value exits 64" '[[ "$RC" -eq 64 && "$OUT" == *usage* ]]'
+run --adopt pi --tool claude
+check "--adopt pi needs pi among the selected tools" '[[ "$RC" -eq 64 ]] && [[ ! -s "$CALLS" ]]'
+run --help
+check "--help documents --adopt and the cooldown variable" '[[ "$OUT" == *"--adopt pi"* && "$OUT" == *BROKKR_AGENT_CLI_MIN_AGE_HOURS* ]]'
+
+if ! have_python; then
+  skip "--adopt pi tests (python3 is needed to build the archive fixtures)"
+else
+reset
+gh_releases earendil-works/pi "v0.4.0=5" "v0.3.0=100" "v0.2.0=900"
+pi_release 0.3.0; pi_release 0.4.0
+run --adopt pi
+check "--adopt pi from nothing: installs the newest aged release, creating ~/.local/bin" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release - -> 0.3.0 updated"* ]] && pi_target_is 0.3.0 && [[ "$(pi_dirs)" == "0.3.0 " ]]'
+check "--adopt pi alone processes only pi" '[[ "$OUT" != *claude* && "$OUT" != *codex* && "$OUT" != *opencode* ]]'
+check "--adopt pi: the new pi runs, and the state file records the adoption" '[[ "$("$PILINK" --version)" == "pi-cli 0.3.0"* ]] && state_has "\"method\": \"pi-release\"" && state_has "\"after\": \"0.3.0\""'
+
+gh_releases earendil-works/pi "v0.3.0=100"
+run --adopt pi
+check "--adopt pi again: the pi-release link is recognised, nothing newer is current" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.3.0 -> 0.3.0 current"* ]]'
+
+reset
+gh_releases earendil-works/pi "v0.4.0=5" "v0.3.0=30"
+pi_release 0.3.0; pi_release 0.4.0
+run --adopt pi
+check "--adopt pi with only young releases: held, nothing created" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release - -> - held"*"0.4.0"* ]] && no_tarball && [[ ! -e "$HOME_DIR/.local/bin" && ! -e "$HOME_DIR/.local/lib" ]]'
+
+reset
+run --adopt pi
+check "--adopt pi with an unreadable release list: held, nothing created" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release"*held*"cannot evaluate release age"* ]] && [[ ! -e "$HOME_DIR/.local/bin" && ! -e "$HOME_DIR/.local/lib" ]]'
+
+reset
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+echo 0.3.0 >"$VERDIR/pi.broken-at"
+run --adopt pi
+check "--adopt pi with a failing smoke check: the new link is removed again, reported rolled-back" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*rolled-back* ]] && [[ ! -e "$PILINK" && ! -L "$PILINK" ]]'
+
+reset
+npm_tool pi @earendil-works/pi-coding-agent 0.1.0
+latest @earendil-works/pi-coding-agent 0.1.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+PATH_PRE="$TOOLBIN" run --adopt pi
+check "--adopt pi next to an npm pi elsewhere on PATH: installs, and warns which pi shadows it (no failure)" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.1.0 -> 0.3.0 updated"*warning*"$NPM/pi/lib/node_modules/@earendil-works/pi-coding-agent"* ]] && pi_target_is 0.3.0'
+
+reset
+npm_tool pi @earendil-works/pi-coding-agent 0.1.0
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --adopt pi
+check "--adopt pi with ~/.local/bin ahead of the npm pi on PATH: no warning" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.1.0 -> 0.3.0 updated"* && "$OUT" != *warning* ]]'
+
+reset
+npm_tool pi @earendil-works/pi-coding-agent 0.1.0 "$HOME_DIR/.local"
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --adopt pi
+check "--adopt pi refuses when ~/.local/bin/pi is an npm symlink, naming the uninstall command, and changes nothing" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*"remove the existing pi install first (e.g. npm uninstall -g --prefix $HOME_DIR/.local @earendil-works/pi-coding-agent)"* ]] && no_tarball && [[ -L "$PILINK" && ! -e "$PIROOT" ]] && no_mutation'
+
+reset
+mkdir -p "$HOME_DIR/.local/bin"
+printf '#!/bin/sh\necho mine\n' >"$PILINK"; chmod 755 "$PILINK"
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --adopt pi
+check "--adopt pi refuses when ~/.local/bin/pi is a regular file" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*"remove the existing pi install first"* ]] && no_tarball && [[ ! -L "$PILINK" && "$(cat "$PILINK")" == *mine* ]]'
+
+reset
+mkdir -p "$HOME_DIR/.local/bin"
+ln -s /nonexistent/elsewhere/pi "$PILINK"
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+run --adopt pi
+check "--adopt pi refuses a symlink that points anywhere but into the pi-release tree" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*"remove the existing pi install first"* ]] && no_tarball && [[ "$(readlink "$PILINK")" == /nonexistent/elsewhere/pi ]]'
+
+reset
+npm_tool pi @earendil-works/pi-coding-agent 0.1.0
+gh_releases earendil-works/pi "v0.4.0=5" "v0.3.0=100"
+pi_release 0.3.0; pi_release 0.4.0
+run --dry-run --adopt pi
+check "--dry-run --adopt pi: reports the plan, reads only the release list, downloads no tarball and creates nothing" '[[ "$RC" -eq 0 && "$OUT" == *"pi pi-release 0.1.0 -> 0.3.0 would-update"*"would install pi 0.3.0"* ]] && no_tarball && [[ ! -e "$HOME_DIR/.local/bin" && ! -e "$HOME_DIR/.local/lib" && ! -e "$STATE" ]] && grep -Fq "$GH_API/repos/earendil-works/pi/releases?per_page=50" "$CALLS"'
+
+reset
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+busy_unit hugin.service active /user.slice/hugin.service 3
+BROKKR_AGENT_CLI_BUSY_UNITS=hugin.service run --adopt pi
+check "--adopt pi honours the busy guard: deferred, nothing downloaded" '[[ "$RC" -eq 0 && "$OUT" == *deferred* ]] && only_systemctl_calls && [[ ! -e "$HOME_DIR/.local/bin" && ! -e "$HOME_DIR/.local/lib" ]]'
+
+reset
+gh_releases earendil-works/pi "v0.3.0=100"
+pi_release 0.3.0
+MOCK_UNAME_S=FreeBSD MOCK_UNAME_M=amd64 run --adopt pi
+check "--adopt pi on an unknown platform: failed, nothing created" '[[ "$RC" -eq 1 && "$OUT" == *"pi pi-release"*failed*"unsupported platform"* ]] && no_tarball && [[ ! -e "$PILINK" ]]'
+fi
 
 # --- apt-owned and unknown installs ------------------------------------------------------------
 reset

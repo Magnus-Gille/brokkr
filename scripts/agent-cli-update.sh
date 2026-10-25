@@ -156,6 +156,14 @@ NPM_REGISTRY=${NPM_REGISTRY%/}; GITHUB_API=${GITHUB_API%/}; GITHUB_DOWNLOAD=${GI
 [[ "$GITHUB_API" =~ $URL_RE ]] || die "invalid BROKKR_GITHUB_API (an https:// base URL)"
 [[ "$GITHUB_DOWNLOAD" =~ $URL_RE ]] || die "invalid BROKKR_GITHUB_DOWNLOAD (an https:// base URL)"
 
+# pi-release layout: <version>/pi/pi below PI_ROOT (the release tarball's top-level pi/ directory
+# extracted inside <version>/), reached through the PI_LINK symlink.
+PI_REL=.local/lib/brokkr/agent-cli/pi
+PI_ROOT=$HOME/$PI_REL
+PI_LINK_DIR=$HOME/.local/bin
+PI_LINK=$PI_LINK_DIR/pi
+PI_KEEP=3
+
 CGROUP_ROOT=${BROKKR_CGROUP_ROOT:-/sys/fs/cgroup}
 STATE_DIR=${BROKKR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/brokkr}
 case "$STATE_DIR" in /*) ;; *) die "the state directory must be an absolute path" ;; esac
@@ -173,6 +181,20 @@ run_limited() { # seconds command... ; no timeout command means no bound
   shift
   if [ -n "$TIMEOUT_BIN" ]; then "$TIMEOUT_BIN" "$secs" "$@"; else "$@"; fi
 }
+
+# Scratch space of a pi-release install: the stage directory and the temporary symlink. They are
+# removed however the script ends, including on a signal (the traps turn a signal into an exit,
+# which runs the EXIT trap).
+PI_STAGE=
+PI_TMPLINK=
+cleanup_pi_scratch() {
+  if [ -n "$PI_STAGE" ]; then rm -rf "$PI_STAGE"; PI_STAGE=; fi
+  if [ -n "$PI_TMPLINK" ]; then rm -f "$PI_TMPLINK"; PI_TMPLINK=; fi
+}
+trap cleanup_pi_scratch EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Prints the first MAJOR.MINOR.PATCH that "$1 --version" reports. It fails when the command
 # exits non-zero or prints none, which doubles as the post-update smoke check.
@@ -505,6 +527,7 @@ gate_target() { # target epoch-or-empty installed-or-empty
 classify() { # tool real-path -> T_METHOD
   local tool=$1 real=$2 rest
   T_METHOD=unknown
+  if [ "$tool" = pi ] && under_home "$real" "$PI_REL"; then T_METHOD=pi-release; return 0; fi
   if [ "$tool" = claude ] && under_home "$real" .local/share/claude/versions; then T_METHOD=native; return 0; fi
   # Homebrew first: node-based formulae keep a private lib/node_modules under
   # Cellar/<name>/<ver>/libexec, and npm must never install into the Cellar.
@@ -759,9 +782,278 @@ update_opencode_installer() { # tool
   return 0
 }
 
+# --- pi-release: checksum-verified release binaries -------------------------------------------------
+# <PI_ROOT>/<version>/pi/pi is the release tarball's pi/ directory unpacked under its version, and
+# PI_LINK is a symlink to the version in use. An update unpacks the new version beside the old one,
+# swaps the symlink atomically and keeps the old directory, so going back is moving one link.
+
+# Prints the version when $1 is exactly <PI_ROOT>/<plain version>/pi/pi (HOME as written or resolved).
+pi_target_version() { # path
+  local rest ver
+  case "$1" in
+    "$HOME/$PI_REL/"*) rest=${1#"$HOME/$PI_REL/"} ;;
+    "$HOME_REAL/$PI_REL/"*) rest=${1#"$HOME_REAL/$PI_REL/"} ;;
+    *) return 1 ;;
+  esac
+  ver=${rest%%/*}
+  is_plain "$ver" && [ "$rest" = "$ver/pi/pi" ] || return 1
+  printf '%s\n' "$ver"
+}
+
+# True when PI_LINK is a symlink into the pi-release tree.
+pi_link_in_tree() {
+  local target
+  [ -L "$PI_LINK" ] || return 1
+  target=$(readlink "$PI_LINK") || return 1
+  pi_target_version "$target" >/dev/null
+}
+
+# The platform part of the release asset name; fails for anything the releases do not cover.
+pi_platform() {
+  local os arch
+  os=$(uname -s 2>/dev/null) || os=
+  arch=$(uname -m 2>/dev/null) || arch=
+  case "$os/$arch" in
+    Darwin/arm64) echo darwin-arm64 ;;
+    Darwin/x86_64) echo darwin-x64 ;;
+    Linux/x86_64) echo linux-x64 ;;
+    Linux/aarch64|Linux/arm64) echo linux-arm64 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The pi that the checks and the smoke test run: the link itself while adopting (an older pi may
+# legitimately come first on PATH then), otherwise whatever PATH finds.
+pi_probe() { if [ "$ADOPT" = pi ]; then tool_version "$PI_LINK"; else tool_version pi; fi; }
+
+# Downloads the archive and SHA256SUMS into the stage and checks the archive's SHA-256 against the
+# one line that names it. Calls fail and returns 1 on any problem.
+SUMS_RE='^([0-9A-Fa-f]{64}) [ *](.+)$'
+pi_download() { # version stage asset
+  local ver=$1 stage=$2 asset=$3 base f line want='' got n=0
+  base=$GITHUB_DOWNLOAD/earendil-works/pi/releases/download/v$ver
+  for f in "$asset" SHA256SUMS; do
+    if ! run_limited "$UPDATE_TIMEOUT" curl -fsSL --proto =https --max-time 600 -o "$stage/$f" "$base/$f" </dev/null; then
+      fail "cannot download $f for pi $ver"; return 1
+    fi
+  done
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    if [[ "$line" =~ $SUMS_RE ]] && [ "${BASH_REMATCH[2]}" = "$asset" ]; then
+      n=$((n + 1)); want=${BASH_REMATCH[1]}
+    elif [[ "$line" == *" $asset" || "$line" == *"*$asset" ]]; then
+      n=$((n + 1)); want=
+    fi
+  done <"$stage/SHA256SUMS"
+  if [ "$n" -ne 1 ] || [ -z "$want" ]; then
+    fail "SHA256SUMS must name $asset exactly once with a 64-digit SHA-256"; return 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    got=$(sha256sum "$stage/$asset" 2>/dev/null) || got=
+  elif command -v shasum >/dev/null 2>&1; then
+    got=$(shasum -a 256 "$stage/$asset" 2>/dev/null) || got=
+  else
+    fail "neither sha256sum nor shasum is available to verify the download"; return 1
+  fi
+  got=$(printf '%s' "${got%% *}" | tr 'A-F' 'a-f')
+  want=$(printf '%s' "$want" | tr 'A-F' 'a-f')
+  if [ -z "$got" ] || [ "$got" != "$want" ]; then fail "checksum mismatch for $asset"; return 1; fi
+  return 0
+}
+
+# The archive may hold only regular files and directories below pi/: no absolute path, no ..
+# component, no link, device or other special member. Judged from the listings, before extracting.
+pi_check_archive() { # archive
+  local names types p t
+  if ! names=$(tar -tzf "$1" 2>/dev/null) || ! types=$(tar -tzvf "$1" 2>/dev/null) || [ -z "$names" ]; then
+    fail "cannot list the pi archive"; return 1
+  fi
+  if [ "$(printf '%s\n' "$names" | wc -l)" -ne "$(printf '%s\n' "$types" | wc -l)" ]; then
+    fail "the pi archive listing is inconsistent"; return 1
+  fi
+  while IFS= read -r p; do
+    case "$p" in
+      pi/|pi/*) ;;
+      *) fail "unexpected path in the pi archive: $(safe_text "$p")"; return 1 ;;
+    esac
+    case "/$p/" in
+      */../*) fail "unsafe path in the pi archive: $(safe_text "$p")"; return 1 ;;
+    esac
+  done <<<"$names"
+  while IFS= read -r t; do
+    case "$t" in
+      -*|d*) ;;
+      *) fail "the pi archive has a member that is neither a regular file nor a directory"; return 1 ;;
+    esac
+  done <<<"$types"
+  return 0
+}
+
+# Keeps the PI_KEEP newest version directories plus $1 (the version now in use) and $2 (the one
+# before it); anything that is not a plain-version directory is left alone.
+pi_prune() { # current previous-or-empty
+  local list v n=0
+  list=$(find "$PI_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed 's|.*/||' \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1nr -k2,2nr -k3,3nr) || list=
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    n=$((n + 1))
+    if [ "$n" -le "$PI_KEEP" ] || [ "$v" = "$1" ] || [ "$v" = "$2" ]; then continue; fi
+    rm -rf "${PI_ROOT:?}/$v" || echo "warning: could not remove the old pi version directory $v" >&2
+  done <<<"$list"
+  return 0
+}
+
+# Points PI_LINK at $1 by renaming a temporary symlink over it, or removes it when $1 is empty.
+pi_set_link() { # target-or-empty
+  if [ -z "$1" ]; then rm -f "$PI_LINK"; return; fi
+  PI_TMPLINK=$PI_LINK_DIR/.pi.new.$$
+  rm -f "$PI_TMPLINK"
+  ln -s "$1" "$PI_TMPLINK" && mv -f "$PI_TMPLINK" "$PI_LINK" || return 1
+  PI_TMPLINK=
+}
+
+# Installs release $1: download, verify, validate, unpack in a private stage, move the stage to its
+# version directory, swap the symlink, smoke-check, and go back to the previous link if that fails.
+pi_install() { # version
+  pi_install_steps "$1"
+  cleanup_pi_scratch
+  return 0
+}
+pi_install_steps() { # version
+  local ver=$1 plat asset stage dest prev='' prev_ver='' got
+  if ! plat=$(pi_platform); then
+    fail "unsupported platform $(safe_text "$(uname -s 2>/dev/null) $(uname -m 2>/dev/null)")"; return 0
+  fi
+  asset=pi-$plat.tar.gz
+  dest=$PI_ROOT/$ver
+  if [ "$DRY_RUN" -eq 1 ]; then
+    T_ACTION=would-update; T_AFTER=$ver
+    T_DETAIL="would install pi $ver from $(safe_text "$GITHUB_DOWNLOAD/earendil-works/pi/releases/download/v$ver/$asset")"
+    return 0
+  fi
+  if ! mkdir -p "$PI_ROOT" "$PI_LINK_DIR"; then fail "cannot create the pi install directories"; return 0; fi
+  if [ -d "$PI_LINK" ]; then fail "$(safe_text "$PI_LINK") is a directory"; return 0; fi
+  if ! stage=$(umask 077; mktemp -d "$PI_ROOT/.stage.XXXXXX"); then fail "cannot create a staging directory"; return 0; fi
+  PI_STAGE=$stage
+  pi_download "$ver" "$stage" "$asset" || return 0
+  pi_check_archive "$stage/$asset" || return 0
+  if ! (umask 022; tar -xzf "$stage/$asset" -C "$stage"); then fail "cannot unpack the pi archive"; return 0; fi
+  rm -f "$stage/$asset" "$stage/SHA256SUMS"
+  if [ ! -f "$stage/pi/pi" ] || [ -L "$stage/pi/pi" ] || [ ! -x "$stage/pi/pi" ]; then
+    fail "the pi archive has no executable pi/pi"; return 0
+  fi
+  if ! got=$(tool_version "$stage/pi/pi") || [ "$got" != "$ver" ]; then
+    fail "the unpacked pi reports ${got:-no version}, expected $ver"; return 0
+  fi
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    # A directory left by an earlier run is reused only when it really is this release.
+    if [ -L "$dest" ] || ! got=$(tool_version "$dest/pi/pi") || [ "$got" != "$ver" ]; then
+      fail "$(safe_text "$dest") exists but does not hold pi $ver; remove it first"; return 0
+    fi
+  else
+    chmod 755 "$stage"
+    if ! mv "$stage" "$dest"; then fail "cannot move the staged pi to $(safe_text "$dest")"; return 0; fi
+    PI_STAGE=
+  fi
+  if [ -L "$PI_LINK" ]; then prev=$(readlink "$PI_LINK") || prev=; fi
+  prev_ver=$(pi_target_version "$prev") || prev_ver=
+  if ! pi_set_link "$dest/pi/pi"; then fail "cannot switch $(safe_text "$PI_LINK") to pi $ver"; return 0; fi
+  got=$(pi_probe) || got=
+  if [ "$got" = "$ver" ]; then
+    T_PATH=$dest/pi/pi; T_AFTER=$ver; T_ACTION=updated
+    pi_prune "$ver" "$prev_ver"
+    return 0
+  fi
+  # The new pi does not run as the release it claims to be: put the previous link back.
+  echo "smoke check failed for pi; restoring ${prev:-no link}"
+  if pi_set_link "$prev"; then
+    if [ -z "$prev" ]; then
+      T_AFTER=; T_ACTION=rolled-back; T_DETAIL="smoke check failed after the install; removed the new link"
+    elif T_AFTER=$(pi_probe); then
+      T_ACTION=rolled-back; T_DETAIL="smoke check failed after the update (reports ${got:-no version}, expected $ver); restored ${prev_ver:-the previous link}"
+    else
+      T_AFTER=; fail "smoke check failed and restoring the previous pi did not give a working CLI"
+    fi
+  else
+    T_AFTER=; fail "smoke check failed and the previous pi link could not be restored"
+  fi
+  return 0
+}
+
+update_pi_release() {
+  local installed
+  if ! installed=$(pi_target_version "$T_PATH"); then
+    fail "cannot determine the installed pi version from its install path"; return 0
+  fi
+  if ! pi_link_in_tree; then
+    fail "pi runs from the pi-release tree but $(safe_text "$PI_LINK") is not the symlink to it"; return 0
+  fi
+  if ! load_releases github "$GITHUB_API/repos/earendil-works/pi/releases?per_page=50" v; then hold_unknown "$LOAD_ERR"; return 0; fi
+  pick_highest "$installed"
+  case "$PICK" in
+    none) T_ACTION=current; T_AFTER=$T_BEFORE; return 0 ;;
+    young) hold "newer release $(young_text "$NEWEST_VER" "$NEWEST_EPOCH")"; return 0 ;;
+  esac
+  pi_install "$PICK_VER"
+  return 0
+}
+
+# --adopt pi: install the cooldown-selected release even when pi is absent or comes from elsewhere
+# (the migration from npm). The only thing it will not touch is another pi at PI_LINK: that install
+# has to be removed first, so two copies never fight over the name.
+adopt_pi() {
+  local bin real prev installed='' ptxt='<prefix>' prefix
+  T_METHOD=pi-release
+  bin=$(command -v pi 2>/dev/null) || bin=
+  case "$bin" in
+    /*)
+      real=$(readlink -f "$bin" 2>/dev/null) || real=
+      T_PATH=$real
+      T_BEFORE=$(tool_version pi) || T_BEFORE= ;;
+  esac
+  if [ -L "$PI_LINK" ]; then
+    prev=$(readlink "$PI_LINK") || prev=
+    installed=$(pi_target_version "$prev") || installed=
+  fi
+  if [ -z "$installed" ] && { [ -L "$PI_LINK" ] || [ -e "$PI_LINK" ]; }; then
+    real=$(readlink -f "$PI_LINK" 2>/dev/null) || real=
+    case "$real" in
+      */lib/node_modules/*) prefix=${real%%/lib/node_modules/*}; ptxt=$(safe_text "$prefix") ;;
+    esac
+    fail "$(safe_text "$PI_LINK") is not a symlink into the pi-release tree; remove the existing pi install first (e.g. npm uninstall -g --prefix $ptxt @earendil-works/pi-coding-agent)"
+    return 0
+  fi
+  if ! load_releases github "$GITHUB_API/repos/earendil-works/pi/releases?per_page=50" v; then hold_unknown "$LOAD_ERR"; return 0; fi
+  pick_highest "$installed"
+  case "$PICK" in
+    none)
+      if [ -n "$installed" ]; then T_ACTION=current; T_AFTER=$T_BEFORE; else hold_unknown "no stable pi release found"; fi
+      return 0 ;;
+    young) hold "newer release $(young_text "$NEWEST_VER" "$NEWEST_EPOCH")"; return 0 ;;
+  esac
+  pi_install "$PICK_VER"
+  if [ "$T_ACTION" = updated ]; then adopt_shadow_note; fi
+  return 0
+}
+
+# After an adoption the new pi must be the one PATH finds; if another pi comes first, say which.
+adopt_shadow_note() {
+  local cur real new
+  cur=$(command -v pi 2>/dev/null) || cur=
+  if [ -z "$cur" ]; then note_detail "warning: pi is not on PATH; add $(safe_text "$PI_LINK_DIR")"; return 0; fi
+  real=$(readlink -f "$cur" 2>/dev/null) || real=$cur
+  new=$(readlink -f "$PI_LINK" 2>/dev/null) || new=$PI_LINK
+  if [ "$real" != "$new" ]; then
+    note_detail "warning: pi on PATH resolves to $(safe_text "$cur") ($(safe_text "$real")) and shadows $(safe_text "$PI_LINK"); remove it or put $(safe_text "$PI_LINK_DIR") first on PATH"
+  fi
+  return 0
+}
+
 process_tool() { # tool -> T_* fields
   local tool=$1 bin real
   T_METHOD=; T_PATH=; T_BEFORE=; T_AFTER=; T_ACTION=; T_DETAIL=
+  if [ "$tool" = pi ] && [ "$ADOPT" = pi ]; then adopt_pi; return 0; fi
   bin=$(command -v "$tool" 2>/dev/null) || bin=
   if [ -z "$bin" ]; then T_ACTION=absent; return 0; fi
   T_METHOD=unknown
@@ -779,6 +1071,7 @@ process_tool() { # tool -> T_* fields
     brew) update_brew "$tool" ;;
     codex-standalone) update_codex_standalone "$tool" ;;
     opencode-installer) update_opencode_installer "$tool" ;;
+    pi-release) update_pi_release ;;
     apt) T_ACTION=external; T_AFTER=$T_BEFORE; T_DETAIL="managed by apt/unattended-upgrades" ;;
     *) fail "unknown install method" ;;
   esac
