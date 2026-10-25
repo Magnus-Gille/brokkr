@@ -22,5 +22,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      # archive-offsite.test.sh drives a real rclone against local-backend crypt
+      # remotes (no network); base32768 names need rclone >= 1.59.
+      - name: Install rclone
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends rclone && rclone version
       - name: Run all operational script tests
         run: make test
