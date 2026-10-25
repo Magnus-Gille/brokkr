@@ -61,6 +61,7 @@ FAKE
 cat >"$BIN/systemctl" <<'FAKE'
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >>"$MOCK_CALLS"
+if [[ -n "${MOCK_SYSTEMCTL_FAIL:-}" && "$*" == "$MOCK_SYSTEMCTL_FAIL" ]]; then echo "systemctl: injected failure" >&2; exit 1; fi
 st=$MOCK_STATE
 start_unit() {
   local u=$1 inst= tpl line
@@ -115,7 +116,17 @@ case "${1:-}" in
   *) exit 64 ;;
 esac
 FAKE
-# Fault injection: cp fails when its destination matches.
+# Fault injection: cp/mv fail when the destination matches, install fails on request.
+cat >"$BIN/mv" <<'FAKE'
+#!/usr/bin/env bash
+if [[ -n "${MOCK_MV_FAIL:-}" && "${!#}" == *"$MOCK_MV_FAIL"* ]]; then echo "mv: injected failure" >&2; exit 1; fi
+exec /bin/mv "$@"
+FAKE
+cat >"$BIN/install" <<'FAKE'
+#!/usr/bin/env bash
+if [[ "${MOCK_INSTALL_FAIL:-0}" == 1 ]]; then echo "install: injected failure" >&2; exit 1; fi
+exec /usr/bin/install "$@"
+FAKE
 cat >"$BIN/cp" <<'FAKE'
 #!/usr/bin/env bash
 if [[ -n "${MOCK_CP_FAIL:-}" && "${!#}" == *"$MOCK_CP_FAIL"* ]]; then echo "cp: injected failure" >&2; exit 1; fi
@@ -163,6 +174,7 @@ reset() {
   rm -f "$BIN/ethtool" "$MOCK_NOSBIN/ethtool"
   : >"$CALLS"
   unset MOCK_ID_ROOT MOCK_REMOTE_ROOT MOCK_SUDO_DENY MOCK_START_FAIL MOCK_ETHTOOL_NOOP MOCK_EEE_UNSUPPORTED MOCK_CP_FAIL
+  unset MOCK_MV_FAIL MOCK_INSTALL_FAIL MOCK_SYSTEMCTL_FAIL
   export BROKKR_EXPECTED_SOURCE="$REPO" BROKKR_EXPECTED_COMMIT="$SHA"
   has_ethtool
 }
@@ -299,6 +311,14 @@ for mode in dry-run apply; do
   refuses "$mode: an ad-hoc unit with an extra dependency link refuses" "critical.target.requires" "${args[@]}"
   reset; seed_legacy; ln -s "$LEGACY" "$UNIT_DIR/eee-alias.service"
   refuses "$mode: an alias of the ad-hoc unit refuses" "eee-alias.service" "${args[@]}"
+  reset; seed_legacy; printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee "eth0" eee on\n' >"$UNIT_DIR/quoted.service"
+  refuses "$mode: a unit setting EEE on a quoted interface refuses" "quoted.service" "${args[@]}"
+  reset; seed_legacy; printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee \\\n  eth0 eee on\n' >"$UNIT_DIR/continued.service"
+  refuses "$mode: a unit setting EEE across a line continuation refuses" "continued.service" "${args[@]}"
+  reset; seed_legacy; printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee "%%i" eee on\n' >"$UNIT_DIR/quoted-eee@.service"
+  mkdir -p "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants"
+  ln -s "$UNIT_DIR/quoted-eee@.service" "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/quoted-eee@eth0.service"
+  refuses "$mode: an enabled instance of a template with a quoted %i refuses" "quoted-eee@eth0.service" "${args[@]}"
   reset; seed_legacy; touch "$STATE/enabled.$INSTANCE"
   refuses "$mode: an instance enabled without its device dependency refuses" "without its device dependency" "${args[@]}"
   reset; seed_legacy; echo not-found >"$STATE/enabled.$INSTANCE"
@@ -405,6 +425,39 @@ reset; seed_legacy; export MOCK_CP_FAIL="eth0-eee-off.service.previous"
 run "$TARGET" eth0 --apply
 check "a failed backup changes nothing" '[[ "$RC" -ne 0 && "$OUT" == *"could not back up"* && -f "$LEGACY" && ! -e "$MANAGED" ]] && ! grep -Eq "^systemctl (enable|restart|disable)" "$CALLS"'
 check "a failed backup reports that nothing was changed" '[[ "$OUT" == *"no unit was changed"* ]]'
+reset; seed_legacy; export MOCK_MV_FAIL="eth0-eee-off.service.previous"
+run "$TARGET" eth0 --apply
+check "a failed backup finalisation changes nothing and leaves no temporary backup" '[[ "$RC" -ne 0 && "$OUT" == *"could not finalize"* && "$OUT" == *"no unit was changed"* && -f "$LEGACY" && ! -e "$MANAGED" && -z "$(find "$UNIT_DIR" -name ".*.tmp" -print)" ]] && ! grep -Eq "^systemctl (enable|restart|disable)" "$CALLS"'
+
+# Each partial apply prints a rollback that restores the exact pre-deploy state.
+partial() { # name expected-output env-assignment...
+  local name=$1 want=$2; shift 2
+  reset; seed_legacy; PRE_STATE="$(unit_state)"
+  OUT="$(cd "$REPO" && env "$@" bash "$DEPLOY" "$TARGET" eth0 --apply 2>&1)"; RC=$?
+  run_rollback; RB=$?
+  check "$name" '[[ "$RC" -ne 0 && "$OUT" == *"$want"* && "$OUT" == *Rollback* && "$RB" -eq 0 && "$(unit_state)" == "$PRE_STATE" && -f "$LEGACY" ]]'
+}
+partial "a failed template install rolls back to the pre-deploy state" "install: injected failure" MOCK_INSTALL_FAIL=1
+partial "a failed daemon-reload rolls back to the pre-deploy state" "systemctl: injected failure" MOCK_SYSTEMCTL_FAIL=daemon-reload
+partial "a failed enable rolls back to the pre-deploy state" "systemctl: injected failure" "MOCK_SYSTEMCTL_FAIL=enable $INSTANCE"
+partial "a failed ad-hoc disable says both units are enabled and rolls back" "both units are enabled" "MOCK_SYSTEMCTL_FAIL=disable eth0-eee-off.service"
+
+# A unit that sets EEE on another interface is not a second owner of this one.
+reset; seed_legacy; printf '[Unit]\nAfter=sys-subsystem-net-devices-eth1.device\n[Service]\nExecStart=/usr/sbin/ethtool --set-eee eth1 eee off\n' >"$UNIT_DIR/eth1-eee.service"
+run "$TARGET" eth0 --apply
+check "a unit setting EEE on a different interface does not block the deploy" '[[ "$RC" -eq 0 && "$OUT" == *"OK: EEE is off on eth0"* ]]'
+
+# Re-applying the installed revision recovers a degraded instance.
+for recover in inactive disabled eee-on; do
+  reset; run "$TARGET" eth0 --apply
+  case $recover in
+    inactive) systemctl stop "$INSTANCE" >/dev/null ;;
+    disabled) systemctl disable "$INSTANCE" >/dev/null ;;
+    eee-on) echo 'enabled - active' >"$STATE/eee.eth0" ;;
+  esac
+  run "$TARGET" eth0 --apply
+  check "re-applying the same revision recovers a $recover instance" '[[ "$RC" -eq 0 && "$OUT" == *"OK: EEE is off"* && "$OUT" != *"already in place"* && -e "$STATE/enabled.$INSTANCE" && -e "$STATE/active.$INSTANCE" && -L "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/$INSTANCE" && "$(cat "$STATE/eee.eth0")" == disabled ]]'
+done
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"

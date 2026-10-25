@@ -139,8 +139,9 @@ managed=$unit_dir/$template_name
 legacy_name=$IFACE-eee-off.service
 legacy=$unit_dir/$legacy_name
 iface_re=$(printf '%s' "$IFACE" | sed 's/[.]/[.]/g')
-# Any EEE change on this interface, whatever value it sets.
-any_set_re="--set-eee[[:space:]]+$iface_re([[:space:]]|\$)"
+# The interface as a whole token, so quoting ("eth0"), line continuations and odd
+# spacing in another unit cannot hide it, while eth01 or eth0.device do not match.
+tok_re="(^|[^A-Za-z0-9_.])$iface_re([^A-Za-z0-9_.]|\$)"
 instance_link=$unit_dir/sys-subsystem-net-devices-$IFACE.device.wants/$instance
 # grep for the scans below. systemd reads unit files as root, so a file the operator
 # cannot read, or a read error, refuses instead of counting as "no match".
@@ -149,6 +150,12 @@ scan_has() { # extended-regex file
   if grep -Eq -e "$1" "$2"; then return 0; else rc=$?; fi
   [ "$rc" = 1 ] || refuse "could not scan ${2#"$unit_dir"/} (grep exit $rc)"
   return 1
+}
+# A file owns EEE on this interface when it runs --set-eee anywhere and names the
+# interface (or, for a template, %i/%I) anywhere. Deliberately broad: systemd
+# quoting and continuations are not parsed, so an ambiguous file refuses.
+owns_eee() { # file token-regex
+  scan_has '--set-eee' "$1" && scan_has "$2" "$1"
 }
 # Every directory must be readable, or a glob below could silently skip it.
 find "$unit_dir" >/dev/null 2>&1 \
@@ -219,7 +226,7 @@ for f in "$unit_dir"/*.service "$unit_dir"/*.service.d/*.conf; do
   [ -e "$f" ] || [ -L "$f" ] || continue
   name=${f#"$unit_dir"/}
   case $name in "$legacy_name"|"$template_name") continue ;; esac
-  if scan_has "$any_set_re" "$f"; then
+  if owns_eee "$f" "$tok_re"; then
     refuse "$name also sets EEE on $IFACE; adopt or remove it manually so that only one unit owns this setting"
   fi
 done
@@ -230,7 +237,7 @@ for f in "$unit_dir"/*.wants/*@"$IFACE".service "$unit_dir"/*.requires/*@"$IFACE
   [ "$name" != "$instance" ] || continue
   for g in "$f" "$unit_dir/${name%%@*}@.service" "$unit_dir/${name%%@*}@.service.d"/*.conf "$unit_dir/$name.d"/*.conf; do
     [ -e "$g" ] || continue
-    if scan_has "--set-eee[[:space:]]+(%[iI]|$iface_re)([[:space:]]|\$)" "$g"; then
+    if owns_eee "$g" "%[iI]|$tok_re"; then
       refuse "$name is enabled and also sets EEE on $IFACE; disable it manually so that only one unit owns this setting"
     fi
   done
@@ -373,7 +380,10 @@ esac
 [ "$active" = active ] || { echo "FAILED: $instance is not active; the ad-hoc unit was left in charge" >&2; exit 3; }
 if [ "$legacy_present" = 1 ]; then
   legacy_disabled=1
-  sudo -n systemctl disable "$legacy_name" </dev/null
+  sudo -n systemctl disable "$legacy_name" </dev/null || {
+    echo "FAILED: could not disable $legacy_name; both units are enabled until rolled back" >&2
+    exit 3
+  }
   legacy_removed=1
   sudo -n rm -f "$legacy" </dev/null
   sudo -n systemctl daemon-reload </dev/null

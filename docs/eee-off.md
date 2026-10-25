@@ -74,7 +74,11 @@ than prompt. Before changing anything it refuses when:
 - any other unit or drop-in in the unit directory sets EEE on that interface, to
   any value, or an enabled instance of another template does through its
   template, its template's drop-ins or its own drop-ins, which would leave two
-  owners of one setting;
+  owners of one setting. A file counts as an owner when it runs `--set-eee`
+  anywhere and names the interface as a whole token anywhere (`%i`/`%I` for a
+  template). This is deliberately broad: quoting and line continuations are not
+  parsed, so an ambiguous file refuses. Commands hidden in scripts that a unit
+  runs are out of scope;
 - a concrete `brokkr-eee-off@<iface>.service` file would shadow the template, a
   drop-in directory overrides the managed template or instance, or the instance
   is in a state other than enabled, disabled or absent;
