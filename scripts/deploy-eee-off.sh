@@ -241,8 +241,11 @@ if [ -e "$managed" ] || [ -L "$managed" ]; then
   managed_present=1
 fi
 instance_enabled=$(systemctl is-enabled "$instance" 2>/dev/null || true)
+# systemd >= 250 reports a unit without a unit file as not-found; that is only
+# expected while the managed template is absent.
 case $instance_enabled in
   enabled|disabled|'') ;;
+  not-found) [ "$managed_present" = 0 ] || refuse "$instance is not-found although $template_name exists; inspect it manually" ;;
   *) refuse "$instance is $instance_enabled; only an enabled, disabled, or absent instance is managed" ;;
 esac
 # is-enabled reports any wants link; only the device dependency re-applies the

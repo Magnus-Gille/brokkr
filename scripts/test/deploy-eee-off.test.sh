@@ -92,7 +92,8 @@ case "${1:-}" in
   # An enabled.* file may hold a non-default state such as enabled-runtime.
   is-enabled)
     if [[ -e "$st/enabled.$2" ]]; then state=$(cat "$st/enabled.$2"); echo "${state:-enabled}"
-    else echo disabled; exit 1; fi ;;
+    elif [[ -e "$MOCK_UNIT_DIR/$2" || ( "$2" == *@*.service && -e "$MOCK_UNIT_DIR/${2%%@*}@.service" ) ]]; then echo disabled; exit 1
+    else echo not-found; exit 4; fi ;;
   is-active) if [[ -e "$st/active.$2" ]]; then echo active; else echo inactive; exit 3; fi ;;
   *) echo "fake systemctl: unexpected $*" >&2; exit 99 ;;
 esac
@@ -300,6 +301,9 @@ for mode in dry-run apply; do
   refuses "$mode: an alias of the ad-hoc unit refuses" "eee-alias.service" "${args[@]}"
   reset; seed_legacy; touch "$STATE/enabled.$INSTANCE"
   refuses "$mode: an instance enabled without its device dependency refuses" "without its device dependency" "${args[@]}"
+  reset; seed_legacy; echo not-found >"$STATE/enabled.$INSTANCE"
+  printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee %%i eee off\n' >"$MANAGED"
+  refuses "$mode: an instance reported not-found while its template exists refuses" "not-found" "${args[@]}"
   # Inspection must be complete: systemd reads these as root, the operator may not.
   if [[ "$(/usr/bin/id -u)" != 0 ]]; then
     reset; seed_legacy; printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee eth0 eee on\n' >"$UNIT_DIR/secret.service"; chmod 000 "$UNIT_DIR/secret.service"
