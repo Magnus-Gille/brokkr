@@ -132,16 +132,34 @@ while True:
     spec = section.get("remote")
     if spec is None or spec.startswith("/"):
         break
-    hop = re.fullmatch(r"([A-Za-z0-9_][A-Za-z0-9_.-]*):.*", spec, re.S)
-    if hop is None: sys.exit(f"remote {chain[-1]!r} must point at a named remote or an absolute local path")
-    if hop.group(1) in chain or len(chain) > 8: sys.exit("remote chain loops or is too deep")
-    if hop.group(1) not in dump: sys.exit(f"underlying remote {hop.group(1)!r} not configured")
-    base = base or hop.group(1)
-    chain.append(hop.group(1)); section = dump[hop.group(1)]
+    hop = spec.split(":", 1)[0] if ":" in spec else ""
+    if not hop or "," in hop or hop not in dump:
+        sys.exit(f"remote {chain[-1]!r} must point at a configured named remote (no inline options) or an absolute local path")
+    if hop in chain or len(chain) > 8: sys.exit("remote chain loops or is too deep")
+    base = base or hop
+    chain.append(hop); section = dump[hop]
+# rclone reads a section named "local" for every bare local path, including the archive
+# source itself, so its overrides apply even though no remote names it.
+if any("." in key for key in dump.get("local", {})): sys.exit("the implicit [local] section sets a global/override option")
 u = dump.get(base, {}) if base else {"type": "local"}
 print("underlying: %s type=%s drive_type=%s drive_id=%s" % (base or "(local path)", u.get("type"), u.get("drive_type"), u.get("drive_id")))
 ' "$REMOTE" 2>&1
 }
+
+# cryptcheck --one-way into a fresh log; sets CC_RC, CC_MATCH and CC_UNCHECKED. Counts
+# come from rclone's own summary notices, not from per-file reports, whose unescaped
+# names would split on a newline. An object whose stored hash is empty is reported as a
+# match and still exits 0; only the "N hashes could not be checked" notice shows it.
+run_cryptcheck() { # log-file
+  if "$RCLONE" cryptcheck --one-way --log-file "$1" --log-level NOTICE "$SRC" "$REMOTE:$NAME" >/dev/null 2>&1
+  then CC_RC=0; else CC_RC=$?; fi
+  cat "$1" >>"$LOG" 2>/dev/null || true
+  CC_MATCH=$(sed -n 's/.*: \([0-9][0-9]*\) matching files$/\1/p' "$1" 2>/dev/null | tail -n 1)
+  CC_UNCHECKED=$(sed -n 's/.*: \([0-9][0-9]*\) hashes could not be checked$/\1/p' "$1" 2>/dev/null | tail -n 1)
+  CC_MATCH=${CC_MATCH:-0} CC_UNCHECKED=${CC_UNCHECKED:-0}
+}
+cryptcheck_ok() { [ "$CC_RC" = 0 ] && [ "$CC_MATCH" = "$files" ] && [ "$CC_UNCHECKED" = 0 ]; }
+cryptcheck_detail() { echo "cryptcheck exit $CC_RC: $CC_MATCH/$files matched, $CC_UNCHECKED hashes unchecked"; }
 
 # A push and a verify must not interleave: a half-pushed archive would fail cryptcheck.
 if [ "$MODE" != --validate ] && command -v flock >/dev/null 2>&1; then
@@ -159,8 +177,10 @@ if [ "$MODE" != --verify ]; then
   args=(--immutable --transfers 4 --checkers 8 --stats 5m --stats-one-line --log-file "$LOG" --log-level INFO)
   [ -z "$BWLIMIT" ] || args+=(--bwlimit "$BWLIMIT")
 
+  [ "$MODE" != --validate ] || exit 0
+  cclog=$(mktemp "$STATE_DIR/.archive-cryptcheck.XXXXXX") || die "cannot create a cryptcheck log"
+  trap 'rm -f "$cclog"' EXIT
   case "$MODE" in
-    --validate) exit 0 ;;
     --dry-run)
       "$RCLONE" copy --dry-run "${args[@]}" "$SRC" "$REMOTE:$NAME"
       note "dry-run complete (see log)" ;;
@@ -169,12 +189,14 @@ if [ "$MODE" != --verify ]; then
       "$RCLONE" copy "${args[@]}" "$SRC" "$REMOTE:$NAME"
       "$RCLONE" copyto "${args[@]}" "$MAN" "$REMOTE:$NAME.sha256"
       note "push complete; running cryptcheck"
-      "$RCLONE" cryptcheck --one-way --log-file "$LOG" --log-level NOTICE "$SRC" "$REMOTE:$NAME"
-      note "cryptcheck OK" ;;
+      run_cryptcheck "$cclog"
+      cryptcheck_ok || die "$(cryptcheck_detail)"
+      note "cryptcheck OK ($CC_MATCH/$files matched)" ;;
     --check)
-      "$RCLONE" cryptcheck --one-way --log-file "$LOG" --log-level NOTICE "$SRC" "$REMOTE:$NAME"
+      run_cryptcheck "$cclog"
+      cryptcheck_ok || die "$(cryptcheck_detail)"
       "$RCLONE" cat "$REMOTE:$NAME.sha256" | cmp -s - "$MAN" || die "remote manifest is missing or differs from $MAN"
-      note "cryptcheck OK (remote manifest byte-identical)" ;;
+      note "cryptcheck OK ($CC_MATCH/$files matched; remote manifest byte-identical)" ;;
   esac
   exit 0
 fi
@@ -305,21 +327,14 @@ if [ "$remote_ok" = 1 ]; then
 
   # Integrity: every archive file matches its encrypted remote copy, and the remote
   # manifest is byte-identical to the local one.
-  if "$RCLONE" cryptcheck --one-way --combined "$WORK/combined" --log-file "$WORK/cryptcheck.log" --log-level NOTICE \
-    "$SRC" "$REMOTE:$NAME" >/dev/null 2>&1; then crc=0; else crc=$?; fi
-  cat "$WORK/cryptcheck.log" >>"$LOG" 2>/dev/null || true
-  read -r match bad < <(awk '/^= /{m++; next} {b++} END {print m+0, b+0}' "$WORK/combined" 2>/dev/null || echo "0 0")
-  # An object whose stored hash is empty is listed as `=` and still exits 0; rclone only
-  # reports it in the "N hashes could not be checked" notice, so that must be zero.
-  unchecked=$(sed -n 's/.* \([0-9][0-9]*\) hashes could not be checked.*/\1/p' "$WORK/cryptcheck.log" 2>/dev/null | tail -n 1)
-  unchecked=${unchecked:-0}
+  run_cryptcheck "$WORK/cryptcheck.log"
   if "$RCLONE" cat "$REMOTE:$NAME.sha256" 2>>"$LOG" | cmp -s - "$MAN"; then man_ok=1; else man_ok=0; fi
-  if [ "$crc" = 0 ] && [ "$match" = "$files" ] && [ "$bad" = 0 ] && [ "$unchecked" = 0 ] && [ "$man_ok" = 1 ]; then
-    record integrity pass "cryptcheck matched $match/$files files; remote manifest byte-identical"
+  if cryptcheck_ok && [ "$man_ok" = 1 ]; then
+    record integrity pass "cryptcheck matched $CC_MATCH/$files files; remote manifest byte-identical"
   elif [ "$man_ok" = 1 ]; then
-    record integrity fail "cryptcheck exit $crc: $match/$files matched, $bad differ/missing/error, $unchecked hashes unchecked"
+    record integrity fail "$(cryptcheck_detail)"
   else
-    record integrity fail "remote manifest missing or differs; cryptcheck exit $crc: $match/$files matched"
+    record integrity fail "remote manifest missing or differs; $(cryptcheck_detail)"
   fi
 
   # Restore: random files come back through the crypt remote and match the manifest.

@@ -20,7 +20,8 @@ fi
 
 TMP="$(fixture_cleanup_alloc)" || { echo "not ok - cannot allocate a test fixture" >&2; exit 1; }
 [ -n "$TMP" ] && [ -d "$TMP" ] || { echo "not ok - fixture allocation returned no directory" >&2; exit 1; }
-trap 'chmod -R u+w "$TMP" 2>/dev/null; fixture_cleanup_on_exit "$TMP"' EXIT
+# fixture_cleanup_on_exit reads the test status from $?, so restore it after the chmod.
+trap 'status=$?; chmod -R u+w "$TMP" 2>/dev/null; (exit "$status"); fixture_cleanup_on_exit "$TMP"' EXIT
 for name in $(compgen -e | grep '^RCLONE_' || true); do unset "$name"; done
 export HOME="$TMP/home" RCLONE_CONFIG="$TMP/rclone.conf" BROKKR_STATE_DIR="$TMP/state"
 export ARCHIVE_RCLONE="$R" ARCHIVE_LOG="$TMP/log" ARCHIVE_NODE=node-a
@@ -134,6 +135,16 @@ filename_encoding = base32768
 password = $P
 password2 = $S
 
+[base archive]
+type = local
+
+[spaced]
+type = crypt
+remote = base archive:$TMP/store
+filename_encoding = base32768
+password = $P
+password2 = $S
+
 [connstr]
 type = crypt
 remote = :s3,access_key_id=AKIDSENTINEL,secret_access_key=SECRETSENTINEL:bucket
@@ -169,8 +180,15 @@ refused "default base32 names refused"      base32      "filename_encoding must 
 refused "plaintext contents (no_data_encryption) refused" nodata "no_data_encryption must be false"
 refused "global.immutable override in the crypt section refused" globalimm "sets a global/override option"
 refused "override.* in the underlying remote refused" chainedover "'sizeonly' sets a global/override option"
-refused "inline options on the underlying remote refused" inlineopt "must point at a named remote or an absolute local path"
-refused "connection-string underlying remote refused" connstr "must point at a named remote or an absolute local path"
+refused "inline options on the underlying remote refused" inlineopt "must point at a configured named remote (no inline options)"
+refused "connection-string underlying remote refused" connstr "must point at a configured named remote"
+expect 0 "underlying remote name with a space accepted" env ARCHIVE_REMOTE=spaced bash "$SCRIPT" --validate
+# rclone reads [local] for every bare local path (the archive source included), so its
+# overrides apply although no remote names it.
+{ cat "$RCLONE_CONFIG"; printf '\n[local]\ntype = local\nglobal.immutable = false\n'; } >"$TMP/local-override.conf"
+WANT="the implicit [local] section sets a global/override option"
+expect 1 "global override in the implicit [local] section refused" env RCLONE_CONFIG="$TMP/local-override.conf" ARCHIVE_REMOTE=good bash "$SCRIPT" --validate
+check "implicit [local] refusal is for the stated reason" '[[ "$OUT" == *"$WANT"* ]]'
 check "inline credentials are never printed" '[[ "$OUT" != *SENTINEL* ]]'
 expect 0 "named underlying remote accepted"  env ARCHIVE_REMOTE=chained bash "$SCRIPT" --validate
 check "validate identifies the underlying remote without its path" '[[ "$OUT" == *"underlying: base type=local"* && "$OUT" != *"$TMP/store"* ]]'
@@ -321,6 +339,9 @@ FAKE
 chmod 755 "$TMP/bin/rclone-nohash" "$TMP/bin/rm"
 verify MOCK_REAL_RCLONE="$R" ARCHIVE_RCLONE="$TMP/bin/rclone-nohash"
 check "unchecked cryptcheck hashes fail integrity" '[ "$RC" = 1 ] && [[ "$(row integrity)" == *"1 hashes unchecked" ]]'
+expect 1 "manual --check fails on unchecked hashes" env MOCK_REAL_RCLONE="$R" ARCHIVE_RCLONE="$TMP/bin/rclone-nohash" "${G[@]}" --check
+check "manual --check names the unchecked hashes" '[[ "$OUT" == *"1 hashes unchecked"* ]]'
+expect 1 "manual --push fails on unchecked hashes" env MOCK_REAL_RCLONE="$R" ARCHIVE_RCLONE="$TMP/bin/rclone-nohash" "${G[@]}" --push
 verify MOCK_RM_FAIL=1
 check "failed scratch removal is delivered as a restore failure" '[ "$RC" = 1 ] && [[ "$(row restore)" == "fail restored 3/3 sampled files but could not remove the scratch copy" ]] && [ "$(panel)" = "archive-verify-node-a fail" ]'
 check "the work directory is still removed afterwards" '[ -z "$(find "$TMP/state" -name ".archive-verify.*")" ]'

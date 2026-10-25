@@ -121,6 +121,21 @@ private_file "$ARCHIVE_CONFIG" "archive config"
 if grep -Eq '^ARCHIVE_LOG=' "$ARCHIVE_CONFIG"; then
   refuse "archive config must not set ARCHIVE_LOG for the deployed unit (it logs to ~/.local/state/brokkr)"
 fi
+# PrivateTmp=yes gives the unit its own /tmp and /var/tmp, so inputs there would pass
+# this preflight and vanish at run time. (The override exists only for the hermetic test,
+# whose fixtures may live under /tmp; ssh does not forward it.)
+tmp_roots=${BROKKR_ARCHIVE_PRIVATE_TMP_ROOTS:-/tmp /var/tmp}
+hidden_by_private_tmp() {
+  for root in $tmp_roots; do case $1 in "$root"|"$root"/*) return 0 ;; esac; done
+  return 1
+}
+if hidden_by_private_tmp "$ARCHIVE_CONFIG"; then refuse "archive config is under a temporary directory that PrivateTmp hides from the unit"; fi
+for key in ARCHIVE_SRC ARCHIVE_MANIFEST ARCHIVE_RCLONE; do
+  value=$(sed -n "s/^$key=//p" "$ARCHIVE_CONFIG" | tail -n 1 | tr -d "\"'")
+  if [ -n "$value" ] && hidden_by_private_tmp "$value"; then
+    refuse "$key is under a temporary directory that PrivateTmp hides from the unit"
+  fi
+done
 for key in HEIMDALL_HUB_URL HEIMDALL_FLEET_TOKEN; do
   grep -Eq "^${key}=.+$" "$DELIVERY_ENV" || refuse "delivery env lacks a non-empty $key"
   if grep -Eq "^${key}=(''|\"\")$" "$DELIVERY_ENV"; then refuse "delivery env lacks a non-empty $key"; fi
@@ -154,7 +169,8 @@ resolve_rclone() {
   rclone_path=$(find_rclone)
   case $rclone_path in
     '') refuse "rclone is not installed on this node (looked in PATH and the rclone search path); install and configure the crypt remote first" ;;
-    /*) safe_path "$rclone_path" || refuse "rclone path is not a plain absolute path" ;;
+    /*) safe_path "$rclone_path" || refuse "rclone path is not a plain absolute path"
+      if hidden_by_private_tmp "$rclone_path"; then refuse "rclone is under a temporary directory that PrivateTmp hides from the unit"; fi ;;
     *) refuse "rclone resolved to a non-absolute command" ;;
   esac
 }

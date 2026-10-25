@@ -24,8 +24,10 @@ Every mode first refuses the remote unless `rclone config dump` shows all of the
   and a damaged block is an error, not zeros;
 - both `password` and `password2` (the salt);
 - `filename_encoding = base32768`;
-- no `global.*` or `override.*` key in the crypt section or in any remote it points
-  through, and every hop is a named remote (`name:path`, without inline `,opt=value`
+- no `global.*` or `override.*` key in the crypt section, in any remote it points
+  through, or in a `[local]` section (rclone reads that section for every bare local
+  path, the archive source included);
+- every hop is a configured named remote (`name:path`, without inline `,opt=value`
   options) or an absolute local path, never a `:backend,...:` connection string.
 
 rclone applies those keys and inline options over command-line flags. A
@@ -96,15 +98,17 @@ following the levels in [backup-evidence.md](backup-evidence.md):
 |---|---|---|---|
 | `preflight` | Present only on failure | — | fail: guard or archive/manifest count refused; copy, integrity and restore are then fail `not verified` |
 | `copy` | `rclone size` count of `<remote>:<name>` and presence of `<name>.sha256` | count equals the manifest and the manifest exists | fail if fewer objects or no manifest; warn if more |
-| `integrity` | `cryptcheck --one-way --combined`, and `rclone cat` of the remote manifest compared byte for byte | exit 0, every archive file in the `=` (match) set, nothing else, no "hashes could not be checked" notice, manifest identical | fail |
+| `integrity` | `cryptcheck --one-way` and its summary notices, and `rclone cat` of the remote manifest compared byte for byte | exit 0, "N matching files" equal to the manifest count, no "hashes could not be checked" notice, manifest identical | fail |
 | `restore` | N random manifest entries (`ARCHIVE_RESTORE_SAMPLES`, default 32) downloaded through the crypt remote into a private scratch directory and hashed with sha256 | every sampled file matches and the scratch copy was removed | fail, including when removal fails |
 | `nearsite` | `sha256sum --check --quiet --strict -` of the local manifest, run in `ARCHIVE_NEARSITE_DIR` on `ARCHIVE_NEARSITE_SSH` | exit 0: every entry present and matching | fail (unreachable host, or the count of `FAILED` entries); warn when not configured; omitted with `ARCHIVE_NEARSITE=off` |
 | `key-drill` | `ARCHIVE_KEY_DRILL_DATE`, recorded by the owner | the drill is at most 365 days old | warn when overdue or never recorded; fail when malformed or in the future |
 
 rclone lists an object whose stored hash is empty as a match and still exits 0. It
-reports such objects only in its "N hashes could not be checked" notice, so the
-verifier reads that notice from its own cryptcheck log and fails integrity unless N
-is zero.
+reports such objects only in its "N hashes could not be checked" notice. Every mode
+that runs cryptcheck (`--push`, `--check`, `--verify`) therefore reads rclone's summary
+notices from a fresh log. It requires "N matching files" to equal the manifest count
+and no unchecked hashes. The per-file report is not parsed, because names containing a
+newline would split its records.
 
 The panel state is the worst row. The panel message starts with every row's status,
 for example `copy=pass integrity=pass restore=pass nearsite=pass key-drill=pass`,
@@ -152,7 +156,9 @@ BROKKR_ARCHIVE_DELIVERY_ENV=/home/operator/.config/brokkr/env \
 The preflight runs the shipped script's `--validate` on the node against the real
 config. That reads only the local rclone config dump and the archive, and writes no
 state or log. The deploy refuses an archive config that sets `ARCHIVE_LOG`, because
-the unit can write only the state directory. `--apply` enables
+the unit can write only the state directory. It also refuses an archive config,
+archive, manifest, or rclone binary under `/tmp` or `/var/tmp`, which `PrivateTmp=yes`
+hides from the unit. This check is lexical and does not follow symlinks. `--apply` enables
 `brokkr-archive-verify.timer`, which runs on the 1st of each month at 03:30 plus up to
 2 h of random delay and catches up after downtime. Deploying does not start a
 verification, because one run re-reads the whole archive and takes hours. Start the

@@ -105,6 +105,8 @@ FAKE
 export MOCK_CALLS="$CALLS" MOCK_BIN="$BIN" MOCK_REMOTE_HOME="$HOME_DIR" MOCK_RCBIN="$RCBIN"
 export MOCK_REMOTE_PATH="$BIN:$PYBIN:/usr/bin:/bin"
 export PATH="$BIN:$PATH" TMPDIR="$TMP/payload-tmp"
+# The fixture itself may live under /tmp (Linux CI); PrivateTmp roots are set per case.
+export BROKKR_ARCHIVE_PRIVATE_TMP_ROOTS=/nonexistent-private-tmp
 unset XDG_CONFIG_HOME
 export BROKKR_EXPECTED_SOURCE="$REPO" BROKKR_EXPECTED_COMMIT="$SHA"
 
@@ -236,6 +238,10 @@ reset; rm -f "$CONFIG"; printf 'x\n' >"$HOME_DIR/.config/brokkr/other"; ln -s "$
 refuses "symlinked archive config refuses" "archive config" "$TARGET"
 reset; printf 'ARCHIVE_LOG=%s/archive.log\n' "$HOME_DIR" >>"$CONFIG"
 refuses "archive config with a log path the unit cannot write refuses" "must not set ARCHIVE_LOG" "$TARGET"
+reset; printf 'ARCHIVE_SRC=/var/tmp/archive\n' >>"$CONFIG"
+BROKKR_ARCHIVE_PRIVATE_TMP_ROOTS=/var/tmp refuses "archive under a PrivateTmp-hidden directory refuses" "ARCHIVE_SRC is under a temporary directory that PrivateTmp hides" "$TARGET"
+reset
+BROKKR_ARCHIVE_PRIVATE_TMP_ROOTS="$RCBIN" refuses "rclone under a PrivateTmp-hidden directory refuses" "rclone is under a temporary directory that PrivateTmp hides" "$TARGET"
 reset; printf 'SURPRISE=1\n' >>"$CONFIG"
 refuses "archive config rejected by the shipped parser refuses" "rejected by the shipped verifier" "$TARGET"
 reset; printf '1 extra\n' >>"$HOME_DIR/archive.sha256"

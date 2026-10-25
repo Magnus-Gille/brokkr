@@ -5,7 +5,8 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d)" || { echo "not ok - cannot allocate a test directory" >&2; exit 1; }
+[ -n "$TMP" ] && [ -d "$TMP" ] || { echo "not ok - mktemp returned no directory" >&2; exit 1; }
 cleanup() {
   rm -rf "$TMP"
 }
