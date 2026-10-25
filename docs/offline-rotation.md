@@ -38,7 +38,15 @@ The disk holds two kinds of data:
 5. Mounts with `nodev,nosuid,noexec` and requires the `BROKKR-OFFLINE-DISK` marker
    written at the format ceremony. `archive`, `manifests`, `services` and `receipts`
    must be real directories on the mounted filesystem, not symlinks. This is checked
-   before copying and again before the receipt is written.
+   before copying and again before the receipt is written. The script never writes to a
+   path that existed before the run:
+   - every manifest and receipt temp file is created with `mktemp` inside a fresh 0700
+     `manifests/.work-<stamp>.*` directory, or in the local receipt directory;
+   - completed files are moved into place only if their final name is absent, and a
+     dangling symlink counts as present.
+
+   A failed run may leave a `.work-*` directory of temp manifests. It is safe to remove
+   by hand.
 6. **Never deletes.** The archive is copied with `rsync -a --ignore-existing`, without
    `--delete`. A changed, truncated or ransomware-encrypted source file therefore cannot
    overwrite the good copy on the disk. The `sha256sum -c --strict` check of the disk copy

@@ -167,6 +167,19 @@ if [ -n "${MOCK_RSYNC_CORRUPT:-}" ] && [ -f "$dst/$MOCK_RSYNC_CORRUPT" ]; then
 fi
 exit "${MOCK_RSYNC_RC:-0}"
 MOCK
+# stat pass-through; MOCK_STAT_FOREIGN=<layout dir> reports another filesystem ID for
+# it and MOCK_STAT_FAIL=<layout dir> makes its filesystem stat fail.
+cat >"$TMP/bin/stat" <<'MOCK'
+#!/usr/bin/env bash
+last="${!#}"
+case "$*" in
+  *%d*)
+    if [ -n "${MOCK_STAT_FOREIGN:-}" ] && [ "${last##*/}" = "$MOCK_STAT_FOREIGN" ]; then echo 999999; exit 0; fi
+    if [ -n "${MOCK_STAT_FAIL:-}" ] && [ "${last##*/}" = "$MOCK_STAT_FAIL" ]; then exit 1; fi ;;
+esac
+exec /usr/bin/stat "$@"
+MOCK
+
 # mkdir pass-through; with MOCK_MKDIR_SIGNAL=1 it sends TERM to the script right after
 # creating the run lock, to hit the window before the script records owning it.
 cat >"$TMP/bin/mkdir" <<'MOCK'
@@ -438,6 +451,52 @@ setup
 : >"$F/disk/services"
 run_rotation
 check "a regular file in place of a layout directory is refused" '[ "$RC" -ne 0 ] && no_receipts && closed_cleanly'
+
+# ── writers never follow pre-planted links at temp or final paths ──────────
+S=2026-10-26T073320Z
+setup
+mkdir -p "$F/disk/manifests"
+: >"$F/alias"
+ln -s "$F/alias" "$F/disk/manifests/.$S-services.sha256.tmp"
+ln -s "$F/alias" "$F/disk/manifests/.$S-services-disk.sha256.tmp"
+MOCK_RSYNC_CORRUPT=db/dump.sql run_rotation
+check "aliased service-manifest temp paths cannot make a corrupt copy pass" '[ "$RC" -ne 0 ] && no_receipts && ! completed'
+check "the alias target is not written through" '[ ! -s "$F/alias" ]'
+
+for planted in "manifests/.$S-archive.sha256.tmp" "receipts/.$S.receipt.tmp"; do
+  setup
+  mkdir -p "$F/disk/$(dirname "$planted")"
+  printf 'precious\n' >"$F/host-file"
+  ln -s "$F/host-file" "$F/disk/$planted"
+  run_rotation
+  check "a planted link at $planted does not overwrite a host file" '[ "$(cat "$F/host-file")" = precious ]'
+done
+
+setup
+printf 'precious\n' >"$F/host-file"
+ln -s "$F/host-file" "$F/receipts/.$S.receipt.tmp"
+run_rotation
+check "a planted link at the local receipt temp does not overwrite a host file" '[ "$(cat "$F/host-file")" = precious ]'
+
+setup
+mkdir -p "$F/disk/receipts"
+ln -s "$F/host-file-missing" "$F/disk/receipts/$S.receipt"
+run_rotation
+check "a dangling link at the final disk receipt is refused" '[ "$RC" -ne 0 ] && [ ! -e "$F/host-file-missing" ] && closed_cleanly'
+
+setup
+mkdir -p "$F/disk/services" "$F/host-dir"
+ln -s "$F/host-dir" "$F/disk/services/$S"
+run_rotation
+check "a link at the final service tree name is refused" '[ "$RC" -ne 0 ] && dir_empty "$F/host-dir" && no_receipts'
+
+setup
+MOCK_STAT_FOREIGN=services run_rotation
+check "a layout directory on another filesystem is refused" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"not on the backup filesystem"* ]] && no_receipts && closed_cleanly'
+
+setup
+MOCK_STAT_FAIL=services run_rotation
+check "a failed filesystem stat of a layout directory is refused" '[ "$RC" -ne 0 ] && no_receipts && closed_cleanly'
 
 # ── service verification never follows links ───────────────────────────────
 setup

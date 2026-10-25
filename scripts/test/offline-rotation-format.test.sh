@@ -29,6 +29,7 @@ mkdir -p "$TMP/bin"
 cat >"$TMP/bin/lsblk" <<'MOCK'
 #!/usr/bin/env bash
 printf 'lsblk %s\n' "$*" >>"$MOCK_CALLS"
+[ ! -e "$MOCK_STATE/lsblk-fail" ] || exit 1
 cols="$2"
 [ "${MOCK_LSBLK_EMPTY:-}" != "$cols" ] || exit 0
 case "$cols" in
@@ -67,6 +68,11 @@ if [ "${MOCK_PARTED_NO_PART:-}" != 1 ]; then
   : >"$MOCK_DEV/sdz1"
   ln -s "$MOCK_DEV/sdz1" "$MOCK_BY_ID/$MOCK_DISK_NAME-part1"
 fi
+# MOCK_AFTER_PARTED=ident|holder: late changes after partitioning.
+case "${MOCK_AFTER_PARTED:-}" in
+  ident) echo SERIAL9999 >"$MOCK_STATE/serial" ;;
+  holder) echo 'md0 raid1 ' >"$MOCK_STATE/child" ;;
+esac
 MOCK
 
 cat >"$TMP/bin/udevadm" <<'MOCK'
@@ -106,6 +112,12 @@ case "$1" in
     done
     dev="${*: -2:1}"
     printf '%s\n' "$dev" >"$MOCK_STATE/open"
+    # MOCK_AFTER_OPEN=mount|ident|query: late changes after the mapping is open.
+    case "${MOCK_AFTER_OPEN:-}" in
+      mount) echo 'sdz1 part /media/automount' >"$MOCK_STATE/child" ;;
+      ident) echo SERIAL9999 >"$MOCK_STATE/serial" ;;
+      query) : >"$MOCK_STATE/lsblk-fail" ;;
+    esac
     if [ "${MOCK_SIGNAL_AFTER:-}" = open ]; then kill -"$MOCK_SIGNAL" "$PPID"; fi ;;
   luksClose)
     [ ! -e "$MOCK_STATE/mounted" ] || exit 5
@@ -270,6 +282,18 @@ done
 setup
 MOCK_AFTER_WIPEFS=ident default_args
 check "an identity change between wipefs and parted stops before parted" '[ "$RC" -ne 0 ] && called "wipefs" && not_called "^parted"'
+
+for late in ident holder; do
+  setup
+  MOCK_AFTER_PARTED="$late" default_args
+  check "a late $late change after partitioning stops before luksFormat" '[ "$RC" -ne 0 ] && not_called "luksFormat" && lock_free'
+done
+
+for late in mount ident query; do
+  setup
+  MOCK_AFTER_OPEN="$late" default_args
+  check "a late $late change after open stops before mkfs and closes the mapping" '[ "$RC" -ne 0 ] && not_called "^mkfs.ext4" && closed_cleanly && lock_free'
+done
 
 # ── identification must succeed and be complete ────────────────────────────
 for cols in TYPE TRAN MAJ:MIN,SIZE,SERIAL SIZE,MODEL NAME,TYPE,MOUNTPOINT; do

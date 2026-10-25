@@ -238,9 +238,19 @@ for d in $LAYOUT; do
   [ -e "$MNT/$d" ] || mkdir "$MNT/$d" || die "cannot create disk layout directory $d"
 done
 check_layout
-for existing in "$MNT/receipts/$STAMP.receipt" "$MNT/services/$STAMP" "$MNT/manifests/$STAMP-archive.sha256"; do
-  [ ! -e "$existing" ] || die "a rotation stamped $STAMP already exists on the disk"
+# Writers never open a path that existed before this run. Final names must be
+# absent (a dangling symlink counts as present); every temp file is created by
+# mktemp inside a fresh 0700 work directory on the backup filesystem, so a planted
+# link cannot alias two temp files or redirect a write to a host file.
+absent() { [ ! -e "$1" ] && [ ! -L "$1" ]; }
+place() { absent "$2" || die "refusing to replace existing $2"; mv "$1" "$2" || die "cannot place $2"; }
+for existing in "receipts/$STAMP.receipt" "services/$STAMP" "services/.partial-$STAMP" \
+  "manifests/$STAMP-archive.sha256" "manifests/$STAMP-services.sha256"; do
+  absent "$MNT/$existing" || die "a rotation stamped $STAMP already exists on the disk ($existing)"
 done
+WORK="$(mktemp -d "$MNT/manifests/.work-$STAMP.XXXXXX")" || die "cannot create a private work directory on the disk"
+[ -d "$WORK" ] && [ ! -L "$WORK" ] && [ "$(fs_id "$WORK")" = "$MNT_FS" ] \
+  || die "work directory $WORK is not a private directory on the backup filesystem"
 
 # ---- Archive: copy without overwrite or delete, then verify -----------------
 log "copying archive (no overwrite, no delete) — slow over USB 2 is expected"
@@ -249,12 +259,13 @@ rsync -a --ignore-existing "$ARCHIVE_SRC/" "$MNT/archive/" || die "archive rsync
 # live source, so a link anywhere in the disk archive would prove nothing.
 link="$(find "$MNT/archive" -type l -print -quit)" || die "cannot scan the disk archive for symlinks"
 [ -z "$link" ] || die "disk archive contains a symlink (${link#"$MNT"/}); verification would read outside the disk"
-cp "$MANIFEST_SNAPSHOT" "$MNT/manifests/.$STAMP-archive.sha256.tmp"
-mv "$MNT/manifests/.$STAMP-archive.sha256.tmp" "$MNT/manifests/$STAMP-archive.sha256"
+ARCHIVE_MANIFEST="$(mktemp "$WORK/archive.XXXXXX")" || die "cannot create the archive manifest temp"
+cp "$MANIFEST_SNAPSHOT" "$ARCHIVE_MANIFEST" || die "cannot copy the archive manifest to the disk"
 log "verifying $ARCHIVE_COUNT archive files against the sha256 manifest"
-(cd "$MNT/archive" && sha256sum -c --strict --quiet "$MNT/manifests/$STAMP-archive.sha256") \
+(cd "$MNT/archive" && sha256sum -c --strict --quiet "$ARCHIVE_MANIFEST") \
   || die "archive verification failed on the disk copy"
-MANIFEST_SHA="$(sha256sum "$MNT/manifests/$STAMP-archive.sha256" | awk '{print $1}')"
+MANIFEST_SHA="$(sha256sum "$ARCHIVE_MANIFEST" | awk '{print $1}')"
+place "$ARCHIVE_MANIFEST" "$MNT/manifests/$STAMP-archive.sha256"
 
 # ---- Service snapshots: new dated tree, verified against the source ---------
 service_manifest() {
@@ -269,11 +280,11 @@ if [ "${#SERVICE_NAMES[@]}" -gt 0 ]; then
   PREV="$(find "$MNT/services" -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9]-*Z' -print \
     | LC_ALL=C sort | tail -n 1)"
   PARTIAL="$MNT/services/.partial-$STAMP"
-  [ ! -e "$PARTIAL" ] || die "leftover partial service tree exists: $PARTIAL"
-  # rsync creates only the last destination component.
+  absent "$PARTIAL" || die "leftover partial service tree exists: $PARTIAL"
+  # rsync creates only the last destination component; mkdir fails on any existing
+  # entry, including a link.
   mkdir "$PARTIAL" || die "cannot create $PARTIAL"
-  SVC_MANIFEST="$MNT/manifests/.$STAMP-services.sha256.tmp"
-  : >"$SVC_MANIFEST"
+  SVC_MANIFEST="$(mktemp "$WORK/services-source.XXXXXX")" || die "cannot create the service manifest temp"
   i=0
   while [ "$i" -lt "${#SERVICE_NAMES[@]}" ]; do
     name="${SERVICE_NAMES[$i]}"; src="${SERVICE_DIRS[$i]}"; i=$((i + 1))
@@ -288,8 +299,7 @@ if [ "${#SERVICE_NAMES[@]}" -gt 0 ]; then
   # Verify by walking the disk copy the same non-following way (find -type f never
   # follows a link) and comparing manifests; `sha256sum -c` would follow a symlink
   # that replaced a hashed file back to live data. Links are kept but not verified.
-  DEST_MANIFEST="$MNT/manifests/.$STAMP-services-disk.sha256.tmp"
-  : >"$DEST_MANIFEST"
+  DEST_MANIFEST="$(mktemp "$WORK/services-disk.XXXXXX")" || die "cannot create the disk manifest temp"
   for name in "${SERVICE_NAMES[@]}"; do
     service_manifest "$PARTIAL/$name" | sed "s|  \./|  $name/|" >>"$DEST_MANIFEST" \
       || die "cannot checksum the disk copy of service $name"
@@ -297,8 +307,8 @@ if [ "${#SERVICE_NAMES[@]}" -gt 0 ]; then
   cmp -s "$SVC_MANIFEST" "$DEST_MANIFEST" \
     || die "service snapshot verification failed on the disk copy"
   rm -f "$DEST_MANIFEST"
-  mv "$SVC_MANIFEST" "$MNT/manifests/$STAMP-services.sha256"
-  mv "$PARTIAL" "$MNT/services/$STAMP"
+  place "$SVC_MANIFEST" "$MNT/manifests/$STAMP-services.sha256"
+  place "$PARTIAL" "$MNT/services/$STAMP"
 fi
 
 # ---- SMART short test on the parent disk ------------------------------------
@@ -337,9 +347,11 @@ case "$health" in
 esac
 
 # ---- Receipts and close ------------------------------------------------------
+# write_receipt TEMP_DIR DEST: write into a fresh mktemp file in TEMP_DIR, make it
+# world-readable (the freshness check may run unprivileged), then place it at DEST.
 write_receipt() {
-  local dest="$1" tmp
-  tmp="$(dirname "$dest")/.$(basename "$dest").tmp"
+  local dest="$2" tmp
+  tmp="$(mktemp "$1/.receipt.XXXXXX")" || return 1
   {
     echo "format=$RECEIPT_FORMAT"
     echo "completed_at=$STAMP"
@@ -351,16 +363,20 @@ write_receipt() {
     echo "service_files_verified=$SERVICE_FILES"
     echo "smart_short_test=passed"
     echo "smart_health=passed"
-  } >"$tmp" && mv "$tmp" "$dest"
+  } >"$tmp" || return 1
+  chmod 0644 "$tmp" || return 1
+  place "$tmp" "$dest"
 }
 check_layout
-write_receipt "$MNT/receipts/$STAMP.receipt" || die "cannot write the disk receipt"
+write_receipt "$WORK" "$MNT/receipts/$STAMP.receipt" || die "cannot write the disk receipt"
+rmdir "$WORK" || die "cannot remove the empty work directory $WORK"
 sync
 umount "$MNT" || die "umount failed"
 cryptsetup luksClose "$MAPPER" || die "luksClose failed"
 
 mkdir -p "$RECEIPT_DIR" || die "cannot create local receipt dir $RECEIPT_DIR"
-write_receipt "$RECEIPT_DIR/$STAMP.receipt" || die "cannot write the local receipt"
+[ -d "$RECEIPT_DIR" ] && [ ! -L "$RECEIPT_DIR" ] || die "local receipt dir is not a real directory: $RECEIPT_DIR"
+write_receipt "$RECEIPT_DIR" "$RECEIPT_DIR/$STAMP.receipt" || die "cannot write the local receipt"
 COMPLETE=1
 log "receipt $STAMP: $ARCHIVE_COUNT archive files and $SERVICE_FILES service files verified"
 echo "offline rotation complete: safe to unplug"
