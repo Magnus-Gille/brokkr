@@ -116,6 +116,11 @@ private_file() {
 }
 private_file "$DELIVERY_ENV" "delivery env"
 private_file "$ARCHIVE_CONFIG" "archive config"
+# The unit can write only the state directory (ReadWritePaths); a configured log path
+# would pass --validate (which writes no log) and then fail every timer run.
+if grep -Eq '^ARCHIVE_LOG=' "$ARCHIVE_CONFIG"; then
+  refuse "archive config must not set ARCHIVE_LOG for the deployed unit (it logs to ~/.local/state/brokkr)"
+fi
 for key in HEIMDALL_HUB_URL HEIMDALL_FLEET_TOKEN; do
   grep -Eq "^${key}=.+$" "$DELIVERY_ENV" || refuse "delivery env lacks a non-empty $key"
   if grep -Eq "^${key}=(''|\"\")$" "$DELIVERY_ENV"; then refuse "delivery env lacks a non-empty $key"; fi

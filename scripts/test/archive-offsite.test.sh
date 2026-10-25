@@ -18,7 +18,8 @@ if [ -z "$R" ]; then
   echo "skip - rclone not installed; archive-offsite tests need a real rclone"; exit 0
 fi
 
-TMP="$(fixture_cleanup_alloc)"
+TMP="$(fixture_cleanup_alloc)" || { echo "not ok - cannot allocate a test fixture" >&2; exit 1; }
+[ -n "$TMP" ] && [ -d "$TMP" ] || { echo "not ok - fixture allocation returned no directory" >&2; exit 1; }
 trap 'chmod -R u+w "$TMP" 2>/dev/null; fixture_cleanup_on_exit "$TMP"' EXIT
 for name in $(compgen -e | grep '^RCLONE_' || true); do unset "$name"; done
 export HOME="$TMP/home" RCLONE_CONFIG="$TMP/rclone.conf" BROKKR_STATE_DIR="$TMP/state"
@@ -28,6 +29,7 @@ SRC="$TMP/archive/photos"
 printf one >"$SRC/a b/x.jpg"
 head -c 300000 /dev/urandom >"$SRC/big.nef"
 printf esc >"$SRC/back\\slash.jpg"
+printf nl >"$SRC/new"$'\n'"line.jpg"
 # GNU sha256sum format, including the escaped form for a name with a backslash.
 write_manifest() {
   python3 -I - "$SRC" "$1" <<'PY'
@@ -87,6 +89,57 @@ directory_name_encryption = false
 filename_encoding = base32768
 password = $P
 password2 = $S
+
+[nodata]
+type = crypt
+remote = $TMP/store
+no_data_encryption = true
+filename_encoding = base32768
+password = $P
+password2 = $S
+
+[globalimm]
+type = crypt
+remote = $TMP/store
+global.immutable = false
+filename_encoding = base32768
+password = $P
+password2 = $S
+
+[base]
+type = local
+
+[sizeonly]
+type = local
+override.size_only = true
+
+[chained]
+type = crypt
+remote = base:$TMP/store
+filename_encoding = base32768
+password = $P
+password2 = $S
+
+[chainedover]
+type = crypt
+remote = sizeonly:$TMP/store
+filename_encoding = base32768
+password = $P
+password2 = $S
+
+[inlineopt]
+type = crypt
+remote = base,links=true:$TMP/store
+filename_encoding = base32768
+password = $P
+password2 = $S
+
+[connstr]
+type = crypt
+remote = :s3,access_key_id=AKIDSENTINEL,secret_access_key=SECRETSENTINEL:bucket
+filename_encoding = base32768
+password = $P
+password2 = $S
 EOF
 
 pass=0; fail=0
@@ -101,12 +154,27 @@ expect() { # expect <0|1> <desc> cmd...
 G=(env ARCHIVE_REMOTE=good bash "$SCRIPT")
 
 # --- remote guard and push (ported from the original 16 checks) --------------
-expect 1 "missing remote refused"         env ARCHIVE_REMOTE=nope bash "$SCRIPT" --validate
-expect 1 "non-crypt remote refused"       env ARCHIVE_REMOTE=plain bash "$SCRIPT" --validate
-expect 1 "crypt without salt refused"     env ARCHIVE_REMOTE=nosalt bash "$SCRIPT" --validate
-expect 1 "clear filenames refused"        env ARCHIVE_REMOTE=clearnames bash "$SCRIPT" --validate
-expect 1 "clear directory names refused"  env ARCHIVE_REMOTE=cleardirs bash "$SCRIPT" --validate
-expect 1 "default base32 names refused"   env ARCHIVE_REMOTE=base32 bash "$SCRIPT" --validate
+# Each refusal must be for its own reason, not an unrelated preflight failure.
+refused() { # desc remote expected-text
+  WANT=$3
+  expect 1 "$1" env ARCHIVE_REMOTE="$2" bash "$SCRIPT" --validate
+  check "$1: for the stated reason" '[[ "$OUT" == *"remote validation failed: "*"$WANT"* ]]'
+}
+refused "missing remote refused"            nope        "not configured"
+refused "non-crypt remote refused"          plain       "is not type crypt"
+refused "crypt without salt refused"        nosalt      "salt (password2)"
+refused "clear filenames refused"           clearnames  "filename_encryption must be standard"
+refused "clear directory names refused"     cleardirs   "directory_name_encryption must be true"
+refused "default base32 names refused"      base32      "filename_encoding must be base32768"
+refused "plaintext contents (no_data_encryption) refused" nodata "no_data_encryption must be false"
+refused "global.immutable override in the crypt section refused" globalimm "sets a global/override option"
+refused "override.* in the underlying remote refused" chainedover "'sizeonly' sets a global/override option"
+refused "inline options on the underlying remote refused" inlineopt "must point at a named remote or an absolute local path"
+refused "connection-string underlying remote refused" connstr "must point at a named remote or an absolute local path"
+check "inline credentials are never printed" '[[ "$OUT" != *SENTINEL* ]]'
+expect 0 "named underlying remote accepted"  env ARCHIVE_REMOTE=chained bash "$SCRIPT" --validate
+check "validate identifies the underlying remote without its path" '[[ "$OUT" == *"underlying: base type=local"* && "$OUT" != *"$TMP/store"* ]]'
+expect 1 "relative archive path refused"  env ARCHIVE_SRC=archive/photos ARCHIVE_REMOTE=good bash "$SCRIPT" --validate
 expect 1 "bad mode refused"               "${G[@]}" --nuke
 expect 1 "missing archive settings refused" env -u ARCHIVE_SRC ARCHIVE_REMOTE=good bash "$SCRIPT" --validate
 expect 1 "rclone config override in env refused" env RCLONE_CONFIG_GOOD_FILENAME_ENCRYPTION=off "${G[@]}" --validate
@@ -222,13 +290,40 @@ check "verify refuses without Heimdall delivery" '[ "$RC" -ne 0 ] && [[ "$OUT" =
 
 verify
 check "healthy verify exits 0 and delivers a per-node panel" '[ "$RC" = 0 ] && [ "$(panel)" = "archive-verify-node-a pass" ]'
-check "copy row counts remote files and the manifest" '[[ "$(row copy)" == "pass remote holds 3/3 files"*"and the manifest" ]]'
-check "integrity row: cryptcheck coverage and byte-identical manifest" '[[ "$(row integrity)" == "pass cryptcheck matched 3/3 files; remote manifest byte-identical" ]]'
+check "copy row counts remote files and the manifest" '[[ "$(row copy)" == "pass remote holds 4/4 files"*"and the manifest" ]]'
+check "integrity row: cryptcheck coverage and byte-identical manifest" '[[ "$(row integrity)" == "pass cryptcheck matched 4/4 files; remote manifest byte-identical" ]]'
 check "restore row: sampled files restored and hashed" '[[ "$(row restore)" == "pass restored 3 random files"*"scratch removed" ]]'
 check "near-site row: sha256sum -c over ssh" '[[ "$(row nearsite)" == pass* ]] && grep -q "sha256sum --check --quiet --strict -" "$MOCK_SSH_CALLS"'
 check "key-drill row reports the owner-recorded date" '[ "$(row key-drill)" = "pass owner-recorded key-custody drill 2026-10-01 (23 days ago); next due 2027-10-01" ]'
 check "no restore scratch or work directory is left behind" '[ -z "$(find "$TMP/state" -name ".archive-verify.*")" ]'
 check "token never reaches the snapshot or log" '! grep -q secret-sentinel "$SNAP" "$ARCHIVE_LOG"'
+check "panel message carries every row status, not just alarms" \
+  '[ "$(python3 -I -c "import json,sys; print(json.load(open(sys.argv[1]))[\"message\"])" "$MOCK_REQUEST_FILE")" = "copy=pass integrity=pass restore=pass nearsite=pass key-drill=pass" ]'
+
+# rclone reports an object with an empty stored hash as a match and exits 0; only the
+# "N hashes could not be checked" notice shows it. The wrapper injects that notice.
+cat >"$TMP/bin/rclone-nohash" <<'FAKE'
+#!/usr/bin/env bash
+"$MOCK_REAL_RCLONE" "$@"; rc=$?
+if [ "$1" = cryptcheck ]; then
+  prev=; for arg in "$@"; do [ "$prev" != --log-file ] || log=$arg; prev=$arg; done
+  printf "2026/10/24 00:00:00 NOTICE: Encrypted drive 'good:photos': 1 hashes could not be checked\n" >>"$log"
+fi
+exit "$rc"
+FAKE
+cat >"$TMP/bin/rm" <<'FAKE'
+#!/usr/bin/env bash
+if [ "${MOCK_RM_FAIL:-0}" = 1 ]; then
+  for arg in "$@"; do case "$arg" in */restore) echo "rm: mock failure" >&2; exit 1 ;; esac; done
+fi
+exec /bin/rm "$@"
+FAKE
+chmod 755 "$TMP/bin/rclone-nohash" "$TMP/bin/rm"
+verify MOCK_REAL_RCLONE="$R" ARCHIVE_RCLONE="$TMP/bin/rclone-nohash"
+check "unchecked cryptcheck hashes fail integrity" '[ "$RC" = 1 ] && [[ "$(row integrity)" == *"1 hashes unchecked" ]]'
+verify MOCK_RM_FAIL=1
+check "failed scratch removal is delivered as a restore failure" '[ "$RC" = 1 ] && [[ "$(row restore)" == "fail restored 3/3 sampled files but could not remove the scratch copy" ]] && [ "$(panel)" = "archive-verify-node-a fail" ]'
+check "the work directory is still removed afterwards" '[ -z "$(find "$TMP/state" -name ".archive-verify.*")" ]'
 
 verify ARCHIVE_RESTORE_SAMPLES=2
 check "restore samples are bounded by ARCHIVE_RESTORE_SAMPLES" '[[ "$(row restore)" == "pass restored 2 random files"* ]]'
@@ -252,7 +347,7 @@ verify "ARCHIVE_NEARSITE_DIR=$TMP/nas;touch"
 check "unsafe near-site path refused before any ssh" '[ "$RC" -ne 0 ] && [ ! -f "$MOCK_REQUEST_FILE" ]'
 printf corrupt >"$TMP/nas/big.nef"
 verify
-check "corrupt near-site file fails only the near-site row" '[ "$RC" = 1 ] && [[ "$(row nearsite)" == *"1 of 3 entries FAILED" ]] && [[ "$(row integrity)" == pass* ]]'
+check "corrupt near-site file fails only the near-site row" '[ "$RC" = 1 ] && [[ "$(row nearsite)" == *"1 of 4 entries FAILED" ]] && [[ "$(row integrity)" == pass* ]]'
 cp "$SRC/big.nef" "$TMP/nas/big.nef"
 
 verify MOCK_HTTP_FAIL=1
@@ -276,7 +371,7 @@ check "corrupted remote object fails integrity and restore" '[ "$RC" = 1 ] && [[
 check "failed restore still removes the scratch copy" '[ -z "$(find "$TMP/state" -name ".archive-verify.*")" ]'
 rm -f "$big"
 verify
-check "missing remote object fails copy and integrity" '[ "$RC" = 1 ] && [[ "$(row copy)" == "fail remote holds only 2/3 files"* ]] && [[ "$(row integrity)" == fail* ]]'
+check "missing remote object fails copy and integrity" '[ "$RC" = 1 ] && [[ "$(row copy)" == "fail remote holds only 3/4 files"* ]] && [[ "$(row integrity)" == fail* ]]'
 
 echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

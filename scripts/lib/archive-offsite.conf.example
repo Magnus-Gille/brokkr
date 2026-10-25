@@ -13,6 +13,9 @@ ARCHIVE_REMOTE=example-archive-crypt
 
 # Optional: explicit rclone binary (the deploy script renders a verified path).
 #ARCHIVE_RCLONE=/usr/local/bin/rclone
+# Optional: log file for manual runs (default ~/.local/state/brokkr/archive-offsite.log).
+# The deployed unit can write only the state directory, so its deploy refuses this key.
+#ARCHIVE_LOG=
 # Optional: push bandwidth limit, e.g. 20M.
 #ARCHIVE_BWLIMIT=
 
@@ -24,7 +27,9 @@ ARCHIVE_RESTORE_SAMPLES=32
 ARCHIVE_NEARSITE_SSH=operator@nas.example
 ARCHIVE_NEARSITE_DIR=/srv/backups/example-archive
 #ARCHIVE_NEARSITE=off
-# --verify: date of the last owner key-custody drill (YYYY-MM-DD). Warns after 365 days.
-ARCHIVE_KEY_DRILL_DATE=2026-10-01
+# --verify: date of the last owner key-custody drill, YYYY-MM-DD (for example 2026-10-01).
+# Set it only after actually performing the drill; unset reports "no drill recorded".
+# Warns 365 days after the recorded date.
+#ARCHIVE_KEY_DRILL_DATE=
 # --verify: Heimdall panel node name; defaults to the short hostname.
 #ARCHIVE_NODE=node-a

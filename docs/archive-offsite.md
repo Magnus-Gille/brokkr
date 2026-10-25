@@ -20,10 +20,20 @@ Every mode first refuses the remote unless `rclone config dump` shows all of the
 
 - `type = crypt`, with an underlying `remote`;
 - `filename_encryption = standard` and `directory_name_encryption = true` (the defaults);
+- `no_data_encryption` and `pass_bad_blocks` absent or false, so contents are encrypted
+  and a damaged block is an error, not zeros;
 - both `password` and `password2` (the salt);
-- `filename_encoding = base32768`.
+- `filename_encoding = base32768`;
+- no `global.*` or `override.*` key in the crypt section or in any remote it points
+  through, and every hop is a named remote (`name:path`, without inline `,opt=value`
+  options) or an absolute local path, never a `:backend,...:` connection string.
 
-The guard prints only a verdict, never a key value. base32768 is required, not just
+rclone applies those keys and inline options over command-line flags. A
+`global.immutable = false` line in the remote section, for example, makes
+`copy --immutable` overwrite a changed object, and `override.size_only = true` would
+reduce cryptcheck to sizes. Connection strings can also carry credentials inline.
+The guard prints only a verdict and the underlying remote's name, type, `drive_type`
+and `drive_id`, never a key, credential, or path. base32768 is required, not just
 preferred: OneDrive caps path length, and the default base32 names overflow it on
 deep archive paths (`pathIsTooLong`). base32768 names fit. An existing base32 remote
 cannot be switched in place: its stored names would no longer decode. Use a new remote
@@ -42,7 +52,9 @@ Pass it with `--config`. The file is parsed, never sourced. It must be a regular
 non-symlink file owned by the invoking user, with no group or other permissions. Only
 the documented `ARCHIVE_*` keys are accepted, each at most once, and the values are
 literal. Config values override the environment. Without `--config` the same
-variables are read from the environment.
+variables are read from the environment. `ARCHIVE_SRC`, `ARCHIVE_MANIFEST`,
+`ARCHIVE_LOG` and `ARCHIVE_RCLONE` must be absolute paths, because the unit runs from
+its release directory.
 
 The manifest is `sha256sum` output generated from inside the archive directory, so its
 paths are relative: `(cd "$ARCHIVE_SRC" && find . -type f -print0 | sort -z | xargs -0 sha256sum) >"$ARCHIVE_MANIFEST"`.
@@ -84,12 +96,21 @@ following the levels in [backup-evidence.md](backup-evidence.md):
 |---|---|---|---|
 | `preflight` | Present only on failure | — | fail: guard or archive/manifest count refused; copy, integrity and restore are then fail `not verified` |
 | `copy` | `rclone size` count of `<remote>:<name>` and presence of `<name>.sha256` | count equals the manifest and the manifest exists | fail if fewer objects or no manifest; warn if more |
-| `integrity` | `cryptcheck --one-way --combined`, and `rclone cat` of the remote manifest compared byte for byte | exit 0, every archive file in the `=` (match) set, nothing else, manifest identical | fail |
+| `integrity` | `cryptcheck --one-way --combined`, and `rclone cat` of the remote manifest compared byte for byte | exit 0, every archive file in the `=` (match) set, nothing else, no "hashes could not be checked" notice, manifest identical | fail |
 | `restore` | N random manifest entries (`ARCHIVE_RESTORE_SAMPLES`, default 32) downloaded through the crypt remote into a private scratch directory and hashed with sha256 | every sampled file matches and the scratch copy was removed | fail, including when removal fails |
 | `nearsite` | `sha256sum --check --quiet --strict -` of the local manifest, run in `ARCHIVE_NEARSITE_DIR` on `ARCHIVE_NEARSITE_SSH` | exit 0: every entry present and matching | fail (unreachable host, or the count of `FAILED` entries); warn when not configured; omitted with `ARCHIVE_NEARSITE=off` |
 | `key-drill` | `ARCHIVE_KEY_DRILL_DATE`, recorded by the owner | the drill is at most 365 days old | warn when overdue or never recorded; fail when malformed or in the future |
 
-The panel state is the worst row. A row that could not run is never pass. The
+rclone lists an object whose stored hash is empty as a match and still exits 0. It
+reports such objects only in its "N hashes could not be checked" notice, so the
+verifier reads that notice from its own cryptcheck log and fails integrity unless N
+is zero.
+
+The panel state is the worst row. The panel message starts with every row's status,
+for example `copy=pass integrity=pass restore=pass nearsite=pass key-drill=pass`,
+followed by the details of any row that is not pass, so passing evidence stays
+visible and a long failure detail can only truncate details. A row that could not
+run is never pass. The
 `key-drill` row is a reminder based on a date the owner records. It does not show that
 the key can be recovered today; only the drill shows that.
 
@@ -129,7 +150,9 @@ BROKKR_ARCHIVE_DELIVERY_ENV=/home/operator/.config/brokkr/env \
 ```
 
 The preflight runs the shipped script's `--validate` on the node against the real
-config. That reads only the local rclone config dump and the archive. `--apply` enables
+config. That reads only the local rclone config dump and the archive, and writes no
+state or log. The deploy refuses an archive config that sets `ARCHIVE_LOG`, because
+the unit can write only the state directory. `--apply` enables
 `brokkr-archive-verify.timer`, which runs on the 1st of each month at 03:30 plus up to
 2 h of random delay and catches up after downtime. Deploying does not start a
 verification, because one run re-reads the whole archive and takes hours. Start the

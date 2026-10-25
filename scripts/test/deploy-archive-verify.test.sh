@@ -10,10 +10,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=scripts/test/lib/fixture-cleanup.sh
 source "$HERE/lib/fixture-cleanup.sh"
-TMP="$(fixture_cleanup_alloc)"
+TMP="$(fixture_cleanup_alloc)" || { echo "not ok - cannot allocate a test fixture" >&2; exit 1; }
+[ -n "$TMP" ] && [ -d "$TMP" ] || { echo "not ok - fixture allocation returned no directory" >&2; exit 1; }
 trap 'fixture_cleanup_on_exit "$TMP"' EXIT
 # The deploy entry path must contain no symlinks (macOS /var is one).
-TMP="$(cd "$TMP" && pwd -P)"
+TMP="$(cd "$TMP" && pwd -P)" && [ -n "$TMP" ] || { echo "not ok - cannot resolve the fixture path" >&2; exit 1; }
 
 REPO="$TMP/repo"; HOME_DIR="$TMP/home"; BIN="$TMP/bin"; CALLS="$TMP/calls"
 RCBIN="$TMP/rcbin"; PYBIN="$TMP/pybin"
@@ -196,7 +197,7 @@ check "dry-run succeeds with valid inputs" '[[ "$RC" -eq 0 && "$OUT" == *DRY-RUN
 check "dry-run mutates nothing on the remote" '[[ "$(tree_state)" == "$before" ]] && no_mutation'
 check "dry-run reports the release target without creating it" '[[ "$OUT" == *"releases/$SHA"* && ! -e "$RELEASE" ]]'
 check "dry-run validated through ssh" 'grep -q "^ssh $TARGET" "$CALLS" && grep -q "^loginctl" "$CALLS"'
-check "dry-run reports the rclone path and the validator verdict" '[[ "$OUT" == *"preflight: rclone present at $RCBIN/rclone"* && "$OUT" == *"preflight: underlying: example-base:archive"* ]]'
+check "dry-run reports the rclone path and the validator verdict" '[[ "$OUT" == *"preflight: rclone present at $RCBIN/rclone"* && "$OUT" == *"preflight: underlying: example-base type="* ]]'
 check "dry-run states what --apply would do and that nothing changed" '[[ "$OUT" == *"--apply would stage the payload"* && "$OUT" == *"Nothing was changed"* ]]'
 check "dry-run only reads the rclone config dump" 'only_config_dump && grep -q "^rclone config dump$" "$CALLS"'
 check "dry-run never prints secret values" '[[ "$OUT" != *secret-sentinel* && "$OUT" != *dummy-password-sentinel* && "$OUT" != *dummy-salt-sentinel* ]]'
@@ -233,6 +234,8 @@ reset; chmod 644 "$CONFIG"
 refuses "world-readable archive config refuses" "archive config" "$TARGET"
 reset; rm -f "$CONFIG"; printf 'x\n' >"$HOME_DIR/.config/brokkr/other"; ln -s "$HOME_DIR/.config/brokkr/other" "$CONFIG"
 refuses "symlinked archive config refuses" "archive config" "$TARGET"
+reset; printf 'ARCHIVE_LOG=%s/archive.log\n' "$HOME_DIR" >>"$CONFIG"
+refuses "archive config with a log path the unit cannot write refuses" "must not set ARCHIVE_LOG" "$TARGET"
 reset; printf 'SURPRISE=1\n' >>"$CONFIG"
 refuses "archive config rejected by the shipped parser refuses" "rejected by the shipped verifier" "$TARGET"
 reset; printf '1 extra\n' >>"$HOME_DIR/archive.sha256"
@@ -307,7 +310,7 @@ check "existing unit is backed up as .previous-<SHA>" '[[ "$(cat "$SERVICE.previ
 check "systemd is reloaded, then the timer enabled" '[[ "$(line_of "^systemctl --user daemon-reload")" -lt "$(line_of "^systemctl --user enable --now brokkr-archive-verify.timer")" ]]'
 check "the service is NOT started during deploy" '! grep -Eq "^systemctl --user (start|restart|try-restart)" "$CALLS" && ! grep -q "^journalctl" "$CALLS"'
 check "output prints how to start and check the first verification" '[[ "$OUT" == *"next: start the first verification with: systemctl --user start --no-block brokkr-archive-verify.service"* && "$OUT" == *"systemctl --user status brokkr-archive-verify.service"* && "$OUT" == *"cat ~/.local/state/brokkr/archive-verify.json"* ]]'
-check "the staged verifier was validated before install and only dumped the rclone config" 'only_config_dump && [[ "$(grep -c "^rclone config dump$" "$CALLS")" -ge 4 ]]'
+check "the staged verifier was validated before install and only dumped the rclone config" 'only_config_dump && [[ "$(grep -c "^rclone config dump$" "$CALLS")" -ge 2 ]]'
 check "output prints a concrete rollback recipe" '[[ "$OUT" == *"Rollback"* && "$OUT" == *"systemctl --user disable --now brokkr-archive-verify.timer"* && "$OUT" == *"$SERVICE.previous-$SHA"* && "$OUT" == *"releases/$SHA"* ]]'
 check "apply never prints secret values" '[[ "$OUT" != *secret-sentinel* && "$OUT" != *dummy-password-sentinel* && "$OUT" != *dummy-salt-sentinel* ]] && ! grep -Fq secret-sentinel "$CALLS"'
 check "apply payload parent and validator scratch are cleaned" '[[ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -print)" ]]'

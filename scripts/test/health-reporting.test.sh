@@ -170,6 +170,14 @@ run_push
 check "redirect is refused rather than forwarding credentials" '[[ "$RC" -ne 0 && "$OUT" == *"HTTPError"* ]]'
 check "push installs the no-redirect handler" 'python3 -c '\''import json,sys; assert json.load(open(sys.argv[1]))["no_redirect"] is True'\'' "$TMP/request.json"'
 
+export MOCK_HTTP_STATUS=200
+printf '{"status":"pass","summary":"copy=pass integrity=pass","checks":[{"name":"copy","status":"pass","detail":"x"}]}\n' > "$TMP/snapshot.json"
+run_push
+check "a producer summary replaces the alarm-only message" 'python3 -c '\''import json,sys; assert json.load(open(sys.argv[1]))["body"]["message"] == "copy=pass integrity=pass"'\'' "$TMP/request.json"'
+printf '{"status":"pass","summary":["copy=pass"],"checks":[]}\n' > "$TMP/snapshot.json"
+run_push
+check "a non-string summary cannot be reported as success" '[[ "$RC" -ne 0 && -s "$TMP/state/last-push-failure" ]]'
+
 printf '{not-json}\n' > "$TMP/snapshot.json"
 run_push
 check "malformed snapshot cannot be reported as success" '[[ "$RC" -ne 0 && -s "$TMP/state/last-push-failure" ]]'

@@ -79,6 +79,10 @@ BWLIMIT="${ARCHIVE_BWLIMIT:-}"
 [[ "$REMOTE" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || die "ARCHIVE_REMOTE must be a plain rclone remote name"
 [[ "$NAME" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || die "ARCHIVE_NAME must be a plain name"
 [ -n "$RCLONE" ] && [ -x "$RCLONE" ] || die "rclone not found (set ARCHIVE_RCLONE)"
+# The unit runs from its release directory, so relative paths would silently change meaning.
+for path in "$SRC" "$MAN" "$LOG" "$RCLONE"; do
+  [[ "$path" == /* ]] || die "ARCHIVE_SRC, ARCHIVE_MANIFEST, ARCHIVE_LOG and ARCHIVE_RCLONE must be absolute paths"
+done
 # --validate writes no state or log: the deploy preflight runs it on the node in a dry run.
 if [ "$MODE" = --validate ]; then LOG=/dev/null; else mkdir -p "$STATE_DIR" "$(dirname "$LOG")"; fi
 
@@ -89,30 +93,53 @@ preflight_archive() {
   local files mlines
   [ -d "$SRC" ] || { echo "archive directory missing: $SRC"; return 1; }
   [ -f "$MAN" ] || { echo "manifest missing: $MAN"; return 1; }
-  files=$(find "$SRC" -type f | wc -l | tr -d ' ')
+  # NUL-counted: a name containing a newline is one file (and one escaped manifest line).
+  files=$(find "$SRC" -type f -print0 | tr -dc '\0' | wc -c | tr -d ' ')
   mlines=$(wc -l <"$MAN" | tr -d ' ')
   [ "$files" -eq "$mlines" ] || { echo "archive has $files files but manifest has $mlines lines"; return 1; }
   echo "$files"
 }
 
-# Fails closed unless REMOTE is crypt with filename + directory-name encryption and a
-# salt. Reads the config dump on stdin and prints only a verdict, never secret values.
+# Fails closed unless REMOTE is crypt with content, filename and directory-name
+# encryption and a salt. Reads the config dump on stdin and prints only a verdict and
+# non-secret identification of the underlying remote, never key or credential values.
 validate_remote() {
   "$RCLONE" config dump 2>/dev/null | python3 -I -c '
-import json, sys
+import json, re, sys
 name = sys.argv[1]
 try:
-    cfg = json.load(sys.stdin).get(name)
+    dump = json.load(sys.stdin)
 except ValueError:
     sys.exit("rclone config dump is not readable")
+cfg = dump.get(name)
 if cfg is None: sys.exit(f"remote {name!r} not configured")
 if cfg.get("type") != "crypt": sys.exit(f"remote {name!r} is not type crypt")
 if cfg.get("filename_encryption", "standard") != "standard": sys.exit("filename_encryption must be standard")
 if str(cfg.get("directory_name_encryption", "true")).lower() != "true": sys.exit("directory_name_encryption must be true")
+if str(cfg.get("no_data_encryption", "false")).lower() != "false": sys.exit("no_data_encryption must be false")
+if str(cfg.get("pass_bad_blocks", "false")).lower() != "false": sys.exit("pass_bad_blocks must be false")
 if not cfg.get("password") or not cfg.get("password2"): sys.exit("crypt password and salt (password2) are both required")
 if not cfg.get("remote"): sys.exit("crypt remote has no underlying remote")
 # OneDrive caps path length; base32 names overflow it (pathIsTooLong), base32768 fits.
 if cfg.get("filename_encoding", "base32") != "base32768": sys.exit("filename_encoding must be base32768")
+# Every section in the chain is checked: rclone applies `global.*` / `override.*` keys
+# and connection-string options (`name,opt=value:` or `:backend,...:`) over command-line
+# flags, so they could switch off --immutable or reduce cryptcheck to sizes.
+section, chain, base = cfg, [name], None
+while True:
+    if any("." in key for key in section): sys.exit(f"remote {chain[-1]!r} sets a global/override option")
+    if section.get("type") in ("union", "combine"): sys.exit(f"remote {chain[-1]!r} is a multi-upstream backend")
+    spec = section.get("remote")
+    if spec is None or spec.startswith("/"):
+        break
+    hop = re.fullmatch(r"([A-Za-z0-9_][A-Za-z0-9_.-]*):.*", spec, re.S)
+    if hop is None: sys.exit(f"remote {chain[-1]!r} must point at a named remote or an absolute local path")
+    if hop.group(1) in chain or len(chain) > 8: sys.exit("remote chain loops or is too deep")
+    if hop.group(1) not in dump: sys.exit(f"underlying remote {hop.group(1)!r} not configured")
+    base = base or hop.group(1)
+    chain.append(hop.group(1)); section = dump[hop.group(1)]
+u = dump.get(base, {}) if base else {"type": "local"}
+print("underlying: %s type=%s drive_type=%s drive_id=%s" % (base or "(local path)", u.get("type"), u.get("drive_type"), u.get("drive_id")))
 ' "$REMOTE" 2>&1
 }
 
@@ -125,13 +152,8 @@ fi
 if [ "$MODE" != --verify ]; then
   files=$(preflight_archive) || die "$files"
   verdict=$(validate_remote) || die "remote validation failed: $verdict"
-  # Show (non-secret) which drive the underlying remote points at, for a human check.
-  "$RCLONE" config dump 2>/dev/null | python3 -I -c '
-import json, sys
-c = json.load(sys.stdin); crypt = c[sys.argv[1]]
-base = crypt["remote"].split(":", 1)[0]; u = c.get(base, {})
-print("underlying:", crypt["remote"], "type=%s drive_type=%s drive_id=%s" % (u.get("type"), u.get("drive_type"), u.get("drive_id")))
-' "$REMOTE" | tee -a "$LOG"
+  # Which drive the underlying remote points at, for a human check (no credentials).
+  printf '%s\n' "$verdict" | tee -a "$LOG"
   note "validated remote=$REMOTE src=$SRC files=$files"
 
   args=(--immutable --transfers 4 --checkers 8 --stats 5m --stats-one-line --log-file "$LOG" --log-level INFO)
@@ -283,14 +305,19 @@ if [ "$remote_ok" = 1 ]; then
 
   # Integrity: every archive file matches its encrypted remote copy, and the remote
   # manifest is byte-identical to the local one.
-  if "$RCLONE" cryptcheck --one-way --combined "$WORK/combined" --log-file "$LOG" --log-level NOTICE \
+  if "$RCLONE" cryptcheck --one-way --combined "$WORK/combined" --log-file "$WORK/cryptcheck.log" --log-level NOTICE \
     "$SRC" "$REMOTE:$NAME" >/dev/null 2>&1; then crc=0; else crc=$?; fi
+  cat "$WORK/cryptcheck.log" >>"$LOG" 2>/dev/null || true
   read -r match bad < <(awk '/^= /{m++; next} {b++} END {print m+0, b+0}' "$WORK/combined" 2>/dev/null || echo "0 0")
+  # An object whose stored hash is empty is listed as `=` and still exits 0; rclone only
+  # reports it in the "N hashes could not be checked" notice, so that must be zero.
+  unchecked=$(sed -n 's/.* \([0-9][0-9]*\) hashes could not be checked.*/\1/p' "$WORK/cryptcheck.log" 2>/dev/null | tail -n 1)
+  unchecked=${unchecked:-0}
   if "$RCLONE" cat "$REMOTE:$NAME.sha256" 2>>"$LOG" | cmp -s - "$MAN"; then man_ok=1; else man_ok=0; fi
-  if [ "$crc" = 0 ] && [ "$match" = "$files" ] && [ "$bad" = 0 ] && [ "$man_ok" = 1 ]; then
+  if [ "$crc" = 0 ] && [ "$match" = "$files" ] && [ "$bad" = 0 ] && [ "$unchecked" = 0 ] && [ "$man_ok" = 1 ]; then
     record integrity pass "cryptcheck matched $match/$files files; remote manifest byte-identical"
   elif [ "$man_ok" = 1 ]; then
-    record integrity fail "cryptcheck exit $crc: $match/$files matched, $bad differ/missing/error"
+    record integrity fail "cryptcheck exit $crc: $match/$files matched, $bad differ/missing/error, $unchecked hashes unchecked"
   else
     record integrity fail "remote manifest missing or differs; cryptcheck exit $crc: $match/$files matched"
   fi
@@ -304,7 +331,8 @@ if [ "$remote_ok" = 1 ]; then
       "$REMOTE:$NAME" "$WORK/restore" >/dev/null 2>&1 || true
     read -r good total < <(python3 -I -c "$MANIFEST_PY" check "$MAN" "$WORK/sample.json" "$WORK/restore" 2>/dev/null || echo "0 $picked")
     chmod -R u+w "$WORK/restore" 2>/dev/null || true
-    rm -rf "$WORK/restore"
+    # A failed removal is restore evidence too: report it rather than abort under set -e.
+    rm -rf "$WORK/restore" 2>/dev/null || true
     if [ -e "$WORK/restore" ]; then
       record restore fail "restored $good/$total sampled files but could not remove the scratch copy"
     elif [ "$good" = "$total" ] && [ "$total" -gt 0 ]; then
@@ -378,9 +406,14 @@ with open(sys.argv[1], encoding="utf-8", errors="replace") as fh:
 if not checks or any(c["status"] not in rank for c in checks):
     sys.exit("no valid verification rows")
 status = max((c["status"] for c in checks), key=rank.get)
+# Every row's status leads the panel message, so truncation can only shorten details.
+summary = " ".join(f'{c["name"]}={c["status"]}' for c in checks)
+alarms = "; ".join(f'{c["name"]}: {c["detail"]}' for c in checks if c["status"] != "pass")
+if alarms:
+    summary += " | " + alarms
 with open(sys.argv[2], "w", encoding="utf-8") as fh:
     json.dump({"name": "brokkr", "namespace": "grimnir", "kind": "platform", "status": status,
-               "checks": checks}, fh, separators=(",", ":"))
+               "summary": summary, "checks": checks}, fh, separators=(",", ":"))
     fh.write("\n")
 PY
 then
