@@ -26,6 +26,10 @@ to a new scratch directory and open representative image and video files as desc
 [`../docs/offsite-photos-backup.md`](../docs/offsite-photos-backup.md). Record copy,
 integrity, restore, and key-recovery evidence separately.
 
+For the immutable archive, the remote also holds its sha256 manifest at
+`<remote>:<name>.sha256`. Check restored files against it as in the
+[yearly key-custody drill](../docs/archive-offsite.md#yearly-key-custody-drill).
+
 ## Preflight
 
 ```bash

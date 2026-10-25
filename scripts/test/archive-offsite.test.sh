@@ -143,6 +143,9 @@ expect 1 "duplicate config key refused"     bash "$SCRIPT" --config "$CONF" --va
 write_conf "ARCHIVE_REMOTE=\$(touch $TMP/pwned)"
 expect 1 "command substitution refused"     bash "$SCRIPT" --config "$CONF" --validate
 check "config value was never executed" '[ ! -e "$TMP/pwned" ]'
+cp "$ROOT/scripts/lib/archive-offsite.conf.example" "$CONF"; chmod 600 "$CONF"
+expect 1 "shipped example config parses (fails only on its placeholder archive)" bash "$SCRIPT" --config "$CONF" --validate
+check "example config reached the archive preflight" '[[ "$OUT" == *"archive directory missing: /srv/archive/example-archive"* ]]'
 
 # --- --verify ----------------------------------------------------------------
 cat >"$TMP/python/sitecustomize.py" <<'PY'
