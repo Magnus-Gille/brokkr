@@ -52,5 +52,8 @@ already running is not killed halfway through an install.
   install locations (`~/.local/bin`, `~/.opencode/bin`) before Homebrew, and its log is
   `~/Library/Logs/brokkr/agent-cli-update.launchd.log`; the machine-readable result is
   `~/.local/state/brokkr/agent-cli-update.json`.
-- Both agents run from this repo checkout (`__BROKKR_DIR__`), so a moved checkout or one left
-  on an unfinished branch changes what the agent runs; re-run the installer after moving it.
+- The offsite-photos agent runs from this repo checkout (`__BROKKR_DIR__`), so a moved checkout
+  or one left on an unfinished branch changes what it runs; re-run the installer after moving it.
+  The agent-cli-update agent instead runs a copy of the updater bound to the checkout's `HEAD`
+  (`~/.local/lib/brokkr/agent-cli-update/releases/<full-sha>/`, plist placeholder
+  `__RELEASE__`); its installer refuses an uncommitted updater.

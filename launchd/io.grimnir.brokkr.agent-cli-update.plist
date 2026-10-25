@@ -6,7 +6,10 @@
   Each tool is updated through the mechanism that installed it; see
   scripts/agent-cli-update.sh and docs/agent-cli-update.md.
 
-  __BROKKR_DIR__ / __HOME__ are substituted by launchd/install-agent-cli-update.sh.
+  __RELEASE__ / __HOME__ are substituted by launchd/install-agent-cli-update.sh, which
+  copies the updater as committed at the checkout's HEAD into
+  ~/.local/lib/brokkr/agent-cli-update/releases/<full-sha>/ (= __RELEASE__), so branch
+  switches in the checkout never change what this agent runs.
   Install: ./launchd/install-agent-cli-update.sh   (see launchd/README.md)
 -->
 <plist version="1.0">
@@ -16,7 +19,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__BROKKR_DIR__/scripts/agent-cli-update.sh</string>
+        <string>__RELEASE__/scripts/agent-cli-update.sh</string>
     </array>
 
     <!-- 04:17, 10:17, 16:17 and 22:17 local. launchd runs one missed firing when the

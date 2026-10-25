@@ -12,12 +12,25 @@ source "$HERE/lib/fixture-cleanup.sh"
 TMP="$(fixture_cleanup_alloc)"
 trap 'fixture_cleanup_on_exit "$TMP"' EXIT
 
-INSTALL="$ROOT/launchd/install-agent-cli-update.sh"
 PLIST_SRC="$ROOT/launchd/io.grimnir.brokkr.agent-cli-update.plist"
 LABEL=io.grimnir.brokkr.agent-cli-update
 BIN="$TMP/bin"; HOME_DIR="$TMP/home"; CALLS="$TMP/calls"
 DEST="$HOME_DIR/Library/LaunchAgents/$LABEL.plist"
 mkdir -p "$BIN" "$HOME_DIR"
+
+# The installer binds the release to its checkout's HEAD, so it runs from a private one-commit
+# copy of the files it needs; the result never depends on this worktree's uncommitted state.
+REPO="$TMP/repo"
+mkdir -p "$REPO/launchd" "$REPO/scripts"
+cp "$ROOT/launchd/install-agent-cli-update.sh" "$PLIST_SRC" "$REPO/launchd/"
+cp "$ROOT/scripts/agent-cli-update.sh" "$REPO/scripts/"
+tgit() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$REPO" "$@"; }
+tgit init -q
+tgit add -A
+tgit -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false commit -qm fixture
+REV="$(tgit rev-parse HEAD)"
+INSTALL="$REPO/launchd/install-agent-cli-update.sh"
+RELEASE_DIR="$HOME_DIR/.local/lib/brokkr/agent-cli-update/releases/$REV"
 
 cat >"$BIN/uname" <<'FAKE'
 #!/bin/sh
@@ -47,14 +60,14 @@ have_python() { command -v python3 >/dev/null 2>&1; }
 echo "launchd-agent-cli-update.test.sh"
 
 # --- the versioned plist ---------------------------------------------------------------------
-check "the plist runs the updater from the repo checkout" 'grep -Fq "<string>__BROKKR_DIR__/scripts/agent-cli-update.sh</string>" "$PLIST_SRC"'
+check "the plist runs the updater from the release copy, not the checkout" 'grep -Fq "<string>__RELEASE__/scripts/agent-cli-update.sh</string>" "$PLIST_SRC" && ! grep -q "__BROKKR_DIR__" "$PLIST_SRC"'
 check "the plist ships placeholders, not machine paths" '! grep -Eq "/Users/|/home/" "$PLIST_SRC"'
 if have_python; then
   cat >"$TMP/plist-check.py" <<'PY'
 import plistlib, sys
 d = plistlib.load(open(sys.argv[1], "rb"))
 assert d["Label"] == sys.argv[2]
-assert d["ProgramArguments"] == ["__BROKKR_DIR__/scripts/agent-cli-update.sh"]
+assert d["ProgramArguments"] == ["__RELEASE__/scripts/agent-cli-update.sh"]
 assert d["StartCalendarInterval"] == [{"Hour": h, "Minute": 17} for h in (4, 10, 16, 22)]
 assert d["RunAtLoad"] is False
 assert d["ProcessType"] == "Background" and d["LowPriorityIO"] is True and d["Nice"] == 10
@@ -70,7 +83,8 @@ fi
 reset
 run
 check "install exits 0 and renders into ~/Library/LaunchAgents" '[[ "$RC" -eq 0 && -f "$DEST" ]]'
-check "install leaves no placeholder behind and points at this checkout and HOME" '! grep -q "__[A-Z_]*__" "$DEST" && grep -Fq "<string>$ROOT/scripts/agent-cli-update.sh</string>" "$DEST" && grep -Fq "$HOME_DIR/Library/Logs/brokkr/agent-cli-update.launchd.log" "$DEST"'
+check "install leaves no placeholder behind and points at the HEAD-bound release and HOME" '! grep -q "__[A-Z_]*__" "$DEST" && grep -Fq "<string>$RELEASE_DIR/scripts/agent-cli-update.sh</string>" "$DEST" && ! grep -Fq "$REPO/" "$DEST" && grep -Fq "$HOME_DIR/Library/Logs/brokkr/agent-cli-update.launchd.log" "$DEST"'
+check "the release holds the committed updater, executable" '[[ -x "$RELEASE_DIR/scripts/agent-cli-update.sh" ]] && cmp -s "$RELEASE_DIR/scripts/agent-cli-update.sh" "$ROOT/scripts/agent-cli-update.sh"'
 check "install creates the log directory and a 0644 plist" '[[ -d "$HOME_DIR/Library/Logs/brokkr" ]] && [[ "$(stat -c %a "$DEST" 2>/dev/null || stat -f %Lp "$DEST")" == 644 ]]'
 check "install boots out, then bootstraps, then enables, in the gui domain" '[[ "$(grep -n "^launchctl bootout" "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n "^launchctl bootstrap" "$CALLS" | head -1 | cut -d: -f1)" ]] && grep -Fxq "launchctl bootstrap gui/$(id -u) $DEST" "$CALLS" && grep -Fxq "launchctl enable gui/$(id -u)/$LABEL" "$CALLS"'
 check "install never starts a run" '! grep -q "^launchctl kickstart" "$CALLS"'
@@ -98,6 +112,11 @@ reset
 mkdir -p "$TMP/home&evil"
 RUN_HOME="$TMP/home&evil" run
 check "a HOME that would corrupt the sed rendering is refused" '[[ "$RC" -eq 1 && "$OUT" == *"cannot be rendered"* ]] && [[ ! -s "$CALLS" ]]'
+reset
+printf '# local edit\n' >>"$REPO/scripts/agent-cli-update.sh"
+run
+check "an uncommitted updater is refused before any release or launchd change" '[[ "$RC" -eq 1 && "$OUT" == *"uncommitted changes"* ]] && [[ ! -s "$CALLS" && ! -e "$DEST" && ! -e "$RELEASE_DIR" ]]'
+tgit checkout -q -- scripts/agent-cli-update.sh
 
 # --- the offsite-photos installer is untouched ----------------------------------------------------
 check "install.sh still manages only the offsite-photos agent" 'grep -Fq "LABEL=\"io.grimnir.brokkr.offsite-photos\"" "$ROOT/launchd/install.sh" && ! grep -q agent-cli-update "$ROOT/launchd/install.sh"'

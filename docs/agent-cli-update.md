@@ -112,8 +112,12 @@ make agent-cli-update-install            # or ./launchd/install-agent-cli-update
 ./launchd/install-agent-cli-update.sh uninstall
 ```
 
-The installer renders the plist into `~/Library/LaunchAgents/`, `bootout`s any
-loaded copy and `bootstrap`s the new one. The agent's PATH is
+The installer copies the updater as committed at the checkout's `HEAD` into
+`~/.local/lib/brokkr/agent-cli-update/releases/<full-sha>/scripts/`, renders the
+plist into `~/Library/LaunchAgents/` pointing at that copy, `bootout`s any loaded
+copy and `bootstrap`s the new one. It refuses when the checkout's updater has
+uncommitted changes, so the release is exactly the named revision; later branch
+switches or a removed worktree do not change what the agent runs. The agent's PATH is
 `~/.local/bin:~/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 launchd's own output goes to `~/Library/Logs/brokkr/agent-cli-update.launchd.log`.
 To try the updater by hand without changing anything:
@@ -224,6 +228,6 @@ example `npm install -g --prefix <prefix> <package>@<version>`. On the Mac,
   `RemainAfterExit` oneshot) defers every run. Name only long-running services.
 - **Overlapping runs are not serialised.** A manual run during a timer firing
   can collide; the services are oneshot, so the timer itself never overlaps.
-- **The Mac agent runs from the repo checkout**, like the offsite-photos agent.
-  Moving the checkout or leaving it on an unfinished branch changes what runs;
-  re-run `make agent-cli-update-install` after moving it.
+- **The Mac agent runs a revision-bound copy**, not the checkout. Re-run
+  `make agent-cli-update-install` from an updated checkout to move it to a newer
+  revision; old release directories are left in place for rollback.
