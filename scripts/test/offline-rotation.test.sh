@@ -424,6 +424,21 @@ setup
 MOCK_MOUNTPOINT_ERR_AFTER_MOUNT=1 run_rotation
 check "an unknown mount state is still unmounted and closed when that succeeds" '[ "$RC" -ne 0 ] && closed_cleanly && no_receipts'
 
+# ── layout directories must be real directories on the backup filesystem ───
+for layout in archive manifests services receipts; do
+  setup
+  mkdir -p "$F/host-$layout"
+  ln -s "$F/host-$layout" "$F/disk/$layout"
+  run_rotation
+  check "a symlinked $layout directory on the disk is refused" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"$layout"* ]] && no_receipts && closed_cleanly'
+  check "nothing is written through a symlinked $layout directory" 'dir_empty "$F/host-$layout"'
+done
+
+setup
+: >"$F/disk/services"
+run_rotation
+check "a regular file in place of a layout directory is refused" '[ "$RC" -ne 0 ] && no_receipts && closed_cleanly'
+
 # ── service verification never follows links ───────────────────────────────
 setup
 MOCK_RSYNC_LINKIFY=db/dump.sql run_rotation

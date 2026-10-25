@@ -22,24 +22,42 @@ check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 mkdir -p "$TMP/bin"
 
+# lsblk mock. MOCK_LSBLK_FAIL=<column list> prints plausible output but exits 1, and
+# MOCK_LSBLK_EMPTY=<column list> prints nothing. MOCK_DURING_CONFIRM changes the world
+# while the operator is at the ERASE prompt (the SIZE,MODEL query is shown just
+# before it): unplug | reuse | mount | ident.
 cat >"$TMP/bin/lsblk" <<'MOCK'
 #!/usr/bin/env bash
 printf 'lsblk %s\n' "$*" >>"$MOCK_CALLS"
-case "$2" in
+cols="$2"
+[ "${MOCK_LSBLK_EMPTY:-}" != "$cols" ] || exit 0
+case "$cols" in
   TYPE) echo "${MOCK_LSBLK_TYPE:-disk}" ;;
   TRAN) echo "${MOCK_LSBLK_TRAN:-usb}" ;;
   PKNAME) echo "${MOCK_LSBLK_PKNAME:-sdz}" ;;
-  SIZE,MODEL) echo '931.5G Example Disk' ;;
+  MAJ:MIN,SIZE,SERIAL) echo "8:208 1000204886016 $(cat "$MOCK_STATE/serial" 2>/dev/null || echo SERIAL0001)" ;;
+  SIZE,MODEL)
+    echo '931.5G Example Disk'
+    case "${MOCK_DURING_CONFIRM:-}" in
+      unplug) rm -f "$MOCK_BY_ID/$MOCK_DISK_NAME" ;;
+      reuse) : >"$MOCK_DEV/sdq"; rm -f "$MOCK_BY_ID/$MOCK_DISK_NAME"; ln -s "$MOCK_DEV/sdq" "$MOCK_BY_ID/$MOCK_DISK_NAME" ;;
+      mount) echo 'sdz1 part /media/automount' >"$MOCK_STATE/child" ;;
+      ident) echo SERIAL9999 >"$MOCK_STATE/serial" ;;
+    esac ;;
   NAME,TYPE,MOUNTPOINT)
     echo 'sdz disk '
-    if [ -n "${MOCK_LSBLK_CHILD:-}" ]; then echo "$MOCK_LSBLK_CHILD"; fi ;;
+    if [ -n "${MOCK_LSBLK_CHILD:-}" ]; then echo "$MOCK_LSBLK_CHILD"; fi
+    if [ -f "$MOCK_STATE/child" ]; then cat "$MOCK_STATE/child"; fi ;;
   *) exit 64 ;;
 esac
+[ "${MOCK_LSBLK_FAIL:-}" != "$cols" ] || exit 1
 MOCK
 
 cat >"$TMP/bin/wipefs" <<'MOCK'
 #!/usr/bin/env bash
 printf 'wipefs %s\n' "$*" >>"$MOCK_CALLS"
+# MOCK_AFTER_WIPEFS=ident: the device's identity changes between stages.
+if [ "${MOCK_AFTER_WIPEFS:-}" = ident ]; then echo SERIAL9999 >"$MOCK_STATE/serial"; fi
 MOCK
 
 cat >"$TMP/bin/parted" <<'MOCK'
@@ -87,7 +105,8 @@ case "$1" in
       case "$arg" in --key-file=*) cat "${arg#--key-file=}" >/dev/null || exit 2 ;; esac
     done
     dev="${*: -2:1}"
-    printf '%s\n' "$dev" >"$MOCK_STATE/open" ;;
+    printf '%s\n' "$dev" >"$MOCK_STATE/open"
+    if [ "${MOCK_SIGNAL_AFTER:-}" = open ]; then kill -"$MOCK_SIGNAL" "$PPID"; fi ;;
   luksClose)
     [ ! -e "$MOCK_STATE/mounted" ] || exit 5
     rm -f "$MOCK_STATE/open" ;;
@@ -106,6 +125,7 @@ printf 'mount %s\n' "$*" >>"$MOCK_CALLS"
 mnt="${!#}"
 [ -e "$MOCK_STATE/open" ] || exit 32
 rmdir "$mnt" && mv "$MOCK_DISK" "$mnt" && printf '%s\n' "$mnt" >"$MOCK_STATE/mounted"
+if [ "${MOCK_SIGNAL_AFTER:-}" = mount ]; then kill -"$MOCK_SIGNAL" "$PPID"; fi
 MOCK
 
 cat >"$TMP/bin/umount" <<'MOCK'
@@ -155,6 +175,10 @@ default_args() {
 called() { grep -q -- "$1" "$F/calls"; }
 not_called() { ! grep -q -- "$1" "$F/calls"; }
 first_index() { grep -n -- "$1" "$F/calls" | head -n 1 | cut -d: -f1; }
+# Line of the first mapping-status query after the open (not the preflight one).
+status_after_open() {
+  awk '/^cryptsetup open/ { o = NR } /^cryptsetup status brokkr-offline/ && o && !s { s = NR } END { print s + 0 }' "$F/calls"
+}
 closed_cleanly() { [ ! -e "$F/state/open" ] && [ ! -e "$F/state/mounted" ] && [ -d "$F/disk" ]; }
 lock_free() { [ -z "$(ls -A "$F/lock")" ]; }
 file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
@@ -168,7 +192,8 @@ check "format succeeds on a confirmed USB whole disk" '[ "$RC" -eq 0 ]'
 check "the disk is wiped and partitioned by its resolved device" 'called "wipefs --all $DISK" && called "parted --script $DISK mklabel gpt mkpart brokkr-offline 1MiB 100%"'
 check "LUKS2 is formatted on the new partition" 'called "cryptsetup luksFormat --type luks2 --batch-mode --key-file=$F/keyfile $PART"'
 check "the mapping is opened from the formatted partition" 'called "cryptsetup open --type luks2 --key-file=$F/keyfile $PART brokkr-offline"'
-check "the mapping backing device is checked before mkfs" '[ "$(first_index "cryptsetup status brokkr-offline")" -lt "$(first_index "^mkfs.ext4")" ] && [ "$(grep -n "cryptsetup luksUUID" "$F/calls" | tail -n 1 | cut -d: -f1)" -lt "$(first_index "^mkfs.ext4")" ]'
+check "the mapping backing device is checked after open and before mkfs" 's="$(status_after_open)"; [ "$s" -gt 0 ] && [ "$s" -lt "$(first_index "^mkfs.ext4")" ] && [ "$(grep -n "cryptsetup luksUUID" "$F/calls" | tail -n 1 | cut -d: -f1)" -lt "$(first_index "^mkfs.ext4")" ]'
+check "the disk identity is re-checked after confirmation and before each stage" '[ "$(grep -c "MAJ:MIN,SIZE,SERIAL" "$F/calls")" -ge 5 ]'
 check "mkfs targets only the mapper device" 'called "mkfs.ext4 -q -L brokkr-offline -m 0 /dev/mapper/brokkr-offline" && [ "$(grep -c "^mkfs.ext4" "$F/calls")" -eq 1 ]'
 check "the marker records the LUKS UUID" 'grep -qx "luks_uuid=$UUID" "$F/disk/BROKKR-OFFLINE-DISK"'
 check "the disk layout is created" '[ -d "$F/disk/archive" ] && [ -d "$F/disk/manifests" ] && [ -d "$F/disk/services" ] && [ -d "$F/disk/receipts" ]'
@@ -234,6 +259,48 @@ setup
 mkdir "$F/lock/brokkr-offline-rotation.lock"
 default_args
 check "a held rotation lock refuses the format" '[ "$RC" -ne 0 ] && not_called "wipefs" && [ -d "$F/lock/brokkr-offline-rotation.lock" ]'
+
+# ── the world changing during confirmation or between stages ───────────────
+for change in unplug reuse mount ident; do
+  setup
+  MOCK_DURING_CONFIRM="$change" default_args
+  check "a disk $change during confirmation is refused before wiping" '[ "$RC" -ne 0 ] && not_called "wipefs" && lock_free'
+done
+
+setup
+MOCK_AFTER_WIPEFS=ident default_args
+check "an identity change between wipefs and parted stops before parted" '[ "$RC" -ne 0 ] && called "wipefs" && not_called "^parted"'
+
+# ── identification must succeed and be complete ────────────────────────────
+for cols in TYPE TRAN MAJ:MIN,SIZE,SERIAL SIZE,MODEL NAME,TYPE,MOUNTPOINT; do
+  setup
+  MOCK_LSBLK_FAIL="$cols" default_args
+  check "a failing lsblk $cols query is refused before wiping" '[ "$RC" -ne 0 ] && not_called "wipefs"'
+  setup
+  MOCK_LSBLK_EMPTY="$cols" default_args
+  check "empty lsblk $cols output is refused before wiping" '[ "$RC" -ne 0 ] && not_called "wipefs"'
+done
+
+setup
+MOCK_LSBLK_FAIL=PKNAME default_args
+check "a failing partition-parent query stops before luksFormat" '[ "$RC" -ne 0 ] && not_called "luksFormat"'
+
+setup
+MOCK_LSBLK_TRAN=nvme MOCK_LSBLK_CHILD='nvme0n1p2 part /' default_args
+check "a system disk is refused" '[ "$RC" -ne 0 ] && not_called "wipefs"'
+
+setup
+MOCK_LSBLK_CHILD='sdz2 part [SWAP]' default_args
+check "a disk with active swap is refused" '[ "$RC" -ne 0 ] && [[ "$OUT" == *"mounted"* ]] && not_called "wipefs"'
+
+# ── signals after open or mount still close the disk ───────────────────────
+for sig in HUP INT QUIT TERM; do
+  for after in open mount; do
+    setup
+    MOCK_SIGNAL="$sig" MOCK_SIGNAL_AFTER="$after" default_args
+    check "$sig after $after closes the disk and releases the lock" '[ "$RC" -ne 0 ] && closed_cleanly && lock_free && [[ "$OUT" != *"OFFLINE_LUKS_UUID="* ]]'
+  done
+done
 
 # ── failures after wiping never reach mkfs on the wrong device ─────────────
 setup

@@ -34,6 +34,7 @@ BY_ID_DIR="${BROKKR_OFFLINE_BY_ID_DIR:-/dev/disk/by-id}"
 MNT="${OFFLINE_MOUNT_POINT:-/mnt/brokkr-offline}"
 LOCK="${BROKKR_OFFLINE_LOCK_DIR:-/run/lock}/brokkr-offline-rotation.lock"
 SETTLE="${BROKKR_OFFLINE_SETTLE_SECONDS:-10}"
+CONFIRM_TIMEOUT="${BROKKR_OFFLINE_CONFIRM_TIMEOUT:-120}"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "$(ts) $*" >&2 || true; }
@@ -83,6 +84,9 @@ elif [ ! -t 0 ]; then
   die "no --key-file and stdin is not a terminal for the passphrase prompt"
 fi
 
+case "$SETTLE" in ''|*[!0-9]*) die "invalid BROKKR_OFFLINE_SETTLE_SECONDS" ;; esac
+case "$CONFIRM_TIMEOUT" in ''|*[!0-9]*|0) die "invalid BROKKR_OFFLINE_CONFIRM_TIMEOUT" ;; esac
+
 for tool in cryptsetup wipefs parted udevadm lsblk mkfs.ext4 mount umount mountpoint; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
 done
@@ -100,16 +104,57 @@ if mkdir "$LOCK" 2>/dev/null; then HELD_LOCK=1; fi
 on_signals
 [ "$HELD_LOCK" = 1 ] || die "an offline rotation or format holds $LOCK; if none is running, remove it by hand"
 
-# ---- Inspect the disk before touching it -------------------------------------
-DISK="$(readlink -f "$DISK_ID")" || die "cannot resolve $DISK_ID"
-[ -e "$DISK" ] || die "$DISK_ID does not resolve to a device"
-[ "$(lsblk -ndo TYPE "$DISK")" = disk ] || die "$DISK_ID is not a whole disk according to lsblk"
-[ "$(lsblk -ndo TRAN "$DISK")" = usb ] || die "$DISK_ID is not a USB disk; refusing"
-tree="$(lsblk -nro NAME,TYPE,MOUNTPOINT "$DISK")" || die "cannot list $DISK_ID"
-while read -r name type mnt; do
-  [ -z "${mnt:-}" ] || die "$name on $DISK_ID is mounted at $mnt; unmount it first"
-  case "$type" in disk|part) ;; *) die "$name on $DISK_ID is an active $type holder; close it first" ;; esac
-done <<<"$tree"
+# ---- Inspect the disk, and re-inspect it before every destructive stage -------
+# The first inspection records the resolved device and its identity (major:minor,
+# size in bytes, serial). Each later one must find the same by-id link resolving to
+# the same device with the same identity, still USB, with nothing mounted (swap
+# included) and no holders, so an unplug or /dev name reuse can never redirect a stage.
+# Every lsblk query is a separately checked assignment that must produce output.
+DISK=""
+IDENT=""
+lsblk_one() {
+  local out
+  out="$(lsblk "$1" "$2" "$3")" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+verify_disk() {
+  local stage="$1" cur type tran ident maj size serial tree name ntype mnt
+  [ -L "$DISK_ID" ] || die "$DISK_ID disappeared (before $stage); refusing"
+  cur="$(readlink -f "$DISK_ID")" || die "cannot resolve $DISK_ID (before $stage)"
+  [ -e "$cur" ] || die "$DISK_ID does not resolve to a device (before $stage)"
+  if [ -z "$DISK" ]; then
+    DISK="$cur"
+  elif [ "$cur" != "$DISK" ]; then
+    die "$DISK_ID now resolves to $cur, not $DISK (before $stage); refusing"
+  fi
+  type="$(lsblk_one -ndo TYPE "$DISK")" || die "cannot read the device type of $DISK (before $stage)"
+  [ "$type" = disk ] || die "$DISK_ID is not a whole disk according to lsblk"
+  tran="$(lsblk_one -ndo TRAN "$DISK")" || die "cannot read the transport of $DISK (before $stage)"
+  [ "$tran" = usb ] || die "$DISK_ID is not a USB disk ($tran); refusing"
+  ident="$(lsblk_one -bndo MAJ:MIN,SIZE,SERIAL "$DISK")" || die "cannot identify $DISK (before $stage)"
+  read -r maj size serial <<<"$ident"
+  [ -n "$maj" ] && [ -n "$size" ] && [ -n "${serial:-}" ] \
+    || die "incomplete identity for $DISK: '$ident' (before $stage)"
+  if [ -z "$IDENT" ]; then
+    IDENT="$ident"
+  elif [ "$ident" != "$IDENT" ]; then
+    die "the device at $DISK changed identity (before $stage); refusing"
+  fi
+  tree="$(lsblk -nro NAME,TYPE,MOUNTPOINT "$DISK")" || die "cannot list $DISK_ID (before $stage)"
+  [ -n "$tree" ] || die "lsblk listed nothing for $DISK_ID (before $stage)"
+  while read -r name ntype mnt; do
+    [ -z "${mnt:-}" ] || die "$name on $DISK_ID is mounted at $mnt; unmount it first"
+    case "$ntype" in
+      disk|part) ;;
+      crypt) [ "$stage" = mkfs ] && [ "$name" = "$MAPPER" ] \
+        || die "$name on $DISK_ID is an active $ntype holder; close it first" ;;
+      *) die "$name on $DISK_ID is an active $ntype holder; close it first" ;;
+    esac
+  done <<<"$tree"
+}
+
+verify_disk confirmation
 case "$(map_state "$MAPPER")" in
   inactive) ;;
   active) die "mapping $MAPPER is already active; close it deliberately before formatting" ;;
@@ -119,14 +164,17 @@ esac
 [ "$(mount_state "$MNT")" = unmounted ] || die "mount point $MNT is in use or cannot be inspected"
 [ -z "$(ls -A "$MNT")" ] || die "mount point is not empty: $MNT"
 
-log "about to ERASE $DISK_ID ($DISK, $(lsblk -ndo SIZE,MODEL "$DISK"))"
-printf 'Type ERASE to wipe this disk: ' >&2
+info="$(lsblk_one -ndo SIZE,MODEL "$DISK")" || die "cannot read the size and model of $DISK"
+log "about to ERASE $DISK_ID ($DISK, $info, identity $IDENT)"
+printf 'Type ERASE within %ss to wipe this disk: ' "$CONFIRM_TIMEOUT" >&2
 answer=""
-IFS= read -r answer || true
+IFS= read -r -t "$CONFIRM_TIMEOUT" answer || true
 [ "$answer" = ERASE ] || die "not confirmed; nothing was changed"
 
 # ---- Partition and LUKS2 -----------------------------------------------------
+verify_disk wipefs
 wipefs --all "$DISK"
+verify_disk parted
 parted --script "$DISK" mklabel gpt mkpart brokkr-offline 1MiB 100%
 udevadm settle
 PART_ID="$DISK_ID-part1"
@@ -134,10 +182,12 @@ waited=0
 while [ ! -e "$PART_ID" ] && [ "$waited" -lt "$SETTLE" ]; do sleep 1; waited=$((waited + 1)); done
 [ -e "$PART_ID" ] || die "new partition $PART_ID did not appear"
 PART="$(readlink -f "$PART_ID")" || die "cannot resolve $PART_ID"
-[ "$(lsblk -ndo PKNAME "$PART")" = "$(basename "$DISK")" ] \
+parent="$(lsblk_one -ndo PKNAME "$PART")" || die "cannot read the parent disk of $PART"
+[ "$parent" = "$(basename "$DISK")" ] \
   || die "partition $PART does not belong to $DISK; refusing to format it"
 
 if [ "${#KEY_ARGS[@]}" -gt 0 ]; then FORMAT_KEY=("${KEY_ARGS[@]}"); else FORMAT_KEY=(--verify-passphrase); fi
+verify_disk luksFormat
 cryptsetup luksFormat --type luks2 --batch-mode "${FORMAT_KEY[@]}" "$PART"
 cryptsetup isLuks --type luks2 "$PART" || die "$PART is not LUKS2 after luksFormat"
 UUID="$(cryptsetup luksUUID "$PART" | tr '[:upper:]' '[:lower:]')"
@@ -193,6 +243,7 @@ if [ "$backing_uuid" != "$UUID" ]; then
   FOREIGN=1
   die "mapping $MAPPER is backed by LUKS UUID '${backing_uuid:-unknown}', not $UUID; refusing to mkfs"
 fi
+verify_disk mkfs
 mkfs.ext4 -q -L brokkr-offline -m 0 "/dev/mapper/$MAPPER"
 
 MOUNT_ATTEMPTED=1

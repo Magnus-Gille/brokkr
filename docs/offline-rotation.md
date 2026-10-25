@@ -36,7 +36,9 @@ The disk holds two kinds of data:
    Without a keyfile it refuses to run unless stdin is a terminal, so cryptsetup cannot
    read a passphrase from a pipe.
 5. Mounts with `nodev,nosuid,noexec` and requires the `BROKKR-OFFLINE-DISK` marker
-   written at the format ceremony.
+   written at the format ceremony. `archive`, `manifests`, `services` and `receipts`
+   must be real directories on the mounted filesystem, not symlinks. This is checked
+   before copying and again before the receipt is written.
 6. **Never deletes.** The archive is copied with `rsync -a --ignore-existing`, without
    `--delete`. A changed, truncated or ransomware-encrypted source file therefore cannot
    overwrite the good copy on the disk. The `sha256sum -c --strict` check of the disk copy
@@ -87,8 +89,15 @@ independently verified copies elsewhere. The destructive steps run through
 before the step it protects:
 
 - The disk must be named by its `/dev/disk/by-id` link and be a whole USB disk, with
-  nothing mounted and no active holders.
-- You must type `ERASE` after seeing the disk's size and model.
+  nothing mounted (swap included) and no active holders. Every `lsblk` query must
+  succeed and return output.
+- You must type `ERASE` within 120 seconds of seeing the disk's size and model. The
+  timeout is `BROKKR_OFFLINE_CONFIRM_TIMEOUT`.
+- The helper records the disk's identity (major:minor, size in bytes, serial). After
+  confirmation, and again right before `wipefs`, `parted`, `luksFormat` and
+  `mkfs.ext4`, it re-checks the by-id link, that identity, the mounts and the
+  holders. If the disk is unplugged, its `/dev` name is reused, or anything else
+  changes, it stops.
 - The `brokkr-offline` mapping must be inactive, and the helper takes the same lock as
   the rotation.
 - The new partition must belong to that disk.

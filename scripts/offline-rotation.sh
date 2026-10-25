@@ -218,7 +218,26 @@ mount -o nodev,nosuid,noexec "/dev/mapper/$MAPPER" "$MNT" || die "mount failed"
 [ -f "$MNT/$MARKER" ] && [ ! -L "$MNT/$MARKER" ] && grep -qxF "luks_uuid=$UUID" "$MNT/$MARKER" \
   || die "disk lacks the $MARKER marker for UUID $UUID — not a prepared rotation disk"
 
-mkdir -p "$MNT/archive" "$MNT/manifests" "$MNT/services" "$MNT/receipts"
+# Layout directories must be real directories on the mounted backup filesystem: a
+# symlink (or a directory on another filesystem) would put copies, manifests or
+# receipts somewhere other than the offline disk while every check still passed.
+LAYOUT="archive manifests services receipts"
+fs_id() { stat -c %d "$1" 2>/dev/null || stat -f %d "$1"; }
+MNT_FS="$(fs_id "$MNT")" || die "cannot stat $MNT"
+check_layout() {
+  local d fs
+  for d in $LAYOUT; do
+    [ ! -L "$MNT/$d" ] || die "disk layout directory $d is a symlink; refusing"
+    [ -d "$MNT/$d" ] || die "disk layout entry $d is not a directory; refusing"
+    fs="$(fs_id "$MNT/$d")" || die "cannot stat disk layout directory $d"
+    [ "$fs" = "$MNT_FS" ] || die "disk layout directory $d is not on the backup filesystem; refusing"
+  done
+}
+for d in $LAYOUT; do
+  [ ! -L "$MNT/$d" ] || die "disk layout directory $d is a symlink; refusing"
+  [ -e "$MNT/$d" ] || mkdir "$MNT/$d" || die "cannot create disk layout directory $d"
+done
+check_layout
 for existing in "$MNT/receipts/$STAMP.receipt" "$MNT/services/$STAMP" "$MNT/manifests/$STAMP-archive.sha256"; do
   [ ! -e "$existing" ] || die "a rotation stamped $STAMP already exists on the disk"
 done
@@ -246,6 +265,7 @@ service_manifest() {
 }
 SERVICE_FILES=0
 if [ "${#SERVICE_NAMES[@]}" -gt 0 ]; then
+  check_layout
   PREV="$(find "$MNT/services" -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9]-*Z' -print \
     | LC_ALL=C sort | tail -n 1)"
   PARTIAL="$MNT/services/.partial-$STAMP"
@@ -333,6 +353,7 @@ write_receipt() {
     echo "smart_health=passed"
   } >"$tmp" && mv "$tmp" "$dest"
 }
+check_layout
 write_receipt "$MNT/receipts/$STAMP.receipt" || die "cannot write the disk receipt"
 sync
 umount "$MNT" || die "umount failed"
