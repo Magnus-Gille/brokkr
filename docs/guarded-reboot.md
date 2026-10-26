@@ -301,7 +301,7 @@ Rendered into the nightly unit by the deploy (the other two units carry only the
 |---|---|---|
 | `BROKKR_GUARDED_REBOOT_MODE` | `report` | `report` or `reboot` |
 | `BROKKR_GUARDED_REBOOT_BUSY_UNITS` | empty | space-separated systemd user `.service` units; the `busy:<unit>` guard |
-| `BROKKR_GUARDED_REBOOT_PEERS` | empty; **required in reboot mode** | space-separated host names that must accept TCP port 22 (normally the host that monitors this one) |
+| `BROKKR_GUARDED_REBOOT_PEERS` | empty; **required in reboot mode** | space-separated host names that must accept TCP port 22 (normally the host that monitors this one). This host itself, loopback names (`localhost*`, `ip6-localhost*`, `ip6-loopback*`) and IP literals are refused, because they cannot show that another host is up. |
 | `BROKKR_GUARDED_REBOOT_MAX_LOAD` | 0.75 x `nproc` | highest 5-minute load average |
 | `BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN` | 60 | minutes; 0 disables the terminal guard |
 | `BROKKR_GUARDED_REBOOT_ALERT_AFTER` | 3 | consecutive deferred nights before the alert (1 to 365) |

@@ -632,7 +632,7 @@ reset; BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=0 run check
 check "unlock: 0 is accepted and is the default" '[[ "$RC" -eq 0 ]]'
 
 # Peers: a peer that is this very host is refused.
-for peer in node-a NODE-A node-a.example Node-A.Example localhost; do
+for peer in node-a NODE-A node-a.example Node-A.Example; do
   reset; BROKKR_GUARDED_REBOOT_PEERS="node-b.example $peer" run check
   check "self peer: '$peer' is this host, so the configuration is refused (exit 64)" '[[ "$RC" -eq 64 && "$OUT" == *"names this host itself"* ]]'
 done
@@ -640,6 +640,11 @@ reset; MOCK_FQDN=node-a.lan.example BROKKR_GUARDED_REBOOT_PEERS="node-a.lan.exam
 check "self peer: the FQDN comes from hostname -f" '[[ "$RC" -eq 64 && "$OUT" == *"names this host itself"* ]]'
 reset; BROKKR_GUARDED_REBOOT_PEERS="node-b.example node-c" run check
 check "self peer: other hosts are accepted" '[[ "$RC" -eq 0 ]]'
+# Loopback and IP literals can never prove that another host is up: peers are host names.
+for peer in localhost LocalHost 127.0.0.1 127.1 10.0.0.5 192.0.2.10 localhost6 localhost.localdomain ip6-localhost ip6-loopback; do
+  reset; BROKKR_GUARDED_REBOOT_PEERS="node-b.example $peer" run check
+  check "peer '$peer' (loopback or an IP literal) is refused (exit 64)" '[[ "$RC" -eq 64 ]]'
+done
 
 # --- escalation and report mode ---------------------------------------------------------------------------------
 reset; trigger_rr; set_who "$(who_row .)"
@@ -748,7 +753,10 @@ check "final guard pass: the kill switch created while the notice is in flight s
 
 reset; reboot_mode; trigger_rr; : >"$MOCK/reboot-fail"; run check
 check "reboot command failure: exit 1, the host latches at once with an audited alert" '[[ "$RC" -eq 1 && "$(reboots)" -eq 1 && "$(state_raw latch)" -eq 1 ]] && audit_line_of alert | grep -q "\"detail\":\"latched: reboot command failed (exit 1)" && notice_has "ALERT node-a: latched: reboot command failed (exit 1)"'
-check "reboot command failure: the attempt is kept, never silently restored" '[[ "$(state_raw attempt_status)" == "\"unresolved\"" && "$(state_raw attempt_boot_id)" == "\"$BID1\"" ]] && [[ "$(audit_actions)" == "reboot alert " ]]'
+check "reboot command failure: the attempt is kept, never silently restored" '[[ "$(state_raw attempt_status)" == "\"unresolved\"" && "$(state_raw attempt_boot_id)" == "\"$BID1\"" ]] && [[ "$(audit_actions)" == "reboot alert alert " ]]'
+# Contract with the maintenance-report projection: the refused command is itself an audited alert
+# whose detail starts "reboot command failed", which resolves the earlier reboot intent there.
+check "reboot command failure: an alert whose detail starts 'reboot command failed' is appended" 'grep -F "\"action\":\"alert\"" "$AUDIT" | grep -q "\"detail\":\"reboot command failed (exit 1); nothing was rebooted"'
 night; run check
 check "reboot command failure: the next night is latched, not retried" '[[ "$OUT" == *"guards: latched"* && "$(reboots)" -eq 1 ]]'
 reset; reboot_mode; trigger_rr; echo dpkg >"$MOCK/pnames"; run check

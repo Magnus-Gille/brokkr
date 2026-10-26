@@ -102,6 +102,12 @@ esac
 PEERS=""
 for PEER_WORD in $PEERS_RAW; do
   [[ "$PEER_WORD" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "invalid BROKKR_GUARDED_REBOOT_PEERS entry (a host name is required)"
+  # A loopback name or an IP literal cannot show that another host is up.
+  [[ "$PEER_WORD" =~ [A-Za-z] ]] || die "invalid BROKKR_GUARDED_REBOOT_PEERS entry (a host name is required, not an IP address)"
+  case $(printf '%s' "$PEER_WORD" | tr 'A-Z' 'a-z') in
+    localhost|localhost.*|localhost[0-9]*|ip6-localhost*|ip6-loopback*)
+      die "BROKKR_GUARDED_REBOOT_PEERS entry '$PEER_WORD' is a loopback name; a peer must be another host" ;;
+  esac
   PEERS="${PEERS:+$PEERS }$PEER_WORD"
 done
 # A peer that is the host being deployed to proves nothing about the host that monitors it. The

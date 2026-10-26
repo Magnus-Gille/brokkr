@@ -93,6 +93,12 @@ PEER_LIST=
 for word in $PEERS_RAW; do
   [[ "$word" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "invalid BROKKR_GUARDED_REBOOT_PEERS entry '$word' (a host name is required)"
   [ "${#word}" -le 253 ] || die "invalid BROKKR_GUARDED_REBOOT_PEERS entry (longer than 253 characters)"
+  # A loopback name or an IP literal cannot show that another host is up (127.0.0.1 is this host).
+  [[ "$word" =~ [A-Za-z] ]] || die "invalid BROKKR_GUARDED_REBOOT_PEERS entry '$word' (a host name is required, not an IP address)"
+  case $(printf '%s' "$word" | tr 'A-Z' 'a-z') in
+    localhost|localhost.*|localhost[0-9]*|ip6-localhost*|ip6-loopback*)
+      die "BROKKR_GUARDED_REBOOT_PEERS entry '$word' is a loopback name; a peer must be another host" ;;
+  esac
   PEER_LIST="${PEER_LIST:+$PEER_LIST }$word"
 done
 # A peer that is this very host says nothing about the host that monitors it, so it is refused:
@@ -1176,7 +1182,8 @@ reboot_attempt() {
   set_event alert "$TRIG_IDS" "" "$reason; nothing was rebooted"
   set_latch "$reason"
   RC=1
-  commit_event 0
+  # Audited: the maintenance report resolves the earlier reboot intent on this alert.
+  commit_event 1
 }
 
 cmd_check() {

@@ -391,6 +391,10 @@ reset; BROKKR_GUARDED_REBOOT_PEERS="NODE-A.Example.Invalid" run "$TARGET"
 check "self peer: the comparison is case-insensitive" '[[ "$RC" -ne 0 && "$OUT" == *"names the host being deployed to"* ]] && ! grep -q ssh "$CALLS"'
 reset; BROKKR_GUARDED_REBOOT_PEERS="localhost" run "$TARGET"
 check "self peer: localhost is refused before ssh" '[[ "$RC" -ne 0 ]] && ! grep -q ssh "$CALLS"'
+for peer in 127.0.0.1 192.0.2.10 localhost6 ip6-localhost; do
+  reset; BROKKR_GUARDED_REBOOT_PEERS="$peer" run "$TARGET"
+  check "peer '$peer' (loopback or an IP literal) is refused before ssh" '[[ "$RC" -ne 0 ]] && ! grep -q ssh "$CALLS"'
+done
 for peer in node-a NODE-A node-a.lan.example Node-A.LAN.example; do
   reset; BROKKR_GUARDED_REBOOT_PEERS="node-b.example $peer" run "$TARGET"
   check "self peer: '$peer' is this host's short name or FQDN, refused by the remote preflight (dry-run)" '[[ "$RC" -ne 0 && "$OUT" == *"is this host itself"* ]] && no_mutation'
