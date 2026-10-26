@@ -268,7 +268,8 @@ echo "SEC_PENDING=${SEC:-0}"; echo "ALL_PENDING=${ALLUP:-0}"; echo "DISK=${DISK:
 #   UNRECOVERED=1: the latest "reboot" record is >=60 min old and no
 #     post-boot-ok / post-boot-issues record follows it. A "reboot" line is the
 #     job's intent record: a following "deferred" whose detail starts with
-#     "reboot aborted" means it never rebooted, so it is neither unrecovered nor
+#     "reboot aborted", or an "alert" whose detail starts with "reboot command
+#     failed", means it never rebooted, so it is neither unrecovered nor
 #     counted in REBOOTS_24H.
 #   LATCHED=1: the latest latch-related record is an "alert" whose detail starts
 #     with "latched" and no later "latch-cleared" record (action "none", appended
@@ -295,10 +296,11 @@ if [ -r "$GR_FILE" ]; then
       la = x; le = e
       if (x == "reboot") { lre = e; rec = 0; if (e >= cutoff) nr++ }
       else if (x == "post-boot-ok" || x == "post-boot-issues") { if (lre > 0) rec = 1 }
-      else if (x == "deferred" && lre > 0 && rec == 0 && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"reboot aborted/) {
-        # The "reboot" line is the job'"'"'s intent record; this abort means it never rebooted.
-        if (lre >= cutoff && nr > 0) nr--
-        lre = 0; rec = 1
+      else if ((x == "deferred" && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"reboot aborted/) ||
+               (x == "alert" && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"reboot command failed/)) {
+        # The "reboot" line is the job'"'"'s intent record; an abort or a refused reboot
+        # command means it never rebooted (a refused command also latches, below).
+        if (lre > 0 && rec == 0) { if (lre >= cutoff && nr > 0) nr--; lre = 0; rec = 1 }
       }
       else if (x == "alert" && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"latched/) latched = 1
       else if (x == "none" && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"latch-cleared/) latched = 0

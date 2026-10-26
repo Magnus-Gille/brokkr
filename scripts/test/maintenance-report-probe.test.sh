@@ -243,6 +243,14 @@ probe 6.12.48+deb13-amd64 "$r"
 check "aborted reboot intent: not unrecovered and not counted as a reboot" \
   '[[ "$(val GUARDED_REBOOT_UNRECOVERED)" == 0 && "$(val GUARDED_REBOOT_REBOOTS_24H)" == 0 && "$(val GUARDED_REBOOT_DEFERRALS_24H)" == 1 ]]'
 
+audit_root unrec-command-failed
+{ aline $((NOW - 2 * 3600)) reboot reboot kernel "" "rebooting"
+  aline $((NOW - 2 * 3600 + 2)) reboot alert kernel "" "reboot command failed (exit 1); nothing was rebooted"
+  aline $((NOW - 2 * 3600 + 3)) reboot alert kernel "" "latched: reboot command failed (exit 1). Automatic reboots stay off until the owner has investigated and runs guarded-reboot.sh clear-latch"; } >"$AUDIT"
+probe 6.12.48+deb13-amd64 "$r"
+check "a failed reboot command resolves the intent (no reboot, not unrecovered) and the host shows latched" \
+  '[[ "$(val GUARDED_REBOOT_UNRECOVERED)" == 0 && "$(val GUARDED_REBOOT_REBOOTS_24H)" == 0 && "$(val GUARDED_REBOOT_LATCHED)" == 1 ]]'
+
 audit_root unrec-plain-deferred
 { aline $((NOW - 2 * 3600)) reboot reboot kernel "" "rebooting"; aline $((NOW - 3600)) reboot deferred kernel load "deferred: load"; } >"$AUDIT"
 probe 6.12.48+deb13-amd64 "$r"
