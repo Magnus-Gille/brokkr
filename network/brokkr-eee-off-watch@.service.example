@@ -25,7 +25,6 @@ Description=Brokkr: re-apply EEE off on %i after a link change (revision @REVISI
 Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/eee-off.md
 BindsTo=sys-subsystem-net-devices-%i.device
 After=sys-subsystem-net-devices-%i.device brokkr-eee-off@%i.service
-JobTimeoutSec=30s
 
 [Service]
 Type=simple

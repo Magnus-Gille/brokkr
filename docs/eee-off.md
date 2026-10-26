@@ -48,7 +48,8 @@ start it:
 is installed as `/etc/systemd/system/brokkr-eee-off-watch@.service` with the
 verified `ethtool` and `ip` paths. Its instance runs `ip -o monitor link`. It
 reads the EEE status (read-only) one second after it starts, once `ip monitor`
-is listening, and on every event that shows
+is listening (a timing margin over a subscription that takes milliseconds, not a
+handshake), and on every event that shows
 `<iface>` with `LOWER_UP`. When the status is anything but `disabled` or
 `not supported`, it restarts `brokkr-eee-off@<iface>.service` and logs why. A
 re-apply that renegotiates the link is a no-op the second time, because EEE then
@@ -60,12 +61,15 @@ failed unit shows in `systemctl --failed` and, where it runs, the
 It has the same two `WantedBy=` entries, `Restart=always`, and is ordered after the
 managed unit so that both do not set EEE at the same boot.
 
-Both units set `JobTimeoutSec=30s`. Being wanted by `multi-user.target` makes them
-part of what the boot waits for, and `BindsTo=`/`After=` make them wait for the
-device. If the interface is missing or was renamed, the job is cancelled after
-30 seconds instead of holding the target for the device timeout (by default
-`DefaultDeviceTimeoutSec=`, 90 s). The unit then stays inactive, and the device
-`.wants/` link can still start it if the device appears later.
+Being wanted by `multi-user.target` makes both units part of what the boot waits
+for, and `BindsTo=`/`After=` make them wait for the device. If the interface is
+missing or was renamed, the device job times out after `DefaultDeviceTimeoutSec=`
+(90 s by default; [systemd.unit(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html),
+`JobRunningTimeoutSec=`), both jobs fail with it, and `multi-user.target` is
+reached that much later. The device `.wants/` link can still start them if the
+device appears later. The units deliberately set no `JobTimeoutSec=`. It would also
+count the time a job waits behind `basic.target`, so a slow boot, such as a long
+`fsck`, would cancel both jobs before they run and leave EEE on.
 
 Interface names are limited to letters, digits, `_` and `.` (at most 15, not
 starting with `.`), so the raw instance name equals the escaped device-unit name.
