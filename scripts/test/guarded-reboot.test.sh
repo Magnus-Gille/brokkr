@@ -141,7 +141,7 @@ esac
 FAKE
 cat >"$BIN/hostname" <<'FAKE'
 #!/bin/bash
-echo node-a
+case "${1:-}" in -f) echo "${MOCK_FQDN:-node-a.example}" ;; *) echo node-a ;; esac
 FAKE
 cat >"$BIN/nproc" <<'FAKE'
 #!/bin/bash
@@ -150,6 +150,9 @@ FAKE
 # timeout 5 bash -c <script> _ <peer>: the peer is reachable unless listed in peers.down.
 cat >"$BIN/timeout" <<'FAKE'
 #!/bin/bash
+# timeout 5 hostname -f (the self-peer check) runs the real command; timeout 5 bash -c <script> _ <peer>
+# is the reachability probe: the peer is reachable unless listed in peers.down.
+if [ "${2:-}" != bash ]; then shift; exec "$@"; fi
 printf 'timeout %s\n' "$*" >>"$MOCK_CALLS"
 peer=${*: -1}
 if grep -Fxq -- "$peer" "$MOCK_DIR/peers.down" 2>/dev/null; then exit 124; fi
@@ -578,44 +581,21 @@ check "peers: a host without timeout cannot check a peer and fails closed" 'defe
 reset; trigger_rr; run check
 check "peers: none configured means no peer check" 'not_deferred && ! grep -q "^timeout" "$CALLS"'
 
-# unlock: every crypttab entry needed at boot must unlock unattended
+# unlock: every crypttab entry needed at boot is an encrypted boot volume. Nothing in crypttab proves
+# that it unlocks unattended, so each one defers and alerts unless the owner has verified it
+# (BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1); options that can prompt stay a hard block regardless.
+unverified_alert() { notice_has "encrypted boot volume: unattended unlock not owner-verified (ADR-009)"; }
 reset; trigger_rr; printf '# comment\nroot UUID=1 none luks\n' >"$CRYPTTAB"; run check
-check "unlock: a passphrase-only entry defers as unlock and alerts" 'deferred_by unlock && notice_has "unattended reboot refused" && audit_has "root"'
+check "unlock: a passphrase entry defers as unlock and alerts that unattended unlock is not owner-verified" 'deferred_by unlock && unverified_alert && audit_has "root"'
 check "unlock: the alert is audited" '[[ "$(audit_actions)" == "deferred alert " ]]'
-reset; trigger_rr; printf 'data UUID=2 - luks,discard\n' >"$CRYPTTAB"; run check
-check "unlock: a dash key field counts as no key, and the entry need not be root" 'deferred_by unlock && audit_has "data"'
-reset; trigger_rr; printf 'swap /dev/sda3\n' >"$CRYPTTAB"; run check
-check "unlock: a missing key and options field counts as no key" 'deferred_by unlock'
-reset; trigger_rr; printf 'root UUID=1 none luks,tpm2-device=auto\n' >"$CRYPTTAB"; run check
-check "unlock: tpm2-device unlocks unattended" 'not_deferred'
-reset; trigger_rr; printf 'root UUID=1 none luks,tpm2-device=auto,tpm2-pcrs=7\n' >"$CRYPTTAB"; run check
-check "unlock: tpm2-device with options but no PIN unlocks unattended" 'not_deferred'
-reset; trigger_rr; printf 'root UUID=1 none luks,tpm2-device=auto,tpm2-pin=yes\n' >"$CRYPTTAB"; run check
-check "unlock: tpm2-device with tpm2-pin=yes asks for a PIN, so it defers and alerts" 'deferred_by unlock && notice_has "unattended reboot refused"'
-reset; trigger_rr; printf 'root UUID=1 none luks,fido2-device=auto\n' >"$CRYPTTAB"; run check
-check "unlock: fido2-device needs a token touch, so it defers" 'deferred_by unlock'
-reset; trigger_rr; printf 'root UUID=1 none luks,fido2-device=auto,fido2-with-client-pin=no\n' >"$CRYPTTAB"; run check
-check "unlock: any fido2-with-* option defers" 'deferred_by unlock'
-reset; trigger_rr; printf 'root UUID=1 /etc/keys/root.key luks,fido2-device=auto\n' >"$CRYPTTAB"; run check
-check "unlock: a key file does not outweigh an option that can prompt" 'deferred_by unlock'
-reset; trigger_rr; printf 'root UUID=1 none luks,pkcs11-uri=auto\n' >"$CRYPTTAB"; run check
-check "unlock: pkcs11-uri defers" 'deferred_by unlock'
-reset; trigger_rr; printf 'root UUID=1 none luks,keyscript=/lib/cryptsetup/scripts/passdev\n' >"$CRYPTTAB"; run check
-check "unlock: keyscript defers (it may prompt)" 'deferred_by unlock'
-reset; trigger_rr; printf 'root UUID=1 none luks,headless=false,tpm2-device=auto\n' >"$CRYPTTAB"; run check
-check "unlock: headless=false defers even with tpm2-device" 'deferred_by unlock'
-reset; trigger_rr; printf 'root UUID=1 /etc/keys/root.key luks,pkcs11-pin=yes\n' >"$CRYPTTAB"; run check
-check "unlock: any *-pin=yes option defers" 'deferred_by unlock'
-reset; trigger_rr; printf 'root UUID=1 - luks,tpm2-device=auto\n' >"$CRYPTTAB"; run check
-check "unlock: a dash key with tpm2-device and no PIN unlocks unattended" 'not_deferred'
+for entry in 'root UUID=1 none luks,tpm2-device=auto' 'root UUID=1 none luks,tpm2-device=auto,tpm2-pcrs=7' 'root UUID=1 - luks,tpm2-device=auto' 'swap /dev/sda3 /dev/urandom swap,cipher=aes-xts-plain64' 'data UUID=2 /etc/keys/data.key luks' 'data UUID=2 keys/data.key luks' 'data UUID=2 - luks,discard' 'swap /dev/sda3'; do
+  reset; trigger_rr; printf '%s\n' "$entry" >"$CRYPTTAB"; run check
+  check "unlock: '$entry' is not inferred to be unattended: it defers and alerts" 'deferred_by unlock && unverified_alert'
+done
 reset; trigger_rr; printf 'root UUID=1 none luks,noauto\n' >"$CRYPTTAB"; run check
 check "unlock: a noauto entry is not needed at boot" 'not_deferred'
-reset; trigger_rr; printf 'swap /dev/sda3 /dev/urandom swap,cipher=aes-xts-plain64\n' >"$CRYPTTAB"; run check
-check "unlock: an entry whose key field is a key-file path does not need a passphrase" 'not_deferred'
-reset; trigger_rr; printf 'data UUID=2 keys/data.key luks\n' >"$CRYPTTAB"; run check
-check "unlock: a relative key field is not a key-file path, so it defers" 'deferred_by unlock'
 reset; trigger_rr; printf 'root UUID=1 none luks,tpm2-device=auto\ndata UUID=2 none luks\nbackup UUID=3 none luks,noauto\n' >"$CRYPTTAB"; run check
-check "unlock: a data volume without unattended unlock defers even when root has it" 'deferred_by unlock && audit_has "data" && ! audit_has "backup"'
+check "unlock: every entry needed at boot counts, not only the root volume, and noauto ones do not" 'deferred_by unlock && audit_has "root,data" && ! audit_has "backup"'
 reset; run check
 check "unlock: with no trigger the guard is not evaluated and nothing alerts" '[[ "$OUT" == *"decision: none"* && "$(notice_count)" -eq 0 ]]'
 reset; trigger_rr; printf 'root UUID=1 none luks\n' >"$CRYPTTAB"; chmod 000 "$CRYPTTAB"
@@ -624,6 +604,42 @@ if [[ -r "$CRYPTTAB" ]]; then skip "unlock: unreadable crypttab (running as root
   check "unlock: an unreadable crypttab fails closed" 'deferred_by unlock'
 fi
 chmod 644 "$CRYPTTAB"
+reset; trigger_rr; : >"$CRYPTTAB"; run check
+check "unlock: a crypttab with no entries needs nothing" 'not_deferred'
+
+# The owner has verified unattended unlock: entries that only needed the owner's word pass.
+for entry in 'root UUID=1 none luks' 'root UUID=1 none luks,tpm2-device=auto' 'data UUID=2 /etc/keys/data.key luks'; do
+  reset; trigger_rr; printf '%s\n' "$entry" >"$CRYPTTAB"; BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1 run check
+  check "unlock verified: '$entry' no longer defers" 'not_deferred'
+done
+# ... but an option that can prompt is a hard block whatever the owner says.
+for entry in 'root UUID=1 none luks,fido2-device=auto' 'root UUID=1 none luks,fido2-device=auto,fido2-with-client-pin=no' 'root UUID=1 /etc/keys/root.key luks,fido2-device=auto' 'root UUID=1 none luks,pkcs11-uri=auto' 'root UUID=1 none luks,keyscript=/lib/cryptsetup/scripts/passdev' 'root UUID=1 none luks,headless=false,tpm2-device=auto' 'root UUID=1 /etc/keys/root.key luks,pkcs11-pin=yes' 'root UUID=1 none luks,tpm2-device=auto,tpm2-pin=yes'; do
+  reset; trigger_rr; printf '%s\n' "$entry" >"$CRYPTTAB"; BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1 run check
+  check "unlock verified: '$entry' still defers (an option that can prompt is a hard block)" 'deferred_by unlock && notice_has "have an option that can prompt"'
+  reset; trigger_rr; printf '%s\n' "$entry" >"$CRYPTTAB"; run check
+  check "unlock unverified: '$entry' defers as well" 'deferred_by unlock'
+done
+reset; trigger_rr; printf 'root UUID=1 none luks\ndata UUID=2 none luks,fido2-device=auto\n' >"$CRYPTTAB"; BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1 run check
+check "unlock verified: only the entries with a prompting option are named" 'deferred_by unlock && audit_has "data" && ! audit_has "root"'
+reset; trigger_rr; printf 'root UUID=1 none luks\ndata UUID=2 none luks,fido2-device=auto\n' >"$CRYPTTAB"; run check
+check "unlock unverified: both kinds are named and both alerts are in one message" 'deferred_by unlock && notice_has "have an option that can prompt" && unverified_alert && [[ "$(notice_count)" -eq 1 ]]'
+for bad_value in 2 yes true -1 ''; do
+  if [[ -z "$bad_value" ]]; then continue; fi
+  reset; BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED="$bad_value" run check
+  check "unlock: BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED='$bad_value' is a configuration error (exit 64)" '[[ "$RC" -eq 64 && "$OUT" == *UNLOCK_VERIFIED* ]]'
+done
+reset; BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=0 run check
+check "unlock: 0 is accepted and is the default" '[[ "$RC" -eq 0 ]]'
+
+# Peers: a peer that is this very host is refused.
+for peer in node-a NODE-A node-a.example Node-A.Example localhost; do
+  reset; BROKKR_GUARDED_REBOOT_PEERS="node-b.example $peer" run check
+  check "self peer: '$peer' is this host, so the configuration is refused (exit 64)" '[[ "$RC" -eq 64 && "$OUT" == *"names this host itself"* ]]'
+done
+reset; MOCK_FQDN=node-a.lan.example BROKKR_GUARDED_REBOOT_PEERS="node-a.lan.example" run check
+check "self peer: the FQDN comes from hostname -f" '[[ "$RC" -eq 64 && "$OUT" == *"names this host itself"* ]]'
+reset; BROKKR_GUARDED_REBOOT_PEERS="node-b.example node-c" run check
+check "self peer: other hosts are accepted" '[[ "$RC" -eq 0 ]]'
 
 # --- escalation and report mode ---------------------------------------------------------------------------------
 reset; trigger_rr; set_who "$(who_row .)"

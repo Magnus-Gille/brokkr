@@ -94,6 +94,26 @@ for word in $PEERS_RAW; do
   [ "${#word}" -le 253 ] || die "invalid BROKKR_GUARDED_REBOOT_PEERS entry (longer than 253 characters)"
   PEER_LIST="${PEER_LIST:+$PEER_LIST }$word"
 done
+# A peer that is this very host says nothing about the host that monitors it, so it is refused:
+# the short name and the FQDN (and localhost) are compared, case-insensitively.
+if [ -n "$PEER_LIST" ]; then
+  own_short=$(hostname -s 2>/dev/null) || own_short=
+  if command -v timeout >/dev/null 2>&1; then own_fqdn=$(timeout 5 hostname -f 2>/dev/null) || own_fqdn=
+  else own_fqdn=$(hostname -f 2>/dev/null) || own_fqdn=; fi
+  own_names=$(printf '%s\n%s\nlocalhost\nlocalhost.localdomain\n' "$own_short" "$own_fqdn" | tr 'A-Z' 'a-z')
+  for word in $PEER_LIST; do
+    lower=$(printf '%s' "$word" | tr 'A-Z' 'a-z')
+    case $'\n'"$own_names"$'\n' in
+      *$'\n'"$lower"$'\n'*) die "BROKKR_GUARDED_REBOOT_PEERS names this host itself ($word); a peer must be another host, normally the one that monitors this one" ;;
+    esac
+  done
+fi
+
+# The owner's word that every encrypted boot volume unlocks unattended (ADR-009). Without it any
+# crypttab entry needed at boot defers the reboot and alerts; see guard_unlock.
+UNLOCK_VERIFIED=${BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED:-0}
+case "$UNLOCK_VERIFIED" in 0|1) ;; *) die "invalid BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED (0 or 1)" ;; esac
+UNLOCK_VERIFIED=$((0 + 10#$UNLOCK_VERIFIED))
 
 cpu_count() {
   local n
@@ -844,50 +864,68 @@ guard_peers() {
   done
 }
 
-# Every crypttab entry needed at boot (not noauto) must unlock unattended, or an unattended reboot
-# would stop the boot at a prompt. An entry counts as unattended only if its key field is a key-file
-# path or its options contain tpm2-device= without tpm2-pin=yes. Anything that can prompt makes it
-# interactive whatever else it says: fido2-device=, pkcs11-uri=, keyscript=, any *-pin=yes,
-# fido2-with-*, headless=false. An empty, none or - key without tpm2 is interactive.
+# Every crypttab entry needed at boot (not noauto) is an encrypted boot volume, and nothing in
+# crypttab proves that it unlocks unattended: a tpm2-device= may need a PIN or a changed PCR policy,
+# a key-file path may sit on a volume that is itself locked. So the job infers nothing: every such
+# entry defers the reboot and alerts ("unattended unlock not owner-verified, ADR-009") unless the
+# owner has set BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1 at deploy, asserting that unattended unlock
+# was verified. Whatever the owner says, an entry with an option that can prompt stays a hard
+# block: fido2-device=, pkcs11-uri=, keyscript=, any *-pin=yes, fido2-with-*, headless=false.
+# The awk prints "H name" for a hard block and "U name" for an entry that needs the owner's word.
 UNLOCK_AWK='
 /^[[:space:]]*#/ { next }
 NF == 0 { next }
 {
-  key = (NF >= 3) ? $3 : "none"
   opts = (NF >= 4) ? $4 : ""
   n = split(opts, o, ",")
-  noauto = 0; interactive = 0; tpm2 = 0
+  noauto = 0; hard = 0
   for (k = 1; k <= n; k++) {
     if (o[k] == "noauto") noauto = 1
-    if (o[k] ~ /^(fido2-device|pkcs11-uri|keyscript)=/) interactive = 1
-    if (o[k] ~ /-pin=yes$/) interactive = 1
-    if (o[k] ~ /^fido2-with-/) interactive = 1
-    if (o[k] == "headless=false") interactive = 1
-    if (o[k] ~ /^tpm2-device=/) tpm2 = 1
+    if (o[k] ~ /^(fido2-device|pkcs11-uri|keyscript)=/) hard = 1
+    if (o[k] ~ /-pin=yes$/) hard = 1
+    if (o[k] ~ /^fido2-with-/) hard = 1
+    if (o[k] == "headless=false") hard = 1
   }
   if (noauto) next
-  unattended = 0
-  if (key ~ /^\//) unattended = 1
-  if (tpm2) unattended = 1
-  if (interactive) unattended = 0
-  if (!unattended) print $1
+  print (hard ? "H " : "U ") $1
 }
 '
+UNLOCK_ALERT=
 guard_unlock() {
-  local names
+  local rows hard='' unverified='' kind name
+  UNLOCK_ALERT=
   [ -e "$CRYPTTAB" ] || return 0
-  if [ ! -r "$CRYPTTAB" ] || ! names=$(awk "$UNLOCK_AWK" "$CRYPTTAB"); then
+  if [ ! -r "$CRYPTTAB" ] || ! rows=$(awk "$UNLOCK_AWK" "$CRYPTTAB"); then
     G_UNLOCK=1; UNLOCK_NAMES="unreadable crypttab"
+    UNLOCK_ALERT="the crypttab cannot be read, so unattended unlock cannot be judged (failing closed)"
     add_guard unlock "cannot read $CRYPTTAB (failing closed)"; return 0
   fi
-  [ -n "$names" ] || return 0
+  while read -r kind name; do
+    [ -n "$name" ] || continue
+    name=$(clean "$name" 40)
+    case "$kind" in
+      H) hard="${hard:+$hard,}$name" ;;
+      *) unverified="${unverified:+$unverified,}$name" ;;
+    esac
+  done <<<"$rows"
+  # Entries that need the owner's word only count while the owner has not given it.
+  if [ "$UNLOCK_VERIFIED" -eq 1 ]; then unverified=''; fi
+  [ -n "$hard$unverified" ] || return 0
   G_UNLOCK=1
-  UNLOCK_NAMES=$(clean "$(printf '%s' "$names" | head -n 8 | tr '\n' ',' | sed 's/,$//')" 120)
-  add_guard unlock "an unattended reboot would stop at a passphrase prompt for crypttab entries: $UNLOCK_NAMES"
+  UNLOCK_NAMES=$hard
+  if [ -n "$unverified" ]; then UNLOCK_NAMES="${UNLOCK_NAMES:+$UNLOCK_NAMES,}$unverified"; fi
+  UNLOCK_NAMES=$(clean "$UNLOCK_NAMES" 120)
+  if [ -n "$hard" ]; then
+    UNLOCK_ALERT="unattended reboot refused: crypttab entries $(clean "$hard" 100) have an option that can prompt (fido2, pkcs11, keyscript, PIN or headless=false), whatever BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED says"
+  fi
+  if [ -n "$unverified" ]; then
+    UNLOCK_ALERT="${UNLOCK_ALERT:+$UNLOCK_ALERT; }encrypted boot volume: unattended unlock not owner-verified (ADR-009): $(clean "$unverified" 100)"
+  fi
+  add_guard unlock "$UNLOCK_ALERT"
 }
 
 evaluate_guards() {
-  GUARD_IDS=; GUARD_DETAIL=; G_KILL=0; G_UNLOCK=0; UNLOCK_NAMES=
+  GUARD_IDS=; GUARD_DETAIL=; G_KILL=0; G_UNLOCK=0; UNLOCK_NAMES=; UNLOCK_ALERT=
   if [ -e "$KILL_SWITCH" ] || [ -L "$KILL_SWITCH" ]; then
     G_KILL=1
     add_guard kill-switch "the kill switch $KILL_SWITCH exists; reboots are disabled by the owner"
@@ -1034,7 +1072,7 @@ note_deferral() {
   fi
   if [ "$G_UNLOCK" -eq 1 ] && [ "$E_UNLOCK_ALERTED" -eq 0 ]; then
     E_UNLOCK_ALERTED=1
-    queue_alert "unattended reboot refused: crypttab entries $UNLOCK_NAMES need an interactive unlock at boot (triggers: $TRIG_IDS)"
+    queue_alert "$UNLOCK_ALERT (triggers: $TRIG_IDS)"
   fi
   if [ "$E_DEFERRALS" -ge "$ALERT_AFTER" ] && [ "$E_ALERTED" -eq 0 ]; then
     E_ALERTED=1
