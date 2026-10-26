@@ -261,7 +261,10 @@ echo "SEC_PENDING=${SEC:-0}"; echo "ALL_PENDING=${ALLUP:-0}"; echo "DISK=${DISK:
 # latch marker), so free text in detail cannot forge a counted action. Lines
 # that do not match are ignored. The last 10000 lines bound the work.
 #   UNRECOVERED=1: the latest "reboot" record is >=60 min old and no
-#     post-boot-ok / post-boot-issues record follows it.
+#     post-boot-ok / post-boot-issues record follows it. A "reboot" line is the
+#     job's intent record: a following "deferred" whose detail starts with
+#     "reboot aborted" means it never rebooted, so it is neither unrecovered nor
+#     counted in REBOOTS_24H.
 #   LATCHED=1: the latest latch-related record is an "alert" whose detail starts
 #     with "latched" and no later "latch-cleared" record (action "none", appended
 #     by the owner's clear-latch command) follows it. A later reboot does not
@@ -285,13 +288,17 @@ if [ -r "$GR_FILE" ]; then
       x = p; sub(/^.*"action":"/, "", x); sub(/"$/, "", x)
       if (!(x in known)) x = "unknown"
       la = x; le = e
-      if (x == "reboot") { lre = e; rec = 0 }
+      if (x == "reboot") { lre = e; rec = 0; if (e >= cutoff) nr++ }
       else if (x == "post-boot-ok" || x == "post-boot-issues") { if (lre > 0) rec = 1 }
+      else if (x == "deferred" && lre > 0 && rec == 0 && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"reboot aborted/) {
+        # The "reboot" line is the job'"'"'s intent record; this abort means it never rebooted.
+        if (lre >= cutoff && nr > 0) nr--
+        lre = 0; rec = 1
+      }
       else if (x == "alert" && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"latched/) latched = 1
       else if (x == "none" && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"latch-cleared/) latched = 0
       if (e >= cutoff) {
-        if (x == "reboot") nr++
-        else if (x == "deferred") nd++
+        if (x == "deferred") nd++
         else if (x == "alert") na++
         else if (x == "post-boot-issues") ni++
         else if (x == "health-issues") nh++

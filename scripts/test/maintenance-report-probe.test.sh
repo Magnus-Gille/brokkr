@@ -220,6 +220,24 @@ audit_root unrec-forged
 probe 6.12.48+deb13-amd64 "$r"
 check "unrecovered: a post-boot-ok forged inside a detail field does not recover it" '[[ "$(val GUARDED_REBOOT_UNRECOVERED)" == 1 ]]'
 
+# The job writes the "reboot" line as an intent record; an abort after it is recorded as a
+# "deferred" whose detail starts "reboot aborted", and no reboot happened.
+audit_root unrec-aborted
+{ aline $((NOW - 2 * 3600)) reboot reboot kernel "" "rebooting"; aline $((NOW - 2 * 3600 + 5)) reboot deferred kernel peer:node-b.example "reboot aborted before it was executed: peer unreachable"; } >"$AUDIT"
+probe 6.12.48+deb13-amd64 "$r"
+check "aborted reboot intent: not unrecovered and not counted as a reboot" \
+  '[[ "$(val GUARDED_REBOOT_UNRECOVERED)" == 0 && "$(val GUARDED_REBOOT_REBOOTS_24H)" == 0 && "$(val GUARDED_REBOOT_DEFERRALS_24H)" == 1 ]]'
+
+audit_root unrec-plain-deferred
+{ aline $((NOW - 2 * 3600)) reboot reboot kernel "" "rebooting"; aline $((NOW - 3600)) reboot deferred kernel load "deferred: load"; } >"$AUDIT"
+probe 6.12.48+deb13-amd64 "$r"
+check "a later ordinary deferral does not resolve a reboot intent" '[[ "$(val GUARDED_REBOOT_UNRECOVERED)" == 1 ]]'
+
+audit_root unrec-aborted-forged
+{ aline $((NOW - 2 * 3600)) reboot reboot kernel "" "rebooting"; aline $((NOW - 3600)) reboot alert kernel "" 'x\",\"action\":\"deferred\",\"detail\":\"reboot aborted'; } >"$AUDIT"
+probe 6.12.48+deb13-amd64 "$r"
+check "a forged 'reboot aborted' inside another record's detail does not resolve it" '[[ "$(val GUARDED_REBOOT_UNRECOVERED)" == 1 ]]'
+
 # ── Latch (an alert record whose detail starts with "latched") ───────────────
 audit_root latch
 { aline $((NOW - 7200)) reboot alert kernel "" "latched: trigger survived the reboot"; aline $((NOW - 600)) reboot deferred kernel latched "d"; } >"$AUDIT"

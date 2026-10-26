@@ -53,12 +53,16 @@ overwritten. The script only verifies that the host's `20auto-upgrades` enables
   deploy-tier host by listing its ID in `BROKKR_ALERT_UNREACHABLE_NODES` in the report's runtime
   environment (see the header of `../scripts/maintenance-report.sh`); ADR-009 relies on this for
   the inference node, which the guarded-reboot job may have rebooted.
-- **Previous kernel.** The previous kernel stays installed through apt's kernel autoremove
-  protection, which keeps the running and the newest kernels; ADR-009 relies on this as the
-  mitigation for manual boot selection. `Remove-Unused-Kernel-Packages` is left as is.
-- **Firmware.** The Raspberry Pi bootloader EEPROM is updated by apt (`rpi-eeprom`) and applied at
-  boot by the stock `rpi-eeprom-update` service, so it takes effect at the next guarded reboot.
-  UEFI / BIOS firmware (fwupd) stays report-only.
+- **Previous kernel.** apt's kernel autoremove protection keeps the running kernel, the newest
+  and the one before it, so after a guarded reboot the previous kernel stays installed for manual
+  boot selection (the mitigation ADR-009 relies on). Checked on both host types with
+  `apt-get -s autoremove`: no kernel would be removed with two kernels installed.
+  `Remove-Unused-Kernel-Packages` is left as is.
+- **Firmware.** apt installs the updated Raspberry Pi bootloader package (`rpi-eeprom`). The stock
+  boot-time `rpi-eeprom-update` service is disabled by the guarded-reboot deploy; the guarded-reboot
+  job stages the update (`rpi-eeprom-update -a`) only inside an admitted reboot, and the bootloader
+  writes it during that reboot (see `../docs/guarded-reboot.md`). UEFI / BIOS firmware (fwupd)
+  stays report-only.
 - **Repair interrupted dpkg** on next run (`AutoFixInterruptedDpkg true`).
 - **Minimal steps** — upgrade in small increments so a power loss leaves a consistent system.
 
