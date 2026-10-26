@@ -27,7 +27,9 @@ link is reported even when a fallback route keeps services up. Start from
 
 [`brokkr-eee-off@.service.example`](brokkr-eee-off@.service.example) is a
 systemd template that keeps Energy Efficient Ethernet off on one wired
-interface; the instance name is the interface. Deploy it with
+interface; the instance name is the interface. Its companion
+[`brokkr-eee-off-watch@.service.example`](brokkr-eee-off-watch@.service.example)
+re-applies the setting when a link change turned EEE back on. Deploy both with
 `scripts/deploy-eee-off.sh`, which adopts an existing ad-hoc EEE-off unit. See
 [`../docs/eee-off.md`](../docs/eee-off.md) for why EEE stays off and why it was
 not the cause of the 2026 link flapping.
