@@ -94,8 +94,13 @@ than prompt. Before changing anything it refuses when:
   the setting when the interface comes back;
 - a file, directory listing or link in the unit directory cannot be read through
   `sudo -n`. systemd reads unit files as root and some are root-only (mode 600),
-  so every scan reads as root rather than as the operator. A read that `sudo -n`
-  refuses stops the deploy instead of counting as "no match";
+  so the unit directory is enumerated once as root (`sudo -n find -L`, two levels
+  deep, which also follows symlinked `.d` and `.wants` directories) and every file
+  is read with `sudo -n cat`. Existence, link and dangling-link checks use that
+  enumeration, not the operator's view. A read or listing that `sudo -n` refuses,
+  a symlink loop, or a file name containing a newline or tab stops the deploy
+  instead of counting as "no match". Only a link whose target root cannot find is
+  skipped, because it runs nothing;
 - a backup for this revision already exists.
 
 Only `/etc/systemd/system` is scanned. Units under `/run` or `/usr/lib` and other

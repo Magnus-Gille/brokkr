@@ -347,7 +347,7 @@ for mode in dry-run apply; do
     printf '[Service]\nExecStartPost=/usr/sbin/ethtool --set-eee eth0 eee on\n' >"$UNIT_DIR/locked.service.d/eee.conf"
     chmod 000 "$UNIT_DIR/locked.service.d/eee.conf" "$UNIT_DIR/locked.service.d"
     MOCK_ROOT_ONLY="$UNIT_DIR/locked.service.d $UNIT_DIR/locked.service.d/eee.conf" \
-      refuses "$mode: a drop-in in a root-only directory that sets EEE refuses" "locked.service.d/eee.conf" "${args[@]}"
+      refuses "$mode: a drop-in in a root-only directory that sets EEE refuses" "locked.service.d/eee.conf also sets EEE" "${args[@]}"
     chmod 755 "$UNIT_DIR/locked.service.d"; chmod 644 "$UNIT_DIR/locked.service.d/eee.conf"
     reset; seed_legacy; mkdir -p "$UNIT_DIR/locked.target.wants"; chmod 000 "$UNIT_DIR/locked.target.wants"
     MOCK_ROOT_ONLY="$UNIT_DIR/locked.target.wants" run "${args[@]}"
@@ -365,8 +365,35 @@ for mode in dry-run apply; do
   MOCK_SUDO_DENY_CMD="cat" refuses "$mode: sudo -n refusing to read a unit refuses" "with sudo -n" "${args[@]}"
   reset; seed_legacy
   MOCK_SUDO_DENY_CMD="find" refuses "$mode: sudo -n refusing to list the unit directory refuses" "could not list" "${args[@]}"
-  reset; seed_legacy
-  MOCK_SUDO_DENY_CMD="readlink" refuses "$mode: sudo -n refusing to read a link refuses" "with sudo -n" "${args[@]}"
+  # Without an ad-hoc unit, so the denied read is the duplicate-owner scan itself.
+  reset; printf '[Service]\nExecStart=/usr/local/bin/other\n' >"$UNIT_DIR/other.service"
+  MOCK_SUDO_DENY_CMD="cat" refuses "$mode: sudo -n refusing to read a candidate owner refuses" "could not read other.service with sudo -n" "${args[@]}"
+  # Symlinked drop-in and dependency directories are followed.
+  reset; seed_legacy; mkdir -p "$TMP/etc/overrides"; ln -s "$TMP/etc/overrides" "$UNIT_DIR/other.service.d"
+  printf '[Service]\nExecStartPost=/usr/sbin/ethtool --set-eee eth0 eee on\n' >"$TMP/etc/overrides/eee.conf"
+  refuses "$mode: a symlinked drop-in directory that sets EEE refuses" "other.service.d/eee.conf also sets EEE" "${args[@]}"
+  reset; seed_legacy; mkdir -p "$TMP/etc/wants"; ln -s "$TMP/etc/wants" "$UNIT_DIR/multi-user.target.wants"
+  printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee %%i eee on\n' >"$UNIT_DIR/other-eee@.service"
+  ln -s "$UNIT_DIR/other-eee@.service" "$TMP/etc/wants/other-eee@eth0.service"
+  refuses "$mode: an instance enabled through a symlinked wants directory refuses" "other-eee@eth0.service is enabled" "${args[@]}"
+  # A file name the enumeration cannot represent refuses.
+  reset; seed_legacy; mkdir -p "$UNIT_DIR/x.service.d"; printf '[Service]\n' >"$UNIT_DIR/x.service.d/10-a
+20-b.conf"
+  refuses "$mode: a drop-in name containing a newline refuses" "could not list" "${args[@]}"
+  if [[ "$(/usr/bin/id -u)" != 0 ]]; then
+    # A link whose target only root can reach is live, not dangling: it is read as
+    # root, and a denied read refuses rather than being skipped.
+    reset; mkdir -p "$TMP/etc/private"; printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee eth0 eee on\n' >"$TMP/etc/private/hidden.service"
+    ln -s "$TMP/etc/private/hidden.service" "$UNIT_DIR/hidden.service"; chmod 000 "$TMP/etc/private"
+    MOCK_ROOT_ONLY="$TMP/etc/private" refuses "$mode: a link into a root-only directory that sets EEE refuses" "hidden.service also sets EEE" "${args[@]}"
+    MOCK_ROOT_ONLY="$TMP/etc/private" MOCK_SUDO_DENY_CMD="cat" \
+      refuses "$mode: a link into a root-only directory whose read sudo -n denies refuses" "could not read hidden.service with sudo -n" "${args[@]}"
+    chmod 755 "$TMP/etc/private"
+  fi
+  reset; seed_legacy; ln -s "$TMP/etc/nonexistent.service" "$UNIT_DIR/ghost.service"
+  run "${args[@]}"
+  check "$mode: a genuinely dangling link is skipped" '[[ "$RC" -eq 0 ]]'
+
   reset; seed_legacy; echo enabled-runtime >"$STATE/enabled.eth0-eee-off.service"
   refuses "$mode: an ad-hoc unit in an unsupported enablement state refuses" "enabled-runtime" "${args[@]}"
 done
@@ -403,6 +430,16 @@ OUT="$ADOPT_OUT"
 : >"$CALLS"; before="$(tree_state)"
 run "$TARGET" eth0 --apply
 check "re-applying the same revision is a verified no-op" '[[ "$RC" -eq 0 && "$OUT" == *"already in place"* && "$(tree_state)" == "$before" ]] && no_mutation'
+
+if [[ "$(/usr/bin/id -u)" != 0 ]]; then
+  # A root-only managed template and device dependency directory are inspected as
+  # root, so an installation that is already in place is still a no-op.
+  chmod 000 "$MANAGED" "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants"
+  : >"$CALLS"; before="$(tree_state)"
+  MOCK_ROOT_ONLY="$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants $MANAGED" run "$TARGET" eth0 --apply
+  check "a root-only managed template and device dependency are read as root (still a no-op)" '[[ "$RC" -eq 0 && "$OUT" == *"already in place"* && "$(tree_state)" == "$before" ]] && no_mutation'
+  chmod 755 "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants"; chmod 644 "$MANAGED"
+fi
 
 # A later revision backs up the managed template and keeps the instance enabled.
 echo "second revision" >>"$REPO/README.md"; git -C "$REPO" commit -qam second
