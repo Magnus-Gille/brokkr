@@ -80,17 +80,22 @@ printf 'sudo %s\n' "$*" >>"$MOCK_CALLS"
 shift
 case "$*" in
   true) [[ "${MOCK_SUDO_FAIL:-0}" != 1 ]] || exit 1; exit 0 ;;
-  "install -d -m 0755 "*)
-    shift 3
+  "install -d -m 0755 /var/lib/brokkr/guarded-reboot")
+    # The production directories are constant arguments; the stub maps /var/lib into the test tree.
     [[ "${MOCK_INSTALL_FAIL:-0}" != 1 ]] || exit 1
-    exec /usr/bin/install -d -m 0755 "$@" ;;
-  "tee -a "*)
-    tee -a "$3" || exit 1
-    if [[ "${MOCK_AUDIT_PRIVATE:-0}" == 1 ]]; then chmod 600 "$3"; fi
+    exec /usr/bin/install -d -m 0755 "$MOCK_VARLIB/brokkr/guarded-reboot" ;;
+  "install -d -m 0755 /var/lib/brokkr /var/lib/brokkr/guarded-reboot")
+    [[ "${MOCK_INSTALL_FAIL:-0}" != 1 ]] || exit 1
+    exec /usr/bin/install -d -m 0755 "$MOCK_VARLIB/brokkr" "$MOCK_VARLIB/brokkr/guarded-reboot" ;;
+  "tee -a /var/lib/brokkr/guarded-reboot/audit.jsonl")
+    target=$MOCK_VARLIB/brokkr/guarded-reboot/audit.jsonl
+    tee -a "$target" || exit 1
+    if [[ "${MOCK_AUDIT_PRIVATE:-0}" == 1 ]]; then chmod 600 "$target"; fi
     exit 0 ;;
   "systemctl disable rpi-eeprom-update.service") echo disabled >>"$MOCK_DIR/eeprom-service"; exit 0 ;;
-  "rpi-eeprom-update -j -m "*)
-    printf '{"EXITCODE": "EXIT_SUCCESS", "BOOTLOADER_CURRENT": 1700000000, "BOOTLOADER_LATEST": 1700000000}\n' >"$5"
+  "rpi-eeprom-update -j -m /run/brokkr-guarded-reboot-eeprom.json")
+    # The constant status file below /run is mapped to the read seam of the job.
+    printf '{"EXITCODE": "EXIT_SUCCESS", "BOOTLOADER_CURRENT": 1700000000, "BOOTLOADER_LATEST": 1700000000}\n' >"$BROKKR_EEPROM_STATUS_FILE"
     exit 0 ;;
   "systemctl reboot") echo REBOOT >>"$MOCK_DIR/reboot-calls"; exit 0 ;;
   *) echo "sudo $*" >>"$MOCK_DIR/unexpected"; exit 99 ;;
@@ -102,8 +107,20 @@ printf 'systemctl %s\n' "$*" >>"$MOCK_CALLS"
 scope=system
 if [[ "${1:-}" == --user ]]; then scope=user; shift; fi
 case "${1:-}" in
-  is-enabled) echo "${MOCK_EEPROM_SERVICE:-enabled}"; [[ "${MOCK_EEPROM_SERVICE:-enabled}" == enabled ]]; exit $? ;;
-  is-active) echo inactive; exit 3 ;;
+  is-enabled)
+    # The brokkr timers answer from fixtures (not-found when absent); the stock EEPROM service from MOCK_EEPROM_SERVICE.
+    case "${2:-}" in
+      brokkr-*)
+        if [[ -e "$MOCK_DIR/enabled.$2" ]]; then st=$(cat "$MOCK_DIR/enabled.$2"); echo "$st"; [[ "$st" == enabled ]]; exit $?; fi
+        echo not-found; exit 1 ;;
+    esac
+    echo "${MOCK_EEPROM_SERVICE:-enabled}"; [[ "${MOCK_EEPROM_SERVICE:-enabled}" == enabled ]]; exit $? ;;
+  is-active)
+    case "${2:-}" in
+      brokkr-*)
+        st=$(cat "$MOCK_DIR/active.$2" 2>/dev/null || echo inactive); echo "$st"; [[ "$st" == active ]]; exit $? ;;
+    esac
+    echo inactive; exit 3 ;;
   list-units) printf 'alpha.service loaded active running Fixture\n'; exit 0 ;;
   --failed) exit 0 ;;
   show) echo inactive; exit 0 ;;
@@ -147,7 +164,7 @@ chmod 755 "$BIN/"*
 mkdir -p "$TMP/eeprom-bin"
 printf '#!/usr/bin/env bash\necho "rpi-eeprom-update runs only through the sudo stub here" >&2\nexit 99\n' >"$TMP/eeprom-bin/rpi-eeprom-update"
 chmod 755 "$TMP/eeprom-bin/rpi-eeprom-update"
-export MOCK_CALLS="$CALLS" MOCK_DIR="$MOCK" MOCK_REMOTE_HOME="$HOME_DIR" MOCK_REMOTE_PATH="$BIN:/usr/bin:/bin"
+export MOCK_CALLS="$CALLS" MOCK_DIR="$MOCK" MOCK_REMOTE_HOME="$HOME_DIR" MOCK_REMOTE_PATH="$BIN:/usr/bin:/bin" MOCK_VARLIB="$TMP/varlib"
 export PATH="$BIN:$PATH" TMPDIR="$TMP/payload-tmp" BROKKR_DEPLOY_PATH_PREFIX="$BIN"
 unset XDG_CONFIG_HOME
 
@@ -175,12 +192,12 @@ reset() {
   mkdir -p "$MOCK" "$BOOT" "$TMP/varlib" "$HOME_DIR"
   : >"$CALLS"
   for v in $(compgen -e | grep -E '^(MOCK_[A-Z_]+|BROKKR_GUARDED_REBOOT_[A-Z_]+)$' || true); do
-    case "$v" in MOCK_CALLS|MOCK_DIR|MOCK_REMOTE_HOME|MOCK_REMOTE_PATH) ;; *) unset "$v" ;; esac
+    case "$v" in MOCK_CALLS|MOCK_DIR|MOCK_REMOTE_HOME|MOCK_REMOTE_PATH|MOCK_VARLIB) ;; *) unset "$v" ;; esac
   done
   unset RATATOSKR_URL RATATOSKR_SEND_API_KEY TELEGRAM_ALLOWED_USERS TELEGRAM_BOT_TOKEN
   rm -f "$BIN/rpi-eeprom-update"
   export RATATOSKR_ENV="$TMP/no-ratatoskr.env" NOTIFY_ENV="$TMP/no-notify.env"
-  export BROKKR_AUDIT_PARENT="$AUDIT_PARENT" BROKKR_GUARDED_REBOOT_AUDIT="$AUDIT_FILE" BROKKR_BOOT_DIR="$BOOT"
+  export BROKKR_AUDIT_PARENT_PROBE="$AUDIT_PARENT" BROKKR_EEPROM_STATUS_FILE="$MOCK/eeprom-status.json" BROKKR_BOOT_DIR="$BOOT"
   export BROKKR_BOOT_ID_FILE="$BOOTID" BROKKR_EEPROM_PENDING_FLAG="$PENDING" BROKKR_CRYPTTAB="$CRYPTTAB"
   export BROKKR_KILL_SWITCH="$TMP/kill-switch" BROKKR_REBOOT_REQUIRED_FILE="$TMP/reboot-required"
   : >"$BOOT/vmlinuz-7.0.0-38-generic"
@@ -280,6 +297,13 @@ check "unlock assessment: a passphrase-only volume is reported with the conseque
 reset; printf 'root UUID=1 none luks,tpm2-device=auto\nswap /dev/sda3 /dev/urandom swap\nx UUID=3 none luks,noauto\n' >"$CRYPTTAB"; run "$TARGET"
 check "unlock assessment: unattended and noauto volumes are fine" '[[ "$OUT" == *"every volume in "*"unlocks unattended or is noauto"* ]]'
 
+# The unlock assessment applies the job's rule: only a key-file path or a PIN-less tpm2-device counts as unattended.
+unlock_names() { grep -o 'needing an interactive passphrase at boot: .*' <<<"$OUT" || true; }
+reset; printf 'a UUID=1 none luks,fido2-device=auto\nb UUID=2 none luks,pkcs11-uri=auto\nc UUID=3 none luks,keyscript=/x\nd UUID=4 none luks,tpm2-device=auto,tpm2-pin=yes\ne UUID=5 none luks,fido2-with-client-pin=no\nf UUID=6 /k luks,headless=false\ng UUID=7 none luks\n' >"$CRYPTTAB"; run "$TARGET"
+check "unlock assessment: fido2, pkcs11, keyscript, a tpm2 PIN, fido2-with-*, headless=false and a plain passphrase are all interactive" '[[ "$OUT" == *"interactive passphrase at boot: a b c d e f g"* ]]'
+reset; printf 'a UUID=1 /etc/keys/a.key luks\nb UUID=2 none luks,tpm2-device=auto\nc UUID=3 - luks,tpm2-device=auto,tpm2-pcrs=7\nd UUID=4 none luks,noauto\n' >"$CRYPTTAB"; run "$TARGET"
+check "unlock assessment: key-file paths, PIN-less tpm2 and noauto entries are unattended" '[[ "$OUT" == *"every volume in "*"unlocks unattended or is noauto"* ]]'
+
 if real_eeprom; then
   skip "stock EEPROM service tests (a real rpi-eeprom-update is on this machine PATH)"
 else
@@ -290,12 +314,20 @@ else
 fi
 
 # --- reboot mode needs a working alert path ------------------------------------------------------------
-reset; BROKKR_GUARDED_REBOOT_MODE=reboot run "$TARGET"
+rbenv() { export BROKKR_GUARDED_REBOOT_MODE=reboot BROKKR_GUARDED_REBOOT_WINDOW=02:00 BROKKR_GUARDED_REBOOT_PEERS=node-b.example; }
+reset; rbenv; run "$TARGET"
 check "reboot mode refuses without notify configuration (dry-run)" '[[ "$RC" -ne 0 && "$OUT" == *"reboot mode needs a working alert path"* ]] && no_mutation'
-: >"$CALLS"; BROKKR_GUARDED_REBOOT_MODE=reboot run "$TARGET" --apply
+: >"$CALLS"; run "$TARGET" --apply
 check "reboot mode refuses without notify configuration (--apply) and changes nothing" '[[ "$RC" -ne 0 && "$OUT" == *"reboot mode needs a working alert path"* ]] && no_mutation && [[ ! -e "$RELEASE" ]]'
-reset; with_notify; BROKKR_GUARDED_REBOOT_MODE=reboot run "$TARGET"
-check "reboot mode passes the preflight with notify configuration" '[[ "$RC" -eq 0 && "$OUT" == *"mode reboot"* ]]'
+reset; with_notify; rbenv; run "$TARGET"
+check "reboot mode passes the preflight with notify configuration, a window and a peer" '[[ "$RC" -eq 0 && "$OUT" == *"mode reboot, window 02:00"* && "$OUT" == *"peers: node-b.example"* ]]'
+# Reboot mode states its window and its peer; neither has a default there.
+reset; with_notify; rbenv; unset BROKKR_GUARDED_REBOOT_WINDOW; run "$TARGET"
+check "reboot mode without an explicit window is refused before ssh (no default window in reboot mode)" '[[ "$RC" -ne 0 && "$OUT" == *"explicit BROKKR_GUARDED_REBOOT_WINDOW"* ]] && ! grep -q ssh "$CALLS"'
+reset; with_notify; rbenv; unset BROKKR_GUARDED_REBOOT_PEERS; run "$TARGET" --apply
+check "reboot mode without a peer is refused before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"needs BROKKR_GUARDED_REBOOT_PEERS"* ]] && ! grep -q ssh "$CALLS"'
+reset; with_notify; BROKKR_GUARDED_REBOOT_PEERS='' run "$TARGET"
+check "report mode needs neither a window nor a peer (it defaults to 03:30 and no peers)" '[[ "$RC" -eq 0 && "$OUT" == *"mode report, window 03:30"* ]]'
 
 # --- preflight refusals (both modes) -----------------------------------------------------------------------
 refuses() { # name expected-text [args...]
@@ -361,7 +393,7 @@ check "the unit PATH reaches sudo, systemctl and the sbin tools" 'grep -Fxq "Env
 check "existing unit is backed up as .previous-<SHA>" '[[ "$(cat "$SVC.previous-$SHA")" == "OLD SERVICE" ]]'
 check "systemd is reloaded and all three timers enabled in one call" '[[ "$(line_of "^systemctl --user daemon-reload")" -lt "$(line_of "^systemctl --user enable --now brokkr-guarded-reboot.timer brokkr-post-boot-check.timer brokkr-post-update-health.timer$")" ]]'
 check "the reboot service is never started and nothing reboots" 'never_rebooted && ! grep -q "systemctl --user start" "$CALLS" && no_unexpected'
-check "the audit directories are created by the one fixed privileged command, parent and directory, mode 0755" 'grep -Fxq "sudo -n install -d -m 0755 $AUDIT_PARENT $AUDIT_DIR" "$CALLS" && [[ "$(mode_of "$AUDIT_PARENT")" == 755 && "$(mode_of "$AUDIT_DIR")" == 755 ]]'
+check "the audit directories are created by the one fixed privileged command, parent and directory, mode 0755" 'grep -Fxq "sudo -n install -d -m 0755 /var/lib/brokkr /var/lib/brokkr/guarded-reboot" "$CALLS" && [[ "$(mode_of "$AUDIT_PARENT")" == 755 && "$(mode_of "$AUDIT_DIR")" == 755 ]]'
 check "the audit directory exists before the release is installed" '[[ "$(line_of "^sudo -n install -d")" -lt "$(line_of "^systemctl --user daemon-reload")" ]]'
 check "the first run is check --report-only and its decision and the status are printed" '[[ "$OUT" == *"== first run: check --report-only"* && "$OUT" == *"decision: none"* && "$OUT" == *"== status"* && "$OUT" == *"configured mode: report"* && "$OUT" == *"busy units: hugin.service other.service; peers: node-b.example"* ]]'
 check "the first run wrote the private state file and one audit line" '[[ "$(mode_of "$STATE_FILE")" == 600 ]] && [[ "$(wc -l <"$AUDIT_FILE" | tr -d " ")" -eq 1 ]]'
@@ -377,14 +409,14 @@ check "re-applying the same revision refuses instead of overwriting" '[[ "$RC" -
 reset
 run "$TARGET" --apply
 check "defaults render the empty busy and peer lists, an empty (auto) load limit, 03:30 and 45 min" 'grep -Fxq "Environment=\"BROKKR_GUARDED_REBOOT_BUSY_UNITS=\"" "$SVC" && grep -Fxq "Environment=\"BROKKR_GUARDED_REBOOT_PEERS=\"" "$SVC" && grep -Fxq "Environment=BROKKR_GUARDED_REBOOT_MAX_LOAD=" "$SVC" && grep -Fxq "OnCalendar=*-*-* 03:30:00" "$TMR" && grep -Fxq "RandomizedDelaySec=45min" "$TMR" && grep -Fxq "Environment=BROKKR_GUARDED_REBOOT_ALERT_AFTER=3" "$SVC"'
-reset; with_notify
-BROKKR_GUARDED_REBOOT_MODE=reboot run "$TARGET" --apply
+reset; with_notify; rbenv
+run "$TARGET" --apply
 check "reboot mode is rendered into all three service units, and the first run is still report-only" '[[ "$RC" -eq 0 && "$OUT" == *"installed in reboot mode"* ]] && grep -Fxq "Environment=BROKKR_GUARDED_REBOOT_MODE=reboot" "$SVC" && grep -Fxq "Environment=BROKKR_GUARDED_REBOOT_MODE=reboot" "$PB_SVC" && grep -Fxq "Environment=BROKKR_GUARDED_REBOOT_MODE=reboot" "$H_SVC" && never_rebooted && grep -q "\"mode\":\"report\"" "$AUDIT_FILE"'
 
 # An existing /var/lib/brokkr is never chmod-ed; only the guarded-reboot directory is created.
 reset; mkdir -p "$AUDIT_PARENT"; chmod 711 "$AUDIT_PARENT"
 run "$TARGET" --apply
-check "an existing world-searchable audit parent is left exactly as it is" '[[ "$RC" -eq 0 && "$(mode_of "$AUDIT_PARENT")" == 711 && "$(mode_of "$AUDIT_DIR")" == 755 ]] && grep -Fxq "sudo -n install -d -m 0755 $AUDIT_DIR" "$CALLS"'
+check "an existing world-searchable audit parent is left exactly as it is" '[[ "$RC" -eq 0 && "$(mode_of "$AUDIT_PARENT")" == 711 && "$(mode_of "$AUDIT_DIR")" == 755 ]] && grep -Fxq "sudo -n install -d -m 0755 /var/lib/brokkr/guarded-reboot" "$CALLS"'
 reset; MOCK_INSTALL_FAIL=1 run "$TARGET" --apply
 check "an audit directory that cannot be created refuses before anything is installed" '[[ "$RC" -ne 0 && "$OUT" == *"could not create the audit directory"* ]] && [[ ! -e "$RELEASE" && ! -e "$UNIT_DIR" ]] && ! grep -q "^systemctl --user" "$CALLS"'
 reset; MOCK_AUDIT_PRIVATE=1 run "$TARGET" --apply
@@ -401,7 +433,7 @@ else
   reset; with_eeprom; MOCK_EEPROM_SERVICE=disabled run "$TARGET" --apply
   check "an already disabled stock service is left alone and the rollback has nothing to re-enable" '[[ "$RC" -eq 0 && ! -s "$MOCK/eeprom-service" && "$OUT" != *"sudo systemctl enable rpi-eeprom-update.service"* ]]'
   reset; with_eeprom; echo "recovery 1790000000" >"$PENDING"; run "$TARGET" --apply
-  check "the deploy summary states that a staged EEPROM update applies at the next boot and that the kill switch does not cancel it" '[[ "$RC" -eq 0 && "$OUT" == *"bootloader update is STAGED"* && "$OUT" == *"next boot of any kind"* && "$OUT" == *"does not cancel it"* && "$OUT" == *"apt-mark hold rpi-eeprom"* ]]'
+  check "the deploy summary states that a staged EEPROM update applies at the next boot and that the kill switch does not cancel it" '[[ "$RC" -eq 0 && "$OUT" == *"bootloader update is STAGED"* && "$OUT" == *"next boot of any kind"* && "$OUT" == *"does not cancel it"* && "$OUT" == *"suspended only when nothing is staged"* && "$OUT" == *"kill switch"* && "$OUT" == *"rpi-eeprom-update.service"* && "$OUT" == *"sudo rpi-eeprom-update -r"* && "$OUT" != *"apt-mark hold rpi-eeprom and/or"* ]]'
   check "the report-only first run does not cancel the staged update itself" '[[ -e "$PENDING" ]] && ! grep -q "rpi-eeprom-update -r" "$CALLS"'
 fi
 
@@ -428,6 +460,28 @@ check "a partial backup (a later unit fails) leaves originals untouched and no t
 reset; seed_units; export MOCK_MV_FAIL="guarded-reboot.timer.previous"
 run "$TARGET" --apply
 check "a failed backup finalize leaves originals untouched and the recipe only offers cleanup" '[[ "$RC" -ne 0 && "$OUT" == *"could not finalize"* ]] && units_intact && no_backup_debris && [[ ! -e "$RELEASE" ]] && [[ "$OUT" != *"mv -f $UNIT_DIR"* ]]'
+
+# --- rollback restores each timer's enabled and active state exactly as it was before the install ----------
+seed_all_units() { mkdir -p "$UNIT_DIR"; local u; for u in $ALL_UNITS; do printf 'OLD %s\n' "$u" >"$UNIT_DIR/$u"; done; }
+timer_state() { printf '%s\n' "$2" >"$MOCK/enabled.$1"; printf '%s\n' "$3" >"$MOCK/active.$1"; } # timer enabled active
+reset; seed_all_units
+timer_state brokkr-guarded-reboot.timer enabled active
+timer_state brokkr-post-boot-check.timer enabled inactive
+timer_state brokkr-post-update-health.timer disabled active
+run "$TARGET" --apply
+check "rollback: a timer that was enabled and active gets enable --now" '[[ "$RC" -eq 0 && "$OUT" == *"  systemctl --user enable --now brokkr-guarded-reboot.timer   # it was enabled and active"* ]]'
+check "rollback: a timer that was enabled but inactive is enabled without --now" '[[ "$OUT" == *"  systemctl --user enable brokkr-post-boot-check.timer   # it was enabled but not active"* && "$OUT" != *"enable --now brokkr-post-boot-check.timer   #"* ]]'
+check "rollback: a timer that was active but disabled is only started" '[[ "$OUT" == *"  systemctl --user start brokkr-post-update-health.timer   # it was active but not enabled"* ]]'
+check "rollback: the new timers are disabled and stopped first" '[[ "$OUT" == *"systemctl --user disable --now brokkr-guarded-reboot.timer brokkr-post-boot-check.timer brokkr-post-update-health.timer"* ]]'
+reset; seed_all_units
+timer_state brokkr-guarded-reboot.timer disabled inactive
+timer_state brokkr-post-boot-check.timer disabled inactive
+timer_state brokkr-post-update-health.timer disabled inactive
+run "$TARGET" --apply
+check "rollback: a timer that was disabled and inactive is never enabled or started again" '[[ "$RC" -eq 0 && "$OUT" == *"# brokkr-guarded-reboot.timer was disabled and inactive before this run: it stays disabled and stopped"* ]] && ! grep -Eq "^  systemctl --user (enable|start) " <<<"$OUT"'
+reset; run "$TARGET" --apply
+check "rollback: timers that did not exist before get no restore line (they are removed)" '[[ "$RC" -eq 0 && "$OUT" == *"rm -f $TMR"* && "$OUT" != *"before this run"* ]]'
+check "rollback: the prior states were read before the install replaced anything" '[[ "$(line_of "^systemctl --user is-enabled brokkr-guarded-reboot.timer")" -lt "$(line_of "^systemctl --user daemon-reload")" ]]'
 
 # --- payload is received and validated before anything changes ---------------------------------------------------------------
 reset; export MOCK_TAR_FAIL=1

@@ -45,17 +45,20 @@ printf 'sudo %s\n' "$*" >>"$MOCK_CALLS"
 if [ "${1:-}" != -n ]; then echo "sudo: stub requires -n" >&2; echo "sudo $*" >>"$MOCK_DIR/unexpected"; exit 2; fi
 shift
 case "$*" in
-  "tee -a "*)
-    [ "$#" -eq 3 ] || { echo "sudo $*" >>"$MOCK_DIR/unexpected"; exit 99; }
+  "tee -a /var/lib/brokkr/guarded-reboot/audit.jsonl")
+    # The production path is a constant argument; the stub maps it into the test tree.
     printf 'umask %s\n' "$(umask)" >>"$MOCK_DIR/tee-umask"
     if [ -e "$MOCK_DIR/audit-fail" ]; then exit 1; fi
-    exec tee -a "$3" ;;
+    exec tee -a "$MOCK_AUDIT_FILE" ;;
   "systemctl reboot")
     echo reboot >>"$MOCK_DIR/reboot-calls"
     if [ -e "$MOCK_DIR/reboot-fail" ]; then exit 1; fi
     exit 0 ;;
   "true") exit 0 ;;
-  "rpi-eeprom-update -j -m "*|"rpi-eeprom-update -a"|"rpi-eeprom-update -r")
+  "rpi-eeprom-update -j -m /run/brokkr-guarded-reboot-eeprom.json")
+    # The status path is a constant argument below /run; the stub maps it into the test tree.
+    exec "$MOCK_BIN/rpi-eeprom-update" -j -m "$BROKKR_EEPROM_STATUS_FILE" ;;
+  "rpi-eeprom-update -a"|"rpi-eeprom-update -r")
     shift
     exec "$MOCK_BIN/rpi-eeprom-update" "$@" ;;
   "install -d -m 0755 "*)
@@ -85,9 +88,9 @@ case "${1:-}" in
       esac
       exit 0
     fi
-    if [ "${2:-}" = -p ] && [ "${3:-}" = Type,UnitFileState,TriggeredBy ]; then
+    if [ "${2:-}" = -p ] && [ "${3:-}" = Type,BusName,UnitFileState,TriggeredBy ]; then
       unit=$4
-      if [ -e "$MOCK_SD/show.$scope.$unit" ]; then cat "$MOCK_SD/show.$scope.$unit"; else printf 'Type=simple\nUnitFileState=enabled\nTriggeredBy=\n'; fi
+      if [ -e "$MOCK_SD/show.$scope.$unit" ]; then cat "$MOCK_SD/show.$scope.$unit"; else printf 'Type=simple\nBusName=\nUnitFileState=enabled\nTriggeredBy=\n'; fi
       exit 0
     fi
     exit 2 ;;
@@ -171,9 +174,13 @@ case "${1:-}" in
     esac
     if [ "$latest" -gt "$cur" ]; then code=EXIT_UPDATE_REQUIRED; rc=1; else code=EXIT_SUCCESS; rc=0; fi
     printf '{\n  "EXITCODE": "%s",\n  "BOOTLOADER_AUTO_UPDATE_MIN_VERSION": 0,\n  "BOOTLOADER_CURRENT": %s,\n  "BOOTLOADER_LATEST": %s,\n  "VL805_CURRENT": "",\n  "VL805_LATEST": "",\n  "VL805_EEPROM": false\n}\n' "$code" "$cur" "$latest" >"$out"
+    # rcmismatch: a status that contradicts the command's own exit status.
+    if [ "$mode" = rcmismatch ]; then rc=$((1 - rc)); fi
     exit "$rc" ;;
   -a)
     [ ! -e "$MOCK_DIR/eeprom.stage-fail" ] || { echo "EEPROM version is frozen" >&2; exit 3; }
+    # stage-partial: the staging fails but leaves its files behind.
+    if [ -e "$MOCK_DIR/eeprom.stage-partial" ]; then echo "recovery 1790000000" >"$BROKKR_EEPROM_PENDING_FLAG"; exit 3; fi
     echo "recovery 1790000000" >"$BROKKR_EEPROM_PENDING_FLAG"
     echo "EEPROM updates pending. Please reboot to apply the update."
     exit 0 ;;
@@ -219,7 +226,7 @@ chmod 755 "$BIN/pgrep"
 
 # --- harness -------------------------------------------------------------------------------------
 export MOCK_DIR="$MOCK" MOCK_CALLS="$CALLS" MOCK_BIN="$BIN" MOCK_SD="$SD"
-STATE="$HOME_DIR/state"; STATE_FILE="$STATE/guarded-reboot.json"; AUDIT="$AUDITDIR/audit.jsonl"
+STATE="$HOME_DIR/state"; STATE_FILE="$STATE/guarded-reboot.json"; AUDIT="$AUDITDIR/audit.jsonl"; export MOCK_AUDIT_FILE="$AUDIT"
 KILL="$TMP/kill-switch"; BOOTID_FILE="$TMP/boot-id"; LOADAVG="$TMP/loadavg"; CRYPTTAB="$TMP/crypttab"
 RR_FILE="$TMP/reboot-required"; PENDING_FLAG="$TMP/eeprom-pending"
 BID1=aaaaaaaa-0000-4000-8000-000000000001
@@ -251,7 +258,7 @@ reset() {
   export BROKKR_NOW_EPOCH=$NOW BROKKR_BOOT_DIR="$BOOT" BROKKR_REBOOT_REQUIRED_FILE="$RR_FILE"
   export BROKKR_CRYPTTAB="$CRYPTTAB" BROKKR_KILL_SWITCH="$KILL" BROKKR_BOOT_ID_FILE="$BOOTID_FILE"
   export BROKKR_LOADAVG_FILE="$LOADAVG" BROKKR_CGROUP_ROOT="$CG" BROKKR_EEPROM_PENDING_FLAG="$PENDING_FLAG"
-  export BROKKR_GUARDED_REBOOT_AUDIT="$AUDIT" BROKKR_STATE_DIR="$STATE" BROKKR_NOTIFY_HELPER="$TMP/notify-stub.sh"
+  export BROKKR_EEPROM_STATUS_FILE="$MOCK/eeprom-status.json" BROKKR_STATE_DIR="$STATE" BROKKR_NOTIFY_HELPER="$TMP/notify-stub.sh"
   export MOCK_KERNEL=7.0.0-38-generic
   printf '%s\n' "$BID1" >"$BOOTID_FILE"
   printf '0.10 0.10 0.10 1/100 1\n' >"$LOADAVG"
@@ -303,7 +310,7 @@ set_eeprom() { with_eeprom; printf '%s\n' "$1" >"$MOCK/eeprom.cur"; printf '%s\n
 eeprom_available() { set_eeprom 1700000000 1790000001; }
 trigger_rr() { : >"$RR_FILE"; printf 'linux-image-7.0.0-39-generic\nlibc6\n' >"$RR_FILE.pkgs"; }
 trigger_kernel() { add_kernel 7.0.0-39-generic; }
-reboot_mode() { export BROKKR_GUARDED_REBOOT_MODE=reboot; }
+reboot_mode() { export BROKKR_GUARDED_REBOOT_MODE=reboot BROKKR_GUARDED_REBOOT_PEERS=node-b.example; }
 
 echo "guarded-reboot.test.sh"
 reset
@@ -353,9 +360,16 @@ BROKKR_NOW_EPOCH=yesterday run check
 check "an invalid clock seam exits 64" '[[ "$RC" -eq 64 ]]'
 BROKKR_STATE_DIR=relative/state run check
 check "a relative state directory exits 64" '[[ "$RC" -eq 64 ]]'
-BROKKR_GUARDED_REBOOT_AUDIT='/tmp/a b.jsonl' run check
-check "an audit path with unsupported characters exits 64" '[[ "$RC" -eq 64 ]]'
 check "invalid configuration never reached sudo or systemctl" '[[ ! -s "$CALLS" ]] && no_unexpected'
+
+# Privileged arguments are constants: no environment variable changes any argument of a sudo call.
+reset; with_eeprom
+BROKKR_GUARDED_REBOOT_AUDIT=/tmp/other-audit.jsonl BROKKR_AUDIT_FILE=/tmp/other-audit.jsonl BROKKR_EEPROM_STATUS_PATH=/tmp/other-status.json run check
+check "the audit path is the constant production path whatever the environment says" 'grep -Fxq "sudo -n tee -a /var/lib/brokkr/guarded-reboot/audit.jsonl" "$CALLS" && ! grep "^sudo" "$CALLS" | grep -q "other-audit" && [[ "$(audit_count)" -eq 1 ]]'
+check "the EEPROM status file is the constant file below /run, written by root through sudo" 'grep -Fxq "sudo -n rpi-eeprom-update -j -m /run/brokkr-guarded-reboot-eeprom.json" "$CALLS" && ! grep "^sudo" "$CALLS" | grep -q "other-status"'
+check "every sudo call in a full run is one of the constant argument lists" '! grep "^sudo" "$CALLS" | grep -Ev "^sudo -n (tee -a /var/lib/brokkr/guarded-reboot/audit.jsonl|rpi-eeprom-update -j -m /run/brokkr-guarded-reboot-eeprom.json|rpi-eeprom-update -a|rpi-eeprom-update -r|systemctl reboot)$"'
+reset; with_eeprom; BROKKR_EEPROM_STATUS_FILE="$MOCK/elsewhere.json" run check
+check "the read-only status seam moves only where the result is read, never the sudo argument" 'grep -Fxq "sudo -n rpi-eeprom-update -j -m /run/brokkr-guarded-reboot-eeprom.json" "$CALLS" && [[ -s "$MOCK/elsewhere.json" ]]'
 
 # --- no trigger, state and audit format ------------------------------------------------------------------
 reset
@@ -574,16 +588,32 @@ reset; trigger_rr; printf 'swap /dev/sda3\n' >"$CRYPTTAB"; run check
 check "unlock: a missing key and options field counts as no key" 'deferred_by unlock'
 reset; trigger_rr; printf 'root UUID=1 none luks,tpm2-device=auto\n' >"$CRYPTTAB"; run check
 check "unlock: tpm2-device unlocks unattended" 'not_deferred'
+reset; trigger_rr; printf 'root UUID=1 none luks,tpm2-device=auto,tpm2-pcrs=7\n' >"$CRYPTTAB"; run check
+check "unlock: tpm2-device with options but no PIN unlocks unattended" 'not_deferred'
+reset; trigger_rr; printf 'root UUID=1 none luks,tpm2-device=auto,tpm2-pin=yes\n' >"$CRYPTTAB"; run check
+check "unlock: tpm2-device with tpm2-pin=yes asks for a PIN, so it defers and alerts" 'deferred_by unlock && notice_has "unattended reboot refused"'
 reset; trigger_rr; printf 'root UUID=1 none luks,fido2-device=auto\n' >"$CRYPTTAB"; run check
-check "unlock: fido2-device unlocks unattended" 'not_deferred'
+check "unlock: fido2-device needs a token touch, so it defers" 'deferred_by unlock'
+reset; trigger_rr; printf 'root UUID=1 none luks,fido2-device=auto,fido2-with-client-pin=no\n' >"$CRYPTTAB"; run check
+check "unlock: any fido2-with-* option defers" 'deferred_by unlock'
+reset; trigger_rr; printf 'root UUID=1 /etc/keys/root.key luks,fido2-device=auto\n' >"$CRYPTTAB"; run check
+check "unlock: a key file does not outweigh an option that can prompt" 'deferred_by unlock'
 reset; trigger_rr; printf 'root UUID=1 none luks,pkcs11-uri=auto\n' >"$CRYPTTAB"; run check
-check "unlock: pkcs11-uri unlocks unattended" 'not_deferred'
+check "unlock: pkcs11-uri defers" 'deferred_by unlock'
 reset; trigger_rr; printf 'root UUID=1 none luks,keyscript=/lib/cryptsetup/scripts/passdev\n' >"$CRYPTTAB"; run check
-check "unlock: keyscript unlocks unattended" 'not_deferred'
+check "unlock: keyscript defers (it may prompt)" 'deferred_by unlock'
+reset; trigger_rr; printf 'root UUID=1 none luks,headless=false,tpm2-device=auto\n' >"$CRYPTTAB"; run check
+check "unlock: headless=false defers even with tpm2-device" 'deferred_by unlock'
+reset; trigger_rr; printf 'root UUID=1 /etc/keys/root.key luks,pkcs11-pin=yes\n' >"$CRYPTTAB"; run check
+check "unlock: any *-pin=yes option defers" 'deferred_by unlock'
+reset; trigger_rr; printf 'root UUID=1 - luks,tpm2-device=auto\n' >"$CRYPTTAB"; run check
+check "unlock: a dash key with tpm2-device and no PIN unlocks unattended" 'not_deferred'
 reset; trigger_rr; printf 'root UUID=1 none luks,noauto\n' >"$CRYPTTAB"; run check
 check "unlock: a noauto entry is not needed at boot" 'not_deferred'
 reset; trigger_rr; printf 'swap /dev/sda3 /dev/urandom swap,cipher=aes-xts-plain64\n' >"$CRYPTTAB"; run check
-check "unlock: an entry with a key file does not need a passphrase" 'not_deferred'
+check "unlock: an entry whose key field is a key-file path does not need a passphrase" 'not_deferred'
+reset; trigger_rr; printf 'data UUID=2 keys/data.key luks\n' >"$CRYPTTAB"; run check
+check "unlock: a relative key field is not a key-file path, so it defers" 'deferred_by unlock'
 reset; trigger_rr; printf 'root UUID=1 none luks,tpm2-device=auto\ndata UUID=2 none luks\nbackup UUID=3 none luks,noauto\n' >"$CRYPTTAB"; run check
 check "unlock: a data volume without unattended unlock defers even when root has it" 'deferred_by unlock && audit_has "data" && ! audit_has "backup"'
 reset; run check
@@ -657,6 +687,12 @@ reset; reboot_mode; run check
 check "reboot mode: no trigger means no reboot" '[[ "$RC" -eq 0 && "$(reboots)" -eq 0 && "$OUT" == *"decision: none"* ]]'
 reset; reboot_mode; trigger_rr; set_who "$(who_row .)"; run check
 check "reboot mode: a guard defers instead of rebooting" 'deferred_by tty && [[ "$(audit_actions)" == "deferred " ]]'
+reset; trigger_rr; BROKKR_GUARDED_REBOOT_MODE=reboot run check
+check "reboot mode without a peer is a configuration error (exit 64) and does nothing" '[[ "$RC" -eq 64 && "$OUT" == *"at least one peer"* && "$(reboots)" -eq 0 && ! -e "$STATE_FILE" ]]'
+reset; trigger_rr; BROKKR_GUARDED_REBOOT_MODE=reboot run check --report-only
+check "--report-only does not need a peer even when the unit says reboot" '[[ "$RC" -eq 0 && "$OUT" == *"decision: would-reboot"* ]]'
+reset; BROKKR_GUARDED_REBOOT_MODE=reboot run status
+check "status and the other subcommands run without a peer" '[[ "$RC" -eq 0 ]]'
 
 reset; reboot_mode; trigger_rr; MOCK_NOTIFY_FAIL=1 run check
 check "fail-closed alert path: a notice that cannot be delivered stops the reboot, guard notify" '[[ "$RC" -eq 0 && "$(reboots)" -eq 0 && "$OUT" == *"guards: notify"* ]] && state_has "\"guards\": \"notify\","'
@@ -674,7 +710,7 @@ check "the sourced notify helper is code: a symlink is not trusted" '[[ "$(reboo
 rm -f "$TMP/notify-open.sh" "$TMP/notify-link.sh"
 
 reset; reboot_mode; trigger_rr; : >"$MOCK/audit-fail"; run check
-check "fail-closed audit: an audit write failure stops everything, exit 1" '[[ "$RC" -eq 1 && "$(reboots)" -eq 0 && "$OUT" == *"not rebooting"* ]]'
+check "fail-closed audit: an audit write failure stops everything, exit 1" '[[ "$RC" -eq 1 && "$(reboots)" -eq 0 && "$OUT" == *"nothing reboots"* ]]'
 check "fail-closed audit: nothing is notified when the audit write fails" '[[ "$(notice_count)" -eq 0 ]] && ! grep -q "^notify" "$CALLS"'
 
 reset; reboot_mode; trigger_rr; : >"$SD/list-fail.system"; run check
@@ -695,38 +731,51 @@ reset; reboot_mode; trigger_rr; MOCK_NOTIFY_KILL=1 run check
 check "final guard pass: the kill switch created while the notice is in flight stops the reboot" '[[ "$RC" -eq 0 && "$(reboots)" -eq 0 && "$OUT" == *"guards: kill-switch"* ]] && [[ "$(state_raw episode_deferrals)" -eq 0 ]]'
 
 reset; reboot_mode; trigger_rr; : >"$MOCK/reboot-fail"; run check
-check "reboot command failure: exit 1, an alert is audited, the attempt record is put back" '[[ "$RC" -eq 1 && "$(reboots)" -eq 1 ]] && audit_has "reboot command failed" && [[ "$(state_raw attempt_status)" == "\"none\"" ]] && notice_has "ALERT node-a: the reboot command failed"'
+check "reboot command failure: exit 1, the host latches at once with an audited alert" '[[ "$RC" -eq 1 && "$(reboots)" -eq 1 && "$(state_raw latch)" -eq 1 ]] && audit_line_of alert | grep -q "\"detail\":\"latched: reboot command failed (exit 1)" && notice_has "ALERT node-a: latched: reboot command failed (exit 1)"'
+check "reboot command failure: the attempt is kept, never silently restored" '[[ "$(state_raw attempt_status)" == "\"unresolved\"" && "$(state_raw attempt_boot_id)" == "\"$BID1\"" ]] && [[ "$(audit_actions)" == "reboot alert " ]]'
+night; run check
+check "reboot command failure: the next night is latched, not retried" '[[ "$OUT" == *"guards: latched"* && "$(reboots)" -eq 1 ]]'
 reset; reboot_mode; trigger_rr; echo dpkg >"$MOCK/pnames"; run check
 check "reboot mode: a running package transaction prevents the reboot" 'deferred_by apt-busy'
 check "reboot mode: nothing is staged or announced when a guard defers" '! grep -q "rpi-eeprom-update -a" "$CALLS" && ! grep -q "^notify Rebooting" "$CALLS"'
 
 # --- EEPROM staging: only inside an admitted guarded reboot ---------------------------------------------------------
+# Order in reboot mode: second full guard pass, the attempt/intent audit record, staging and its
+# verification, the confirmed notice, the final guard pass, the reboot.
 reset; reboot_mode; eeprom_available; run check
 check "eeprom: an admitted reboot stages the update once and then reboots" '[[ "$RC" -eq 0 && "$(reboots)" -eq 1 && "$(count_calls "^sudo -n rpi-eeprom-update -a$")" -eq 1 && "$(count_calls "^sudo -n rpi-eeprom-update -r$")" -eq 0 ]]'
-check "eeprom: staging comes after the second guard pass and before the audit line, notice and reboot" '[[ "$(calls_before "sudo -n rpi-eeprom-update -a" "who -u")" -ge 2 && "$(line_of "^sudo -n rpi-eeprom-update -a$")" -lt "$(line_of "^sudo -n tee -a ")" && "$(line_of "^sudo -n tee -a ")" -lt "$(line_of "^notify Rebooting")" && "$(line_of "^notify Rebooting")" -lt "$(line_of "^sudo -n systemctl reboot$")" ]]'
-check "eeprom: the reboot record notes the staged version" 'audit_line_of reboot | grep -q "eeprom-staged 1790000001" && audit_has "\"triggers\":\"eeprom\""'
+check "eeprom: the intent audit record comes after the second guard pass and BEFORE the staging, then the notice, the final pass and the reboot" '[[ "$(calls_before "sudo -n tee -a " "who -u")" -ge 2 && "$(line_of "^sudo -n tee -a ")" -lt "$(line_of "^sudo -n rpi-eeprom-update -a$")" && "$(line_of "^sudo -n rpi-eeprom-update -a$")" -lt "$(line_of "^notify Rebooting")" && "$(calls_after "notify Rebooting" "who -u")" -ge 1 && "$(line_of "^notify Rebooting")" -lt "$(line_of "^sudo -n systemctl reboot$")" ]]'
+check "eeprom: the intent record carries the identities, the planned staging and the reversal recipe" 'audit_line_of reboot | grep -q "identities eeprom=1790000001; eeprom-staging planned (version 1790000001); reversal irreversible" && audit_has "\"triggers\":\"eeprom\""'
+check "eeprom: only one audit line is written before the reboot" '[[ "$(audit_actions)" == "reboot " ]]'
 check "eeprom: the attempt identity is the available bootloader version" '[[ "$(state_raw attempt_identities)" == "\"eeprom=1790000001\"" ]]'
 check "eeprom: the update is staged when the reboot is requested" '[[ -s "$PENDING_FLAG" ]]'
-check "eeprom: every privileged EEPROM command is one of the fixed forms" '! grep "^sudo -n rpi-eeprom-update" "$CALLS" | grep -Ev "^sudo -n rpi-eeprom-update (-j -m [^ ]+|-a|-r)$"'
 reset; reboot_mode; trigger_kernel; eeprom_available; run check
-check "eeprom: a combined kernel and eeprom attempt records both identities" '[[ "$(state_raw attempt_identities)" == "\"kernel=7.0.0-39-generic,eeprom=1790000001\"" ]] && audit_line_of reboot | grep -q "eeprom-staged"'
+check "eeprom: a combined kernel and eeprom attempt records both identities" '[[ "$(state_raw attempt_identities)" == "\"kernel=7.0.0-39-generic,eeprom=1790000001\"" ]] && audit_line_of reboot | grep -q "eeprom-staging planned"'
 reset; reboot_mode; trigger_kernel; run check
-check "eeprom: without an eeprom trigger nothing is staged" '[[ "$(reboots)" -eq 1 ]] && ! grep -q "rpi-eeprom-update -a" "$CALLS"'
+check "eeprom: without an eeprom trigger nothing is staged and the record plans no staging" '[[ "$(reboots)" -eq 1 ]] && ! grep -q "rpi-eeprom-update -a" "$CALLS" && ! audit_has "eeprom-staging"'
 
-reset; reboot_mode; eeprom_available; : >"$MOCK/eeprom.stage-fail"; run check
-check "eeprom: a staging failure stops the reboot, guard eeprom-stage, nothing left staged" '[[ "$RC" -eq 0 && "$(reboots)" -eq 0 && "$OUT" == *"guards: eeprom-stage"* ]] && [[ ! -e "$PENDING_FLAG" ]] && [[ "$(count_calls "^sudo -n rpi-eeprom-update -r$")" -ge 1 ]] && ! grep -q "^notify Rebooting" "$CALLS"'
+reset; reboot_mode; eeprom_available; : >"$MOCK/audit-fail"; run check
+check "eeprom: an audit failure prevents the staging, the notice and the reboot (exit 1)" '[[ "$RC" -eq 1 && "$(reboots)" -eq 0 && ! -e "$PENDING_FLAG" && "$(notice_count)" -eq 0 ]] && ! grep -q "rpi-eeprom-update -a" "$CALLS"'
+
+reset; reboot_mode; eeprom_available; : >"$MOCK/eeprom.stage-partial"; run check
+check "eeprom: a staging failure appends the abort, cancels with -r, and stops the reboot (guard eeprom-stage)" '[[ "$RC" -eq 0 && "$(reboots)" -eq 0 && "$OUT" == *"guards: eeprom-stage"* ]] && [[ "$(audit_actions)" == "reboot deferred " ]] && audit_line_of deferred | grep -q "\"detail\":\"reboot aborted" && [[ ! -e "$PENDING_FLAG" ]] && ! grep -q "^notify Rebooting" "$CALLS"'
+check "eeprom: the abort is appended before the cancellation, and the cancellation worked, so no latch" '[[ "$(line_of "^sudo -n tee -a ")" -lt "$(line_of "^sudo -n rpi-eeprom-update -a$")" && "$(count_calls "^sudo -n tee -a ")" -eq 2 && "$(count_calls "^sudo -n rpi-eeprom-update -r$")" -eq 1 && "$(state_raw latch)" -eq 0 ]]'
+reset; reboot_mode; eeprom_available; : >"$MOCK/eeprom.stage-partial"; : >"$MOCK/eeprom.cancel-fail"; run check
+check "eeprom: if the cancellation after a staging failure fails too, the host latches (an alert starting latched)" '[[ "$RC" -eq 1 && "$(reboots)" -eq 0 && "$(state_raw latch)" -eq 1 ]] && audit_line_of alert | grep -q "\"detail\":\"latched: " && notice_has "ALERT node-a: latched: "'
+check "eeprom: and the next night is blocked by the latch and by the stray staged update" 'night; run check; [[ "$OUT" == *"latched"* && "$OUT" == *"eeprom-stray"* && "$(reboots)" -eq 0 ]]'
 reset; reboot_mode; eeprom_available; MOCK_NOTIFY_FAIL=1 run check
-check "eeprom: a notice that cannot be delivered cancels the staged update and stops the reboot" '[[ "$(reboots)" -eq 0 && ! -e "$PENDING_FLAG" && "$OUT" == *"guards: notify"* ]] && audit_has "staged EEPROM update was cancelled"'
+check "eeprom: a notice that cannot be delivered cancels the staged update and stops the reboot" '[[ "$(reboots)" -eq 0 && ! -e "$PENDING_FLAG" && "$OUT" == *"guards: notify"* ]] && [[ "$(audit_actions)" == "reboot deferred " ]] && [[ "$(count_calls "^sudo -n rpi-eeprom-update -r$")" -eq 1 ]]'
+reset; reboot_mode; eeprom_available; export MOCK_NOTIFY_FAIL=1; : >"$MOCK/eeprom.cancel-fail"; run check
+check "eeprom: an aborted reboot whose staged update cannot be cancelled latches the host" '[[ "$RC" -eq 1 && "$(state_raw latch)" -eq 1 && -e "$PENDING_FLAG" ]] && audit_line_of alert | grep -q "\"detail\":\"latched: "'
+unset MOCK_NOTIFY_FAIL
 reset; reboot_mode; eeprom_available; echo "$(who_row .)" >"$MOCK/who.out.after-notice"; run check
 check "eeprom: a guard in the final pass cancels the staged update and stops the reboot" '[[ "$(reboots)" -eq 0 && ! -e "$PENDING_FLAG" && "$OUT" == *"guards: tty"* ]]'
 reset; reboot_mode; eeprom_available; MOCK_NOTIFY_KILL=1 run check
 check "eeprom: the kill switch appearing before the reboot cancels the staged update" '[[ "$(reboots)" -eq 0 && ! -e "$PENDING_FLAG" ]]'
-reset; reboot_mode; eeprom_available; : >"$MOCK/audit-fail"; run check
-check "eeprom: an audit failure after staging cancels it, exit 1, no notice, no reboot" '[[ "$RC" -eq 1 && "$(reboots)" -eq 0 && ! -e "$PENDING_FLAG" && "$(notice_count)" -eq 0 ]]'
 reset; reboot_mode; eeprom_available; : >"$MOCK/reboot-fail"; run check
-check "eeprom: a failing reboot command cancels the staged update" '[[ "$RC" -eq 1 && ! -e "$PENDING_FLAG" ]]'
-reset; reboot_mode; eeprom_available; : >"$MOCK/eeprom.stage-fail"; : >"$MOCK/eeprom.cancel-fail"; run check
-check "eeprom: a cancel that fails after a staging failure is surfaced (exit 0 deferral, still no reboot)" '[[ "$(reboots)" -eq 0 ]]'
+check "eeprom: a failing reboot command cancels the staged update and latches with the reboot failure" '[[ "$RC" -eq 1 && ! -e "$PENDING_FLAG" && "$(state_raw latch)" -eq 1 ]] && audit_line_of alert | grep -q "\"detail\":\"latched: reboot command failed (exit 1)"'
+reset; reboot_mode; eeprom_available; : >"$MOCK/reboot-fail"; : >"$MOCK/eeprom.cancel-fail"; run check
+check "eeprom: a failing reboot command with a staged update that cannot be cancelled says so in the latch" '[[ "$RC" -eq 1 && -e "$PENDING_FLAG" ]] && audit_line_of alert | grep -q "reboot command failed (exit 1); the staged EEPROM update could not be cancelled"'
 
 reset; reboot_mode; eeprom_available; : >"$KILL"; run check
 check "eeprom: the kill switch prevents staging" 'deferred_by kill-switch && ! grep -q "rpi-eeprom-update -a" "$CALLS"'
@@ -736,6 +785,16 @@ reset; eeprom_available; run check
 check "eeprom: report mode never stages" '! grep -q "rpi-eeprom-update -a" "$CALLS"'
 reset; reboot_mode; eeprom_available; run check --report-only
 check "eeprom: --report-only never stages" '! grep -q "rpi-eeprom-update -a" "$CALLS" && [[ "$(reboots)" -eq 0 ]]'
+
+# The EEPROM status is a root-written file below /run, read unprivileged: it must be fresh and agree
+# with the command's exit status, or the status is unknown (never a trigger).
+reset; with_eeprom; eeprom_available; echo nojson >"$MOCK/eeprom.mode"
+printf '{"EXITCODE": "EXIT_UPDATE_REQUIRED", "BOOTLOADER_CURRENT": 1700000000, "BOOTLOADER_LATEST": 1790000001}\n' >"$MOCK/eeprom-status.json"
+touch -t 202001010000 "$MOCK/eeprom-status.json"
+run check
+check "eeprom status: a stale file left by an earlier run is not taken for this run's answer" '[[ "$OUT" == *"decision: none"* && "$OUT" != *"triggers: eeprom"* ]] && audit_has "stale"'
+reset; with_eeprom; eeprom_available; echo rcmismatch >"$MOCK/eeprom.mode"; run check
+check "eeprom status: a status that contradicts the command's exit status is unknown" '[[ "$OUT" == *"decision: none"* ]] && audit_has "does not match the exit status"'
 
 # A staged update found when no attempt is in progress is cancelled, audited and announced.
 reset; with_eeprom; echo "recovery 1790000000" >"$PENDING_FLAG"; run check
@@ -751,6 +810,19 @@ reset; echo "recovery 1790000000" >"$PENDING_FLAG"; run check
 check "stray staging: a host without rpi-eeprom-update is left alone" '[[ "$RC" -eq 0 ]] && ! grep -q "rpi-eeprom-update" "$CALLS"'
 reset; with_eeprom; run check
 check "stray staging: nothing staged means no cancel call" '! grep -q "rpi-eeprom-update -r" "$CALLS"'
+
+# A stray staged update that cannot be cancelled blocks admission until a later run cancels it.
+reset; reboot_mode; with_eeprom; trigger_rr; echo "recovery 1790000000" >"$PENDING_FLAG"; : >"$MOCK/eeprom.cancel-fail"; run check
+check "stray staging: a failed cancellation blocks the reboot with the guard eeprom-stray and exit 1" '[[ "$RC" -eq 1 && "$(reboots)" -eq 0 && "$OUT" == *"guards: eeprom-stray"* ]] && ! grep -q "rpi-eeprom-update -a" "$CALLS" && ! grep -q "^notify Rebooting" "$CALLS"'
+check "stray staging: the alert was audited and delivered before the run returned" 'audit_line_of alert | grep -q "\"detail\":\"eeprom-cancel-failed" && notice_has "ALERT node-a: eeprom-cancel-failed"'
+rm -f "$MOCK/eeprom.cancel-fail"; night; run check
+check "stray staging: the block persists only until a later run cancels successfully, then the night proceeds" '[[ ! -e "$PENDING_FLAG" && "$(reboots)" -eq 1 ]] && audit_has "eeprom-cancelled"'
+reset; reboot_mode; with_eeprom; trigger_rr; echo "recovery 1790000000" >"$PENDING_FLAG"; : >"$MOCK/eeprom.cancel-fail"; run check; night; run check
+check "stray staging: while it cannot be cancelled every night stays blocked" '[[ "$(reboots)" -eq 0 && "$OUT" == *"guards: eeprom-stray"* ]]'
+reset; with_eeprom; trigger_rr; echo "recovery 1790000000" >"$PENDING_FLAG"; run check --report-only
+check "stray staging: --report-only may not cancel, so it reports the block instead of a would-reboot" 'deferred_by eeprom-stray'
+reset; with_eeprom; echo "recovery 1790000000" >"$PENDING_FLAG"; : >"$MOCK/eeprom.cancel-fail"; run check
+check "stray staging: with no trigger the failed cancellation is still alerted, audited and exit 1" '[[ "$RC" -eq 1 ]] && audit_has "eeprom-cancel-failed" && [[ "$OUT" == *"decision: none"* ]]'
 
 # --- post-boot: the health check after a guarded reboot ---------------------------------------------------------------
 # attempt: a reboot-mode night that reboots for the reboot-required trigger (BID1); after_reboot: the
@@ -782,35 +854,95 @@ attempt; after_reboot; : >"$SD/failed-fail.system"; run post-boot
 check "post-boot issues: failed units that cannot be listed are an issue, not a pass" 'audit_line_of post-boot-issues | grep -q "cannot query the failed system units"'
 attempt; after_reboot; : >"$SD/list-fail.user"; run post-boot
 check "post-boot issues: user services that cannot be listed are an issue" 'audit_line_of post-boot-issues | grep -q "cannot list the running user services"'
-attempt; printf '%s\n' "$BID2" >"$BOOTID_FILE"; advance 600; run post-boot
-check "post-boot issues: the same trigger identity still pending after the reboot" '[[ "$(audit_actions)" == "reboot post-boot-issues alert " ]] && audit_line_of post-boot-issues | grep -q "trigger identity still pending after the reboot: reboot-required=" && [[ "$(state_raw latch)" -eq 1 ]]'
-attempt; printf '%s\n' "$BID2" >"$BOOTID_FILE"; advance 600; printf 'linux-image-9.9.9\n' >"$RR_FILE.pkgs"; run post-boot
-check "post-boot: a trigger with a different identity is a note, not an issue, and does not latch" '[[ "$(audit_actions)" == "reboot post-boot-ok " && "$(state_raw latch)" -eq 0 ]] && audit_line_of post-boot-ok | grep -q "new trigger since the reboot: reboot-required="'
 
+# The recorded targets are verified positively; an unknown observation is an issue and latches.
+attempt; printf '%s\n' "$BID2" >"$BOOTID_FILE"; advance 600; run post-boot
+check "post-boot issues: the reboot-required flag still present with the same identity" '[[ "$(audit_actions)" == "reboot post-boot-issues alert " ]] && audit_line_of post-boot-issues | grep -q "the reboot-required flag is still present with the same identity" && [[ "$(state_raw latch)" -eq 1 ]]'
+attempt; printf '%s\n' "$BID2" >"$BOOTID_FILE"; advance 600; printf 'linux-image-9.9.9\n' >"$RR_FILE.pkgs"; run post-boot
+check "post-boot: a reboot-required flag whose identity changed is a note, not an issue, and does not latch" '[[ "$(audit_actions)" == "reboot post-boot-ok " && "$(state_raw latch)" -eq 0 ]] && audit_line_of post-boot-ok | grep -q "new trigger since the reboot: reboot-required="'
+
+attempt_kernel() { reset; reboot_mode; trigger_kernel; run check; printf '%s\n' "$BID2" >"$BOOTID_FILE"; advance 600; }
+attempt_kernel; export MOCK_KERNEL=7.0.0-39-generic; run post-boot
+check "post-boot kernel attempt: the running kernel equals the recorded expected version" '[[ "$(audit_actions)" == "reboot post-boot-ok " && "$(state_raw attempt_status)" == "\"ok\"" ]]'
+attempt_kernel; run post-boot
+check "post-boot kernel attempt: still running the old kernel is an issue and latches" '[[ "$(audit_actions)" == "reboot post-boot-issues alert " && "$(state_raw latch)" -eq 1 ]] && audit_line_of post-boot-issues | grep -q "running kernel is 7.0.0-38-generic, the attempt expected 7.0.0-39-generic"'
+attempt_kernel; export MOCK_KERNEL=7.0.0-40-generic; run post-boot
+check "post-boot kernel attempt: any kernel other than the recorded one is an issue, even a newer one" 'audit_line_of post-boot-issues | grep -q "the attempt expected 7.0.0-39-generic"'
+
+attempt_eeprom() { reset; reboot_mode; eeprom_available; run check; rm -f "$PENDING_FLAG" "$MOCK/eeprom-status.json"; printf '%s\n' "$BID2" >"$BOOTID_FILE"; advance 600; }
+attempt_eeprom; set_eeprom 1790000001 1790000001; run post-boot
+check "post-boot EEPROM attempt: a successful status read at the recorded target is verified" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
+attempt_eeprom; set_eeprom 1790000009 1790000009; run post-boot
+check "post-boot EEPROM attempt: a bootloader newer than the target is fine" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
+attempt_eeprom; set_eeprom 1700000000 1790000001; run post-boot
+check "post-boot EEPROM attempt: a bootloader still below the target is an issue and latches" '[[ "$(audit_actions)" == "reboot post-boot-issues alert " && "$(state_raw latch)" -eq 1 ]] && audit_line_of post-boot-issues | grep -q "bootloader is 1700000000, the attempt expected at least 1790000001"'
+attempt_eeprom; echo nojson >"$MOCK/eeprom.mode"; run post-boot
+check "post-boot EEPROM attempt: an unknown status is an issue, never a pass" 'audit_line_of post-boot-issues | grep -q "bootloader version unknown after the reboot" && [[ "$(state_raw latch)" -eq 1 ]]'
+attempt_eeprom; set_eeprom 1790000001 1790000001; rm -f "$BIN/rpi-eeprom-update"; run post-boot
+check "post-boot EEPROM attempt: a host that lost rpi-eeprom-update cannot verify, which is an issue" 'audit_line_of post-boot-issues | grep -q "rpi-eeprom-update is missing"'
+attempt_eeprom; set_eeprom 1790000001 1790000001; echo rcmismatch >"$MOCK/eeprom.mode"; run post-boot
+check "post-boot EEPROM attempt: a contradictory status is unknown, hence an issue" 'audit_line_of post-boot-issues | grep -q "does not match the exit status"'
+reset; reboot_mode; trigger_kernel; eeprom_available; trigger_rr; run check; rm -f "$PENDING_FLAG" "$RR_FILE" "$RR_FILE.pkgs"; printf '%s\n' "$BID2" >"$BOOTID_FILE"; advance 600; export MOCK_KERNEL=7.0.0-39-generic; set_eeprom 1790000001 1790000001; run post-boot
+check "post-boot: an attempt for several triggers is verified for each of them" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
+reset; reboot_mode; trigger_kernel; eeprom_available; run check; rm -f "$PENDING_FLAG"; printf '%s\n' "$BID2" >"$BOOTID_FILE"; advance 600; export MOCK_KERNEL=7.0.0-39-generic; set_eeprom 1700000000 1790000001; run post-boot
+check "post-boot: one target missed among several is enough for an issue" 'audit_line_of post-boot-issues | grep -q "bootloader is 1700000000" && ! audit_line_of post-boot-issues | grep -q "running kernel is"'
+
+# Outcome durability: the outcome is appended BEFORE it is persisted.
+attempt; after_reboot; : >"$MOCK/audit-fail"; run post-boot
+check "outcome durability: if the post-boot record cannot be appended the attempt stays unresolved, exit 1" '[[ "$RC" -eq 1 && "$(state_raw attempt_status)" == "\"unresolved\"" && "$(state_raw latch)" -eq 0 ]] && ! audit_has "post-boot-ok"'
+check "outcome durability: the notice still goes out" 'notice_has "back up: node-a kernel 7.0.0-38-generic; health OK"'
+rm -f "$MOCK/audit-fail"; advance 10800; run check
+check "outcome durability: the next check latches the unverified attempt as missing verification" '[[ "$(state_raw latch)" -eq 1 ]] && audit_line_of alert | grep -q "post-boot verification missing"'
+attempt; after_reboot; set_running system alpha.service; : >"$MOCK/audit-fail"; run post-boot
+check "outcome durability: failing issues are not persisted either (no latch, still unresolved), and the issue notice goes out" '[[ "$RC" -eq 1 && "$(state_raw attempt_status)" == "\"unresolved\"" && "$(state_raw latch)" -eq 0 ]] && notice_has "issues: system services not running again: beta.service"'
+
+# On-demand exemptions: only Type=dbus, a BusName, a TriggeredBy or a transient unit may be down.
+# A static or indirect unit file proves nothing about whether the service is long-running.
 attempt; after_reboot; set_running system alpha.service
-show_fixture system beta.service "Type=dbus" "UnitFileState=enabled" "TriggeredBy="
+show_fixture system beta.service "Type=dbus" "BusName=org.example.Svc" "UnitFileState=static" "TriggeredBy="
 run post-boot
-check "post-boot ignores a D-Bus activated service that is not running" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
+check "on-demand: a static D-Bus activated service that is not running is exempt" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
 attempt; after_reboot; set_running system alpha.service
-show_fixture system beta.service "Type=simple" "UnitFileState=static" "TriggeredBy="
+show_fixture system beta.service "Type=simple" "BusName=org.example.Svc" "UnitFileState=enabled" "TriggeredBy="
 run post-boot
-check "post-boot ignores a static unit that is not running" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
+check "on-demand: a service with a BusName is exempt" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
 attempt; after_reboot; set_running system alpha.service
-show_fixture system beta.service "Type=simple" "UnitFileState=indirect" "TriggeredBy="
+show_fixture system beta.service "Type=simple" "BusName=" "UnitFileState=enabled" "TriggeredBy=beta.socket"
 run post-boot
-check "post-boot ignores an indirect unit that is not running" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
+check "on-demand: a socket-activated service is exempt" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
 attempt; after_reboot; set_running system alpha.service
-show_fixture system beta.service "Type=simple" "UnitFileState=enabled" "TriggeredBy=beta.socket"
+show_fixture system beta.service "Type=simple" "BusName=" "UnitFileState=transient" "TriggeredBy="
 run post-boot
-check "post-boot ignores a socket-activated service that is not running" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
+check "on-demand: a transient unit is exempt" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
+attempt; after_reboot; set_running system alpha.service
+show_fixture system beta.service "Type=simple" "BusName=" "UnitFileState=static" "TriggeredBy="
+run post-boot
+check "on-demand: a static long-running service that disappeared is an issue (no blanket static exemption)" '[[ "$(audit_actions)" == "reboot post-boot-issues alert " ]] && audit_line_of post-boot-issues | grep -q "system services not running again: beta.service"'
+attempt; after_reboot; set_running system alpha.service
+show_fixture system beta.service "Type=simple" "BusName=" "UnitFileState=indirect" "TriggeredBy="
+run post-boot
+check "on-demand: an indirect unit file is not an exemption either" '[[ "$(audit_actions)" == "reboot post-boot-issues alert " ]]'
 attempt; after_reboot; set_running user
-show_fixture user agent.service "Type=dbus" "UnitFileState=enabled" "TriggeredBy="
+show_fixture user agent.service "Type=dbus" "BusName=" "UnitFileState=enabled" "TriggeredBy="
 run post-boot
-check "post-boot ignores an on-demand user service" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
+check "on-demand: a Type=dbus user service is exempt" '[[ "$(audit_actions)" == "reboot post-boot-ok " ]]'
 attempt; after_reboot; set_running system alpha.service
-show_fixture system beta.service "Type=simple" "UnitFileState=enabled" "TriggeredBy="
+show_fixture system beta.service "Type=simple" "BusName=" "UnitFileState=enabled" "TriggeredBy="
 run post-boot
 check "post-boot: an enabled long-running service that is missing is an issue" '[[ "$(audit_actions)" == "reboot post-boot-issues alert " ]]'
+
+# safe_text and the state validator agree: an escaped unit name and every replaced character
+# round-trips through write, load, status and clear-latch.
+reset; reboot_mode; trigger_rr; set_running system alpha.service 'foo\x2dbar.service'; run check
+check "round trip: an escaped unit name is written to the baseline as valid JSON" 'json_ok "$STATE_FILE" && grep -Fq "foo\\\\x2dbar.service" "$STATE_FILE"'
+after_reboot; set_failed system 'bad\x2dunit.service'; run post-boot
+check "round trip: a failed escaped unit name lands in the audit and the state (replaced characters become ?)" 'audit_line_of post-boot-issues | grep -q "failed system units: bad?x2dunit.service" && json_ok "$STATE_FILE"'
+run status
+check "round trip: status reads the state back" '[[ "$RC" -eq 0 && "$OUT" == *"LATCH: automatic reboots are OFF"* && "$OUT" == *"bad?x2dunit"* ]]'
+run clear-latch
+check "round trip: clear-latch reads and rewrites it" '[[ "$RC" -eq 0 && "$(state_raw latch)" -eq 0 ]] && grep -Fq "foo\\\\x2dbar.service" "$STATE_FILE"'
+night; run check
+check "round trip: the next nightly check loads the rewritten state" '[[ "$RC" -eq 0 ]]'
 
 reset; reboot_mode; trigger_rr; set_running system alpha.service brokkr-guarded-reboot.service brokkr-post-boot-check.service run-r1234.service; run check
 check "the baseline leaves out this job's own units and transient run units" '! grep -q "brokkr-guarded-reboot" "$STATE_FILE" && ! grep -q "brokkr-post-boot-check" "$STATE_FILE" && ! grep -q "run-r1234" "$STATE_FILE"'
@@ -847,7 +979,7 @@ check "clear-latch: if the audit append fails the latch stays, exit 1" '[[ "$RC"
 attempt; advance 3600; run check
 check "unresolved attempt within the grace period: guard attempt-pending, no latch" '[[ "$OUT" == *"guards: attempt-pending"* ]] && [[ "$(state_raw latch)" -eq 0 && "$(reboots)" -eq 1 ]]'
 attempt; advance 10800; run check
-check "unresolved attempt, boot id unchanged: latched as reboot did not happen" '[[ "$OUT" == *"guards: latched"* && "$(state_raw latch)" -eq 1 && "$(reboots)" -eq 1 ]] && audit_line_of alert | grep -q "\"detail\":\"latched: automatic reboots are off: reboot did not happen"'
+check "unresolved attempt, boot id unchanged: latched as reboot did not happen" '[[ "$OUT" == *"guards: latched"* && "$(state_raw latch)" -eq 1 && "$(reboots)" -eq 1 ]] && audit_line_of alert | grep -q "\"detail\":\"latched: reboot did not happen"'
 attempt; after_reboot; advance 10800; trigger_rr; run check
 check "unresolved attempt, rebooted but no post-boot result: latched as post-boot verification missing" '[[ "$OUT" == *"guards: latched"* && "$(state_raw latch)" -eq 1 && "$(reboots)" -eq 1 ]] && audit_line_of alert | grep -q "post-boot verification missing"'
 attempt; after_reboot; advance 10800; run check
@@ -876,7 +1008,7 @@ check "health: the audit lines keep the agreed shape (empty triggers and guards)
 
 reset; run check; set_failed user bad.service; advance 3600; run health
 check "health: a failed user unit is an issue" 'audit_line_of health-issues | grep -q "failed user units: bad.service"'
-reset; run check; set_running system alpha.service; show_fixture system beta.service "Type=dbus" "UnitFileState=enabled" "TriggeredBy="; advance 3600; run health
+reset; run check; set_running system alpha.service; show_fixture system beta.service "Type=dbus" "BusName=" "UnitFileState=enabled" "TriggeredBy="; advance 3600; run health
 check "health ignores on-demand units as post-boot does" '[[ "$(audit_actions)" == "none " ]]'
 reset; run check; advance 259200; run health
 check "health: a baseline older than two days means the nightly check stopped, audited" 'audit_line_of health-issues | grep -q "pre-update baseline is stale"'
