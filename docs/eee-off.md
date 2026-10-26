@@ -92,8 +92,10 @@ than prompt. Before changing anything it refuses when:
 - the managed instance reports `enabled` but has no
   `sys-subsystem-net-devices-<iface>.device.wants/` link, which is what re-applies
   the setting when the interface comes back;
-- the operator cannot read every file and directory in the unit directory. systemd
-  reads them as root, so an unreadable file could still set EEE;
+- a file, directory listing or link in the unit directory cannot be read through
+  `sudo -n`. systemd reads unit files as root and some are root-only (mode 600),
+  so every scan reads as root rather than as the operator. A read that `sudo -n`
+  refuses stops the deploy instead of counting as "no match";
 - a backup for this revision already exists.
 
 Only `/etc/systemd/system` is scanned. Units under `/run` or `/usr/lib` and other

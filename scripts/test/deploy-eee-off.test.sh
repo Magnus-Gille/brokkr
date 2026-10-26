@@ -54,7 +54,16 @@ printf 'sudo %s\n' "$*" >>"$MOCK_CALLS"
 if [[ "${MOCK_SUDO_DENY:-0}" == 1 ]]; then echo "sudo: a password is required" >&2; exit 1; fi
 [[ "${1:-}" == -n ]] || { echo "fake sudo: -n required" >&2; exit 99; }
 shift
-exec "$@"
+if [[ -n "${MOCK_SUDO_DENY_CMD:-}" && "${1:-}" == "$MOCK_SUDO_DENY_CMD" ]]; then
+  echo "sudo: a password is required" >&2; exit 1
+fi
+# Root can read root-only paths (mode 000 for the operator here): lift their mode
+# for this one command, then restore it, innermost first.
+read -r -a root_only <<<"${MOCK_ROOT_ONLY:-}"
+for p in "${root_only[@]}"; do chmod u+rwx "$p"; done
+"$@"; rc=$?
+for (( i=${#root_only[@]}-1; i>=0; i-- )); do chmod 000 "${root_only[i]}"; done
+exit "$rc"
 FAKE
 # The fake systemctl runs a started unit's ExecStart (with %i expanded), so the
 # rendered unit is exercised end to end against the fake ethtool.
@@ -324,15 +333,40 @@ for mode in dry-run apply; do
   reset; seed_legacy; echo not-found >"$STATE/enabled.$INSTANCE"
   printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee %%i eee off\n' >"$MANAGED"
   refuses "$mode: an instance reported not-found while its template exists refuses" "not-found" "${args[@]}"
-  # Inspection must be complete: systemd reads these as root, the operator may not.
+  # systemd reads unit files as root and some are root-only (mode 600), so every scan
+  # reads through sudo -n. What even sudo -n cannot read or list refuses.
   if [[ "$(/usr/bin/id -u)" != 0 ]]; then
+    reset; seed_legacy; printf '[Service]\nExecStart=/usr/local/bin/build-cleanup\n' >"$UNIT_DIR/build-cleanup.service"; chmod 000 "$UNIT_DIR/build-cleanup.service"
+    MOCK_ROOT_ONLY="$UNIT_DIR/build-cleanup.service" run "${args[@]}"
+    check "$mode: a root-only unit without an EEE command is read through sudo -n and accepted" '[[ "$RC" -eq 0 ]] && grep -Fq "sudo -n cat -- $UNIT_DIR/build-cleanup.service" "$CALLS"'
+    chmod 644 "$UNIT_DIR/build-cleanup.service"
+    reset; seed_legacy; printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee eth0 eee on\n' >"$UNIT_DIR/root-eee.service"; chmod 000 "$UNIT_DIR/root-eee.service"
+    MOCK_ROOT_ONLY="$UNIT_DIR/root-eee.service" refuses "$mode: a root-only unit that sets EEE refuses" "root-eee.service also sets EEE" "${args[@]}"
+    chmod 644 "$UNIT_DIR/root-eee.service"
+    reset; seed_legacy; mkdir -p "$UNIT_DIR/locked.service.d"
+    printf '[Service]\nExecStartPost=/usr/sbin/ethtool --set-eee eth0 eee on\n' >"$UNIT_DIR/locked.service.d/eee.conf"
+    chmod 000 "$UNIT_DIR/locked.service.d/eee.conf" "$UNIT_DIR/locked.service.d"
+    MOCK_ROOT_ONLY="$UNIT_DIR/locked.service.d $UNIT_DIR/locked.service.d/eee.conf" \
+      refuses "$mode: a drop-in in a root-only directory that sets EEE refuses" "locked.service.d/eee.conf" "${args[@]}"
+    chmod 755 "$UNIT_DIR/locked.service.d"; chmod 644 "$UNIT_DIR/locked.service.d/eee.conf"
+    reset; seed_legacy; mkdir -p "$UNIT_DIR/locked.target.wants"; chmod 000 "$UNIT_DIR/locked.target.wants"
+    MOCK_ROOT_ONLY="$UNIT_DIR/locked.target.wants" run "${args[@]}"
+    check "$mode: a root-only directory without an EEE command is listed through sudo -n and accepted" '[[ "$RC" -eq 0 ]]'
+    chmod 755 "$UNIT_DIR/locked.target.wants"
     reset; seed_legacy; printf '[Service]\nExecStart=/usr/sbin/ethtool --set-eee eth0 eee on\n' >"$UNIT_DIR/secret.service"; chmod 000 "$UNIT_DIR/secret.service"
-    refuses "$mode: an unreadable unit file refuses" "cannot read secret.service" "${args[@]}"
+    refuses "$mode: a unit file even sudo -n cannot read refuses" "could not read secret.service with sudo -n" "${args[@]}"
     chmod 644 "$UNIT_DIR/secret.service"
     reset; seed_legacy; mkdir -p "$UNIT_DIR/locked.target.wants"; chmod 000 "$UNIT_DIR/locked.target.wants"
-    refuses "$mode: an unreadable unit directory refuses" "could not read every directory" "${args[@]}"
+    refuses "$mode: a directory even sudo -n cannot list refuses" "with sudo -n" "${args[@]}"
     chmod 755 "$UNIT_DIR/locked.target.wants"
   fi
+  # Fail closed when sudo -n itself refuses a read or a listing.
+  reset; seed_legacy
+  MOCK_SUDO_DENY_CMD="cat" refuses "$mode: sudo -n refusing to read a unit refuses" "with sudo -n" "${args[@]}"
+  reset; seed_legacy
+  MOCK_SUDO_DENY_CMD="find" refuses "$mode: sudo -n refusing to list the unit directory refuses" "could not list" "${args[@]}"
+  reset; seed_legacy
+  MOCK_SUDO_DENY_CMD="readlink" refuses "$mode: sudo -n refusing to read a link refuses" "with sudo -n" "${args[@]}"
   reset; seed_legacy; echo enabled-runtime >"$STATE/enabled.eth0-eee-off.service"
   refuses "$mode: an ad-hoc unit in an unsupported enablement state refuses" "enabled-runtime" "${args[@]}"
 done

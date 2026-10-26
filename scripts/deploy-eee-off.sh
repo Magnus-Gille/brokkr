@@ -143,13 +143,17 @@ iface_re=$(printf '%s' "$IFACE" | sed 's/[.]/[.]/g')
 # spacing in another unit cannot hide it, while eth01 or eth0.device do not match.
 tok_re="(^|[^A-Za-z0-9_.])$iface_re([^A-Za-z0-9_.]|\$)"
 instance_link=$unit_dir/sys-subsystem-net-devices-$IFACE.device.wants/$instance
-# grep for the scans below. systemd reads unit files as root, so a file the operator
-# cannot read, or a read error, refuses instead of counting as "no match".
+# systemd reads unit files as root and some are root-only (mode 600), so every file,
+# listing and link below is read through sudo -n. A read that fails refuses instead
+# of counting as "no match".
+root_cat() { sudo -n cat -- "$1" </dev/null 2>/dev/null; }
 scan_has() { # extended-regex file
-  [ -r "$2" ] || refuse "cannot read ${2#"$unit_dir"/} as $user; inspect it as root"
-  if grep -Eq -e "$1" "$2"; then return 0; else rc=$?; fi
-  [ "$rc" = 1 ] || refuse "could not scan ${2#"$unit_dir"/} (grep exit $rc)"
-  return 1
+  if ! content=$(root_cat "$2"); then
+    # A dangling link (a unit removed without being disabled) runs nothing.
+    if [ -L "$2" ] && [ ! -e "$2" ]; then return 1; fi
+    refuse "could not read ${2#"$unit_dir"/} with sudo -n; inspect it as root"
+  fi
+  printf '%s\n' "$content" | grep -Eq -e "$1"
 }
 # A file owns EEE on this interface when it runs --set-eee anywhere and names the
 # interface (or, for a template, %i/%I) anywhere. Deliberately broad: systemd
@@ -157,9 +161,12 @@ scan_has() { # extended-regex file
 owns_eee() { # file token-regex
   scan_has '--set-eee' "$1" && scan_has "$2" "$1"
 }
-# Every directory must be readable, or a glob below could silently skip it.
-find "$unit_dir" >/dev/null 2>&1 \
-  || refuse "could not read every directory under $unit_dir as $user; inspect it as root"
+# Listed as root, so a root-only directory cannot hide an entry. Unit names cannot
+# contain whitespace; entries are split on newlines with globbing off.
+listing=$(sudo -n find "$unit_dir" -mindepth 1 -print </dev/null 2>/dev/null) \
+  || refuse "could not list $unit_dir with sudo -n; inspect it as root"
+nl='
+'
 
 # The committed template must be the one this script expects, then it is rendered.
 [ "$(grep -Fxc 'ExecStart=@ETHTOOL@ --set-eee %i eee off' "$work/template")" = 1 ] \
@@ -172,19 +179,21 @@ legacy_enabled=
 if [ -e "$legacy" ] || [ -L "$legacy" ]; then
   [ -f "$legacy" ] && [ ! -L "$legacy" ] || refuse "$legacy_name is not a regular non-symlink file; inspect it manually"
   [ ! -e "$legacy.d" ] && [ ! -L "$legacy.d" ] || refuse "$legacy_name has a drop-in directory; adopt it manually"
+  legacy_content=$(root_cat "$legacy") || refuse "could not read $legacy_name with sudo -n; inspect it as root"
+  legacy_grep() { printf '%s\n' "$legacy_content" | grep "$@"; }
   # Only the exact shape this deploy replaces is adopted, because the unit is then
   # deleted: one Exec directive, which runs ethtool by absolute path with exactly
   # these arguments.
-  [ "$(grep -Ec '^[[:space:]]*Exec[A-Za-z]*[[:space:]]*=' "$legacy")" = 1 ] \
-    && grep -Eq -e "^ExecStart=/([A-Za-z0-9._-]+/)*ethtool[[:space:]]+--set-eee[[:space:]]+$iface_re[[:space:]]+eee[[:space:]]+off[[:space:]]*\$" "$legacy" \
+  [ "$(legacy_grep -Ec '^[[:space:]]*Exec[A-Za-z]*[[:space:]]*=')" = 1 ] \
+    && legacy_grep -Eq -e "^ExecStart=/([A-Za-z0-9._-]+/)*ethtool[[:space:]]+--set-eee[[:space:]]+$iface_re[[:space:]]+eee[[:space:]]+off[[:space:]]*\$" \
     || refuse "$legacy_name is not the ad-hoc EEE-off unit (exactly one Exec line, ExecStart=/.../ethtool --set-eee $IFACE eee off); inspect it manually"
   # Disabling a unit acts on everything its [Install] section names (Also=, Alias=),
   # so only directives without side effects on other units are accepted.
   allowed='Description|Documentation|After|Before|BindsTo|Requires|Wants|PartOf|Type|RemainAfterExit|ExecStart|WantedBy'
-  if bad=$(grep -Ev '^[[:space:]]*($|[#;]|\[)' "$legacy" | grep -Ev "^($allowed)=" | head -n 1) && [ -n "$bad" ]; then
+  if bad=$(legacy_grep -Ev '^[[:space:]]*($|[#;]|\[)' | grep -Ev "^($allowed)=" | head -n 1) && [ -n "$bad" ]; then
     refuse "$legacy_name is not the ad-hoc EEE-off unit (unsupported directive ${bad%%=*}); inspect it manually"
   fi
-  [ "$(grep -Ec '^WantedBy=' "$legacy")" = 1 ] && grep -Fxq "WantedBy=sys-subsystem-net-devices-$IFACE.device" "$legacy" \
+  [ "$(legacy_grep -Ec '^WantedBy=')" = 1 ] && legacy_grep -Fxq "WantedBy=sys-subsystem-net-devices-$IFACE.device" \
     || refuse "$legacy_name is not the ad-hoc EEE-off unit (it must have exactly WantedBy=sys-subsystem-net-devices-$IFACE.device); inspect it manually"
   legacy_present=1
   legacy_enabled=$(systemctl is-enabled "$legacy_name" 2>/dev/null || true)
@@ -212,36 +221,59 @@ if [ "$legacy_present" = 1 ]; then
   # Disabling removes every link to the unit, but the rollback can only recreate the
   # device dependency its [Install] section declares, so no other link may exist.
   wanted_link=$unit_dir/sys-subsystem-net-devices-$IFACE.device.wants/$legacy_name
-  links=$(find "$unit_dir" -type l) || refuse "could not list the links under $unit_dir"
+  links=$(sudo -n find "$unit_dir" -mindepth 1 -type l -print </dev/null 2>/dev/null) \
+    || refuse "could not list the links under $unit_dir with sudo -n"
+  old_ifs=$IFS; IFS=$nl; set -f
   for f in $links; do
-    target=$(readlink "$f" 2>/dev/null) || continue
+    target=$(sudo -n readlink -- "$f" </dev/null 2>/dev/null) \
+      || refuse "could not read the link ${f#"$unit_dir"/} with sudo -n"
     [ "${target##*/}" = "$legacy_name" ] || [ "${f##*/}" = "$legacy_name" ] || continue
     [ "$f" = "$wanted_link" ] \
       || refuse "${f#"$unit_dir"/} links to $legacy_name beyond its device dependency; remove it or adopt the unit manually"
   done
+  IFS=$old_ifs; set +f
 fi
 # Any other unit or drop-in that already sets EEE on this interface, to any value,
 # would make two owners of one setting.
-for f in "$unit_dir"/*.service "$unit_dir"/*.service.d/*.conf; do
-  [ -e "$f" ] || [ -L "$f" ] || continue
+old_ifs=$IFS; IFS=$nl; set -f
+for f in $listing; do
   name=${f#"$unit_dir"/}
+  case $name in
+    */*/*) continue ;;
+    *.service.d/*.conf) ;;
+    */*) continue ;;
+    *.service) ;;
+    *) continue ;;
+  esac
   case $name in "$legacy_name"|"$template_name") continue ;; esac
   if owns_eee "$f" "$tok_re"; then
     refuse "$name also sets EEE on $IFACE; adopt or remove it manually so that only one unit owns this setting"
   fi
 done
 # An enabled instance of another template whose command sets EEE on its instance.
-for f in "$unit_dir"/*.wants/*@"$IFACE".service "$unit_dir"/*.requires/*@"$IFACE".service; do
-  [ -e "$f" ] || [ -L "$f" ] || continue
+for f in $listing; do
+  case ${f#"$unit_dir"/} in
+    */*/*) continue ;;
+    *.wants/*@"$IFACE".service|*.requires/*@"$IFACE".service) ;;
+    *) continue ;;
+  esac
   name=${f##*/}
   [ "$name" != "$instance" ] || continue
-  for g in "$f" "$unit_dir/${name%%@*}@.service" "$unit_dir/${name%%@*}@.service.d"/*.conf "$unit_dir/$name.d"/*.conf; do
-    [ -e "$g" ] || continue
+  # The enabled link itself (its target is the template wherever it lives), plus
+  # the template, its drop-ins and the instance's drop-ins in this directory.
+  for g in "$f" $listing; do
+    if [ "$g" != "$f" ]; then
+      case ${g#"$unit_dir"/} in
+        "${name%%@*}@.service"|"${name%%@*}@.service.d/"*.conf|"$name.d/"*.conf) ;;
+        *) continue ;;
+      esac
+    fi
     if owns_eee "$g" "%[iI]|$tok_re"; then
       refuse "$name is enabled and also sets EEE on $IFACE; disable it manually so that only one unit owns this setting"
     fi
   done
 done
+IFS=$old_ifs; set +f
 managed_present=0
 if [ -e "$managed" ] || [ -L "$managed" ]; then
   [ -f "$managed" ] && [ ! -L "$managed" ] || refuse "$template_name is not a regular non-symlink file; inspect it manually"
