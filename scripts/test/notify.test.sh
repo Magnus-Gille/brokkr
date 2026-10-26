@@ -107,5 +107,47 @@ check "a config file missing an unrelated key does not abort the caller" test "$
 check "the lookup falls through to the direct Telegram fallback" \
   grep -q 'api.telegram.org/botfake-bot-token/sendMessage' "$CALLS"
 
+# notify_telegram_confirmed returns 0 only when delivery was confirmed (HTTP 200 from the
+# endpoint that took the request); everything else is a non-zero status. notify_telegram
+# itself stays best-effort and always returns 0.
+run_confirmed() {
+  set +e
+  env -i \
+    HOME="$TMP/home" \
+    PATH="$TMP/bin:/usr/local/bin:/usr/bin:/bin" \
+    MOCK_CALLS="$CALLS" \
+    RATATOSKR_ENV="$TMP/missing-ratatoskr.env" \
+    NOTIFY_ENV="$TMP/missing-notify.env" \
+    "$@" \
+    bash -c 'set -euo pipefail; source "$1"; notify_telegram_confirmed "synthetic alert"' _ "$LIB" \
+    >"$TMP/confirmed.out" 2>&1
+  CONFIRMED_RC=$?
+  set -e
+}
+: >"$CALLS"
+run_confirmed TELEGRAM_ALLOWED_USERS=123456789
+check "confirmed: an unconfigured notifier is not a delivery" test "$CONFIRMED_RC" -ne 0
+check "confirmed: an unconfigured notifier performs no network request" test ! -s "$CALLS"
+: >"$CALLS"
+run_confirmed TELEGRAM_ALLOWED_USERS=123456789 RATATOSKR_URL=http://ratatoskr.example/api/send \
+  RATATOSKR_SEND_API_KEY=fake-send-key
+check "confirmed: Ratatoskr HTTP 200 is a delivery" test "$CONFIRMED_RC" -eq 0
+check "confirmed: the send key stays out of process arguments" sh -c '! grep "^argv=.*fake-send-key" "$1"' _ "$CALLS"
+: >"$CALLS"
+run_confirmed TELEGRAM_ALLOWED_USERS=123456789 RATATOSKR_URL=http://ratatoskr.example/api/send \
+  RATATOSKR_SEND_API_KEY=fake-send-key MOCK_RAT_CODE=503
+check "confirmed: Ratatoskr failure without a bot token is not a delivery" test "$CONFIRMED_RC" -ne 0
+: >"$CALLS"
+run_confirmed TELEGRAM_ALLOWED_USERS=123456789 TELEGRAM_BOT_TOKEN=fake-bot-token
+check "confirmed: a direct Telegram HTTP 200 is a delivery" test "$CONFIRMED_RC" -eq 0
+check "confirmed: the bot token stays out of process arguments" sh -c '! grep "^argv=.*fake-bot-token" "$1"' _ "$CALLS"
+: >"$CALLS"
+run_confirmed TELEGRAM_ALLOWED_USERS=123456789 TELEGRAM_BOT_TOKEN=fake-bot-token MOCK_RAT_CODE=500
+check "confirmed: a direct Telegram failure is not a delivery" test "$CONFIRMED_RC" -ne 0
+: >"$CALLS"
+run_confirmed TELEGRAM_ALLOWED_USERS=123456789 RATATOSKR_URL=http://ratatoskr.example/api/send \
+  RATATOSKR_SEND_API_KEY=fake-send-key TELEGRAM_BOT_TOKEN=fake-bot-token MOCK_RAT_CODE=503
+check "confirmed: the direct fallback counts only if it also answers 200 (it does not here)" test "$CONFIRMED_RC" -ne 0
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
