@@ -14,6 +14,15 @@
 #         per-host, scheduled step). Pushes an action-needed Telegram alert when
 #         a reboot is pending, security updates are still outstanding, disk is
 #         tight, a host lacks the patcher, or a firmware update is available.
+#         Reboot-needed means /var/run/reboot-required or a newer installed
+#         kernel of the SAME flavour than the running one (needrestart's raw
+#         kernel status is not used: false positive on Raspberry Pi 5). It also
+#         projects the guarded-reboot job's audit file (Grimnir ADR-009 section
+#         on audit): 24 h counts and last action in the host's Munin status, a
+#         Munin log entry for reboots / post-boot or daily-health issues, and a
+#         Telegram alert (every tier) for a reboot that never reported its
+#         post-boot check. An unreachable deploy-tier host is alerted; an
+#         unreachable node-tier host is only recorded in Munin.
 #
 #   deps  Weekly. Run `npm outdated` across every service repo checked out under
 #         ~/repos and report counts (total + major bumps) to Munin. DETECT +
@@ -39,7 +48,7 @@
 # Legacy --munin-token VALUE and --munin-token=VALUE forms are rejected.
 set -euo pipefail
 
-REPORT_VERSION="1.2.0"
+REPORT_VERSION="1.3.0"
 
 # ── Registry path: grimnir owns the canonical host inventory ─────────────────
 : "${REGISTRY_PATH:=/opt/grimnir/services.json}"
@@ -186,17 +195,30 @@ alert() { $DRY_RUN && { echo "  [dry-run] telegram: $1"; return 0; }; notify_tel
 # ═════════════════════════════════════════════════════════════════════════════
 os_probe_cmd() {
 cat <<'PROBE'
-RR=no; [ -e /var/run/reboot-required ] && RR=yes
-# Backup signal (Debian 13): needrestart kernel status >=2 means the running
-# kernel is older than the installed one — a reboot is recommended.
-if [ "$RR" = no ] && command -v needrestart >/dev/null 2>&1; then
-  KSTA=$(needrestart -b 2>/dev/null | awk -F: '/NEEDRESTART-KSTA/{print $2+0}')
-  [ "${KSTA:-0}" -ge 2 ] 2>/dev/null && RR=yes
+#
+# BROKKR_PROBE_ROOT is a test seam only: it prefixes every path the probe reads
+# so a hermetic test can point it at a fixture tree. It is unset in production
+# (and is not forwarded over ssh), so the probe then reads the real system.
+R=${BROKKR_PROBE_ROOT:-}
+RR=no; [ -e "$R/var/run/reboot-required" ] && RR=yes
+# Backup signal: a newer kernel of the SAME flavour is installed than the one
+# running. The flavour is the text after the last "-" of `uname -r` (generic,
+# amd64, 2712, v8). needrestart's raw kernel status (NEEDRESTART-KSTA) is
+# deliberately NOT used: on a Raspberry Pi 5 it compares the running 2712 kernel
+# with the v8 flavour (KSTA 3) although both are the same version, a permanent
+# false positive. Version order uses sort -V, so 6.12.9 sorts below 6.12.48.
+if [ "$RR" = no ]; then
+  KREL=$(uname -r)
+  KFLAV=${KREL##*-}
+  if [ -n "$KFLAV" ] && [ "$KFLAV" != "$KREL" ]; then
+    KNEWEST=$(for k in "$R"/boot/vmlinuz-*-"$KFLAV"; do [ -e "$k" ] && printf '%s\n' "${k##*/vmlinuz-}"; done | sort -V | tail -n 1)
+    [ -n "$KNEWEST" ] && [ "$KNEWEST" != "$KREL" ] && RR=yes
+  fi
 fi
-RRPKGS=0; [ -f /var/run/reboot-required.pkgs ] && RRPKGS=$(wc -l < /var/run/reboot-required.pkgs | tr -d ' ')
+RRPKGS=0; [ -f "$R/var/run/reboot-required.pkgs" ] && RRPKGS=$(wc -l < "$R/var/run/reboot-required.pkgs" | tr -d ' ')
 UU=$(dpkg -l unattended-upgrades 2>/dev/null | grep -c '^ii' || true)
-if [ -x /usr/lib/update-notifier/apt-check ]; then
-  AC=$(/usr/lib/update-notifier/apt-check 2>&1); ALLUP=${AC%;*}; SEC=${AC#*;}
+if [ -x "$R/usr/lib/update-notifier/apt-check" ]; then
+  AC=$("$R/usr/lib/update-notifier/apt-check" 2>&1); ALLUP=${AC%;*}; SEC=${AC#*;}
 else
   ALLUP=$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' || true)
   SEC=$(apt-get -s upgrade 2>/dev/null | awk '/^Inst/ && /security/{c++} END{print c+0}')
@@ -204,6 +226,67 @@ fi
 DISK=$(df -P / | awk 'NR==2{gsub(/%/,"",$5); print $5}')
 echo "REBOOT=$RR"; echo "REBOOT_PKGS=$RRPKGS"; echo "UU_INSTALLED=$UU"
 echo "SEC_PENDING=${SEC:-0}"; echo "ALL_PENDING=${ALLUP:-0}"; echo "DISK=${DISK:-0}"; echo "KERNEL=$(uname -r)"
+
+# ── Guarded-reboot audit projection (Grimnir ADR-009) ────────────────────────
+# The guarded-reboot job appends one JSON object per line to a root-owned,
+# world-readable audit file; this only READS it (unprivileged, sed/awk only, no
+# jq or python on the host). Key order is fixed:
+#   {"ts":..,"epoch":N,"host":..,"mode":..,"action":..,"triggers":..,"guards":..,"boot_id":..,"detail":..}
+# Only the anchored prefix up to "action" is parsed (and "detail" start for the
+# latch marker), so free text in detail cannot forge a counted action. Lines
+# that do not match are ignored. The last 10000 lines bound the work.
+#   UNRECOVERED=1: the latest "reboot" record is >=60 min old and no
+#     post-boot-ok / post-boot-issues record follows it.
+#   LATCHED=1: an "alert" record whose detail starts with "latched" is not
+#     followed by a later "reboot" record (the owner clears the latch).
+#   An "alert" whose detail starts with "eeprom-cancelled" (a staged EEPROM
+#     update found outside a guarded reboot, and cancelled) is just an alert: it
+#     is counted in ALERTS_24H and has no action value of its own.
+GR_DIR="$R/var/lib/brokkr/guarded-reboot"; GR_FILE="$GR_DIR/audit.jsonl"
+if [ -r "$GR_FILE" ]; then
+  echo "GUARDED_REBOOT=present"
+  tail -n 10000 "$GR_FILE" 2>/dev/null | awk -v now="$(date +%s)" '
+    BEGIN {
+      cutoff = now - 86400; la = "none"; le = 0; lre = 0; rec = 1; latched = 0
+      n = split("none deferred would-reboot reboot alert post-boot-ok post-boot-issues health-ok health-issues", a, " ")
+      for (i = 1; i <= n; i++) known[a[i]] = 1
+    }
+    {
+      if (!match($0, /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*"/)) next
+      p = substr($0, 1, RLENGTH)
+      e = p; sub(/^.*"epoch":/, "", e); sub(/,.*$/, "", e); e += 0
+      x = p; sub(/^.*"action":"/, "", x); sub(/"$/, "", x)
+      if (!(x in known)) x = "unknown"
+      la = x; le = e
+      if (x == "reboot") { lre = e; rec = 0; latched = 0 }
+      else if (x == "post-boot-ok" || x == "post-boot-issues") { if (lre > 0) rec = 1 }
+      else if (x == "alert" && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"latched/) latched = 1
+      if (e >= cutoff) {
+        if (x == "reboot") nr++
+        else if (x == "deferred") nd++
+        else if (x == "alert") na++
+        else if (x == "post-boot-issues") ni++
+        else if (x == "health-issues") nh++
+      }
+    }
+    END {
+      unrec = (lre > 0 && rec == 0 && now - lre >= 3600) ? 1 : 0
+      printf "GUARDED_REBOOT_LAST_ACTION=%s\n", la
+      printf "GUARDED_REBOOT_LAST_EPOCH=%.0f\n", le
+      printf "GUARDED_REBOOT_REBOOTS_24H=%d\n", nr
+      printf "GUARDED_REBOOT_DEFERRALS_24H=%d\n", nd
+      printf "GUARDED_REBOOT_ALERTS_24H=%d\n", na
+      printf "GUARDED_REBOOT_ISSUES_24H=%d\n", ni
+      printf "GUARDED_REBOOT_HEALTH_ISSUES_24H=%d\n", nh
+      printf "GUARDED_REBOOT_LAST_REBOOT_EPOCH=%.0f\n", lre
+      printf "GUARDED_REBOOT_UNRECOVERED=%d\n", unrec
+      printf "GUARDED_REBOOT_LATCHED=%d\n", latched
+    }'
+elif [ -e "$GR_FILE" ] || { [ -d "$GR_DIR" ] && [ ! -x "$GR_DIR" ]; }; then
+  echo "GUARDED_REBOOT=unreadable"
+else
+  echo "GUARDED_REBOOT=absent"
+fi
 
 # ── Firmware status — mechanism auto-detected, DETECT+REPORT only ────────────
 # rpi-eeprom handles Pi bootloader EEPROM; fwupd handles UEFI capsule/LVFS hosts;
@@ -279,6 +362,14 @@ resolve_remote() {
   if [[ "$bare" != "$host" ]] && ssh "${SSH_OPTS[@]}" "$DEPLOY_USER@$bare" true 2>/dev/null; then
     echo "$DEPLOY_USER@$bare"; return 0; fi
   return 1
+}
+
+# Epoch seconds -> ISO-8601 UTC for the guarded-reboot projection (GNU date -d,
+# BSD date -r, else the raw number); "-" for 0 / unset.
+epoch_iso() {
+  local e="${1:-0}"
+  [[ "$e" =~ ^[0-9]+$ && "$e" -gt 0 ]] || { echo "-"; return 0; }
+  date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$e"
 }
 
 run_os() {
@@ -382,13 +473,38 @@ run_os() {
     fw_lat=$(grep -m1 '^FW_LAT=' <<<"$blob" | cut -d= -f2- || true)
     fw_detail=$(grep -m1 '^FW_DETAIL=' <<<"$blob" | cut -d= -f2- || true)
 
+    # Guarded-reboot audit projection (Grimnir ADR-009). The values come from an
+    # audit file on the host: treat them as untrusted text — numbers are reduced
+    # to digits-or-zero, flags are set only by an exact "1", and the last action
+    # must be a known audit action. A probe without these keys counts as absent.
+    local gr_state gr_last gr_last_epoch gr_reboots gr_deferrals gr_alerts gr_issues gr_health gr_last_reboot gr_unrec gr_latched
+    gr_state=$(grep -m1 '^GUARDED_REBOOT=' <<<"$blob" | cut -d= -f2 || true)
+    gr_last=$(grep -m1 '^GUARDED_REBOOT_LAST_ACTION=' <<<"$blob" | cut -d= -f2- || true)
+    gr_last_epoch=$(grep -m1 '^GUARDED_REBOOT_LAST_EPOCH=' <<<"$blob" | cut -d= -f2- || true)
+    gr_reboots=$(grep -m1 '^GUARDED_REBOOT_REBOOTS_24H=' <<<"$blob" | cut -d= -f2- || true)
+    gr_deferrals=$(grep -m1 '^GUARDED_REBOOT_DEFERRALS_24H=' <<<"$blob" | cut -d= -f2- || true)
+    gr_alerts=$(grep -m1 '^GUARDED_REBOOT_ALERTS_24H=' <<<"$blob" | cut -d= -f2- || true)
+    gr_issues=$(grep -m1 '^GUARDED_REBOOT_ISSUES_24H=' <<<"$blob" | cut -d= -f2- || true)
+    gr_health=$(grep -m1 '^GUARDED_REBOOT_HEALTH_ISSUES_24H=' <<<"$blob" | cut -d= -f2- || true)
+    gr_last_reboot=$(grep -m1 '^GUARDED_REBOOT_LAST_REBOOT_EPOCH=' <<<"$blob" | cut -d= -f2- || true)
+    gr_unrec=$(grep -m1 '^GUARDED_REBOOT_UNRECOVERED=' <<<"$blob" | cut -d= -f2- || true)
+    gr_latched=$(grep -m1 '^GUARDED_REBOOT_LATCHED=' <<<"$blob" | cut -d= -f2- || true)
+    case "$gr_state" in present|unreadable) ;; *) gr_state=absent ;; esac
+    case "$gr_last" in
+      none|deferred|would-reboot|reboot|alert|post-boot-ok|post-boot-issues|health-ok|health-issues) ;;
+      *) gr_last=unknown ;;
+    esac
+
     # Sanitize numeric fields — apt-check writes to stderr and can emit a
     # non-numeric error (e.g. apt-lock contention); a non-numeric value would
     # make the `[[ x -gt 0 ]]` tests below return 2 and abort under set -e.
     local v
-    for v in rrpkgs uu sec all disk fw_pending; do
-      case "${!v}" in *[!0-9]*|'') printf -v "$v" '%s' 0 ;; esac
+    for v in rrpkgs uu sec all disk fw_pending gr_last_epoch gr_reboots gr_deferrals gr_alerts gr_issues gr_health gr_last_reboot; do
+      # Over 12 digits is garbage for a count or an epoch (and would overflow -gt).
+      case "${!v}" in *[!0-9]*|''|?????????????*) printf -v "$v" '%s' 0 ;; esac
     done
+    [[ "$gr_unrec" == 1 ]] || gr_unrec=0
+    [[ "$gr_latched" == 1 ]] || gr_latched=0
 
     # Human-readable description of what firmware update is pending (mechanism
     # dependent: Pi EEPROM reports a current→latest date pair, fwupd reports
@@ -404,7 +520,17 @@ run_os() {
     printf "  firmware[%s]=%s pending=%s%s\n" \
       "$fw_mech" "$fw_status" "$fw_pending" "${fw_desc:+ ($fw_desc)}"
 
-    local line="  $short: security_pending=$sec, all_pending=$all, reboot=$rr, disk=${disk}%, uu_installed=$uu, kernel=$kern, firmware=$fw_mech:$fw_status${fw_desc:+ ($fw_desc)}"
+    # Guarded-reboot summary for the status line and console (absent / unreadable
+    # when the host has no readable audit file). An empty audit reads as last=none.
+    local gr_desc
+    if [[ "$gr_state" == present ]]; then
+      gr_desc="last:${gr_last}@$(epoch_iso "$gr_last_epoch") reboots_24h=$gr_reboots deferrals_24h=$gr_deferrals alerts_24h=$gr_alerts issues_24h=$gr_issues health_issues_24h=$gr_health unrecovered=$gr_unrec latched=$gr_latched"
+    else
+      gr_desc="$gr_state"
+    fi
+    printf "  guarded_reboot=%s\n" "$gr_desc"
+
+    local line="  $short: security_pending=$sec, all_pending=$all, reboot=$rr, disk=${disk}%, uu_installed=$uu, kernel=$kern, firmware=$fw_mech:$fw_status${fw_desc:+ ($fw_desc)}, guarded_reboot=$gr_desc"
     summary+=$'\n'"$line"
 
     # Per-host Munin state
@@ -416,6 +542,23 @@ run_os() {
     report_write "maintenance/firmware/$short" "latest" \
       "$short firmware @ $TIMESTAMP: mech=$fw_mech, status=$fw_status, pending=$fw_pending${fw_desc:+ — $fw_desc}${fw_cur:+ (cur=$fw_cur, lat=$fw_lat)}" \
       "[\"maintenance\",\"firmware\",\"$short\",\"$fw_mech\",\"automated\"]"
+
+    # Audit-event projection (ADR-009): an executed reboot, a failed post-boot
+    # check, or a daily health regression in the last 24 h is an autonomous
+    # mutation record. The daily run makes the 24 h windows consecutive, so each
+    # event is projected about once. Best-effort like the writes above.
+    if [[ "$gr_reboots" -gt 0 || "$gr_issues" -gt 0 || "$gr_health" -gt 0 ]]; then
+      report_log "maintenance/os/$short" \
+        "Guarded-reboot audit @ $TIMESTAMP: $short last 24 h: reboots=$gr_reboots post_boot_issues=$gr_issues health_issues=$gr_health (last record: $gr_last at $(epoch_iso "$gr_last_epoch")). Autonomous host mutation; reversal: irreversible (ADR-009)." \
+        "[\"maintenance\",\"os-event\",\"guarded-reboot\",\"audit\",\"$short\",\"automated\"]"
+    fi
+
+    # An unrecovered reboot (reboot record >= 60 min old with no post-boot
+    # record) is alerted for EVERY tier: the host came up unhealthy or never
+    # reported, and nothing else will say so.
+    if [[ "$gr_unrec" == 1 ]]; then
+      alerts+=$'\n'"🚨 $short rebooted at $(epoch_iso "$gr_last_reboot") but never reported its post-boot check"; any_action=true
+    fi
 
     # OS-condition alerts fire for deploy-tier (critical service hosts) only;
     # node-tier OS status is recorded to Munin but not alerted, to avoid surprise

@@ -229,5 +229,141 @@ check "an unreachable deploy host + prod-shaped notify config still exits 0" \
 check "the run still reports the unreachable host, not a silent abort" \
   grep -q 'nas-fixture: UNREACHABLE' "$TMP/unreachable.out"
 
+# ── Guarded-reboot audit projection (Grimnir ADR-009) ────────────────────────
+# The probe emits GUARDED_REBOOT_* keys; the report folds them into the host's Munin status,
+# logs reboot / post-boot-issues / health-issues events (reversal kind: irreversible), and
+# alerts on an unrecovered reboot for every host tier. The probe parsing itself is covered by
+# maintenance-report-probe.test.sh; here the ssh fake returns canned probe output per host.
+mkdir -p "$TMP/mbin" "$TMP/probe-out"
+cp "$TMP/bin/curl" "$TMP/bin/hostname" "$TMP/mbin/"
+cat >"$TMP/mbin/ssh" <<'MOCK'
+#!/usr/bin/env bash
+# ssh [-o opt]... user@host COMMAND: per-host canned probe output; no file = unreachable.
+target="${@: -2:1}"; host="${target#*@}"
+[[ -f "$MOCK_PROBE_OUT/$host" ]] || exit 255
+if [[ "${!#}" == true ]]; then exit 0; fi
+cat "$MOCK_PROBE_OUT/$host"
+MOCK
+chmod +x "$TMP/mbin/ssh" "$TMP/mbin/curl" "$TMP/mbin/hostname"
+
+cat >"$TMP/services-gr.json" <<'JSON'
+{"components":[{"name":"fixture","repo":"fixture","host":"other-host","deploy":true,"scan":false}],
+ "nodes":[{"name":"inference-fixture","hostname":"inference-fixture.example","role":"inference","status":"active"}]}
+JSON
+
+BASE_PROBE=$'REBOOT=no\nREBOOT_PKGS=0\nUU_INSTALLED=1\nSEC_PENDING=0\nALL_PENDING=0\nDISK=50\nKERNEL=fixture\nFW_MECH=none\nFW_STATUS=current\nFW_PENDING=0\nFW_CUR=\nFW_LAT=\nFW_DETAIL=\n'
+set_probe() { # host [extra probe lines]
+  printf '%s%s' "$BASE_PROBE" "${2:-}" >"$TMP/probe-out/$1"
+}
+clear_probe() { rm -f "$TMP/probe-out/$1"; }
+not() { ! "$@"; }
+NOW_E="$(date +%s)"
+GR_ACTIVE=$'GUARDED_REBOOT=present\nGUARDED_REBOOT_LAST_ACTION=health-issues\nGUARDED_REBOOT_LAST_EPOCH='"$((NOW_E - 600))"$'\nGUARDED_REBOOT_REBOOTS_24H=1\nGUARDED_REBOOT_DEFERRALS_24H=2\nGUARDED_REBOOT_ALERTS_24H=1\nGUARDED_REBOOT_ISSUES_24H=1\nGUARDED_REBOOT_HEALTH_ISSUES_24H=1\nGUARDED_REBOOT_LAST_REBOOT_EPOCH='"$((NOW_E - 7200))"$'\nGUARDED_REBOOT_UNRECOVERED=0\nGUARDED_REBOOT_LATCHED=1\n'
+REBOOT_EPOCH=1793000000
+REBOOT_ISO="$(python3 -c 'import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$REBOOT_EPOCH")"
+GR_UNRECOVERED=$'GUARDED_REBOOT=present\nGUARDED_REBOOT_LAST_ACTION=reboot\nGUARDED_REBOOT_LAST_EPOCH='"$REBOOT_EPOCH"$'\nGUARDED_REBOOT_REBOOTS_24H=0\nGUARDED_REBOOT_DEFERRALS_24H=0\nGUARDED_REBOOT_ALERTS_24H=0\nGUARDED_REBOOT_ISSUES_24H=0\nGUARDED_REBOOT_HEALTH_ISSUES_24H=0\nGUARDED_REBOOT_LAST_REBOOT_EPOCH='"$REBOOT_EPOCH"$'\nGUARDED_REBOOT_UNRECOVERED=1\nGUARDED_REBOOT_LATCHED=0\n'
+
+run_os() { # [extra args...]: os mode against the per-host fake; stdout in $TMP/os.out
+  : >"$TMP/calls.jsonl"; : >"$TMP/curl.argv"
+  env \
+    PATH="$TMP/mbin:$PATH" \
+    MOCK_PROBE_OUT="$TMP/probe-out" \
+    MOCK_MUNIN_CALLS="$TMP/calls.jsonl" MOCK_MUNIN_ARGV="$TMP/curl.argv" MOCK_MUNIN_STDIN="$TMP/curl.stdin" \
+    MUNIN_TOKEN="${MOCK_MUNIN_TOKEN-fixture-token}" \
+    REGISTRY_PATH="$TMP/services-gr.json" REGISTRY_NO_GIT=1 REPOS_DIR="$TMP/repos" \
+    RATATOSKR_ENV="$TMP/none.env" NOTIFY_ENV="$TMP/none.env" \
+    bash "$ROOT/scripts/maintenance-report.sh" os "$@" >"$TMP/os.out" 2>"$TMP/os.err"
+}
+call_has_text() { # method namespace text [key]
+  METHOD="$1" NAMESPACE="$2" TEXT="$3" KEY="${4:-}" python3 - "$TMP/calls.jsonl" <<'PY'
+import json, os, sys
+for line in open(sys.argv[1], encoding='utf-8'):
+    params = json.loads(line)['params']
+    args = params['arguments']
+    if (params['name'] == os.environ['METHOD'] and args['namespace'] == os.environ['NAMESPACE']
+            and (not os.environ['KEY'] or args.get('key') == os.environ['KEY'])
+            and os.environ['TEXT'] in args.get('content', '')):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+out_has() { grep -qF -- "$1" "$TMP/os.out"; }
+
+clear_probe inference-fixture.example
+set_probe other-host "$GR_ACTIVE"
+run_os
+check "guarded-reboot counters are part of the host's Munin status" \
+  call_has_text memory_write maintenance/os/other-host "reboots_24h=1 deferrals_24h=2 alerts_24h=1 issues_24h=1 health_issues_24h=1 unrecovered=0 latched=1" latest
+check "the Munin status shows the last guarded-reboot action" \
+  call_has_text memory_write maintenance/os/other-host "guarded_reboot=last:health-issues@" latest
+check "a 24 h reboot / post-boot-issues / health-issues event is logged for the host" \
+  has_call memory_log maintenance/os/other-host
+check "the audit-event log says the reversal kind is irreversible" \
+  call_has_text memory_log maintenance/os/other-host "reversal: irreversible"
+check "the audit-event log carries the 24 h counts" \
+  call_has_text memory_log maintenance/os/other-host "reboots=1 post_boot_issues=1 health_issues=1"
+check "no unrecovered alert when the reboot was followed by a post-boot record" \
+  not out_has "never reported its post-boot check"
+
+set_probe other-host $'GUARDED_REBOOT=absent\n'
+run_os
+check "absent audit file: status says guarded_reboot=absent" \
+  call_has_text memory_write maintenance/os/other-host "guarded_reboot=absent" latest
+check "absent audit file: no audit-event log" not has_call memory_log maintenance/os/other-host
+
+set_probe other-host
+run_os
+check "a probe without guarded-reboot keys is tolerated (treated as absent)" \
+  call_has_text memory_write maintenance/os/other-host "guarded_reboot=absent" latest
+
+set_probe other-host $'GUARDED_REBOOT=present\nGUARDED_REBOOT_LAST_ACTION=deferred\nGUARDED_REBOOT_LAST_EPOCH=1\nGUARDED_REBOOT_REBOOTS_24H=0\nGUARDED_REBOOT_DEFERRALS_24H=3\nGUARDED_REBOOT_ALERTS_24H=0\nGUARDED_REBOOT_ISSUES_24H=0\nGUARDED_REBOOT_HEALTH_ISSUES_24H=0\nGUARDED_REBOOT_UNRECOVERED=0\nGUARDED_REBOOT_LATCHED=0\n'
+run_os
+check "deferrals alone do not produce an audit-event log" not has_call memory_log maintenance/os/other-host
+
+set_probe other-host $'GUARDED_REBOOT=present\nGUARDED_REBOOT_LAST_ACTION=health-issues\nGUARDED_REBOOT_LAST_EPOCH=1\nGUARDED_REBOOT_REBOOTS_24H=0\nGUARDED_REBOOT_DEFERRALS_24H=0\nGUARDED_REBOOT_ALERTS_24H=0\nGUARDED_REBOOT_ISSUES_24H=0\nGUARDED_REBOOT_HEALTH_ISSUES_24H=2\nGUARDED_REBOOT_UNRECOVERED=0\nGUARDED_REBOOT_LATCHED=0\n'
+run_os
+check "a daily health regression alone is logged like post-boot issues" \
+  call_has_text memory_log maintenance/os/other-host "health_issues=2"
+
+# Hostile or garbled probe values degrade to zero / unknown instead of aborting the run.
+set_probe other-host $'GUARDED_REBOOT=present\nGUARDED_REBOOT_LAST_ACTION=$(rm -rf /)\nGUARDED_REBOOT_LAST_EPOCH=abc\nGUARDED_REBOOT_REBOOTS_24H=x\nGUARDED_REBOOT_UNRECOVERED=7\nGUARDED_REBOOT_LATCHED=yes\n'
+if run_os; then garbled_rc=0; else garbled_rc=$?; fi
+check "garbled guarded-reboot values do not fail the run" test "$garbled_rc" -eq 0
+check "garbled guarded-reboot values are not echoed into Munin" not grep -q 'rm -rf' "$TMP/calls.jsonl"
+check "garbled flags are not read as set" call_has_text memory_write maintenance/os/other-host "unrecovered=0 latched=0" latest
+
+set_probe other-host "$GR_ACTIVE"
+run_os --dry-run
+check "dry-run writes no Munin state or log for the guarded-reboot projection" test ! -s "$TMP/calls.jsonl"
+if MOCK_MUNIN_TOKEN='' run_os; then notoken_rc=0; else notoken_rc=$?; fi
+check "a missing Munin token is tolerated with guarded-reboot data" test "$notoken_rc" -eq 0
+check "a missing Munin token sends no request" test ! -s "$TMP/curl.argv"
+
+# Unrecovered reboot: alerted for every tier through the existing Telegram path.
+set_probe other-host "$GR_UNRECOVERED"
+set_probe inference-fixture.example "$GR_UNRECOVERED"
+run_os --dry-run
+check "unrecovered reboot on a deploy-tier host alerts with the reboot time" \
+  out_has "other-host rebooted at $REBOOT_ISO but never reported its post-boot check"
+check "unrecovered reboot on a node-tier host alerts too" \
+  out_has "inference-fixture rebooted at $REBOOT_ISO but never reported its post-boot check"
+run_os
+check "unrecovered=1 is visible in the Munin status" \
+  call_has_text memory_write maintenance/os/other-host "unrecovered=1" latest
+
+# What the report already does when a host is unreachable over SSH, so that a host that never
+# came back is surfaced even though it cannot report: a deploy-tier host is alerted as
+# unreachable; a node-tier host is only recorded in Munin (it may be legitimately powered off)
+# and gets no Telegram alert.
+clear_probe other-host
+clear_probe inference-fixture.example
+run_os --dry-run
+check "unreachable deploy-tier host is alerted" out_has "other-host unreachable for OS maintenance check"
+check "unreachable node-tier host is recorded in the summary" out_has "inference-fixture: unreachable (node, best-effort)"
+check "unreachable node-tier host is not alerted" not out_has "inference-fixture unreachable"
+run_os
+check "unreachable hosts overwrite their Munin status with UNREACHABLE" \
+  call_has_text memory_write maintenance/os/other-host "UNREACHABLE" latest
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
