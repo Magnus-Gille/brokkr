@@ -71,6 +71,15 @@ case "${1:-}" in
 esac
 exec /usr/bin/uname "$@"
 FAKE
+# hostname: the remote host answers to a short name and an FQDN (the self-peer check compares both).
+cat >"$BIN/hostname" <<'FAKE'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -s) echo "${MOCK_HOSTNAME_SHORT:-node-a}" ;;
+  -f) echo "${MOCK_HOSTNAME_FQDN:-node-a.lan.example}" ;;
+  *) echo "${MOCK_HOSTNAME_SHORT:-node-a}" ;;
+esac
+FAKE
 # sudo: the fixed argument lists only. install -d really creates the directories (under the caller's
 # umask, like the real thing); tee -a really appends; the reboot is recorded and must never happen.
 cat >"$BIN/sudo" <<'FAKE'
@@ -291,18 +300,23 @@ reset; TELEGRAM_ALLOWED_USERS=123 TELEGRAM_BOT_TOKEN=tok run "$TARGET"
 check "notify discovery: the environment counts too" '[[ "$OUT" == *"notify configuration present"* ]]'
 reset; mkdir -p "$HOME_DIR/repos/ratatoskr"; printf 'TELEGRAM_ALLOWED_USERS=123\nTELEGRAM_BOT_TOKEN=tok\n' >"$HOME_DIR/repos/ratatoskr/.env"; unset RATATOSKR_ENV NOTIFY_ENV; run "$TARGET"
 check "notify discovery: the Ratatoskr .env under HOME counts" '[[ "$OUT" == *"notify configuration present"* ]]'
-
+# The unlock assessment applies the job's rule: nothing is inferred from tpm2-device= or a key path.
 reset; printf 'root UUID=1 none luks\ndata UUID=2 none luks,tpm2-device=auto\n' >"$CRYPTTAB"; run "$TARGET"
-check "unlock assessment: a passphrase-only volume is reported with the consequence" '[[ "$RC" -eq 0 && "$OUT" == *"WARN: unlock assessment: crypttab entries needing an interactive passphrase at boot: root"* && "$OUT" == *"defer every reboot"* ]]'
-reset; printf 'root UUID=1 none luks,tpm2-device=auto\nswap /dev/sda3 /dev/urandom swap\nx UUID=3 none luks,noauto\n' >"$CRYPTTAB"; run "$TARGET"
-check "unlock assessment: unattended and noauto volumes are fine" '[[ "$OUT" == *"every volume in "*"unlocks unattended or is noauto"* ]]'
-
-# The unlock assessment applies the job's rule: only a key-file path or a PIN-less tpm2-device counts as unattended.
-unlock_names() { grep -o 'needing an interactive passphrase at boot: .*' <<<"$OUT" || true; }
+check "unlock assessment: every encrypted boot volume is reported as not owner-verified, with the consequence" '[[ "$RC" -eq 0 && "$OUT" == *"WARN: unlock assessment: encrypted boot volumes whose unattended unlock is not owner-verified (ADR-009): root data"* && "$OUT" == *"defer every reboot"* && "$OUT" == *"BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1"* && "$OUT" != *"WARNING *****"* ]]'
+reset; printf 'a UUID=1 /etc/keys/a.key luks\nb UUID=2 none luks,tpm2-device=auto\nc UUID=3 - luks,tpm2-device=auto,tpm2-pcrs=7\n' >"$CRYPTTAB"; run "$TARGET"
+check "unlock assessment: key-file paths and PIN-less tpm2 are not inferred to be unattended" '[[ "$OUT" == *"not owner-verified (ADR-009): a b c"* ]]'
+reset; printf 'a UUID=1 none luks,noauto\nb UUID=2 none luks,noauto\n' >"$CRYPTTAB"; run "$TARGET"
+check "unlock assessment: noauto entries are not needed at boot" '[[ "$OUT" == *"no encrypted volume in "*"is needed at boot"* && "$OUT" != *"WARN: unlock assessment"* ]]'
 reset; printf 'a UUID=1 none luks,fido2-device=auto\nb UUID=2 none luks,pkcs11-uri=auto\nc UUID=3 none luks,keyscript=/x\nd UUID=4 none luks,tpm2-device=auto,tpm2-pin=yes\ne UUID=5 none luks,fido2-with-client-pin=no\nf UUID=6 /k luks,headless=false\ng UUID=7 none luks\n' >"$CRYPTTAB"; run "$TARGET"
-check "unlock assessment: fido2, pkcs11, keyscript, a tpm2 PIN, fido2-with-*, headless=false and a plain passphrase are all interactive" '[[ "$OUT" == *"interactive passphrase at boot: a b c d e f g"* ]]'
-reset; printf 'a UUID=1 /etc/keys/a.key luks\nb UUID=2 none luks,tpm2-device=auto\nc UUID=3 - luks,tpm2-device=auto,tpm2-pcrs=7\nd UUID=4 none luks,noauto\n' >"$CRYPTTAB"; run "$TARGET"
-check "unlock assessment: key-file paths, PIN-less tpm2 and noauto entries are unattended" '[[ "$OUT" == *"every volume in "*"unlocks unattended or is noauto"* ]]'
+check "unlock assessment: options that can prompt are a hard block, named apart from the volumes that only need the owner's word" '[[ "$OUT" == *"an option that can prompt (a hard block even when unlock is verified): a b c d e f"* && "$OUT" == *"not owner-verified (ADR-009): g"* ]]'
+reset; printf 'root UUID=1 none luks\nfido UUID=2 none luks,fido2-device=auto\n' >"$CRYPTTAB"; BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1 run "$TARGET"
+check "unlock verified: the deploy prints a prominent warning, and still names the hard block" '[[ "$RC" -eq 0 && "$OUT" == *"***** WARNING ***** BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1"* && "$OUT" == *"hangs the host at the passphrase prompt"* && "$OUT" == *"accepted on the owner"*": root"* && "$OUT" == *"a hard block even when unlock is verified): fido"* ]]'
+reset; run "$TARGET"
+check "unlock verified: without the flag there is no such warning" '[[ "$OUT" != *"***** WARNING *****"* ]]'
+for v in 2 yes true -1; do
+  reset; BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED="$v" run "$TARGET"
+  check "invalid UNLOCK_VERIFIED '$v' refuses before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED"* ]] && ! grep -q ssh "$CALLS"'
+done
 
 if real_eeprom; then
   skip "stock EEPROM service tests (a real rpi-eeprom-update is on this machine PATH)"
@@ -314,7 +328,7 @@ else
 fi
 
 # --- reboot mode needs a working alert path ------------------------------------------------------------
-rbenv() { export BROKKR_GUARDED_REBOOT_MODE=reboot BROKKR_GUARDED_REBOOT_WINDOW=02:00 BROKKR_GUARDED_REBOOT_PEERS=node-b.example; }
+rbenv() { export BROKKR_GUARDED_REBOOT_MODE=reboot BROKKR_GUARDED_REBOOT_WINDOW=02:00 BROKKR_GUARDED_REBOOT_PEERS=node-b.example BROKKR_GUARDED_REBOOT_PEER_WINDOW=05:00 BROKKR_GUARDED_REBOOT_PEER_SPREAD=45; }
 reset; rbenv; run "$TARGET"
 check "reboot mode refuses without notify configuration (dry-run)" '[[ "$RC" -ne 0 && "$OUT" == *"reboot mode needs a working alert path"* ]] && no_mutation'
 : >"$CALLS"; run "$TARGET" --apply
@@ -328,6 +342,68 @@ reset; with_notify; rbenv; unset BROKKR_GUARDED_REBOOT_PEERS; run "$TARGET" --ap
 check "reboot mode without a peer is refused before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"needs BROKKR_GUARDED_REBOOT_PEERS"* ]] && ! grep -q ssh "$CALLS"'
 reset; with_notify; BROKKR_GUARDED_REBOOT_PEERS='' run "$TARGET"
 check "report mode needs neither a window nor a peer (it defaults to 03:30 and no peers)" '[[ "$RC" -eq 0 && "$OUT" == *"mode report, window 03:30"* ]]'
+
+# The peer's own window and spread: reboot mode refuses unless the two windows, each extended by its
+# spread, are at least 120 minutes apart on the 24-hour circle. All of this is checked before ssh.
+window_case() { # name expected(ok|refuse) own-window own-spread peer-window peer-spread
+  local name=$1 expect=$2
+  reset; with_notify; rbenv
+  export BROKKR_GUARDED_REBOOT_WINDOW=$3 BROKKR_GUARDED_REBOOT_SPREAD=$4 BROKKR_GUARDED_REBOOT_PEER_WINDOW=$5 BROKKR_GUARDED_REBOOT_PEER_SPREAD=$6
+  run "$TARGET"
+  if [[ "$expect" == ok ]]; then
+    check "windows: $name" '[[ "$RC" -eq 0 && "$OUT" == *"mode reboot"* ]]'
+  else
+    check "windows: $name" '[[ "$RC" -ne 0 && "$OUT" == *"reboot windows are too close"* ]] && ! grep -q ssh "$CALLS"'
+  fi
+}
+window_case "02:00+45 and 05:00+45 are 135 minutes apart (valid)" ok 02:00 45 05:00 45
+window_case "a gap of exactly 120 minutes after this host is valid (02:00+45, 04:45)" ok 02:00 45 04:45 45
+window_case "a gap of 119 minutes after this host is refused (02:00+45, 04:44)" refuse 02:00 45 04:44 45
+window_case "the same window overlaps (02:00, 02:00)" refuse 02:00 45 02:00 45
+window_case "a peer window inside this host's spread overlaps (02:00+45, 02:30)" refuse 02:00 45 02:30 10
+window_case "a peer whose window ends 90 minutes before this one starts is refused, across midnight (02:00, 00:00+30)" refuse 02:00 45 00:00 30
+window_case "a gap of exactly 120 minutes before this host is valid (02:00, 00:00+0)" ok 02:00 45 00:00 0
+window_case "a gap of 119 minutes before this host is refused (02:00, 00:01+0)" refuse 02:00 45 00:01 0
+window_case "a peer at 23:00+30 is clear of 02:00+45 across midnight (valid)" ok 02:00 45 23:00 30
+window_case "wrapping midnight: 23:30+30 and 01:30 are only 90 minutes apart" refuse 23:30 30 01:30 15
+window_case "wrapping midnight: 23:30+30 and 02:00+15 are 120 minutes apart (valid)" ok 23:30 30 02:00 15
+window_case "wrapping midnight: 23:30+30 and 21:00+30 leave exactly 120 minutes (valid)" ok 23:30 30 21:00 30
+window_case "wrapping midnight: 23:30+30 and 21:00+31 leave only 119 minutes" refuse 23:30 30 21:00 31
+reset; with_notify; rbenv; unset BROKKR_GUARDED_REBOOT_PEER_WINDOW; run "$TARGET"
+check "reboot mode without the peer's window is refused before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"needs BROKKR_GUARDED_REBOOT_PEER_WINDOW"* ]] && ! grep -q ssh "$CALLS"'
+reset; with_notify; rbenv; unset BROKKR_GUARDED_REBOOT_PEER_SPREAD; run "$TARGET"
+check "reboot mode without the peer's spread is refused before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"needs BROKKR_GUARDED_REBOOT_PEER_SPREAD"* ]] && ! grep -q ssh "$CALLS"'
+for v in 25:00 5:00 05:60 noon; do
+  reset; with_notify; rbenv; BROKKR_GUARDED_REBOOT_PEER_WINDOW="$v" run "$TARGET"
+  check "an invalid peer window '$v' is refused before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"invalid BROKKR_GUARDED_REBOOT_PEER_WINDOW"* ]] && ! grep -q ssh "$CALLS"'
+done
+for v in abc 241 -1; do
+  reset; with_notify; rbenv; BROKKR_GUARDED_REBOOT_PEER_SPREAD="$v" run "$TARGET"
+  check "an invalid peer spread '$v' is refused before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"invalid BROKKR_GUARDED_REBOOT_PEER_SPREAD"* ]] && ! grep -q ssh "$CALLS"'
+done
+reset; with_notify; run "$TARGET"
+check "report mode needs no peer window (and the default window is unchecked)" '[[ "$RC" -eq 0 ]]'
+
+# A peer must be another host.
+reset; BROKKR_GUARDED_REBOOT_PEERS="node-a.example.invalid" run "$TARGET"
+check "self peer: the deploy target itself is refused before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"names the host being deployed to"* ]] && ! grep -q ssh "$CALLS"'
+reset; BROKKR_GUARDED_REBOOT_PEERS="NODE-A.Example.Invalid" run "$TARGET"
+check "self peer: the comparison is case-insensitive" '[[ "$RC" -ne 0 && "$OUT" == *"names the host being deployed to"* ]] && ! grep -q ssh "$CALLS"'
+reset; BROKKR_GUARDED_REBOOT_PEERS="localhost" run "$TARGET"
+check "self peer: localhost is refused before ssh" '[[ "$RC" -ne 0 ]] && ! grep -q ssh "$CALLS"'
+for peer in node-a NODE-A node-a.lan.example Node-A.LAN.example; do
+  reset; BROKKR_GUARDED_REBOOT_PEERS="node-b.example $peer" run "$TARGET"
+  check "self peer: '$peer' is this host's short name or FQDN, refused by the remote preflight (dry-run)" '[[ "$RC" -ne 0 && "$OUT" == *"is this host itself"* ]] && no_mutation'
+done
+reset; BROKKR_GUARDED_REBOOT_PEERS="node-a" run "$TARGET" --apply
+check "self peer: refused by the remote preflight on --apply too, nothing changed" '[[ "$RC" -ne 0 && "$OUT" == *"is this host itself"* && ! -e "$RELEASE" ]] && no_mutation'
+reset; MOCK_HOSTNAME_SHORT=db1 MOCK_HOSTNAME_FQDN=db1.lan.example BROKKR_GUARDED_REBOOT_PEERS="node-b.example" run "$TARGET"
+check "self peer: another host is accepted" '[[ "$RC" -eq 0 ]]'
+
+reset; with_notify; rbenv; BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1 run "$TARGET" --apply
+check "the unlock verification flag is rendered into the unit as 1, with a closing warning" '[[ "$RC" -eq 0 && "$OUT" == *"***** WARNING ***** BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1 is rendered into the unit"* ]] && grep -Fxq "Environment=BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1" "$SVC"'
+reset; with_notify; rbenv; run "$TARGET" --apply
+check "the unlock verification flag defaults to 0 in the unit" '[[ "$RC" -eq 0 ]] && grep -Fxq "Environment=BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=0" "$SVC"'
 
 # --- preflight refusals (both modes) -----------------------------------------------------------------------
 refuses() { # name expected-text [args...]
