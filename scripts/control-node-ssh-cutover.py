@@ -82,6 +82,7 @@ AUTHORIZED_KEY_TYPES = frozenset(
         "sk-ecdsa-sha2-nistp256@openssh.com",
     }
 )
+AUTHORIZED_KEYS_FIELD_SEPARATOR = re.compile(r"[ \t]+")
 SSHD_UNITS = ("ssh.service", "ssh.socket", "sshd.service")
 DEFAULT_AUTHORIZED_KEYS_FILES = (".ssh/authorized_keys", ".ssh/authorized_keys2")
 
@@ -273,10 +274,28 @@ def single_value(config: dict[str, list[str]], key: str) -> str | None:
 
 
 def wildcard_match(value: str, pattern: str) -> bool:
-    """OpenSSH match_pattern(): only * and ? are wildcards; everything else is literal."""
-    pattern = re.sub(r"\*+", "*", pattern)
-    regex = "".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in pattern)
-    return re.fullmatch(regex, value, re.DOTALL) is not None
+    """OpenSSH match_pattern(): only * and ? are wildcards; everything else is literal.
+
+    Iterative matching that only backtracks to the last `*`, so the worst case stays
+    O(len(value) * len(pattern)) instead of exponential.
+    """
+    v = p = 0
+    star = mark = -1
+    while v < len(value):
+        if p < len(pattern) and pattern[p] == "*":
+            star, mark = p, v
+            p += 1
+        elif p < len(pattern) and pattern[p] in ("?", value[v]):
+            v += 1
+            p += 1
+        elif star >= 0:
+            mark += 1
+            p, v = star + 1, mark
+        else:
+            return False
+    while p < len(pattern) and pattern[p] == "*":
+        p += 1
+    return p == len(pattern)
 
 
 def tokens(config: dict[str, list[str]], key: str) -> list[str]:
@@ -543,8 +562,13 @@ def usable_key(key_type: str, blob: str, timeout: int) -> bool:
 
 
 def classify_authorized_keys_line(line: bytes, timeout: int) -> str:
-    """Return "skip", "key", "options" or "invalid" for one authorized_keys line."""
-    fields = line.decode("utf-8", errors="replace").split()
+    """Return "skip", "key", "options" or "invalid" for one authorized_keys line.
+
+    Like OpenSSH, only ASCII spaces and tabs separate fields, so a record that relies
+    on other (for example Unicode) whitespace is invalid rather than repaired.
+    """
+    record = line.decode("utf-8", errors="replace").strip(" \t\r")
+    fields = AUTHORIZED_KEYS_FIELD_SEPARATOR.split(record) if record else []
     if not fields or fields[0].startswith("#"):
         return "skip"
     if fields[0] in AUTHORIZED_KEY_TYPES:

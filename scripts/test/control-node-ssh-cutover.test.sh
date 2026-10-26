@@ -1328,6 +1328,41 @@ elif section == "wildcard":
     for value, pattern, want in cases:
         expect((value, pattern), match(value, pattern), want)
 
+    # Repeated wildcards must not backtrack exponentially (a short AllowUsers
+    # pattern could otherwise stall the preflight with no subprocess timeout).
+    import signal
+
+    def too_slow(signum, frame):
+        raise TimeoutError("wildcard_match backtracked")
+
+    signal.signal(signal.SIGALRM, too_slow)
+    signal.alarm(2)
+    try:
+        expect("adversarial repeated wildcards miss", match("a" * 32, "*a" * 16 + "b"), False)
+        expect("adversarial repeated wildcards hit", match("a" * 40 + "b", "*a" * 16 + "b"), True)
+    except TimeoutError:
+        failures.append(("adversarial repeated wildcards", "timeout", "bounded"))
+    finally:
+        signal.alarm(0)
+
+elif section == "classify":
+    # Like OpenSSH, only ASCII spaces and tabs separate authorized_keys fields.
+    classify = module.classify_authorized_keys_line
+    cases = [
+        ("ssh-ed25519 %s" % blob, "key"),
+        ("ssh-ed25519\t%s\tcomment" % blob, "key"),
+        ("  ssh-ed25519 %s" % blob, "key"),
+        ("ssh-ed25519 %s owner@höst" % blob, "key"),
+        ("ssh-ed25519 %s" % blob, "invalid"),
+        ("ssh-ed25519 %s" % blob, "invalid"),
+        (" ssh-ed25519 %s" % blob, "invalid"),
+        ('from="198.51.100.0/24" ssh-ed25519 %s' % blob, "options"),
+        ("# ssh-ed25519 %s" % blob, "skip"),
+        ("", "skip"),
+    ]
+    for line, want in cases:
+        expect(repr(line[:24]), classify(line.encode("utf-8"), 10), want)
+
 elif section == "single_value":
     single = module.single_value
     expect("absent", single({}, "k"), None)
@@ -1382,6 +1417,7 @@ unit_case() { # unit_case DESC SECTION
 unit_case "AuthorizedKeysFile token expansion" expand
 unit_case "group resolution via getgrouplist, unnamed gids and empty sets" groups
 unit_case "OpenSSH match_pattern wildcard semantics" wildcard
+unit_case "authorized_keys fields split only on ASCII space and tab" classify
 unit_case "single_value only accepts one agreed value" single_value
 if [ -n "$KEYBASE" ]; then
   unit_case "authorized_keys safe_path walk stops at the home directory" safe_path
