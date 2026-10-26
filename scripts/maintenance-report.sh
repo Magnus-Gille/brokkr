@@ -22,7 +22,20 @@
 #         Munin log entry for reboots / post-boot or daily-health issues, and a
 #         Telegram alert (every tier) for a reboot that never reported its
 #         post-boot check. An unreachable deploy-tier host is alerted; an
-#         unreachable node-tier host is only recorded in Munin.
+#         unreachable node-tier host is only recorded in Munin (it may be
+#         legitimately powered off) UNLESS it is listed in
+#         BROKKR_ALERT_UNREACHABLE_NODES.
+#
+#         BROKKR_ALERT_UNREACHABLE_NODES  Optional, empty by default. A
+#         whitespace-separated list of node IDs (the registry node name or the
+#         short host name; letters, digits, dot, underscore, hyphen) that
+#         must be alerted when unreachable, exactly like a deploy-tier host: the
+#         guarded-reboot job may have rebooted them and they may not have come
+#         back (Grimnir ADR-009 relies on this for the inference node). Set it
+#         in the report's runtime environment (for example a systemd drop-in on
+#         the control node); real IDs are never committed. An invalid entry is
+#         ignored and an entry matching no active node is reported, both in the
+#         Telegram alert, so a typo cannot silently disable the alert.
 #
 #   deps  Weekly. Run `npm outdated` across every service repo checked out under
 #         ~/repos and report counts (total + major bumps) to Munin. DETECT +
@@ -202,16 +215,28 @@ cat <<'PROBE'
 R=${BROKKR_PROBE_ROOT:-}
 RR=no; [ -e "$R/var/run/reboot-required" ] && RR=yes
 # Backup signal: a newer kernel of the SAME flavour is installed than the one
-# running. The flavour is the text after the last "-" of `uname -r` (generic,
-# amd64, 2712, v8). needrestart's raw kernel status (NEEDRESTART-KSTA) is
-# deliberately NOT used: on a Raspberry Pi 5 it compares the running 2712 kernel
-# with the v8 flavour (KSTA 3) although both are the same version, a permanent
-# false positive. Version order uses sort -V, so 6.12.9 sorts below 6.12.48.
+# running. Flavour rule (identical to the guarded-reboot job): the version part
+# of a kernel release is the longest prefix matching
+#   ^[0-9]+(\.[0-9]+)*(\+[a-z0-9]+)?(-[0-9]+)?
+# and the flavour is everything after the "-" that follows it:
+#   7.0.0-38-generic -> generic        6.12.48+deb13-amd64 -> amd64
+#   6.12.48+deb13-rt-amd64 -> rt-amd64 6.18.50+rpt-rpi-2712 -> rpi-2712 (vs rpi-v8)
+# Candidates are the installed vmlinuz-* whose flavour equals the running one
+# EXACTLY, so rt-amd64 never counts for amd64. needrestart's raw kernel status
+# (NEEDRESTART-KSTA) is deliberately NOT used: on a Raspberry Pi 5 it compares the
+# running 2712 kernel with the v8 flavour (KSTA 3) although both are the same
+# version, a permanent false positive. Version order uses sort -V, so 6.12.9
+# sorts below 6.12.48. No flavour or no candidate means no signal.
+kflav() { printf '%s\n' "$1" | sed -nE 's/^[0-9]+(\.[0-9]+)*(\+[a-z0-9]+)?(-[0-9]+)?-//p'; }
 if [ "$RR" = no ]; then
   KREL=$(uname -r)
-  KFLAV=${KREL##*-}
-  if [ -n "$KFLAV" ] && [ "$KFLAV" != "$KREL" ]; then
-    KNEWEST=$(for k in "$R"/boot/vmlinuz-*-"$KFLAV"; do [ -e "$k" ] && printf '%s\n' "${k##*/vmlinuz-}"; done | sort -V | tail -n 1)
+  KFLAV=$(kflav "$KREL")
+  if [ -n "$KFLAV" ]; then
+    KNEWEST=$(for k in "$R"/boot/vmlinuz-*; do
+      [ -e "$k" ] || continue
+      kr=${k##*/vmlinuz-}
+      [ "$(kflav "$kr")" = "$KFLAV" ] && printf '%s\n' "$kr"
+    done | sort -V | tail -n 1)
     [ -n "$KNEWEST" ] && [ "$KNEWEST" != "$KREL" ] && RR=yes
   fi
 fi
@@ -237,8 +262,10 @@ echo "SEC_PENDING=${SEC:-0}"; echo "ALL_PENDING=${ALLUP:-0}"; echo "DISK=${DISK:
 # that do not match are ignored. The last 10000 lines bound the work.
 #   UNRECOVERED=1: the latest "reboot" record is >=60 min old and no
 #     post-boot-ok / post-boot-issues record follows it.
-#   LATCHED=1: an "alert" record whose detail starts with "latched" is not
-#     followed by a later "reboot" record (the owner clears the latch).
+#   LATCHED=1: the latest latch-related record is an "alert" whose detail starts
+#     with "latched" and no later "latch-cleared" record (action "none", appended
+#     by the owner's clear-latch command) follows it. A later reboot does not
+#     clear the latch; only the owner does.
 #   An "alert" whose detail starts with "eeprom-cancelled" (a staged EEPROM
 #     update found outside a guarded reboot, and cancelled) is just an alert: it
 #     is counted in ALERTS_24H and has no action value of its own.
@@ -258,9 +285,10 @@ if [ -r "$GR_FILE" ]; then
       x = p; sub(/^.*"action":"/, "", x); sub(/"$/, "", x)
       if (!(x in known)) x = "unknown"
       la = x; le = e
-      if (x == "reboot") { lre = e; rec = 0; latched = 0 }
+      if (x == "reboot") { lre = e; rec = 0 }
       else if (x == "post-boot-ok" || x == "post-boot-issues") { if (lre > 0) rec = 1 }
       else if (x == "alert" && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"latched/) latched = 1
+      else if (x == "none" && $0 ~ /^\{"ts":"[^"]*","epoch":[0-9]+,"host":"[^"]*","mode":"[^"]*","action":"[^"]*","triggers":"[^"]*","guards":"[^"]*","boot_id":"[^"]*","detail":"latch-cleared/) latched = 0
       if (e >= cutoff) {
         if (x == "reboot") nr++
         else if (x == "deferred") nd++
@@ -394,35 +422,73 @@ run_os() {
   # Resolved via each node's hostname (preferred) or ssh_alias; nodes with
   # neither (not-yet-provisioned) are skipped — this tracks grimnir keeping the
   # node hostnames current (grimnir#41).
-  local NODE_HOSTS=()
-  while IFS='|' read -r _ n_host n_alias _ n_status _rest; do
+  # Exception: nodes listed in BROKKR_ALERT_UNREACHABLE_NODES (runtime env, never
+  # committed) ARE alerted when unreachable, like a deploy-tier host: the
+  # guarded-reboot job may have rebooted them and they may not have come back.
+  local NODE_HOSTS=() NODE_NAMES=() KNOWN_IDS=" "
+  while IFS='|' read -r n_name n_host n_alias _ n_status _rest; do
     [[ "$n_status" == "active" ]] || continue
     local nh="${n_host:-$n_alias}"
     [[ -n "$nh" ]] || continue
+    KNOWN_IDS+="$n_name ${nh%%.*} "
     local nshort="${nh%%.*}" dup=0 dh
     [[ "$nshort" == "$LOCAL_HOST" ]] && continue
     for dh in "${DEPLOY_HOSTS[@]}"; do
       [[ "${dh%%.*}" == "$nshort" ]] && { dup=1; break; }
     done
-    [[ "$dup" == 0 ]] && NODE_HOSTS+=("$nh")
+    if [[ "$dup" == 0 ]]; then NODE_HOSTS+=("$nh"); NODE_NAMES+=("$n_name"); fi
   done < <(REGISTRY_PATH="$REGISTRY" QUERY=nodes \
     node --input-type=commonjs "$REGISTRY_JS")
 
-  # Combined, tier-tagged worklist: "deploy|host" and "node|host". Guard the
+  # Combined, tier-tagged worklist: "deploy|host" and "node|host|name". Guard the
   # NODE_HOSTS expansion: it can be empty, and under `set -u` bash 3.2/4.3 abort
   # on "${empty[@]}"; this script deliberately supports bash 3.2+.
-  local ENTRIES=() e
-  for e in "${DEPLOY_HOSTS[@]}"; do ENTRIES+=("deploy|$e"); done
+  local ENTRIES=() e ni=0
+  for e in "${DEPLOY_HOSTS[@]}"; do ENTRIES+=("deploy|$e"); KNOWN_IDS+="${e%%.*} "; done
   if [[ ${#NODE_HOSTS[@]} -gt 0 ]]; then
-    for e in "${NODE_HOSTS[@]}"; do ENTRIES+=("node|$e"); done
+    for e in "${NODE_HOSTS[@]}"; do ENTRIES+=("node|$e|${NODE_NAMES[$ni]}"); ni=$((ni + 1)); done
   fi
 
   local probe; probe="$(os_probe_cmd)"
   local summary="OS patch status ($RUN_DATE):" alerts="" any_action=false
 
+  # BROKKR_ALERT_UNREACHABLE_NODES: whitespace-separated node IDs (registry node
+  # name or short host name). Validated; an invalid or unmatched entry never
+  # silently disables the alert — the run continues and the alert says so (the
+  # invalid text itself is not echoed).
+  local ALERT_NODES=() an_list an_raw an_id an_re='^[A-Za-z0-9][A-Za-z0-9._-]*$' an_bad=false
+  an_raw="$(printf '%s' "${BROKKR_ALERT_UNREACHABLE_NODES:-}" | tr -s '[:space:]' ' ')"
+  if [[ -n "${an_raw// /}" ]]; then
+    read -r -a an_list <<<"$an_raw"
+    for an_id in "${an_list[@]}"; do
+      if [[ "$an_id" =~ $an_re ]]; then
+        ALERT_NODES+=("$an_id")
+        if [[ "$KNOWN_IDS" != *" $an_id "* ]]; then
+          echo "WARNING: BROKKR_ALERT_UNREACHABLE_NODES lists '$an_id', which matches no active registry node" >&2
+          alerts+=$'\n'"⚠️ BROKKR_ALERT_UNREACHABLE_NODES lists '$an_id', which matches no active registry node"
+          any_action=true
+        fi
+      else
+        an_bad=true
+      fi
+    done
+  fi
+  if $an_bad; then
+    echo "WARNING: BROKKR_ALERT_UNREACHABLE_NODES has an invalid entry (ignored)" >&2
+    alerts+=$'\n'"⚠️ BROKKR_ALERT_UNREACHABLE_NODES has an invalid entry (ignored)"
+    any_action=true
+  fi
+
   for entry in "${ENTRIES[@]}"; do
-    local tier="${entry%%|*}" host="${entry#*|}"
+    local tier="${entry%%|*}" rest="${entry#*|}"
+    local host="${rest%%|*}" nname="" listed=false
+    [[ "$rest" == *"|"* ]] && nname="${rest#*|}"
     local short="${host%%.*}" blob target
+    if [[ "$tier" == "node" && ${#ALERT_NODES[@]} -gt 0 ]]; then
+      for an_id in "${ALERT_NODES[@]}"; do
+        [[ "$an_id" == "$short" || ( -n "$nname" && "$an_id" == "$nname" ) ]] && listed=true
+      done
+    fi
     echo "▶ $host ($tier)"
     if target="$(resolve_remote "$host")"; then
       if [[ "$target" == "LOCAL" ]]; then
@@ -443,10 +509,15 @@ run_os() {
       report_write "maintenance/firmware/$short" "latest" \
         "$short firmware @ $TIMESTAMP: mech=unknown, status=unreachable, pending=0" \
         "[\"maintenance\",\"firmware\",\"$short\",\"automated\",\"error\"]"
-      if [[ "$tier" == "node" ]]; then
+      if [[ "$tier" == "node" ]] && ! $listed; then
         # Best-effort node (may be legitimately powered off, e.g. orin) —
         # record it, but do NOT alert or flag action.
         summary+=$'\n'"  $short: unreachable (node, best-effort)"
+      elif $listed; then
+        # Listed in BROKKR_ALERT_UNREACHABLE_NODES: alert like a deploy-tier host.
+        summary+=$'\n'"  $short: UNREACHABLE"
+        alerts+=$'\n'"⚠️ $short unreachable for OS maintenance check — if it was rebooted by the guarded-reboot job it may not have come back"
+        any_action=true
       else
         summary+=$'\n'"  $short: UNREACHABLE"
         alerts+=$'\n'"⚠️ $short unreachable for OS maintenance check"

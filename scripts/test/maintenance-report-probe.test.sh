@@ -101,6 +101,38 @@ r="$(mkroot noflav 6.12.57)"
 probe 6.12 "$r"
 check "a kernel release without a flavour: no signal, no reboot" '[[ "$(val REBOOT)" == no ]]'
 
+# Flavour rule (shared with the guarded-reboot job): the version part is the longest prefix
+# matching ^[0-9]+(\.[0-9]+)*(\+[a-z0-9]+)?(-[0-9]+)?, the flavour is what follows the next "-".
+# 7.0.0-38-generic -> generic; 6.12.48+deb13-amd64 -> amd64; 6.12.48+deb13-rt-amd64 -> rt-amd64;
+# 6.18.50+rpt-rpi-2712 -> rpi-2712 (vs rpi-v8). Candidates must match the running flavour EXACTLY.
+r="$(mkroot rt-beside 6.12.48+deb13-amd64 6.12.57+deb13-rt-amd64)"
+probe 6.12.48+deb13-amd64 "$r"
+check "flavour: a newer rt-amd64 kernel beside the running amd64 does not trigger a reboot" '[[ "$(val REBOOT)" == no ]]'
+
+r="$(mkroot rt-same 6.12.48+deb13-rt-amd64 6.12.57+deb13-rt-amd64 6.12.99+deb13-amd64)"
+probe 6.12.48+deb13-rt-amd64 "$r"
+check "flavour: a newer rt-amd64 kernel for the running rt-amd64 triggers a reboot" '[[ "$(val REBOOT)" == yes ]]'
+
+r="$(mkroot rt-cur 6.12.48+deb13-rt-amd64 6.12.99+deb13-amd64)"
+probe 6.12.48+deb13-rt-amd64 "$r"
+check "flavour: running rt-amd64 is the newest rt-amd64 (plain amd64 is newer): no reboot" '[[ "$(val REBOOT)" == no ]]'
+
+r="$(mkroot pi4-v8 6.18.50+rpt-rpi-v8 6.18.99+rpt-rpi-2712)"
+probe 6.18.50+rpt-rpi-v8 "$r"
+check "flavour: running rpi-v8 ignores a newer rpi-2712" '[[ "$(val REBOOT)" == no ]]'
+
+r="$(mkroot ubu-64k 7.0.0-38-generic 7.0.0-40-generic-64k)"
+probe 7.0.0-38-generic "$r"
+check "flavour: a newer generic-64k kernel does not count for running generic" '[[ "$(val REBOOT)" == no ]]'
+
+r="$(mkroot ubu-64k-run 7.0.0-38-generic-64k 7.0.0-40-generic-64k 7.0.0-41-generic)"
+probe 7.0.0-38-generic-64k "$r"
+check "flavour: a newer generic-64k kernel counts for running generic-64k" '[[ "$(val REBOOT)" == yes ]]'
+
+r="$(mkroot deb-odd 6.12.48+deb13-amd64 6.12.99+deb13-amd64.old)"
+probe 6.12.48+deb13-amd64 "$r"
+check "flavour: a vmlinuz file with a suffix after the flavour is not a candidate" '[[ "$(val REBOOT)" == no ]]'
+
 # ── Guarded-reboot audit projection ──────────────────────────────────────────
 AUDIT=""
 aline() { # epoch mode action triggers guards detail
@@ -199,10 +231,32 @@ audit_root nolatch
 probe 6.12.48+deb13-amd64 "$r"
 check "latch: an ordinary alert (detail not starting with latched) does not latch" '[[ "$(val GUARDED_REBOOT_LATCHED)" == 0 ]]'
 
-audit_root latch-cleared
-{ aline $((NOW - 7200)) reboot alert kernel "" "latched: x"; aline $((NOW - 3600)) reboot reboot kernel "" "owner cleared the latch, rebooted"; aline $((NOW - 3000)) reboot post-boot-ok kernel "" ok; } >"$AUDIT"
+# Only the owner's clear-latch command clears the latch: it appends action "none" with a detail
+# starting "latch-cleared". A later reboot record (or anything else) does not.
+audit_root latch-reboot
+{ aline $((NOW - 7200)) reboot alert kernel "" "latched: x"; aline $((NOW - 3600)) reboot reboot kernel "" "rebooted"; aline $((NOW - 3000)) reboot post-boot-ok kernel "" ok; } >"$AUDIT"
 probe 6.12.48+deb13-amd64 "$r"
-check "latch: a later reboot record means the latch was cleared" '[[ "$(val GUARDED_REBOOT_LATCHED)" == 0 ]]'
+check "latch: a later reboot record does NOT clear the latch" '[[ "$(val GUARDED_REBOOT_LATCHED)" == 1 ]]'
+
+audit_root latch-cleared
+{ aline $((NOW - 7200)) reboot alert kernel "" "latched: x"; aline $((NOW - 3600)) reboot none "" "" "latch-cleared by the owner"; } >"$AUDIT"
+probe 6.12.48+deb13-amd64 "$r"
+check "latch: a later latch-cleared record (action none) clears the latch" '[[ "$(val GUARDED_REBOOT_LATCHED)" == 0 ]]'
+
+audit_root latch-again
+{ aline $((NOW - 7200)) reboot alert kernel "" "latched: x"; aline $((NOW - 3600)) reboot none "" "" "latch-cleared by the owner"; aline $((NOW - 600)) reboot alert kernel "" "latched: again"; } >"$AUDIT"
+probe 6.12.48+deb13-amd64 "$r"
+check "latch: a latched alert after latch-cleared latches again" '[[ "$(val GUARDED_REBOOT_LATCHED)" == 1 ]]'
+
+audit_root latch-wrong-action
+{ aline $((NOW - 7200)) reboot alert kernel "" "latched: x"; aline $((NOW - 3600)) reboot alert kernel "" "latch-cleared but as an alert"; } >"$AUDIT"
+probe 6.12.48+deb13-amd64 "$r"
+check "latch: latch-cleared only counts on an action none record" '[[ "$(val GUARDED_REBOOT_LATCHED)" == 1 ]]'
+
+audit_root latch-forged
+{ aline $((NOW - 7200)) reboot alert kernel "" "latched: x"; aline $((NOW - 3600)) reboot none "" "" 'harmless\",\"detail\":\"latch-cleared'; } >"$AUDIT"
+probe 6.12.48+deb13-amd64 "$r"
+check "latch: a latch-cleared forged inside another detail does not clear it" '[[ "$(val GUARDED_REBOOT_LATCHED)" == 1 ]]'
 
 # An alert whose detail starts with eeprom-cancelled (a staged EEPROM update found outside a
 # guarded reboot and cancelled) is an ordinary alert: counted with the alerts, no latch, no new

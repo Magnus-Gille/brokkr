@@ -248,7 +248,7 @@ chmod +x "$TMP/mbin/ssh" "$TMP/mbin/curl" "$TMP/mbin/hostname"
 
 cat >"$TMP/services-gr.json" <<'JSON'
 {"components":[{"name":"fixture","repo":"fixture","host":"other-host","deploy":true,"scan":false}],
- "nodes":[{"name":"inference-fixture","hostname":"inference-fixture.example","role":"inference","status":"active"}]}
+ "nodes":[{"name":"inf-node","hostname":"inference-fixture.example","role":"inference","status":"active"}]}
 JSON
 
 BASE_PROBE=$'REBOOT=no\nREBOOT_PKGS=0\nUU_INSTALLED=1\nSEC_PENDING=0\nALL_PENDING=0\nDISK=50\nKERNEL=fixture\nFW_MECH=none\nFW_STATUS=current\nFW_PENDING=0\nFW_CUR=\nFW_LAT=\nFW_DETAIL=\n'
@@ -364,6 +364,40 @@ check "unreachable node-tier host is not alerted" not out_has "inference-fixture
 run_os
 check "unreachable hosts overwrite their Munin status with UNREACHABLE" \
   call_has_text memory_write maintenance/os/other-host "UNREACHABLE" latest
+
+# BROKKR_ALERT_UNREACHABLE_NODES: space-separated node IDs (the registry node name, or the short
+# host name) whose unreachability alerts like a deploy-tier host (the guarded-reboot job may have
+# rebooted them and they may not have come back). Unlisted nodes keep the Munin-only behaviour.
+ALERT_TEXT="inference-fixture unreachable for OS maintenance check — if it was rebooted by the guarded-reboot job it may not have come back"
+set_probe other-host
+clear_probe inference-fixture.example
+BROKKR_ALERT_UNREACHABLE_NODES="inf-node" run_os --dry-run
+check "a listed unreachable node (by registry name) is alerted with the guarded-reboot hint" out_has "$ALERT_TEXT"
+check "a listed unreachable node is flagged UNREACHABLE in the summary" out_has "inference-fixture: UNREACHABLE"
+BROKKR_ALERT_UNREACHABLE_NODES="something-else inference-fixture" run_os --dry-run
+check "a listed unreachable node (by short host name, among several IDs) is alerted" out_has "$ALERT_TEXT"
+BROKKR_ALERT_UNREACHABLE_NODES="something-else" run_os --dry-run
+check "an unlisted unreachable node stays Munin-only" not out_has "inference-fixture unreachable"
+check "an unlisted unreachable node is still recorded in the summary" out_has "inference-fixture: unreachable (node, best-effort)"
+set_probe inference-fixture.example
+BROKKR_ALERT_UNREACHABLE_NODES="inf-node" run_os --dry-run
+check "a listed node that is reachable is not alerted" not out_has "inference-fixture unreachable"
+clear_probe inference-fixture.example
+BROKKR_ALERT_UNREACHABLE_NODES="inf-node" run_os
+check "a listed unreachable node still overwrites its Munin status" \
+  call_has_text memory_write maintenance/os/inference-fixture "UNREACHABLE" latest
+
+# An invalid or unmatched entry must not silently disable the alert: the run continues and
+# says so in the alert. The invalid text is never echoed.
+if BROKKR_ALERT_UNREACHABLE_NODES='inf-node bad;$(id) ghost-node' run_os --dry-run; then listed_rc=0; else listed_rc=$?; fi
+check "a bad entry does not fail the run" test "$listed_rc" -eq 0
+check "a valid entry beside a bad one still alerts" out_has "$ALERT_TEXT"
+check "an invalid entry is reported as ignored, without echoing it" \
+  out_has "BROKKR_ALERT_UNREACHABLE_NODES has an invalid entry (ignored)"
+check "invalid entry text is not echoed" not out_has 'bad;'
+check "an entry matching no active node is reported" out_has "BROKKR_ALERT_UNREACHABLE_NODES lists 'ghost-node', which matches no active registry node"
+BROKKR_ALERT_UNREACHABLE_NODES='' run_os --dry-run
+check "an empty setting (default) raises no configuration alert" not out_has "BROKKR_ALERT_UNREACHABLE_NODES"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

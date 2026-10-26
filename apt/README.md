@@ -46,7 +46,16 @@ overwritten. The script only verifies that the host's `20auto-upgrades` enables
   done only by Brokkr's guarded-reboot job (workload, load and session guards, post-boot check,
   audit trail). The daily `brokkr-maintenance-os` report (07:00 on control-node) still detects
   `reboot-required`, or a running kernel older than the newest installed kernel of the same
-  flavour, and surfaces it to Munin and Telegram, together with the guarded-reboot audit summary.
+  flavour (version part = longest prefix matching `^[0-9]+(\.[0-9]+)*(\+[a-z0-9]+)?(-[0-9]+)?`,
+  flavour = what follows the next `-`, so `rt-amd64` never counts for `amd64` and `rpi-2712` never
+  for `rpi-v8`), and surfaces it to Munin and Telegram, together with the guarded-reboot audit
+  summary. A node that is only recorded in Munin when unreachable can be made to alert like a
+  deploy-tier host by listing its ID in `BROKKR_ALERT_UNREACHABLE_NODES` in the report's runtime
+  environment (see the header of `../scripts/maintenance-report.sh`); ADR-009 relies on this for
+  the inference node, which the guarded-reboot job may have rebooted.
+- **Previous kernel.** The previous kernel stays installed through apt's kernel autoremove
+  protection, which keeps the running and the newest kernels; ADR-009 relies on this as the
+  mitigation for manual boot selection. `Remove-Unused-Kernel-Packages` is left as is.
 - **Firmware.** The Raspberry Pi bootloader EEPROM is updated by apt (`rpi-eeprom`) and applied at
   boot by the stock `rpi-eeprom-update` service, so it takes effect at the next guarded reboot.
   UEFI / BIOS firmware (fwupd) stays report-only.
