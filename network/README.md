@@ -11,6 +11,13 @@ NAS health snapshot runs it every 15 minutes. Use the public, placeholder-only
 [`Tailscale authentication recovery runbook`](../runbooks/tailscale-auth-recovery.md)
 for an attended `NeedsLogin` recovery and post-reboot verification.
 
+[`tailscale/control-node-ssh-policy.example.json`](tailscale/control-node-ssh-policy.example.json)
+is the placeholder-only policy fragment for turning Tailscale SSH off on the
+control node while keeping OpenSSH over the tailnet. Use it only through the
+owner-attended
+[`control-node OpenSSH cutover runbook`](../runbooks/control-node-openssh-cutover.md),
+which also covers the read-only `scripts/control-node-ssh-cutover.py` preflight.
+
 The local [`check-link-health.py`](check-link-health.py) check watches each
 configured wired interface for a speed below its expected minimum, kernel link
 drops, PHY downshifts, and NIC error growth, so a flapping or negotiated-down
