@@ -1,0 +1,12 @@
+# Brokkr · verify the encrypted archive off-site copy monthly (user timer).
+[Unit]
+Description=Run Brokkr archive off-site verification monthly
+
+[Timer]
+OnCalendar=*-*-01 03:30:00
+RandomizedDelaySec=2h
+Persistent=true
+Unit=brokkr-archive-verify.service
+
+[Install]
+WantedBy=timers.target

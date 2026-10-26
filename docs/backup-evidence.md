@@ -34,6 +34,7 @@ host involved; never infer it from a directory name or from transport over SMB/H
 | Mímir artifacts | NAS `backups/mimir/` | Inherits the NAS volume's storage properties; producer behavior belongs to Mímir | Do not claim encryption from Brokkr without live block-device and Mímir evidence |
 | Munin memory | NAS `backups/munin-memory/` | Inherits the NAS volume's storage properties; dump format belongs to Munin | Do not claim encryption from Brokkr without live block-device and Munin evidence |
 | Photos offsite | `brokkr-photos-crypt:current` | Each run fails closed unless rclone reports `crypt`, standard filename encryption, and directory-name encryption | A successful preflight proves configuration at that moment; only a restore from a fresh key setup proves key recovery |
+| Archive off-site | A dedicated crypt remote (see [archive-offsite.md](archive-offsite.md)) | Every mode fails closed unless the remote is `crypt` with standard name and directory encryption, a salt, and base32768 names | The monthly `--verify` reports copy, integrity and restore as separate rows; key recovery is only the yearly owner drill |
 | Offline rotation disk | Disconnected LUKS2 USB disk ([offline rotation](offline-rotation.md)) | Each rotation fails closed unless the configured LUKS UUID resolves to a LUKS2 header that reports the same UUID | A receipt proves integrity at rotation time; restore and key recovery need that document's drills |
 
 No hardening task should enable or change disk, Time Machine, or rclone encryption as a

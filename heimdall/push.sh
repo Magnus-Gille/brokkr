@@ -67,11 +67,18 @@ try:
         raise ValueError("snapshot checks must be an array of objects")
     if any(c.get("status") not in ("pass", "warn", "fail") for c in checks):
         raise ValueError("check status must be pass, warn, or fail")
+    summary = snap.get("summary")
+    if summary is not None and (not isinstance(summary, str) or not summary.strip()):
+        raise ValueError("snapshot summary must be a non-empty string")
 except (OSError, TypeError, ValueError) as error:
     print(f"brokkr push failed: {type(error).__name__}", file=sys.stderr)
     sys.exit(1)
 alarms = [c for c in checks if c.get("status") in ("warn", "fail")]
-if alarms:
+# A producer whose passing rows are evidence in their own right (archive verification)
+# supplies its own bounded summary; everyone else gets the alarm-only message.
+if summary is not None:
+    msg = summary
+elif alarms:
     msg = "; ".join(f'{c.get("name", "unnamed")}: {c.get("detail", "")}' for c in alarms)
 else:
     msg = f'{len(checks)} checks, all nominal'
