@@ -24,9 +24,16 @@ make_repo() { # dir
   cp "$ROOT/scripts/lib/deploy-source.sh" "$r/scripts/lib/"
   cp "$ROOT/systemd/user/"brokkr-agent-cli-update.* "$r/systemd/user/" 2>/dev/null
   echo "unrelated file that must never ship" >"$r/README.md"
-  git init -q "$r"; git -C "$r" config user.name test; git -C "$r" config user.email test@example.invalid
+  fgit init -q "$r"; fgit -C "$r" config user.name test; fgit -C "$r" config user.email test@example.invalid
 }
-commit_repo() { git -C "$1" add . ; git -C "$1" commit -qm fixture; git -C "$1" rev-parse HEAD; }
+# Fixture git never reads the user's global or system config, so no hook, template or signing
+# program of theirs runs while the test builds its repositories.
+fgit() {
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TEMPLATE_DIR="$TMP/empty-git-template" \
+    git -c core.hooksPath=/dev/null -c commit.gpgsign=false -c tag.gpgsign=false "$@"
+}
+mkdir -p "$TMP/empty-git-template"
+commit_repo() { fgit -C "$1" add . ; fgit -C "$1" commit -qm fixture; fgit -C "$1" rev-parse HEAD; }
 make_repo "$REPO"
 SHA="$(commit_repo "$REPO")"
 DEPLOY="$REPO/scripts/deploy-agent-cli-update.sh"
