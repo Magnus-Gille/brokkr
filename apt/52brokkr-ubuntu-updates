@@ -1,5 +1,7 @@
-// Brokkr-managed — installed by scripts/setup-host-patching.sh onto Ubuntu hosts
-// (Grimnir ADR-009: regular OS updates, guarded reboots).
+// Brokkr-managed — installed by scripts/setup-host-patching.sh only onto the Ubuntu
+// hosts the owner approved in BROKKR_REGULAR_UPDATE_HOSTS (Grimnir ADR-009: regular OS
+// updates, guarded reboots). Any other host keeps the distribution's security
+// baseline, and the script removes this file from it.
 //
 // The distribution's own 50unattended-upgrades (release, -security, ESM) stays in
 // place and is never overwritten by Brokkr; apt merges list-valued options across

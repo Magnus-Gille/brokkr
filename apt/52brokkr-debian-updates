@@ -1,5 +1,7 @@
-// Brokkr-managed — installed by scripts/setup-host-patching.sh onto Debian /
-// Raspberry Pi OS hosts (Grimnir ADR-009: regular OS updates, guarded reboots).
+// Brokkr-managed — installed by scripts/setup-host-patching.sh only onto the Debian /
+// Raspberry Pi OS hosts the owner approved in BROKKR_REGULAR_UPDATE_HOSTS (Grimnir
+// ADR-009: regular OS updates, guarded reboots). Any other host gets the security
+// baseline only, and the script removes this file from it.
 //
 // apt merges list-valued options across apt.conf.d files, so these patterns are
 // appended to the security-only baseline in 50unattended-upgrades. Origins:
@@ -11,8 +13,8 @@
 // Every repository is matched by exact origin, label and codename / channel; a
 // channel that is not listed here is never admitted. Debian-family hosts have no
 // Tailscale apt repository, so none is listed. A pattern that matches no
-// configured repository is a no-op, so one file serves every Debian-family host
-// whatever subset of these repositories it has.
+// configured repository is a no-op, so one file serves every approved Debian-family
+// host whatever subset of these repositories it has.
 // Reboots are never done here; see the guarded-reboot job and 50unattended-upgrades.
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian";

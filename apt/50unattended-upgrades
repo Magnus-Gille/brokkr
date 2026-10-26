@@ -5,7 +5,8 @@
 //   * Security: only the Debian-Security archive is listed here.
 //   * Regular updates (Debian stable and stable-updates, the Raspberry Pi
 //     archive with kernel / firmware / rpi-eeprom, gh) come from the
-//     52brokkr-debian-updates drop-in, and Claude Code from 51brokkr-claude-code;
+//     52brokkr-debian-updates drop-in, installed only on hosts the owner approved
+//     in BROKKR_REGULAR_UPDATE_HOSTS; Claude Code comes from 51brokkr-claude-code.
 //     apt appends their Origins-Pattern entries to the list below.
 //   * NO automatic reboot, ever, from unattended-upgrades. Automatic-Reboot
 //     stays "false" because reboots are done by Brokkr's guarded-reboot job
