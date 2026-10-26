@@ -146,8 +146,12 @@ case "${1:-}" in
 esac
 FAKE
 # The fake ip only plays back the lines of MOCK_IP_LINES for `ip -o monitor link`.
+# It takes a moment to subscribe, like the real netlink listener, and then logs that it
+# is listening, so a test can tell whether a status read came before or after.
 cat >"$STORE/ip" <<'FAKE'
 #!/usr/bin/env bash
+sleep 0.3
+printf 'ip %s (subscribed)\n' "$*" >>"$MOCK_CALLS"
 if [[ -n "${MOCK_IP_LINES:-}" && -f "$MOCK_IP_LINES" ]]; then cat "$MOCK_IP_LINES"; fi
 exit 0
 FAKE
@@ -489,6 +493,7 @@ check "apply with the ad-hoc unit present succeeds" '[[ "$RC" -eq 0 && "$OUT" ==
 check "the managed template is installed with the pinned ethtool and revision" 'grep -Fxq "ExecStart=$BIN/ethtool --set-eee %i eee off" "$MANAGED" && grep -q "$SHA" "$MANAGED" && ! grep -Eq "@[A-Z_]+@" "$MANAGED"'
 check "the managed template is wanted by the interface device and by multi-user.target" 'grep -Fxq "WantedBy=sys-subsystem-net-devices-%i.device multi-user.target" "$MANAGED"'
 check "the managed template carries a start limit" 'grep -Fxq "StartLimitBurst=5" "$MANAGED"'
+check "both templates bound how long a boot waits for the device" 'grep -Eq "^JobTimeoutSec=[0-9]+s$" "$MANAGED" && grep -Eq "^JobTimeoutSec=[0-9]+s$" "$WATCH_TEMPLATE"'
 check "the managed instance is enabled and active" '[[ -e "$STATE/enabled.$INSTANCE" && -e "$STATE/active.$INSTANCE" ]]'
 check "the managed instance is wanted by the interface device" '[[ -L "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/$INSTANCE" ]]'
 check "the watcher template is installed rendered with the revision and pinned paths" '[[ -f "$WATCH_TEMPLATE" ]] && ! grep -Eq "@[A-Z_]+@" "$WATCH_TEMPLATE" && grep -Fq "$SHA" "$WATCH_TEMPLATE" && grep -Fq "$BIN/ip -o monitor link" "$WATCH_TEMPLATE" && grep -Fq "$BIN/ethtool" "$WATCH_TEMPLATE"'
@@ -540,6 +545,11 @@ check "a later revision replaces the managed template" '[[ "$RC" -eq 0 ]] && gre
 check "a later revision's rollback restores the previous template without disabling" '[[ "$OUT" == *"mv -f $MANAGED.previous-$SHA2 $MANAGED"* && "$OUT" != *"systemctl disable"*"$INSTANCE"* ]]'
 run_rollback; RB=$?
 check "a later revision's rollback recipe restores the previous template, still enabled and active" '[[ "$RB" -eq 0 && "$(cat "$MANAGED")" == "$MANAGED_BEFORE" && -e "$STATE/enabled.$INSTANCE" && -e "$STATE/active.$INSTANCE" ]]'
+# A watcher that was running is stopped before its template is restored, so it cannot
+# restart the managed unit mid-rollback, and is started again at the end.
+recipe_line() { printf '%s\n' "$OUT" | sed -n '/^Rollback/,$p' | grep -nF -- "$1" | head -1 | cut -d: -f1; }
+check "a later revision's rollback stops the running watcher first and restarts it last" '[[ -n "$(recipe_line "systemctl stop $WATCH")" && "$(recipe_line "systemctl stop $WATCH")" -lt "$(recipe_line "mv -f $WATCH_TEMPLATE.previous-$SHA2")" && "$(recipe_line "systemctl daemon-reload")" -lt "$(recipe_line "systemctl restart $WATCH")" ]]'
+check "a later revision's rollback leaves the watcher enabled and active on its previous template" '[[ -e "$STATE/enabled.$WATCH" && -e "$STATE/active.$WATCH" && -f "$WATCH_TEMPLATE" && ! -e "$WATCH_TEMPLATE.previous-$SHA2" ]]'
 git -C "$REPO" reset -q --hard "$SHA"
 
 # A previously enabled but inactive instance is not left active by the rollback.
@@ -712,6 +722,9 @@ echo disabled >"$STATE/eee.eth0"; run_watch
 check "watcher: EEE already disabled and no link event restarts nothing" '[[ -n "$WATCH_SCRIPT" && "$W_RESTARTS" == 0 ]]'
 echo 'enabled - active' >"$STATE/eee.eth0"; run_watch
 check "watcher: EEE enabled at start restarts the unit once" '[[ "$W_RESTARTS" == 1 ]]'
+: >"$CALLS"; echo disabled >"$STATE/eee.eth0"; run_watch
+check "watcher: the start check reads EEE only after ip monitor is listening" '[[ -n "$(line_of "^ip -o monitor link (subscribed)")" && -n "$(line_of "^ethtool --show-eee eth0")" && "$(line_of "^ip -o monitor link (subscribed)")" -lt "$(line_of "^ethtool --show-eee eth0")" ]]'
+echo 'enabled - active' >"$STATE/eee.eth0"
 run_watch "$UP"
 check "watcher: a LOWER_UP event of the interface with EEE enabled restarts the unit again" '[[ "$W_RESTARTS" == 2 ]]'
 run_watch "$DOWN"
