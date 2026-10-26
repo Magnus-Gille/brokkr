@@ -47,7 +47,8 @@ start it:
 [`network/brokkr-eee-off-watch@.service.example`](../network/brokkr-eee-off-watch@.service.example)
 is installed as `/etc/systemd/system/brokkr-eee-off-watch@.service` with the
 verified `ethtool` and `ip` paths. Its instance runs `ip -o monitor link`. It
-reads the EEE status (read-only) when it starts and on every event that shows
+reads the EEE status (read-only) one second after it starts, once `ip monitor`
+is listening, and on every event that shows
 `<iface>` with `LOWER_UP`. When the status is anything but `disabled` or
 `not supported`, it restarts `brokkr-eee-off@<iface>.service` and logs why. A
 re-apply that renegotiates the link is a no-op the second time, because EEE then
@@ -59,6 +60,13 @@ failed unit shows in `systemctl --failed` and, where it runs, the
 It has the same two `WantedBy=` entries, `Restart=always`, and is ordered after the
 managed unit so that both do not set EEE at the same boot.
 
+Both units set `JobTimeoutSec=30s`. Being wanted by `multi-user.target` makes them
+part of what the boot waits for, and `BindsTo=`/`After=` make them wait for the
+device. If the interface is missing or was renamed, the job is cancelled after
+30 seconds instead of holding the target for the device timeout (by default
+`DefaultDeviceTimeoutSec=`, 90 s). The unit then stays inactive, and the device
+`.wants/` link can still start it if the device appears later.
+
 Interface names are limited to letters, digits, `_` and `.` (at most 15, not
 starting with `.`), so the raw instance name equals the escaped device-unit name.
 
@@ -67,10 +75,11 @@ starting with `.`), so the raw instance name equals the escaped device-unit name
 The first managed release (PR #158) and the ad-hoc unit before it were started
 only by a link in `sys-subsystem-net-devices-<iface>.device.wants/`. On
 2026-10-26 the control node rebooted, the ad-hoc unit did not run (no journal
-entry at all) and EEE was found enabled. The managed release used the same trigger,
-so it would have failed the same way. The exact path on that boot is not proven
-(the device unit's journal of that boot was not captured), but primary sources
-show why the trigger is fragile:
+entry at all) and EEE was found enabled. The managed release uses the same trigger,
+so it is exposed to the same failure; that it would have failed is an inference.
+Why the ad-hoc unit did not run on that boot is unresolved, because the device
+unit's journal of that boot was not captured. Primary sources show why the
+trigger is fragile:
 
 - A `.wants/` link on a device unit is acted on only when the device unit *changes*
   to plugged. [systemd.device(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.device.html):
@@ -225,7 +234,8 @@ change.
 
 Every `--apply` that changed something prints a rollback recipe listing only the
 steps that run completed. It handles the watcher first, so that the watcher cannot
-restart the managed unit during the rollback. For each instance it stops it if it
+restart the managed unit during the rollback: a watcher that was running before is
+stopped first and started again on its previous template at the end. For each instance it stops it if it
 was inactive before. It disables it if it was disabled before, or, if it was
 already enabled, removes only the links this run added (on a migration, the new
 `multi-user.target.wants/` link). It removes each template or restores its
@@ -283,8 +293,9 @@ come back. Run the read-only checks as the operator on the node.
    ```
 
    Pass: EEE is `disabled`, both units are active, and this boot's journal shows
-   the managed unit finishing. The device-unit lines show which trigger fired first,
-   which settles the diagnosis above.
+   the managed unit finishing. This verifies the new triggers. It cannot tell why
+   the old unit did not run on 2026-10-26, because the boot dependencies have
+   changed; the device-unit lines are recorded only as context.
 4. **Link change** (optional, approved): unplug and replug the cable, or make the
    switch port renegotiate. Then `ethtool --show-eee <iface>` must read `disabled`.
    The watcher's journal shows a re-apply only if the driver had turned EEE on.

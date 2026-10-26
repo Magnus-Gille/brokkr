@@ -10,7 +10,8 @@
 # interface's device unit, so a driver reload or hotplug starts it again. The
 # companion brokkr-eee-off-watch@<iface>.service restarts it when a link change
 # turned EEE back on. The start limit stops a driver that never keeps EEE off from
-# renegotiating the link in a loop.
+# renegotiating the link in a loop. The job timeout bounds how long a boot waits
+# for the device.
 #
 # EEE was NOT the cause of the link flapping that prompted this; see
 # docs/eee-off.md for why it stays off anyway.
@@ -21,6 +22,9 @@ BindsTo=sys-subsystem-net-devices-%i.device
 After=sys-subsystem-net-devices-%i.device
 StartLimitIntervalSec=10min
 StartLimitBurst=5
+# A missing or renamed interface must not hold multi-user.target for the device
+# timeout; the job is cancelled instead and the unit stays inactive.
+JobTimeoutSec=30s
 
 [Service]
 Type=oneshot

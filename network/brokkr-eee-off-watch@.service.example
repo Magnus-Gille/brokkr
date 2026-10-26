@@ -16,13 +16,16 @@
 # that unit's start limit fails it, and the watcher stops restarting a failed unit,
 # so the link is not renegotiated in a loop and the failure stays visible.
 #
-# systemd turns "$$" into "$" and joins the continued lines with spaces, so the
-# script below is one sh -c line with explicit separators.
+# The start check waits a second while ip monitor subscribes, so a link change
+# right after the check is still seen; events that arrive meanwhile queue in the
+# pipe. systemd turns "$$" into "$" and joins the continued lines with spaces, so
+# the script below is one sh -c line with explicit separators.
 [Unit]
 Description=Brokkr: re-apply EEE off on %i after a link change (revision @REVISION@)
 Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/eee-off.md
 BindsTo=sys-subsystem-net-devices-%i.device
 After=sys-subsystem-net-devices-%i.device brokkr-eee-off@%i.service
+JobTimeoutSec=30s
 
 [Service]
 Type=simple
@@ -34,13 +37,13 @@ ExecStart=/bin/sh -c 'iface=$$1; unit=brokkr-eee-off@$$iface.service; \
     if systemctl is-failed --quiet "$$unit"; then echo "EEE on $$iface is $$status but $$unit has failed; not restarting it" >&2; return 0; fi; \
     echo "EEE on $$iface is $$status after $$1; restarting $$unit"; \
     systemctl restart --no-block "$$unit" || echo "could not restart $$unit" >&2; }; \
-  { echo start; exec @IP@ -o monitor link; } | while IFS= read -r line; do \
-    case $$line in \
-      start) check "the watcher started" ;; \
-      Deleted*) ;; \
-      *": $$iface: <"*LOWER_UP*) check "a link change" ;; \
-    esac; \
-  done' brokkr-eee-off-watch %i
+  @IP@ -o monitor link | { sleep 1; check "the watcher started"; \
+    while IFS= read -r line; do \
+      case $$line in \
+        Deleted*) ;; \
+        *": $$iface: <"*LOWER_UP*) check "a link change" ;; \
+      esac; \
+    done; }' brokkr-eee-off-watch %i
 
 [Install]
 WantedBy=sys-subsystem-net-devices-%i.device multi-user.target

@@ -466,7 +466,11 @@ print_state() {
     return 0
   fi
   echo "Rollback (run on the target as $user; only steps this run completed are listed):"
-  # The watcher first, so it cannot restart the managed unit during the rollback.
+  # The watcher first, so it cannot restart the managed unit during the rollback. One
+  # that was running before is stopped too and started again at the end.
+  if [ "$watch_installed" = 1 ] && [ "$watch_active" = active ]; then
+    echo "  sudo systemctl stop $watch_instance   # started again below"
+  fi
   rollback_unit "$watch_instance" "$watch_enable_ran" "$watch_restarted" "$watch_enabled" "$watch_active" "$watch_new_links"
   rollback_unit "$instance" "$instance_enable_ran" "$instance_restarted" "$instance_enabled" "$instance_active" "$instance_new_links"
   if [ "$watch_installed" = 1 ]; then
@@ -481,7 +485,7 @@ print_state() {
   if [ "$instance_restarted" = 1 ] && [ "$instance_active" = active ] && [ "$managed_backed_up" = 1 ]; then
     echo "  sudo systemctl restart $instance   # it was active before this run; re-run the previous template"
   fi
-  if [ "$watch_restarted" = 1 ] && [ "$watch_active" = active ] && [ "$watch_backed_up" = 1 ]; then
+  if [ "$watch_installed" = 1 ] && [ "$watch_active" = active ] && [ "$watch_backed_up" = 1 ]; then
     echo "  sudo systemctl restart $watch_instance   # it was active before this run; run the previous template"
   fi
   if [ "$legacy_backed_up" = 1 ] && [ "$legacy_removed" = 0 ]; then
@@ -600,4 +604,3 @@ else
   }
   echo "==> DRY-RUN complete. Re-run with --apply to install."
 fi
-
