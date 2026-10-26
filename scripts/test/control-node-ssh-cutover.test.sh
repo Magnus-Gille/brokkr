@@ -5,6 +5,13 @@
 # real binary run against temp known_hosts files and generated fixture keys. No host,
 # network, service, or real home directory is touched. All names and addresses are
 # reserved example values.
+#
+# The host-role authorized_keys fixtures need a directory chain that OpenSSH's StrictModes
+# accepts (no group- or world-writable ancestor), which a sticky /tmp is not. They are
+# created in a fresh mktemp -d directory under the first suitable base of $RUNNER_TEMP,
+# $XDG_RUNTIME_DIR, $TMPDIR (or /tmp) and, as a last resort, $HOME. Only that new
+# directory is created and removed (EXIT trap); no existing file under $HOME or anywhere
+# else is read, and no real key file is ever opened.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -372,6 +379,33 @@ done
 reset_operator; G_STRICT=''; run_op before
 expect "operator: missing StrictHostKeyChecking fails closed" 2 blocked strict_host_key_checking_weak "" \
   'd["checks"]["strict_host_key_checking_enforced"] is False'
+
+# Repeated ssh -G keys: every occurrence must agree (casefolded), otherwise fail closed.
+reset_operator; G_STRICT=yes; G_EXTRA=$'stricthostkeychecking no\n'; run_op before
+expect "operator: conflicting StrictHostKeyChecking values are weak" 2 blocked strict_host_key_checking_weak ""
+
+reset_operator; G_STRICT=yes; G_EXTRA=$'stricthostkeychecking YES\n'; run_op before
+expect "operator: repeated identical StrictHostKeyChecking values pass" 0 pass "" ""
+
+reset_operator; G_EXTRA=$'hostname other.example.ts.net\n'; run_op before
+expect "operator: conflicting hostname values are an error" 1 error ssh_config_unavailable ""
+
+reset_operator; G_EXTRA=$'hostname CTL1.EXAMPLE.TS.NET\n'; run_op before
+expect "operator: a repeated hostname differing only in case passes" 0 pass "" ""
+
+reset_operator; G_EXTRA=$'port 2222\n'; run_op before
+expect "operator: conflicting port values are an error" 1 error ssh_config_unavailable ""
+
+reset_operator; G_EXTRA=$'user other\n'; run_op before
+expect "operator: conflicting user values are an error" 1 error ssh_config_unavailable ""
+
+reset_operator; G_EXTRA=$'hostkeyalias keyalias-a.example\nhostkeyalias keyalias-b.example\n'; run_op before
+expect "operator: conflicting HostKeyAlias values are an error" 1 error ssh_config_unavailable ""
+
+reset_operator
+printf 'keyalias.example ssh-ed25519 %s\n' "$BLOB" >"$TMP/known_hosts"
+G_EXTRA=$'hostkeyalias keyalias.example\nhostkeyalias keyalias.example\n'; run_op before
+expect "operator: a repeated identical HostKeyAlias is the lookup name" 0 pass "" ""
 for mode in ask true yes; do
   reset_operator; G_STRICT="$mode"; run_op before
   expect "operator: StrictHostKeyChecking $mode passes" 0 pass "" ""
@@ -566,15 +600,51 @@ if [ -z "$KEYBASE" ]; then
 fi
 
 ssh-keygen -q -t ecdsa -b 256 -N '' -C fixture -f "$TMP/ecdsakey"
+ssh-keygen -q -t rsa -b 2048 -N '' -C fixture -f "$TMP/rsakey"
 EBLOB="$(awk '{print $2}' "$TMP/ecdsakey.pub")"
-cat >"$TMP/skblob.py" <<'EOF'
+RBLOB="$(awk '{print $2}' "$TMP/rsakey.pub")"
+# Build complete and deliberately broken key blobs from the generated fixture keys.
+cat >"$TMP/blobs.py" <<'EOF'
 import base64
 import struct
+import sys
 
-key_type = b"sk-ssh-ed25519@openssh.com"
-print(base64.b64encode(struct.pack(">I", len(key_type)) + key_type + b"fixture").decode())
+
+def wire(data):
+    return struct.pack(">I", len(data)) + data
+
+
+def fields(path):
+    blob = base64.b64decode(open(path, encoding="utf-8").read().split()[1])
+    out = []
+    while blob:
+        (size,) = struct.unpack(">I", blob[:4])
+        out.append(blob[4:4 + size])
+        blob = blob[4 + size:]
+    return out
+
+
+kind, ed_path, ec_path = sys.argv[1:4]
+ed = fields(ed_path)
+ec = fields(ec_path)
+blobs = {
+    # Complete security-key public keys: type, key material, application.
+    "sk-ed25519": wire(b"sk-ssh-ed25519@openssh.com") + wire(ed[1]) + wire(b"ssh:"),
+    "sk-ecdsa": wire(b"sk-ecdsa-sha2-nistp256@openssh.com") + wire(ec[1]) + wire(ec[2]) + wire(b"ssh:"),
+    # Broken ed25519 structures that still start with the right type string.
+    "header-only": wire(b"ssh-ed25519"),
+    "truncated": wire(b"ssh-ed25519") + wire(ed[1][:16]),
+    "trailing": wire(b"ssh-ed25519") + wire(ed[1]) + b"junk",
+}
+print(base64.b64encode(blobs[kind]).decode())
 EOF
-SKBLOB="$("$PYTHON" "$TMP/skblob.py")"
+make_blob() { "$PYTHON" "$TMP/blobs.py" "$1" "$TMP/hostkey.pub" "$TMP/ecdsakey.pub"; }
+SKEDBLOB="$(make_blob sk-ed25519)"
+SKECBLOB="$(make_blob sk-ecdsa)"
+HDRBLOB="$(make_blob header-only)"
+TRUNCBLOB="$(make_blob truncated)"
+TRAILBLOB="$(make_blob trailing)"
+mkpath no-keygen tailscale ssh sshd systemctl bash cat sleep
 
 reset_host() {
   H_STATE=Running H_SELF_ONLINE=true H_IPS='"192.0.2.50","2001:db8::50"'
@@ -700,6 +770,31 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   reset_host; S_USEDNS=''; run_host before
   expect "host: missing usedns fails closed" 2 blocked usedns_enabled ""
 
+  # Repeated sshd -T keys: every occurrence must agree (casefolded), otherwise fail closed.
+  reset_host; S_EXTRA=$'passwordauthentication yes\n'; run_host before
+  expect "host: conflicting passwordauthentication values are blocked" 2 blocked password_auth_enabled ""
+
+  reset_host; S_EXTRA=$'pubkeyauthentication no\n'; run_host before
+  expect "host: conflicting pubkeyauthentication values are blocked" 2 blocked pubkey_auth_disabled ""
+
+  reset_host; S_EXTRA=$'kbdinteractiveauthentication yes\n'; run_host before
+  expect "host: conflicting kbdinteractiveauthentication values are blocked" 2 blocked kbd_interactive_auth_enabled ""
+
+  reset_host; S_KBD=''; S_CR=no; S_EXTRA=$'challengeresponseauthentication yes\n'; run_host before
+  expect "host: conflicting challengeresponseauthentication values are blocked" 2 blocked kbd_interactive_auth_enabled ""
+
+  reset_host; S_EXTRA=$'usedns yes\n'; run_host before
+  expect "host: conflicting usedns values are blocked" 2 blocked usedns_enabled ""
+
+  reset_host; S_EXTRA=$'permitrootlogin yes\n'; run_host before
+  expect "host: conflicting permitrootlogin values in the root context are blocked" 2 blocked root_login_permitted ""
+
+  reset_host; S_EXTRA=$'authorizedkeyscommand /usr/local/bin/lookup-keys\n'; run_host before
+  expect "host: conflicting authorizedkeyscommand values warn" 0 pass "" authorized_keys_command_not_evaluated
+
+  reset_host; S_EXTRA=$'passwordauthentication NO\npubkeyauthentication yes\nusedns no\npermitrootlogin no\nauthorizedkeyscommand none\n'; run_host before
+  expect "host: repeated identical values do not conflict" 0 pass "" ""
+
   # PermitRootLogin must be exactly "no" in the root connection context. The key-based
   # values stay blocked because AuthorizedKeysCommand, TrustedUserCAKeys or principals
   # can authorize root without any local key file.
@@ -784,6 +879,36 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   reset_host; S_ALLOW="${USERNAME}@192.0.*"; run_host before
   expect "host: AllowUsers user@wildcard not matching the client address" 2 blocked operator_user_not_allowed ""
 
+  # OpenSSH match_pattern(): only * and ? are wildcards; [ ] and \ are literal; case-sensitive.
+  reset_host; S_ALLOW="${USERNAME}@198.51.100.*"; run_host before
+  expect "host: AllowUsers user@a.b.c.* matches" 0 pass "" ""
+
+  reset_host; S_ALLOW="${USERNAME}@198.51.100.?"; run_host before
+  expect "host: AllowUsers ? matches exactly one character" 0 pass "" ""
+
+  reset_host; S_ALLOW="${USERNAME}@198.51.100.??"; run_host before
+  expect "host: AllowUsers ?? needs two characters" 2 blocked operator_user_not_allowed ""
+
+  reset_host; S_ALLOW="${USERNAME}@198.51.100.[7]"; run_host before
+  expect "host: AllowUsers bracket class is literal, not a wildcard" 2 blocked operator_user_not_allowed ""
+
+  reset_host; S_ALLOW="${USERNAME%?}?"; run_host before
+  expect "host: AllowUsers ? in the user part matches one character" 0 pass "" ""
+
+  reset_host; S_ALLOW="[${USERNAME:0:1}]${USERNAME:1}"; run_host before
+  expect "host: AllowUsers bracketed user spelling is literal and does not match" 2 blocked operator_user_not_allowed ""
+
+  reset_host; S_ALLOW="\\${USERNAME}"; run_host before
+  expect "host: AllowUsers backslash is literal" 2 blocked operator_user_not_allowed ""
+
+  reset_host; S_DENY="[${USERNAME:0:1}]${USERNAME:1}"; run_host before
+  expect "host: DenyUsers bracketed user spelling is literal and does not deny" 0 pass "" ""
+
+  if [ "$(printf '%s' "$USERNAME" | tr '[:lower:]' '[:upper:]')" != "$USERNAME" ]; then
+    reset_host; S_ALLOW="$(printf '%s' "$USERNAME" | tr '[:lower:]' '[:upper:]')"; run_host before
+    expect "host: AllowUsers matching is case-sensitive" 2 blocked operator_user_not_allowed ""
+  fi
+
   reset_host; S_ALLOW="${USERNAME}@2001:db8::/32"; H_CLIENT="$CLIENT6"; run_host before
   expect "host: AllowUsers user@IPv6 network containing the client" 0 pass "" ""
 
@@ -855,6 +980,20 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
 
     reset_host; S_DENYG="!$NO_SUCH_GROUP"; run_host before
     expect "host: DenyGroups negation is not evaluated" 2 blocked access_filter_not_evaluated ""
+
+    reset_host; S_ALLOWG="[${PRIMARY_GROUP:0:1}]${PRIMARY_GROUP:1}"; run_host before
+    expect "host: AllowGroups bracketed group spelling is literal and does not match" 2 blocked operator_group_not_allowed ""
+
+    reset_host; S_DENYG="[${PRIMARY_GROUP:0:1}]${PRIMARY_GROUP:1}"; run_host before
+    expect "host: DenyGroups bracketed group spelling is literal and does not deny" 0 pass "" ""
+
+    reset_host; S_ALLOWG="${PRIMARY_GROUP%?}?"; run_host before
+    expect "host: AllowGroups ? matches one character" 0 pass "" ""
+
+    if [ "$(printf '%s' "$PRIMARY_GROUP" | tr '[:lower:]' '[:upper:]')" != "$PRIMARY_GROUP" ]; then
+      reset_host; S_ALLOWG="$(printf '%s' "$PRIMARY_GROUP" | tr '[:lower:]' '[:upper:]')"; run_host before
+      expect "host: AllowGroups matching is case-sensitive" 2 blocked operator_group_not_allowed ""
+    fi
   else
     echo "  NOTE  group-filter cases skipped: id -gn gave no primary group name"
   fi
@@ -901,9 +1040,42 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   expect "host: a valid key beside an options-prefixed key passes with a warning" 0 pass "" authorized_keys_options_not_evaluated \
     'd["counts"]["operator_authorized_keys"]==1'
 
-  reset_host; write_keys "ecdsa-sha2-nistp256 $EBLOB ecdsa" "sk-ssh-ed25519@openssh.com $SKBLOB sk"; run_host before
-  expect "host: ecdsa and sk key types are usable keys" 0 pass "" "" \
-    'd["counts"]["operator_authorized_keys"]==2'
+  reset_host
+  write_keys "ecdsa-sha2-nistp256 $EBLOB ecdsa" "ssh-rsa $RBLOB rsa" \
+    "sk-ssh-ed25519@openssh.com $SKEDBLOB sk-ed" "sk-ecdsa-sha2-nistp256@openssh.com $SKECBLOB sk-ecdsa"
+  run_host before
+  expect "host: ecdsa, rsa and complete sk keys are usable keys" 0 pass "" "" \
+    'd["counts"]["operator_authorized_keys"]==4'
+
+  # A correct type header is not enough: ssh-keygen must accept the whole key.
+  reset_host; write_keys "ssh-ed25519 $HDRBLOB header-only"; run_host before
+  expect "host: a blob holding only the type header does not count" 2 blocked operator_authorized_keys_missing authorized_keys_invalid_lines \
+    'd["counts"]["operator_authorized_keys"]==0'
+
+  reset_host; write_keys "ssh-ed25519 $TRUNCBLOB truncated"; run_host before
+  expect "host: a blob with a truncated key field does not count" 2 blocked operator_authorized_keys_missing authorized_keys_invalid_lines
+
+  reset_host; write_keys "ssh-ed25519 $TRAILBLOB trailing"; run_host before
+  expect "host: trailing garbage after a valid key structure does not count" 2 blocked operator_authorized_keys_missing authorized_keys_invalid_lines
+
+  reset_host; write_keys "from=\"198.51.100.0/24\" ssh-ed25519 $HDRBLOB header-only"; run_host before
+  expect "host: an options-prefixed header-only blob is invalid, not options" 2 blocked operator_authorized_keys_missing authorized_keys_invalid_lines
+
+  reset_host; write_keys "ssh-ed25519 $BLOB one" "ssh-ed25519 $TRAILBLOB trailing"; run_host before
+  expect "host: a valid key beside a trailing-garbage key passes with a warning" 0 pass "" authorized_keys_invalid_lines \
+    'd["counts"]["operator_authorized_keys"]==1'
+
+  reset_host; TOOL_PATH="$TMP/path-badkeygen"; run_host before
+  expect "host: ssh-keygen rejecting every key leaves no usable key" 2 blocked operator_authorized_keys_missing authorized_keys_invalid_lines
+
+  reset_host; TOOL_PATH="$TMP/path-no-keygen"; run_host before
+  expect "host: missing ssh-keygen is a validation error" 1 error authorized_keys_validation_unavailable ""
+
+  reset_host; write_keys "from=\"198.51.100.0/24\" ssh-ed25519 $BLOB options"; TOOL_PATH="$TMP/path-no-keygen"; run_host before
+  expect "host: missing ssh-keygen also fails options-prefixed detection" 1 error authorized_keys_validation_unavailable ""
+
+  reset_host; write_keys '# only comments' 'not a key'; TOOL_PATH="$TMP/path-no-keygen"; run_host before
+  expect "host: ssh-keygen is not needed when no line names a key type" 2 blocked operator_authorized_keys_missing authorized_keys_invalid_lines
 
   reset_host; chmod 664 "$KEYBASE/keys/$USERNAME/authorized_keys"; run_host before
   expect "host: group-writable authorized_keys is unsafe and counts nothing" 2 blocked authorized_keys_unsafe_permissions,operator_authorized_keys_missing "" \
@@ -1108,12 +1280,61 @@ elif section == "groups":
     def fake_getgrouplist(name, gid):
         if name == "u":
             return [gid, 10, 99]
+        if name == "empty":
+            return []
+        if name == "unnamed":
+            return [98, 99]
         raise OSError("lookup failed")
 
     module.grp.getgrgid = fake_getgrgid
     module.os.getgrouplist = fake_getgrouplist
     expect("getgrouplist groups with names; unnamed gids skipped", module.account_groups(module.Account("u", 1000, "/h", 5)), {"primary", "wheel"})
     expect("a failed getgrouplist fails the lookup", module.account_groups(module.Account("v", 1000, "/h", 5)), None)
+    expect("an empty group list is not a usable group set", module.account_groups(module.Account("empty", 1000, "/h", 5)), None)
+    expect("a group list of only unnamed gids is not a usable group set", module.account_groups(module.Account("unnamed", 1000, "/h", 5)), None)
+
+    # Host-level: group filters over an unresolvable group set must not pass or fail on guesses.
+    client = module.ipaddress.ip_address("198.51.100.7")
+    for config in ({"allowgroups": ["wheel"]}, {"denygroups": ["wheel"]}):
+        for name in ("empty", "unnamed"):
+            report = module.Report("host", "before")
+            module.check_access_filters(report, config, module.Account(name, 1000, "/h", 5), client)
+            expect(("empty group set", config, name), (report.reasons, report.checks), ({"access_filter_not_evaluated"}, {"operator_user_permitted": False}))
+    report = module.Report("host", "before")
+    module.check_access_filters(report, {"allowgroups": ["wheel"]}, module.Account("u", 1000, "/h", 5), client)
+    expect("a resolvable set still evaluates", (report.reasons, report.checks), (set(), {"operator_user_permitted": True}))
+
+elif section == "wildcard":
+    match = module.wildcard_match
+    cases = [
+        ("abc", "abc", True),
+        ("abc", "a*", True),
+        ("a", "a*", True),
+        ("abc", "a?c", True),
+        ("ac", "a?c", False),
+        ("abc", "[a]bc", False),
+        ("[a]bc", "[a]bc", True),
+        ("a", "[a-z]", False),
+        ("a.c", "a.c", True),
+        ("abc", "a.c", False),
+        ("a\\c", "a\\c", True),
+        ("abc", "a\\*", False),
+        ("Abc", "abc", False),
+        ("abc", "ABC", False),
+        ("a\nb", "a?b", True),
+        ("", "*", True),
+        ("", "?", False),
+    ]
+    for value, pattern, want in cases:
+        expect((value, pattern), match(value, pattern), want)
+
+elif section == "single_value":
+    single = module.single_value
+    expect("absent", single({}, "k"), None)
+    expect("one value", single({"k": ["Yes"]}, "k"), "yes")
+    expect("identical values, case and space folded", single({"k": ["yes", " YES "]}, "k"), "yes")
+    expect("conflicting values", single({"k": ["yes", "no"]}, "k"), None)
+    expect("conflict after a repeat", single({"k": ["no", "no", "yes"]}, "k"), None)
 
 elif section == "safe_path":
     base = os.path.join(keybase, "unit")
@@ -1126,7 +1347,7 @@ elif section == "safe_path":
     account = module.Account("u", os.getuid(), home, os.getgid())
 
     def scan():
-        result = module.authorized_keys_state([".ssh/authorized_keys"], account)
+        result = module.authorized_keys_state([".ssh/authorized_keys"], account, 10)
         return result.count, result.unsafe
 
     os.chmod(key_file, 0o600)
@@ -1159,7 +1380,9 @@ unit_case() { # unit_case DESC SECTION
   fi
 }
 unit_case "AuthorizedKeysFile token expansion" expand
-unit_case "group resolution via getgrouplist" groups
+unit_case "group resolution via getgrouplist, unnamed gids and empty sets" groups
+unit_case "OpenSSH match_pattern wildcard semantics" wildcard
+unit_case "single_value only accepts one agreed value" single_value
 if [ -n "$KEYBASE" ]; then
   unit_case "authorized_keys safe_path walk stops at the home directory" safe_path
 else

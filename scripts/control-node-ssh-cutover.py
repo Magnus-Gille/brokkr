@@ -2,8 +2,8 @@
 """Preflight for moving control-node SSH from Tailscale SSH to OpenSSH.
 
 The preflight itself makes no connection to the target and writes nothing. It only runs
-`tailscale status --json`, `ssh -G`, `ssh-keygen -F`, `sshd -T -C ...` and
-`systemctl is-active`, and reads local files. These commands run as the caller: in
+`tailscale status --json`, `ssh -G`, `ssh-keygen -F`, `ssh-keygen -l -f -` (to validate
+authorized_keys entries), `sshd -T -C ...` and `systemctl is-active`, and reads local files. These commands run as the caller: in
 particular `ssh -G` evaluates the workstation's client configuration exactly as `ssh`
 would, including any `Match exec` commands in it, so review that configuration first.
 
@@ -23,8 +23,11 @@ keyboard-interactive off; PermitRootLogin "no" in the root context (the key-base
 are blocked because AuthorizedKeysCommand or certificates can authorize root without a
 local key file); UseDNS "no"; a port-22 listener that is laddr or the unspecified address
 of laddr's family; DenyUsers/AllowUsers/DenyGroups/AllowGroups that admit the operator
-(user@host patterns are matched against the client address); and at least one usable key
-in authorized_keys files that pass OpenSSH's StrictModes path check.
+(user@host patterns are matched against the client address, with OpenSSH's rule that only
+"*" and "?" are wildcards); and at least one usable key (one that ssh-keygen accepts) in
+authorized_keys files that pass OpenSSH's StrictModes path check. A key repeated in the
+ssh -G or sshd -T output with conflicting values never passes: it fails closed through
+the check's own reason.
 
 Output is exactly one line of JSON on stdout and nothing on stderr. It carries only
 booleans, integer counts and short snake_case codes: never hostnames, addresses,
@@ -39,7 +42,6 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-import fnmatch
 import grp
 import hashlib
 import ipaddress
@@ -207,8 +209,15 @@ def normalize_dns_name(value: object) -> str | None:
 # --------------------------------------------------------------- subprocesses
 
 
-def run_command(argv: list[str], timeout: int, code: str, timeout_code: str | None = None):
+def run_command(
+    argv: list[str],
+    timeout: int,
+    code: str,
+    timeout_code: str | None = None,
+    input_text: str | None = None,
+):
     """Run a read-only command; map the expected failure modes to specific codes."""
+    stdin = {"stdin": subprocess.DEVNULL} if input_text is None else {"input": input_text}
     try:
         return subprocess.run(
             argv,
@@ -216,7 +225,7 @@ def run_command(argv: list[str], timeout: int, code: str, timeout_code: str | No
             capture_output=True,
             text=True,
             timeout=timeout,
-            stdin=subprocess.DEVNULL,
+            **stdin,
         )
     except subprocess.TimeoutExpired:
         raise Abort(timeout_code or code) from None
@@ -255,6 +264,19 @@ def parse_keyed_lines(text: str) -> dict[str, list[str]]:
 def first_value(config: dict[str, list[str]], key: str) -> str | None:
     values = config.get(key)
     return values[0] if values else None
+
+
+def single_value(config: dict[str, list[str]], key: str) -> str | None:
+    """The casefolded value if every occurrence of the key agrees; None if absent or conflicting."""
+    values = {value.strip().casefold() for value in config.get(key, [])}
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def wildcard_match(value: str, pattern: str) -> bool:
+    """OpenSSH match_pattern(): only * and ? are wildcards; everything else is literal."""
+    pattern = re.sub(r"\*+", "*", pattern)
+    regex = "".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in pattern)
+    return re.fullmatch(regex, value, re.DOTALL) is not None
 
 
 def tokens(config: dict[str, list[str]], key: str) -> list[str]:
@@ -399,19 +421,18 @@ def run_operator(args: argparse.Namespace, timeout: int) -> Report:
     if result.returncode != 0:
         raise Abort("ssh_config_unavailable")
     config = parse_keyed_lines(result.stdout)
-    hostname = first_value(config, "hostname")
-    port = first_value(config, "port")
-    user = first_value(config, "user")
+    hostname = single_value(config, "hostname")
+    port = single_value(config, "port")
+    user = single_value(config, "user")
     if not hostname or not port or not user:
         raise Abort("ssh_config_unavailable")
 
     tailnet_ips = peer.get("TailscaleIPs")
     tailnet_ips = [ip for ip in tailnet_ips if isinstance(ip, str)] if isinstance(tailnet_ips, list) else []
-    name = hostname.casefold()
-    name = name[:-1] if name.endswith(".") else name
+    name = hostname[:-1] if hostname.endswith(".") else hostname
     report.check(
         "ssh_route_tailnet",
-        name in (target, target.split(".")[0]) or hostname in tailnet_ips,
+        name in (target, target.split(".")[0]) or hostname in {ip.casefold() for ip in tailnet_ips},
         "ssh_route_not_tailnet",
     )
     proxied = any(
@@ -422,15 +443,22 @@ def run_operator(args: argparse.Namespace, timeout: int) -> Report:
     report.check("ssh_route_unproxied", not proxied, "ssh_route_proxied")
     report.check("ssh_port_22", port == "22", "ssh_port_not_22")
     report.check("ssh_user_not_root", user != "root", "ssh_user_root")
-    strict = first_value(config, "stricthostkeychecking")
+    strict = single_value(config, "stricthostkeychecking")
     report.check(
         "strict_host_key_checking_enforced",
-        strict is not None and strict.casefold() in STRICT_HOST_KEY_CHECKING_OK,
+        strict in STRICT_HOST_KEY_CHECKING_OK,
         "strict_host_key_checking_weak",
     )
 
-    alias = first_value(config, "hostkeyalias")
-    lookup_name = alias if alias and alias.casefold() != "none" else hostname
+    # known_hosts patterns are matched against the name as ssh uses it, so look up the
+    # original spelling once the (casefolded) values are known to agree.
+    lookup_name = first_value(config, "hostname") or hostname
+    if "hostkeyalias" in config:
+        alias = single_value(config, "hostkeyalias")
+        if alias is None:
+            raise Abort("ssh_config_unavailable")
+        if alias != "none":
+            lookup_name = first_value(config, "hostkeyalias") or alias
     plain, revoked = lookup_known_hosts(lookup_name, known_hosts_paths(config), timeout)
     report.counts["known_hosts_entries"] = len(plain)
     is_revoked = expected in revoked
@@ -501,15 +529,28 @@ def blob_has_type(blob: str, key_type: str) -> bool:
     return length > 0 and raw[4:4 + length] == key_type.encode("ascii") and len(raw) >= 4 + length
 
 
-def classify_authorized_keys_line(line: bytes) -> str:
+def usable_key(key_type: str, blob: str, timeout: int) -> bool:
+    """A key whose blob names its type and that ssh-keygen accepts as a complete public key."""
+    if not blob_has_type(blob, key_type):
+        return False
+    result = run_command(
+        ["ssh-keygen", "-l", "-f", "-"],
+        timeout,
+        "authorized_keys_validation_unavailable",
+        input_text=f"{key_type} {blob}\n",
+    )
+    return result.returncode == 0
+
+
+def classify_authorized_keys_line(line: bytes, timeout: int) -> str:
     """Return "skip", "key", "options" or "invalid" for one authorized_keys line."""
     fields = line.decode("utf-8", errors="replace").split()
     if not fields or fields[0].startswith("#"):
         return "skip"
     if fields[0] in AUTHORIZED_KEY_TYPES:
-        return "key" if len(fields) >= 2 and blob_has_type(fields[1], fields[0]) else "invalid"
+        return "key" if len(fields) >= 2 and usable_key(fields[0], fields[1], timeout) else "invalid"
     for index in range(1, len(fields) - 1):
-        if fields[index] in AUTHORIZED_KEY_TYPES and blob_has_type(fields[index + 1], fields[index]):
+        if fields[index] in AUTHORIZED_KEY_TYPES and usable_key(fields[index], fields[index + 1], timeout):
             return "options"
     return "invalid"
 
@@ -521,12 +562,13 @@ class KeyScan(NamedTuple):
     invalid_lines: bool
 
 
-def authorized_keys_state(templates: list[str], account: Account) -> KeyScan:
+def authorized_keys_state(templates: list[str], account: Account, timeout: int) -> KeyScan:
     """Usable-key count and findings over the existing key files.
 
     A file that fails safe_path() is ignored by OpenSSH, so it contributes no keys and
-    is reported as unsafe. Only lines that start with a known key type and a matching
-    blob count; options-prefixed keys are not evaluated and only produce a warning.
+    is reported as unsafe. Only lines that start with a known key type and a complete
+    key that ssh-keygen accepts count; options-prefixed keys are not evaluated and only
+    produce a warning.
     """
     count = 0
     unsafe = options_lines = invalid_lines = False
@@ -551,7 +593,7 @@ def authorized_keys_state(templates: list[str], account: Account) -> KeyScan:
         except OSError:
             raise Abort("authorized_keys_unreadable") from None
         for line in data.splitlines():
-            kind = classify_authorized_keys_line(line)
+            kind = classify_authorized_keys_line(line, timeout)
             if kind == "key":
                 count += 1
             elif kind == "options":
@@ -614,7 +656,7 @@ def account_groups(account: Account) -> set[str] | None:
             names.add(grp.getgrgid(gid).gr_name)
         except KeyError:
             continue
-    return names
+    return names or None
 
 
 def user_pattern_verdict(pattern: str, user: str, client: IPAddress) -> bool | None:
@@ -626,7 +668,7 @@ def user_pattern_verdict(pattern: str, user: str, client: IPAddress) -> bool | N
     user_part, at, host_part = pattern.partition("@")
     if "!" in user_part:
         return None
-    if not fnmatch.fnmatchcase(user, user_part):
+    if not wildcard_match(user, user_part):
         return False
     if not at:
         return True
@@ -635,13 +677,13 @@ def user_pattern_verdict(pattern: str, user: str, client: IPAddress) -> bool | N
     try:
         return client in ipaddress.ip_network(host_part, strict=False)
     except ValueError:
-        return fnmatch.fnmatchcase(str(client), host_part)
+        return wildcard_match(str(client), host_part)
 
 
 def group_pattern_verdict(pattern: str, groups: set[str]) -> bool | None:
     if "!" in pattern:
         return None
-    return any(fnmatch.fnmatchcase(name, pattern) for name in groups)
+    return any(wildcard_match(name, pattern) for name in groups)
 
 
 def check_access_filters(report: Report, config: dict[str, list[str]], account: Account, client: IPAddress) -> None:
@@ -730,28 +772,28 @@ def run_host(args: argparse.Namespace, timeout: int) -> Report:
     config = load_sshd_config(operator.name, client, listen, timeout)
     root_config = load_sshd_config("root", client, listen, timeout)
 
-    report.check(
-        "pubkey_auth_enabled",
-        (first_value(config, "pubkeyauthentication") or "").casefold() == "yes",
-        "pubkey_auth_disabled",
-    )
+    # Conflicting repeated values never pass: single_value() is None for them.
+    report.check("pubkey_auth_enabled", single_value(config, "pubkeyauthentication") == "yes", "pubkey_auth_disabled")
     report.check(
         "password_auth_disabled",
-        (first_value(config, "passwordauthentication") or "").casefold() == "no",
+        single_value(config, "passwordauthentication") == "no",
         "password_auth_enabled",
     )
-    kbd = first_value(config, "kbdinteractiveauthentication")
-    if kbd is None:
-        kbd = first_value(config, "challengeresponseauthentication")
-    report.check("kbd_interactive_auth_disabled", (kbd or "yes").casefold() == "no", "kbd_interactive_auth_enabled")
+    if "kbdinteractiveauthentication" in config:
+        kbd = single_value(config, "kbdinteractiveauthentication")
+    elif "challengeresponseauthentication" in config:
+        kbd = single_value(config, "challengeresponseauthentication")
+    else:
+        kbd = "yes"  # neither option present: treated as enabled
+    report.check("kbd_interactive_auth_disabled", kbd == "no", "kbd_interactive_auth_enabled")
 
     # Hostname-based Match/AllowUsers semantics cannot be evaluated from an address.
-    report.check("usedns_disabled", (first_value(config, "usedns") or "").casefold() == "no", "usedns_enabled")
+    report.check("usedns_disabled", single_value(config, "usedns") == "no", "usedns_enabled")
 
     # Root login is judged from the root connection context only, and only "no" is safe:
     # AuthorizedKeysCommand, TrustedUserCAKeys or principals can authorize root without
     # any local key file, so the key-based values are blocked rather than counted.
-    root_login = (first_value(root_config, "permitrootlogin") or "").casefold()
+    root_login = single_value(root_config, "permitrootlogin") or ""
     report.checks["root_login_safe"] = root_login == "no"
     if root_login in ("prohibit-password", "without-password"):
         report.reasons.add("root_key_login_possible")
@@ -771,11 +813,10 @@ def run_host(args: argparse.Namespace, timeout: int) -> Report:
         report.warnings.add("sshd_bound_to_tailnet_address_only")
 
     check_access_filters(report, config, operator, client)
-    command = first_value(config, "authorizedkeyscommand")
-    if command is not None and command.casefold() != "none":
+    if "authorizedkeyscommand" in config and single_value(config, "authorizedkeyscommand") != "none":
         report.warnings.add("authorized_keys_command_not_evaluated")
 
-    scan = authorized_keys_state(authorized_keys_templates(config), operator)
+    scan = authorized_keys_state(authorized_keys_templates(config), operator, timeout)
     report.counts["operator_authorized_keys"] = scan.count
     report.check("authorized_keys_safe", not scan.unsafe, "authorized_keys_unsafe_permissions")
     report.check("operator_has_authorized_keys", scan.count > 0, "operator_authorized_keys_missing")
