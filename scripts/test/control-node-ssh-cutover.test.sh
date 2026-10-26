@@ -10,11 +10,43 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECK="$HERE/../control-node-ssh-cutover.py"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+KEYBASE=''
+cleanup() {
+  rm -rf "$TMP"
+  if [ -n "$KEYBASE" ]; then rm -rf "$KEYBASE"; fi
+}
+trap cleanup EXIT
 
 command -v ssh-keygen >/dev/null || { echo "ssh-keygen is required for this test" >&2; exit 1; }
 # Resolve the real interpreter once: version-manager shims need the caller's PATH.
 PYTHON="$(python3 -c 'import sys; print(sys.executable)')"
+
+# Host-role authorized_keys fixtures need OpenSSH-style safe ancestors (no directory up to
+# / may be group- or world-writable), which a world-writable /tmp is not. Use the first
+# candidate base whose whole realpath chain is owned by root or this user and not
+# group/world-writable. Real key files are never read.
+SAFE_CHAIN='
+import os
+import sys
+
+path = os.path.realpath(sys.argv[1])
+uid = os.getuid()
+while True:
+    info = os.stat(path)
+    if info.st_uid not in (0, uid) or info.st_mode & 0o022:
+        sys.exit(1)
+    parent = os.path.dirname(path)
+    if parent == path:
+        break
+    path = parent
+'
+for key_base_candidate in "${RUNNER_TEMP:-}" "${XDG_RUNTIME_DIR:-}" "${TMPDIR:-/tmp}" "${HOME:-}"; do
+  if [ -z "$key_base_candidate" ] || [ ! -d "$key_base_candidate" ]; then continue; fi
+  if "$PYTHON" -I -c "$SAFE_CHAIN" "$key_base_candidate" 2>/dev/null; then
+    if KEYBASE="$(mktemp -d "$key_base_candidate/brokkr-cutover.XXXXXX" 2>/dev/null)"; then break; fi
+    KEYBASE=''
+  fi
+done
 
 # ---------------------------------------------------------------- fakes on PATH
 STUBS="$TMP/stubs"
@@ -122,7 +154,12 @@ CLIENT6='2001:db8::7'
 # Substrings that must never appear in tool output.
 LEAK=(ctl1 example 192.0.2 198.51.100 2001:db8 "$CLIENT4" "$CLIENT6" "$FP" "${FP#SHA256:}" "$OFP" "${OFP#SHA256:}"
   "$BLOB" "$OBLOB" "$TMP" keyalias nosuchuser not-an-ip fe80 eth0)
+if [ -n "$KEYBASE" ]; then LEAK+=("$KEYBASE"); fi
+PRIMARY_GROUP="$(id -gn 2>/dev/null || true)"
+NO_SUCH_GROUP='nosuchgroup-zz9'
+LEAK+=("$NO_SUCH_GROUP")
 LEAK_WORDS=(ops "$USERNAME")
+if [ -n "$PRIMARY_GROUP" ]; then LEAK_WORDS+=("$PRIMARY_GROUP"); fi
 
 PASS=0
 FAIL=0
@@ -227,7 +264,8 @@ build_status() {
 
 build_ssh_g() {
   {
-    printf 'user %s\nhostname %s\nport %s\nstricthostkeychecking %s\n' "$G_USER" "$G_HOST" "$G_PORT" "$G_STRICT"
+    printf 'user %s\nhostname %s\nport %s\n' "$G_USER" "$G_HOST" "$G_PORT"
+    if [ -n "$G_STRICT" ]; then printf 'stricthostkeychecking %s\n' "$G_STRICT"; fi
     printf 'userknownhostsfile %s/known_hosts %s/known_hosts2\n' "$TMP" "$TMP"
     printf 'globalknownhostsfile %s/global_known_hosts\n' "$TMP"
     printf '%s' "$G_EXTRA"
@@ -326,10 +364,14 @@ expect "operator: non-22 port" 2 blocked ssh_port_not_22 ""
 reset_operator; G_USER=root; run_op before
 expect "operator: root ssh user" 2 blocked ssh_user_root ""
 
-for mode in false no off accept-new; do
+for mode in false no off accept-new unexpected; do
   reset_operator; G_STRICT="$mode"; run_op before
   expect "operator: StrictHostKeyChecking $mode is weak" 2 blocked strict_host_key_checking_weak ""
 done
+
+reset_operator; G_STRICT=''; run_op before
+expect "operator: missing StrictHostKeyChecking fails closed" 2 blocked strict_host_key_checking_weak "" \
+  'd["checks"]["strict_host_key_checking_enforced"] is False'
 for mode in ask true yes; do
   reset_operator; G_STRICT="$mode"; run_op before
   expect "operator: StrictHostKeyChecking $mode passes" 0 pass "" ""
@@ -475,6 +517,11 @@ export MOCK_TAILSCALE_JSON='[]'
 run_op_keep before
 expect "operator: non-object tailscale output is an error" 1 error tailscale_status_invalid ""
 
+MOCK_TAILSCALE_JSON="$(head -c 50000 /dev/zero | tr '\0' '[')"
+export MOCK_TAILSCALE_JSON
+run_op_keep before
+expect "operator: deeply nested tailscale output is an error, not a traceback" 1 error tailscale_status_invalid ""
+
 reset_operator; EXTRA_PEERS=',"nodekey:bad":"not-an-object"'; run_op before
 expect "operator: non-object peer is an error" 1 error tailscale_status_invalid ""
 
@@ -513,33 +560,50 @@ if [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || [ "$USERNAME" = root ]; th
   HOST_USER_OK=0
   echo "  NOTE  host-role cases skipped: the current user name is not usable as the --ssh-user fixture"
 fi
+if [ -z "$KEYBASE" ]; then
+  HOST_USER_OK=0
+  echo "  NOTE  host-role cases skipped: no temp base with a root/user-owned, non-writable ancestor chain"
+fi
+
+ssh-keygen -q -t ecdsa -b 256 -N '' -C fixture -f "$TMP/ecdsakey"
+EBLOB="$(awk '{print $2}' "$TMP/ecdsakey.pub")"
+cat >"$TMP/skblob.py" <<'EOF'
+import base64
+import struct
+
+key_type = b"sk-ssh-ed25519@openssh.com"
+print(base64.b64encode(struct.pack(">I", len(key_type)) + key_type + b"fixture").decode())
+EOF
+SKBLOB="$("$PYTHON" "$TMP/skblob.py")"
 
 reset_host() {
   H_STATE=Running H_SELF_ONLINE=true H_IPS='"192.0.2.50","2001:db8::50"'
-  S_PUBKEY=yes S_PASSWORD=no S_KBD=no S_CR='' S_ROOT=no S_PORTS=22
-  S_LISTEN='0.0.0.0:22 [::]:22' S_ALLOW='' S_DENY='' S_AKC=none S_EXTRA=''
-  S_AKF="$TMP/keys/%u/authorized_keys"
-  R_ON=0 R_ROOT=no R_PASSWORD=no R_AKF="$S_AKF"
+  S_PUBKEY=yes S_PASSWORD=no S_KBD=no S_CR='' S_ROOT=no S_USEDNS=no S_PORTS=22
+  S_LISTEN='0.0.0.0:22 [::]:22' S_ALLOW='' S_DENY='' S_ALLOWG='' S_DENYG='' S_AKC=none S_EXTRA=''
+  S_AKF="$KEYBASE/keys/%u/authorized_keys"
+  R_ON=0 R_ROOT=no R_PASSWORD=no
   H_USER="$USERNAME" H_CLIENT="$CLIENT4"
   MOCK_ACTIVE_UNITS='ssh.service'
   TOOL_PATH="$TMP/path-all"
-  rm -rf "$TMP/keys" "$TMP/rootkeys"
-  mkdir -p "$TMP/keys/$USERNAME" "$TMP/keys/root"
-  chmod 755 "$TMP/keys" "$TMP/keys/$USERNAME" "$TMP/keys/root"
-  {
-    printf '# operator key\n\n'
-    printf 'ssh-ed25519 %s one\n' "$BLOB"
-    printf 'ssh-ed25519 %s two\n' "$OBLOB"
-  } >"$TMP/keys/$USERNAME/authorized_keys"
-  chmod 644 "$TMP/keys/$USERNAME/authorized_keys"
+  chmod 700 "$KEYBASE"
+  rm -rf "$KEYBASE/keys" "$KEYBASE/unsafe" "$KEYBASE/safe"
+  mkdir -p "$KEYBASE/keys/$USERNAME"
+  chmod 755 "$KEYBASE/keys" "$KEYBASE/keys/$USERNAME"
+  write_keys '# operator key' '' "ssh-ed25519 $BLOB one" "ssh-ed25519 $OBLOB two"
   unset MOCK_TAILSCALE_RC MOCK_TAILSCALE_SLEEP MOCK_SSHD_RC MOCK_SSHD_ROOT_RC MOCK_SSHD_ROOT_CONFIG BROKKR_CUTOVER_TIMEOUT_SECS
   export MOCK_ACTIVE_UNITS
+}
+
+# write_keys LINE...: replace the operator's authorized_keys with LINEs (mode 0644).
+write_keys() {
+  printf '%s\n' "$@" >"$KEYBASE/keys/$USERNAME/authorized_keys"
+  chmod 644 "$KEYBASE/keys/$USERNAME/authorized_keys"
 }
 
 # render_sshd: print a fake `sshd -T` configuration from the current S_* variables.
 render_sshd() {
   local item
-  set -f # the AllowUsers/DenyUsers fixtures contain literal wildcards
+  set -f # the AllowUsers/DenyUsers/group fixtures contain literal wildcards
   {
     for item in $S_PORTS; do printf 'port %s\n' "$item"; done
     for item in $S_LISTEN; do printf 'listenaddress %s\n' "$item"; done
@@ -548,8 +612,11 @@ render_sshd() {
     if [ -n "$S_KBD" ]; then printf 'kbdinteractiveauthentication %s\n' "$S_KBD"; fi
     if [ -n "$S_CR" ]; then printf 'challengeresponseauthentication %s\n' "$S_CR"; fi
     if [ -n "$S_ROOT" ]; then printf 'permitrootlogin %s\n' "$S_ROOT"; fi
+    if [ -n "$S_USEDNS" ]; then printf 'usedns %s\n' "$S_USEDNS"; fi
     for item in $S_ALLOW; do printf 'allowusers %s\n' "$item"; done
     for item in $S_DENY; do printf 'denyusers %s\n' "$item"; done
+    for item in $S_ALLOWG; do printf 'allowgroups %s\n' "$item"; done
+    for item in $S_DENYG; do printf 'denygroups %s\n' "$item"; done
     printf 'authorizedkeysfile %s\n' "$S_AKF"
     printf 'authorizedkeyscommand %s\n' "$S_AKC"
     printf '%s' "$S_EXTRA"
@@ -558,15 +625,15 @@ render_sshd() {
 }
 
 # build_host: write the tailscale status and the operator-context sshd -T output. When
-# R_ON=1 the root-context output differs by R_ROOT, R_PASSWORD and R_AKF (as a Match
-# block would); otherwise the root context falls back to the operator output.
+# R_ON=1 the root-context output differs by R_ROOT and R_PASSWORD (as a Match block
+# would); otherwise the root context falls back to the operator output.
 build_host() {
   local root_config
   export MOCK_TAILSCALE_JSON="{\"BackendState\":\"${H_STATE}\",\"TailscaleIPs\":[${H_IPS}],\"Self\":{\"Online\":${H_SELF_ONLINE},\"DNSName\":\"ctl1.example.ts.net.\"}}"
   render_sshd >"$MOCK_SSHD_FILE"
   : >"$MOCK_SSHD_ARGV_FILE"
   if [ "$R_ON" -eq 1 ]; then
-    root_config="$(S_ROOT="$R_ROOT" S_PASSWORD="$R_PASSWORD" S_AKF="$R_AKF" render_sshd)"
+    root_config="$(S_ROOT="$R_ROOT" S_PASSWORD="$R_PASSWORD" render_sshd)"
     export MOCK_SSHD_ROOT_CONFIG="$root_config"
   else
     unset MOCK_SSHD_ROOT_CONFIG
@@ -625,6 +692,17 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   reset_host; S_KBD=''; S_CR=''; run_host before
   expect "host: neither kbd option present is treated as enabled" 2 blocked kbd_interactive_auth_enabled ""
 
+  # UseDNS: hostname-based Match/AllowUsers semantics cannot be evaluated from an address.
+  reset_host; S_USEDNS=yes; run_host before
+  expect "host: UseDNS yes is blocked" 2 blocked usedns_enabled "" \
+    'd["checks"]["usedns_disabled"] is False'
+
+  reset_host; S_USEDNS=''; run_host before
+  expect "host: missing usedns fails closed" 2 blocked usedns_enabled ""
+
+  # PermitRootLogin must be exactly "no" in the root connection context. The key-based
+  # values stay blocked because AuthorizedKeysCommand, TrustedUserCAKeys or principals
+  # can authorize root without any local key file.
   reset_host; S_ROOT=yes; run_host before
   expect "host: PermitRootLogin yes" 2 blocked root_login_permitted ""
 
@@ -635,21 +713,11 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   expect "host: missing permitrootlogin fails closed" 2 blocked root_login_permitted ""
 
   reset_host; S_ROOT=prohibit-password; run_host before
-  expect "host: prohibit-password with no root keys passes" 0 pass "" ""
+  expect "host: prohibit-password is blocked even with no root key file" 2 blocked root_key_login_possible "" \
+    'd["checks"]["root_login_safe"] is False and set(d["counts"])=={"operator_authorized_keys"}'
 
   reset_host; S_ROOT=without-password; run_host before
-  expect "host: without-password with no root keys passes" 0 pass "" ""
-
-  reset_host; S_ROOT=prohibit-password
-  printf '# only a comment\n\n' >"$TMP/keys/root/authorized_keys"
-  run_host before
-  expect "host: prohibit-password with a comment-only root file passes" 0 pass "" ""
-
-  reset_host; S_ROOT=prohibit-password
-  printf 'ssh-ed25519 %s root\n' "$OBLOB" >"$TMP/keys/root/authorized_keys"
-  run_host before
-  expect "host: prohibit-password with a root key" 2 blocked root_key_login_possible "" \
-    'set(d["counts"])=={"operator_authorized_keys"}'
+  expect "host: without-password is blocked even with no root key file" 2 blocked root_key_login_possible ""
 
   reset_host; S_PORTS='2222 22'; run_host before
   expect "host: port 22 among several ports passes" 0 pass "" ""
@@ -657,15 +725,38 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   reset_host; S_PORTS=2222 S_LISTEN='0.0.0.0:2222'; run_host before
   expect "host: sshd not on port 22" 2 blocked sshd_not_listening_on_tailnet,sshd_port_not_22 ""
 
+  # Listener: exactly laddr, or the unspecified address of laddr's own family.
+  reset_host; S_LISTEN='0.0.0.0:22'; run_host before
+  expect "host: IPv4 wildcard listener passes for an IPv4 client" 0 pass "" ""
+
   reset_host; S_LISTEN='[::]:22'; run_host before
-  expect "host: IPv6 wildcard listen address passes without warning" 0 pass "" ""
+  expect "host: IPv6 wildcard alone does not serve an IPv4 client" 2 blocked sshd_not_listening_on_tailnet "" \
+    'd["checks"]["sshd_listens_on_tailnet"] is False'
+
+  reset_host; S_LISTEN='[2001:db8::50]:22'; run_host before
+  expect "host: IPv6 tailnet address alone does not serve an IPv4 client" 2 blocked sshd_not_listening_on_tailnet ""
+
+  reset_host; S_LISTEN='[::]:22'; H_CLIENT="$CLIENT6"; run_host before
+  expect "host: IPv6 wildcard listener passes for an IPv6 client" 0 pass "" ""
+
+  reset_host; S_LISTEN='0.0.0.0:22'; H_CLIENT="$CLIENT6"; run_host before
+  expect "host: IPv4 wildcard alone does not serve an IPv6 client" 2 blocked sshd_not_listening_on_tailnet ""
 
   reset_host; S_LISTEN='192.0.2.50:22'; run_host before
-  expect "host: tailnet-only IPv4 listen address warns" 0 pass "" sshd_bound_to_tailnet_address_only \
+  expect "host: exact IPv4 laddr listener warns" 0 pass "" sshd_bound_to_tailnet_address_only \
     'd["checks"]["sshd_listens_on_tailnet"] is True'
 
-  reset_host; S_LISTEN='[2001:db8:0:0:0:0:0:50]:22'; run_host before
-  expect "host: tailnet-only IPv6 listen address is normalised and warns" 0 pass "" sshd_bound_to_tailnet_address_only
+  reset_host; S_LISTEN='192.0.2.50:22 [::]:22'; run_host before
+  expect "host: exact laddr with only a foreign-family wildcard still warns" 0 pass "" sshd_bound_to_tailnet_address_only
+
+  reset_host; S_LISTEN='192.0.2.50:22 0.0.0.0:22'; run_host before
+  expect "host: same-family wildcard beside an exact laddr does not warn" 0 pass "" ""
+
+  reset_host; S_LISTEN='[2001:db8:0:0:0:0:0:50]:22'; H_CLIENT="$CLIENT6"; run_host before
+  expect "host: exact IPv6 laddr is normalised and warns" 0 pass "" sshd_bound_to_tailnet_address_only
+
+  reset_host; S_LISTEN='192.0.2.60:22'; run_host before
+  expect "host: a different address than laddr is not enough" 2 blocked sshd_not_listening_on_tailnet ""
 
   reset_host; S_LISTEN='198.51.100.9:22 192.0.2.50:2222'; run_host before
   expect "host: no listen address reaches the tailnet" 2 blocked sshd_not_listening_on_tailnet ""
@@ -673,11 +764,43 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   reset_host; S_LISTEN=''; run_host before
   expect "host: no listen address at all" 2 blocked sshd_not_listening_on_tailnet ""
 
+  # AllowUsers / DenyUsers (user@source patterns are evaluated against the client address).
   reset_host; S_ALLOW='someone-else'; run_host before
-  expect "host: AllowUsers excludes the operator user" 2 blocked operator_user_not_allowed ""
+  expect "host: AllowUsers excludes the operator user" 2 blocked operator_user_not_allowed "" \
+    'd["checks"]["operator_user_permitted"] is False'
 
-  reset_host; S_ALLOW="someone-else ${USERNAME}@192.0.2.0/24"; run_host before
-  expect "host: AllowUsers user@host entry matches the user" 0 pass "" ""
+  reset_host; S_ALLOW="someone-else ${USERNAME}@${CLIENT4}"; run_host before
+  expect "host: AllowUsers user@address matches the client" 0 pass "" ""
+
+  reset_host; S_ALLOW="${USERNAME}@198.51.100.0/24"; run_host before
+  expect "host: AllowUsers user@network containing the client matches" 0 pass "" ""
+
+  reset_host; S_ALLOW="${USERNAME}@192.0.2.0/24"; run_host before
+  expect "host: AllowUsers user@network excluding the client is blocked" 2 blocked operator_user_not_allowed ""
+
+  reset_host; S_ALLOW="${USERNAME}@198.51.*"; run_host before
+  expect "host: AllowUsers user@wildcard matching the client address" 0 pass "" ""
+
+  reset_host; S_ALLOW="${USERNAME}@192.0.*"; run_host before
+  expect "host: AllowUsers user@wildcard not matching the client address" 2 blocked operator_user_not_allowed ""
+
+  reset_host; S_ALLOW="${USERNAME}@2001:db8::/32"; H_CLIENT="$CLIENT6"; run_host before
+  expect "host: AllowUsers user@IPv6 network containing the client" 0 pass "" ""
+
+  reset_host; S_ALLOW="${USERNAME}@198.51.100.0/24"; H_CLIENT="$CLIENT6"; run_host before
+  expect "host: AllowUsers IPv4 network never contains an IPv6 client" 2 blocked operator_user_not_allowed ""
+
+  reset_host; S_ALLOW="${USERNAME}@!192.0.2.1"; run_host before
+  expect "host: AllowUsers host negation is not evaluated" 2 blocked access_filter_not_evaluated ""
+
+  reset_host; S_ALLOW="${USERNAME}@${CLIENT4},192.0.2.1"; run_host before
+  expect "host: AllowUsers host list is not evaluated" 2 blocked access_filter_not_evaluated ""
+
+  reset_host; S_ALLOW="!${USERNAME}"; run_host before
+  expect "host: AllowUsers negated user is not evaluated" 2 blocked access_filter_not_evaluated ""
+
+  reset_host; S_ALLOW="someone-else@!192.0.2.1 ${USERNAME}"; run_host before
+  expect "host: an unevaluable pattern for another user does not matter" 0 pass "" ""
 
   reset_host; S_ALLOW='*'; run_host before
   expect "host: AllowUsers wildcard matches" 0 pass "" ""
@@ -688,23 +811,63 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   reset_host; S_DENY='*'; run_host before
   expect "host: DenyUsers wildcard denies" 2 blocked operator_user_denied ""
 
+  reset_host; S_DENY="${USERNAME}@198.51.100.0/24"; run_host before
+  expect "host: DenyUsers user@network containing the client denies" 2 blocked operator_user_denied ""
+
+  reset_host; S_DENY="${USERNAME}@192.0.2.0/24"; run_host before
+  expect "host: DenyUsers user@network excluding the client passes" 0 pass "" ""
+
+  reset_host; S_DENY="${USERNAME}@!192.0.2.1"; run_host before
+  expect "host: DenyUsers host negation is not evaluated" 2 blocked access_filter_not_evaluated ""
+
   reset_host; S_DENY='someone-else'; run_host before
   expect "host: DenyUsers for another user passes" 0 pass "" ""
 
-  reset_host; S_EXTRA=$'allowgroups wheel\n'; run_host before
-  expect "host: AllowGroups is a warning" 0 pass "" group_filters_not_evaluated
+  reset_host; S_DENY="$USERNAME" S_ALLOW='someone-else'; run_host before
+  expect "host: denied and not allowed are both reported" 2 blocked operator_user_denied,operator_user_not_allowed ""
 
-  reset_host; S_EXTRA=$'denygroups wheel\n'; run_host before
-  expect "host: DenyGroups is a warning" 0 pass "" group_filters_not_evaluated
+  # AllowGroups / DenyGroups use the user's real primary group (and getgrouplist groups).
+  if [ -n "$PRIMARY_GROUP" ]; then
+    reset_host; S_DENYG="$PRIMARY_GROUP"; run_host before
+    expect "host: DenyGroups names the primary group" 2 blocked operator_group_denied "" \
+      'd["checks"]["operator_user_permitted"] is False'
+
+    reset_host; S_DENYG="$NO_SUCH_GROUP"; run_host before
+    expect "host: DenyGroups for a non-existent group passes" 0 pass "" ""
+
+    reset_host; S_DENYG='*'; run_host before
+    expect "host: DenyGroups wildcard denies" 2 blocked operator_group_denied ""
+
+    reset_host; S_ALLOWG="$PRIMARY_GROUP"; run_host before
+    expect "host: AllowGroups names the primary group" 0 pass "" ""
+
+    reset_host; S_ALLOWG="$NO_SUCH_GROUP"; run_host before
+    expect "host: AllowGroups without a matching group is blocked" 2 blocked operator_group_not_allowed ""
+
+    reset_host; S_ALLOWG="$NO_SUCH_GROUP $PRIMARY_GROUP"; run_host before
+    expect "host: AllowGroups with one matching entry passes" 0 pass "" ""
+
+    reset_host; S_ALLOWG="${PRIMARY_GROUP:0:1}*"; run_host before
+    expect "host: AllowGroups wildcard matches the primary group" 0 pass "" ""
+
+    reset_host; S_ALLOWG="!$PRIMARY_GROUP"; run_host before
+    expect "host: AllowGroups negation is not evaluated" 2 blocked access_filter_not_evaluated ""
+
+    reset_host; S_DENYG="!$NO_SUCH_GROUP"; run_host before
+    expect "host: DenyGroups negation is not evaluated" 2 blocked access_filter_not_evaluated ""
+  else
+    echo "  NOTE  group-filter cases skipped: id -gn gave no primary group name"
+  fi
 
   reset_host; S_AKC=/usr/local/bin/lookup-keys; run_host before
   expect "host: AuthorizedKeysCommand is a warning" 0 pass "" authorized_keys_command_not_evaluated
 
-  reset_host; rm -f "$TMP/keys/$USERNAME/authorized_keys"; run_host before
+  # Authorized keys: only well-formed keys count, unsafe files contribute nothing.
+  reset_host; rm -f "$KEYBASE/keys/$USERNAME/authorized_keys"; run_host before
   expect "host: no authorized_keys file" 2 blocked operator_authorized_keys_missing "" \
     'd["counts"]["operator_authorized_keys"]==0'
 
-  reset_host; printf '# nothing here\n\n   \n' >"$TMP/keys/$USERNAME/authorized_keys"; run_host before
+  reset_host; write_keys '# nothing here' '' '   '; run_host before
   expect "host: authorized_keys with no key lines" 2 blocked operator_authorized_keys_missing ""
 
   reset_host; build_host
@@ -713,17 +876,73 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   run_host_keep before
   expect "host: AuthorizedKeysFile none means no key files" 2 blocked operator_authorized_keys_missing ""
 
-  reset_host; chmod 664 "$TMP/keys/$USERNAME/authorized_keys"; run_host before
-  expect "host: group-writable authorized_keys is unsafe" 2 blocked authorized_keys_unsafe_permissions "" \
-    'd["checks"]["authorized_keys_safe"] is False'
+  reset_host; write_keys 'not a public key'; run_host before
+  expect "host: a non-key line is invalid and counts nothing" 2 blocked operator_authorized_keys_missing authorized_keys_invalid_lines \
+    'd["counts"]["operator_authorized_keys"]==0'
 
-  reset_host; chmod 646 "$TMP/keys/$USERNAME/authorized_keys"; run_host before
-  expect "host: world-writable authorized_keys is unsafe" 2 blocked authorized_keys_unsafe_permissions ""
+  reset_host; write_keys "ssh-rsa $BLOB wrong-type"; run_host before
+  expect "host: a key type with a blob of another type is invalid" 2 blocked operator_authorized_keys_missing authorized_keys_invalid_lines
 
-  reset_host; chmod 775 "$TMP/keys/$USERNAME"; run_host before
-  expect "host: group-writable parent directory is unsafe" 2 blocked authorized_keys_unsafe_permissions ""
+  reset_host; write_keys 'ssh-ed25519 !!!not-base64!!!'; run_host before
+  expect "host: a key type with a non-base64 blob is invalid" 2 blocked operator_authorized_keys_missing authorized_keys_invalid_lines
 
-  reset_host; rm -f "$TMP/keys/$USERNAME/authorized_keys"; mkdir "$TMP/keys/$USERNAME/authorized_keys"; run_host before
+  reset_host; write_keys 'ssh-ed25519'; run_host before
+  expect "host: a key type without a blob is invalid" 2 blocked operator_authorized_keys_missing authorized_keys_invalid_lines
+
+  reset_host; write_keys "from=\"198.51.100.0/24\" ssh-ed25519 $BLOB options"; run_host before
+  expect "host: an options-prefixed key does not count and warns" 2 blocked operator_authorized_keys_missing authorized_keys_options_not_evaluated \
+    'd["counts"]["operator_authorized_keys"]==0'
+
+  reset_host; write_keys "ssh-ed25519 $BLOB one" 'garbage line'; run_host before
+  expect "host: a valid key beside an invalid line passes with a warning" 0 pass "" authorized_keys_invalid_lines \
+    'd["counts"]["operator_authorized_keys"]==1'
+
+  reset_host; write_keys "ssh-ed25519 $BLOB one" "command=\"true\" ssh-ed25519 $OBLOB two"; run_host before
+  expect "host: a valid key beside an options-prefixed key passes with a warning" 0 pass "" authorized_keys_options_not_evaluated \
+    'd["counts"]["operator_authorized_keys"]==1'
+
+  reset_host; write_keys "ecdsa-sha2-nistp256 $EBLOB ecdsa" "sk-ssh-ed25519@openssh.com $SKBLOB sk"; run_host before
+  expect "host: ecdsa and sk key types are usable keys" 0 pass "" "" \
+    'd["counts"]["operator_authorized_keys"]==2'
+
+  reset_host; chmod 664 "$KEYBASE/keys/$USERNAME/authorized_keys"; run_host before
+  expect "host: group-writable authorized_keys is unsafe and counts nothing" 2 blocked authorized_keys_unsafe_permissions,operator_authorized_keys_missing "" \
+    'd["checks"]["authorized_keys_safe"] is False and d["counts"]["operator_authorized_keys"]==0'
+
+  reset_host; chmod 646 "$KEYBASE/keys/$USERNAME/authorized_keys"; run_host before
+  expect "host: world-writable authorized_keys is unsafe" 2 blocked authorized_keys_unsafe_permissions,operator_authorized_keys_missing ""
+
+  reset_host; chmod 775 "$KEYBASE/keys/$USERNAME"; run_host before
+  expect "host: group-writable parent directory is unsafe" 2 blocked authorized_keys_unsafe_permissions,operator_authorized_keys_missing ""
+
+  reset_host; chmod 775 "$KEYBASE/keys"; run_host before
+  expect "host: group-writable ancestor directory is unsafe" 2 blocked authorized_keys_unsafe_permissions,operator_authorized_keys_missing ""
+
+  reset_host; chmod 770 "$KEYBASE"; run_host before
+  expect "host: group-writable distant ancestor is unsafe" 2 blocked authorized_keys_unsafe_permissions,operator_authorized_keys_missing ""
+
+  reset_host
+  mkdir "$KEYBASE/unsafe"
+  chmod 775 "$KEYBASE/unsafe"
+  rm -f "$KEYBASE/keys/$USERNAME/authorized_keys"
+  printf 'ssh-ed25519 %s linked\n' "$BLOB" >"$KEYBASE/unsafe/real_keys"
+  chmod 644 "$KEYBASE/unsafe/real_keys"
+  ln -s "$KEYBASE/unsafe/real_keys" "$KEYBASE/keys/$USERNAME/authorized_keys"
+  run_host before
+  expect "host: a key file symlinked into an unsafe directory is unsafe" 2 blocked authorized_keys_unsafe_permissions,operator_authorized_keys_missing ""
+
+  reset_host
+  mkdir "$KEYBASE/safe"
+  chmod 755 "$KEYBASE/safe"
+  rm -f "$KEYBASE/keys/$USERNAME/authorized_keys"
+  printf 'ssh-ed25519 %s linked\n' "$BLOB" >"$KEYBASE/safe/real_keys"
+  chmod 644 "$KEYBASE/safe/real_keys"
+  ln -s "$KEYBASE/safe/real_keys" "$KEYBASE/keys/$USERNAME/authorized_keys"
+  run_host before
+  expect "host: a key file symlinked into a safe directory passes" 0 pass "" "" \
+    'd["counts"]["operator_authorized_keys"]==1'
+
+  reset_host; rm -f "$KEYBASE/keys/$USERNAME/authorized_keys"; mkdir "$KEYBASE/keys/$USERNAME/authorized_keys"; run_host before
   expect "host: authorized_keys that is a directory is unsafe" 2 blocked authorized_keys_unsafe_permissions,operator_authorized_keys_missing ""
 
   reset_host; build_host; export MOCK_SSHD_RC=255
@@ -801,7 +1020,7 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
     "-T -C user=$USERNAME,host=$CLIENT6,addr=$CLIENT6,laddr=2001:db8::50,lport=22" \
     "-T -C user=root,host=$CLIENT6,addr=$CLIENT6,laddr=2001:db8::50,lport=22"
 
-  reset_host; H_IPS='"2001:db8::50","192.0.2.60","192.0.2.50"'; run_host before
+  reset_host; H_IPS='"2001:db8::50","192.0.2.60","192.0.2.50"'; S_LISTEN='192.0.2.60:22 0.0.0.0:22'; run_host before
   expect "host: tailnet addresses in mixed order pass" 0 pass "" ""
   expect_sshd_argv "host: laddr is the first tailnet address of the client's family" \
     "-T -C user=$USERNAME,host=$CLIENT4,addr=$CLIENT4,laddr=192.0.2.60,lport=22" \
@@ -829,25 +1048,8 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   reset_host; S_ROOT=yes R_ON=1 R_ROOT=no; run_host before
   expect "host: root login is judged from the root context only" 0 pass "" ""
 
-  reset_host; S_ROOT=no R_ON=1 R_ROOT=prohibit-password
-  printf 'ssh-ed25519 %s root\n' "$OBLOB" >"$TMP/keys/root/authorized_keys"
-  run_host before
-  expect "host: root context prohibit-password with a root key" 2 blocked root_key_login_possible ""
-
   reset_host; S_ROOT=no R_ON=1 R_ROOT=prohibit-password; run_host before
-  expect "host: root context prohibit-password without root keys passes" 0 pass "" ""
-
-  reset_host; S_ROOT=no R_ON=1 R_ROOT=prohibit-password R_AKF="$TMP/rootkeys/authorized_keys"
-  mkdir -p "$TMP/rootkeys"
-  chmod 755 "$TMP/rootkeys"
-  printf 'ssh-ed25519 %s root\n' "$OBLOB" >"$TMP/rootkeys/authorized_keys"
-  run_host before
-  expect "host: root keys come from the root-context AuthorizedKeysFile" 2 blocked root_key_login_possible ""
-
-  reset_host; S_ROOT=no R_ON=1 R_ROOT=prohibit-password R_AKF=none
-  printf 'ssh-ed25519 %s root\n' "$OBLOB" >"$TMP/keys/root/authorized_keys"
-  run_host before
-  expect "host: root-context AuthorizedKeysFile none ignores the operator-context root file" 0 pass "" ""
+  expect "host: root context prohibit-password is blocked" 2 blocked root_key_login_possible ""
 
   reset_host; build_host; export MOCK_SSHD_ROOT_RC=255
   run_host_keep before
@@ -858,32 +1060,110 @@ if [ "$HOST_USER_OK" -eq 1 ]; then
   expect "host: empty root-context sshd -T output is an error" 1 error sshd_config_unavailable ""
 fi
 
-# ------------------------------------------------- authorized-keys path expansion
-echo "-- unit: AuthorizedKeysFile expansion"
-cat >"$TMP/expand.py" <<'EOF'
+# --------------------------------------------------------------- unit: helpers
+echo "-- unit: helper functions"
+cat >"$TMP/unit.py" <<'EOF'
 import importlib.util
+import os
 import sys
 
-spec = importlib.util.spec_from_file_location("cutover", sys.argv[1])
+sys.dont_write_bytecode = True
+section, check_path, keybase, blob = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("cutover", check_path)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-expand = module.expand_authorized_keys_path
-cases = [
-    (("%h/.ssh/ak", "/h", "u", 7), "/h/.ssh/ak"),
-    ((".ssh/ak", "/h", "u", 7), "/h/.ssh/ak"),
-    (("/etc/keys/%u", "/h", "u", 7), "/etc/keys/u"),
-    (("/etc/keys/%U", "/h", "u", 7), "/etc/keys/7"),
-    (("/etc/%%u/%u", "/h", "u", 7), "/etc/%u/u"),
-]
-bad = [(args, want, expand(*args)) for args, want in cases if expand(*args) != want]
-if bad:
-    print(bad)
+failures = []
+
+
+def expect(name, got, want):
+    if got != want:
+        failures.append((name, got, want))
+
+
+if section == "expand":
+    expand = module.expand_authorized_keys_path
+    cases = [
+        (("%h/.ssh/ak", "/h", "u", 7), "/h/.ssh/ak"),
+        ((".ssh/ak", "/h", "u", 7), "/h/.ssh/ak"),
+        (("/etc/keys/%u", "/h", "u", 7), "/etc/keys/u"),
+        (("/etc/keys/%U", "/h", "u", 7), "/etc/keys/7"),
+        (("/etc/%%u/%u", "/h", "u", 7), "/etc/%u/u"),
+    ]
+    for args, want in cases:
+        expect(args, expand(*args), want)
+
+elif section == "groups":
+    class Entry:
+        def __init__(self, name, members):
+            self.gr_name = name
+            self.gr_mem = members
+
+    names = {5: "primary", 10: "wheel"}
+
+    def fake_getgrgid(gid):
+        if gid in names:
+            return Entry(names[gid], [])
+        raise KeyError(gid)
+
+    def fake_getgrouplist(name, gid):
+        if name == "u":
+            return [gid, 10, 99]
+        raise OSError("lookup failed")
+
+    module.grp.getgrgid = fake_getgrgid
+    module.os.getgrouplist = fake_getgrouplist
+    expect("getgrouplist groups with names; unnamed gids skipped", module.account_groups(module.Account("u", 1000, "/h", 5)), {"primary", "wheel"})
+    expect("a failed getgrouplist fails the lookup", module.account_groups(module.Account("v", 1000, "/h", 5)), None)
+
+elif section == "safe_path":
+    base = os.path.join(keybase, "unit")
+    home = os.path.join(base, "home")
+    ssh_dir = os.path.join(home, ".ssh")
+    key_file = os.path.join(ssh_dir, "authorized_keys")
+    os.makedirs(ssh_dir)
+    with open(key_file, "w", encoding="utf-8") as handle:
+        handle.write("ssh-ed25519 %s one\n" % blob)
+    account = module.Account("u", os.getuid(), home, os.getgid())
+
+    def scan():
+        result = module.authorized_keys_state([".ssh/authorized_keys"], account)
+        return result.count, result.unsafe
+
+    os.chmod(key_file, 0o600)
+    os.chmod(ssh_dir, 0o700)
+    os.chmod(home, 0o755)
+    os.chmod(base, 0o770)  # group-writable above the home directory must not matter
+    expect("walk stops at the home directory", scan(), (1, False))
+    os.chmod(home, 0o775)
+    expect("group-writable home directory is unsafe", scan(), (0, True))
+    os.chmod(home, 0o755)
+    os.chmod(ssh_dir, 0o770)
+    expect("group-writable .ssh is unsafe", scan(), (0, True))
+    os.chmod(ssh_dir, 0o700)
+    os.chmod(key_file, 0o660)
+    expect("group-writable key file is unsafe", scan(), (0, True))
+    os.chmod(key_file, 0o600)
+    expect("restored permissions are safe again", scan(), (1, False))
+
+if failures:
+    for failure in failures:
+        print(failure)
     sys.exit(1)
 EOF
-if UNIT_OUT="$("$PYTHON" "$TMP/expand.py" "$CHECK" 2>&1)"; then
-  ok "AuthorizedKeysFile token expansion"
+unit_case() { # unit_case DESC SECTION
+  local out
+  if out="$("$PYTHON" "$TMP/unit.py" "$2" "$CHECK" "$KEYBASE" "$BLOB" 2>&1)"; then
+    ok "$1"
+  else
+    bad "$1 ($out)"
+  fi
+}
+unit_case "AuthorizedKeysFile token expansion" expand
+unit_case "group resolution via getgrouplist" groups
+if [ -n "$KEYBASE" ]; then
+  unit_case "authorized_keys safe_path walk stops at the home directory" safe_path
 else
-  bad "AuthorizedKeysFile token expansion ($UNIT_OUT)"
+  echo "  NOTE  safe_path unit case skipped: no safe temp base"
 fi
 
 echo "----"

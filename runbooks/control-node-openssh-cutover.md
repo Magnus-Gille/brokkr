@@ -69,11 +69,14 @@ repository:
 
 ## 1. Read-only preflight (before)
 
-`scripts/control-node-ssh-cutover.py` runs only local reads (`tailscale status
---json`, `ssh -G`, `ssh-keygen -F`, `sshd -T`, `systemctl is-active`, key-file
-metadata). It never connects to the target and never changes anything. Its
-single-line JSON output contains only booleans, counts, and reason codes, so it
-is safe to keep as evidence. Exit codes: 0 pass, 2 blocked, 1 error.
+`scripts/control-node-ssh-cutover.py` runs `tailscale status --json`,
+`ssh -G`, `ssh-keygen -F`, `sshd -T -C`, and `systemctl is-active`, and reads
+key-file metadata. It never connects to the target and changes nothing itself.
+`ssh -G` evaluates the workstation's SSH client configuration exactly as `ssh`
+would, including any `Match exec` commands in it, so review that configuration
+as you would before any `ssh` run. The single-line JSON output contains only
+booleans, counts, and reason codes, so it is safe to keep as evidence. Exit
+codes: 0 pass, 2 blocked, 1 error.
 
 On the operator workstation:
 
@@ -115,18 +118,36 @@ sudo python3 scripts/control-node-ssh-cutover.py host --phase before \
   --client-address <source device tailnet address>
 ```
 
-The script asks `sshd -T -C` for the effective configuration of that exact
-connection, so `Match` blocks are applied once for the account and once for
-`root`. It proves `sshd` is active, accepts public keys only, refuses root
-logins with keys or passwords, listens on port 22 on the tailnet address, does
-not exclude the account, and finds at least one key in a safely owned
-`authorized_keys`. It must pass for every account and source.
+The script asks `sshd -T -C` for the effective configuration of a connection
+from that source address, once for the account and once for `root`, so
+address- and user-based `Match` blocks apply. It requires `UseDNS no` (the
+OpenSSH default), because hostname-based `Match` and `AllowUsers` rules cannot
+be evaluated from an address. It proves that:
+
+- `sshd` is active and accepts only public keys;
+- `PermitRootLogin` is `no`;
+- `sshd` listens on port 22 on the tailnet address of the source's address
+  family;
+- the account passes `DenyUsers`, `AllowUsers`, `DenyGroups`, and `AllowGroups`
+  for that source;
+- the account has at least one valid, option-free public key in an
+  `authorized_keys` file whose path passes OpenSSH's `StrictModes` ownership
+  and permission rules.
+
+It must pass for every account and source.
+
+If it blocks with `root_key_login_possible`, the host still allows root to log
+in with keys (Debian's default is `prohibit-password`). Add a drop-in with
+`PermitRootLogin no` that sorts before vendor drop-ins. Run `sudo sshd -t`,
+reload `sshd` with the console open, and re-run the preflight. Do not continue
+while root can log in.
 
 Finally, prove public-key login and the fallback route together from the
 operator workstation:
 
 ```bash
-ssh -o BatchMode=yes -o StrictHostKeyChecking=yes <lan-fallback-alias> true
+ssh -o BatchMode=yes -o PreferredAuthentications=publickey \
+  -o StrictHostKeyChecking=yes <lan-fallback-alias> true
 ```
 
 ## 2. Snapshot the policy
@@ -147,7 +168,8 @@ sudo tailscale set --ssh=false
 In a new terminal on the operator workstation, prove OpenSSH over the tailnet:
 
 ```bash
-ssh -o BatchMode=yes -o StrictHostKeyChecking=yes control-node true
+ssh -o BatchMode=yes -o PreferredAuthentications=publickey \
+  -o StrictHostKeyChecking=yes control-node true
 python3 scripts/control-node-ssh-cutover.py operator --phase after \
   --target-dns-name control-node.example.ts.net \
   --ssh-host control-node \

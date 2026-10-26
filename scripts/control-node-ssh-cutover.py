@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Read-only preflight for moving control-node SSH from Tailscale SSH to OpenSSH.
+"""Preflight for moving control-node SSH from Tailscale SSH to OpenSSH.
 
-This is a local-only, non-mutating check for an owner-attended change. It never opens
-a network connection to the target and never changes state. It only runs
+The preflight itself makes no connection to the target and writes nothing. It only runs
 `tailscale status --json`, `ssh -G`, `ssh-keygen -F`, `sshd -T -C ...` and
-`systemctl is-active`, and reads local files.
+`systemctl is-active`, and reads local files. These commands run as the caller: in
+particular `ssh -G` evaluates the workstation's client configuration exactly as `ssh`
+would, including any `Match exec` commands in it, so review that configuration first.
 
 Roles:
   operator  run on the operator workstation before/after the cutover
@@ -16,6 +17,14 @@ for the operator's login and a second time with `user=root` for the root-login r
 <client> is --client-address (the operator workstation's tailnet address) and <laddr> is
 this node's first tailnet address of the same IP version. If there is none, the check
 is blocked with client_address_family_unavailable.
+
+From those outputs the host role requires: public-key login on; password and
+keyboard-interactive off; PermitRootLogin "no" in the root context (the key-based values
+are blocked because AuthorizedKeysCommand or certificates can authorize root without a
+local key file); UseDNS "no"; a port-22 listener that is laddr or the unspecified address
+of laddr's family; DenyUsers/AllowUsers/DenyGroups/AllowGroups that admit the operator
+(user@host patterns are matched against the client address); and at least one usable key
+in authorized_keys files that pass OpenSSH's StrictModes path check.
 
 Output is exactly one line of JSON on stdout and nothing on stderr. It carries only
 booleans, integer counts and short snake_case codes: never hostnames, addresses,
@@ -31,6 +40,7 @@ import argparse
 import base64
 import binascii
 import fnmatch
+import grp
 import hashlib
 import ipaddress
 import json
@@ -58,10 +68,20 @@ FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 USERNAME = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 TIMEOUT = re.compile(r"[1-9][0-9]*")
 
-WEAK_STRICT_HOST_KEY_CHECKING = frozenset({"false", "no", "off", "accept-new"})
+STRICT_HOST_KEY_CHECKING_OK = frozenset({"true", "yes", "ask"})
+AUTHORIZED_KEY_TYPES = frozenset(
+    {
+        "ssh-ed25519",
+        "ssh-rsa",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "sk-ssh-ed25519@openssh.com",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+    }
+)
 SSHD_UNITS = ("ssh.service", "ssh.socket", "sshd.service")
 DEFAULT_AUTHORIZED_KEYS_FILES = (".ssh/authorized_keys", ".ssh/authorized_keys2")
-FALLBACK_ROOT_HOME = "/root"
 
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
@@ -78,6 +98,7 @@ class Account(NamedTuple):
     name: str
     uid: int
     home: str
+    gid: int
 
 
 class Report:
@@ -214,7 +235,7 @@ def load_tailscale_status(timeout: int) -> dict:
         raise Abort("tailscale_status_failed")
     try:
         status = json.loads(result.stdout)
-    except ValueError:  # json.JSONDecodeError and oversized-number errors
+    except (ValueError, RecursionError):  # JSONDecodeError, oversized numbers, deep nesting
         raise Abort("tailscale_status_invalid") from None
     if not isinstance(status, dict):
         raise Abort("tailscale_status_invalid")
@@ -401,10 +422,10 @@ def run_operator(args: argparse.Namespace, timeout: int) -> Report:
     report.check("ssh_route_unproxied", not proxied, "ssh_route_proxied")
     report.check("ssh_port_22", port == "22", "ssh_port_not_22")
     report.check("ssh_user_not_root", user != "root", "ssh_user_root")
-    strict = (first_value(config, "stricthostkeychecking") or "ask").casefold()
+    strict = first_value(config, "stricthostkeychecking")
     report.check(
         "strict_host_key_checking_enforced",
-        strict not in WEAK_STRICT_HOST_KEY_CHECKING,
+        strict is not None and strict.casefold() in STRICT_HOST_KEY_CHECKING_OK,
         "strict_host_key_checking_weak",
     )
 
@@ -438,15 +459,77 @@ def expand_authorized_keys_path(template: str, home: str, user: str, uid: int) -
     return path if os.path.isabs(path) else os.path.join(home, path)
 
 
-def unsafe_node(info: os.stat_result, account: Account) -> bool:
-    """Owned by neither the user nor root, or writable by group/other."""
-    return info.st_uid not in (0, account.uid) or bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+def unsafe_owner_or_mode(info: os.stat_result, uid: int) -> bool:
+    """OpenSSH safe_path(): not owned by root or the user, or writable by group/other."""
+    return info.st_uid not in (0, uid) or bool(info.st_mode & 0o022)
 
 
-def authorized_keys_state(templates: list[str], account: Account) -> tuple[int, bool]:
-    """Return (key-line count, unsafe-permissions flag) over the existing key files."""
+def safe_path(path: str, info: os.stat_result, account: Account) -> bool:
+    """Mirror OpenSSH misc.c safe_path() as used with StrictModes.
+
+    The canonical file must be regular, owned by root or the user and not group- or
+    world-writable. Every directory above it, up to and including the canonical home
+    directory (or /), must satisfy the same ownership and mode rule.
+    """
+    if not stat.S_ISREG(info.st_mode) or unsafe_owner_or_mode(info, account.uid):
+        return False
+    current = os.path.realpath(path)
+    home = os.path.realpath(account.home) if account.home and os.path.isdir(account.home) else None
+    while True:
+        current = os.path.dirname(current)
+        try:
+            directory = os.stat(current)
+        except OSError:
+            return False
+        if unsafe_owner_or_mode(directory, account.uid):
+            return False
+        if home is not None and current == home:
+            return True
+        if current in ("/", "."):
+            return True
+
+
+def blob_has_type(blob: str, key_type: str) -> bool:
+    """True if a base64 public-key blob's first SSH wire string is `key_type`."""
+    try:
+        raw = base64.b64decode(blob, validate=True)
+    except (ValueError, binascii.Error):
+        return False
+    if len(raw) < 4:
+        return False
+    length = int.from_bytes(raw[:4], "big")
+    return length > 0 and raw[4:4 + length] == key_type.encode("ascii") and len(raw) >= 4 + length
+
+
+def classify_authorized_keys_line(line: bytes) -> str:
+    """Return "skip", "key", "options" or "invalid" for one authorized_keys line."""
+    fields = line.decode("utf-8", errors="replace").split()
+    if not fields or fields[0].startswith("#"):
+        return "skip"
+    if fields[0] in AUTHORIZED_KEY_TYPES:
+        return "key" if len(fields) >= 2 and blob_has_type(fields[1], fields[0]) else "invalid"
+    for index in range(1, len(fields) - 1):
+        if fields[index] in AUTHORIZED_KEY_TYPES and blob_has_type(fields[index + 1], fields[index]):
+            return "options"
+    return "invalid"
+
+
+class KeyScan(NamedTuple):
+    count: int
+    unsafe: bool
+    options_lines: bool
+    invalid_lines: bool
+
+
+def authorized_keys_state(templates: list[str], account: Account) -> KeyScan:
+    """Usable-key count and findings over the existing key files.
+
+    A file that fails safe_path() is ignored by OpenSSH, so it contributes no keys and
+    is reported as unsafe. Only lines that start with a known key type and a matching
+    blob count; options-prefixed keys are not evaluated and only produce a warning.
+    """
     count = 0
-    unsafe = False
+    unsafe = options_lines = invalid_lines = False
     seen: set[str] = set()
     for template in templates:
         path = expand_authorized_keys_path(template, account.home, account.name, account.uid)
@@ -459,13 +542,8 @@ def authorized_keys_state(templates: list[str], account: Account) -> tuple[int, 
             continue
         except OSError:
             raise Abort("authorized_keys_unreadable") from None
-        try:
-            parent = os.stat(os.path.dirname(path))
-        except OSError:
-            raise Abort("authorized_keys_unreadable") from None
-        if not stat.S_ISREG(info.st_mode) or unsafe_node(info, account) or unsafe_node(parent, account):
+        if not safe_path(path, info, account):
             unsafe = True
-        if not stat.S_ISREG(info.st_mode):
             continue
         try:
             with open(path, "rb") as handle:
@@ -473,10 +551,14 @@ def authorized_keys_state(templates: list[str], account: Account) -> tuple[int, 
         except OSError:
             raise Abort("authorized_keys_unreadable") from None
         for line in data.splitlines():
-            stripped = line.strip()
-            if stripped and not stripped.startswith(b"#"):
+            kind = classify_authorized_keys_line(line)
+            if kind == "key":
                 count += 1
-    return count, unsafe
+            elif kind == "options":
+                options_lines = True
+            elif kind == "invalid":
+                invalid_lines = True
+    return KeyScan(count, unsafe, options_lines, invalid_lines)
 
 
 def parse_listen_address(value: str) -> tuple[IPAddress, int] | None:
@@ -509,16 +591,90 @@ def tailnet_addresses(status: dict) -> list[IPAddress]:
         raise Abort("tailscale_status_invalid") from None
 
 
-def user_listed(patterns: list[str], user: str) -> bool:
-    return any(fnmatch.fnmatchcase(user, pattern.split("@", 1)[0]) for pattern in patterns)
-
-
 def account_for(name: str) -> Account | None:
     try:
         entry = pwd.getpwnam(name)
     except KeyError:
         return None
-    return Account(entry.pw_name, entry.pw_uid, entry.pw_dir)
+    return Account(entry.pw_name, entry.pw_uid, entry.pw_dir, entry.pw_gid)
+
+
+def account_groups(account: Account) -> set[str] | None:
+    """Group names as sshd resolves them (getgrouplist); None if the lookup fails.
+
+    Like OpenSSH's ga_init(), group ids without a name are skipped.
+    """
+    try:
+        gids = os.getgrouplist(account.name, account.gid)
+    except OSError:
+        return None
+    names: set[str] = set()
+    for gid in gids:
+        try:
+            names.add(grp.getgrgid(gid).gr_name)
+        except KeyError:
+            continue
+    return names
+
+
+def user_pattern_verdict(pattern: str, user: str, client: IPAddress) -> bool | None:
+    """Match an AllowUsers/DenyUsers pattern; None if it cannot be evaluated here.
+
+    `user@host` patterns are evaluated against the client address (UseDNS is required
+    to be off, so the host is the address). Negation and host lists are not evaluated.
+    """
+    user_part, at, host_part = pattern.partition("@")
+    if "!" in user_part:
+        return None
+    if not fnmatch.fnmatchcase(user, user_part):
+        return False
+    if not at:
+        return True
+    if "!" in host_part or "," in host_part:
+        return None
+    try:
+        return client in ipaddress.ip_network(host_part, strict=False)
+    except ValueError:
+        return fnmatch.fnmatchcase(str(client), host_part)
+
+
+def group_pattern_verdict(pattern: str, groups: set[str]) -> bool | None:
+    if "!" in pattern:
+        return None
+    return any(fnmatch.fnmatchcase(name, pattern) for name in groups)
+
+
+def check_access_filters(report: Report, config: dict[str, list[str]], account: Account, client: IPAddress) -> None:
+    """Evaluate DenyUsers, AllowUsers, DenyGroups and AllowGroups (OpenSSH order)."""
+    deny_users = [user_pattern_verdict(p, account.name, client) for p in tokens(config, "denyusers")]
+    allow_users = [user_pattern_verdict(p, account.name, client) for p in tokens(config, "allowusers")]
+    deny_group_patterns = tokens(config, "denygroups")
+    allow_group_patterns = tokens(config, "allowgroups")
+    unevaluated = any(verdict is None for verdict in deny_users + allow_users)
+    deny_groups: list[bool | None] = []
+    allow_groups: list[bool | None] = []
+    if deny_group_patterns or allow_group_patterns:
+        groups = account_groups(account)
+        if groups is None:
+            unevaluated = True
+        else:
+            deny_groups = [group_pattern_verdict(p, groups) for p in deny_group_patterns]
+            allow_groups = [group_pattern_verdict(p, groups) for p in allow_group_patterns]
+            unevaluated = unevaluated or any(verdict is None for verdict in deny_groups + allow_groups)
+
+    reasons: set[str] = set()
+    if unevaluated:
+        reasons.add("access_filter_not_evaluated")
+    if True in deny_users:
+        reasons.add("operator_user_denied")
+    if allow_users and True not in allow_users and None not in allow_users:
+        reasons.add("operator_user_not_allowed")
+    if True in deny_groups:
+        reasons.add("operator_group_denied")
+    if allow_groups and True not in allow_groups and None not in allow_groups:
+        reasons.add("operator_group_not_allowed")
+    report.checks["operator_user_permitted"] = not reasons
+    report.reasons.update(reasons)
 
 
 def parse_client_address(value: str) -> IPAddress:
@@ -589,46 +745,44 @@ def run_host(args: argparse.Namespace, timeout: int) -> Report:
         kbd = first_value(config, "challengeresponseauthentication")
     report.check("kbd_interactive_auth_disabled", (kbd or "yes").casefold() == "no", "kbd_interactive_auth_enabled")
 
-    # Root login is judged from the root connection context only.
+    # Hostname-based Match/AllowUsers semantics cannot be evaluated from an address.
+    report.check("usedns_disabled", (first_value(config, "usedns") or "").casefold() == "no", "usedns_enabled")
+
+    # Root login is judged from the root connection context only, and only "no" is safe:
+    # AuthorizedKeysCommand, TrustedUserCAKeys or principals can authorize root without
+    # any local key file, so the key-based values are blocked rather than counted.
     root_login = (first_value(root_config, "permitrootlogin") or "").casefold()
-    if root_login == "no":
-        report.checks["root_login_safe"] = True
-    elif root_login in ("prohibit-password", "without-password"):
-        root_account = account_for("root") or Account("root", 0, FALLBACK_ROOT_HOME)
-        root_keys, _ = authorized_keys_state(authorized_keys_templates(root_config), root_account)
-        report.check("root_login_safe", root_keys == 0, "root_key_login_possible")
-    else:
-        report.check("root_login_safe", False, "root_login_permitted")
+    report.checks["root_login_safe"] = root_login == "no"
+    if root_login in ("prohibit-password", "without-password"):
+        report.reasons.add("root_key_login_possible")
+    elif root_login != "no":
+        report.reasons.add("root_login_permitted")
 
     report.check("sshd_port_22", "22" in tokens(config, "port"), "sshd_port_not_22")
 
+    # A port-22 listener must be exactly laddr or the unspecified address of laddr's own
+    # family; "::" is never assumed to accept IPv4.
     parsed = [parse_listen_address(line.split()[0]) for line in config.get("listenaddress", []) if line.split()]
-    listeners = [item for item in parsed if item is not None and item[1] == 22]
-    wildcard = any(address.is_unspecified for address, _ in listeners)
-    on_tailnet = any(address in tailnet for address, _ in listeners)
-    report.check("sshd_listens_on_tailnet", wildcard or on_tailnet, "sshd_not_listening_on_tailnet")
-    if on_tailnet and not wildcard:
+    listeners = [item[0] for item in parsed if item is not None and item[1] == 22]
+    wildcard = any(address.is_unspecified and address.version == listen.version for address in listeners)
+    exact = any(address == listen for address in listeners)
+    report.check("sshd_listens_on_tailnet", wildcard or exact, "sshd_not_listening_on_tailnet")
+    if exact and not wildcard:
         report.warnings.add("sshd_bound_to_tailnet_address_only")
 
-    allow = tokens(config, "allowusers")
-    deny = tokens(config, "denyusers")
-    not_allowed = bool(allow) and not user_listed(allow, operator.name)
-    denied = user_listed(deny, operator.name)
-    report.checks["operator_user_permitted"] = not (not_allowed or denied)
-    if not_allowed:
-        report.reasons.add("operator_user_not_allowed")
-    if denied:
-        report.reasons.add("operator_user_denied")
-    if "allowgroups" in config or "denygroups" in config:
-        report.warnings.add("group_filters_not_evaluated")
+    check_access_filters(report, config, operator, client)
     command = first_value(config, "authorizedkeyscommand")
     if command is not None and command.casefold() != "none":
         report.warnings.add("authorized_keys_command_not_evaluated")
 
-    keys, unsafe = authorized_keys_state(authorized_keys_templates(config), operator)
-    report.counts["operator_authorized_keys"] = keys
-    report.check("authorized_keys_safe", not unsafe, "authorized_keys_unsafe_permissions")
-    report.check("operator_has_authorized_keys", keys > 0, "operator_authorized_keys_missing")
+    scan = authorized_keys_state(authorized_keys_templates(config), operator)
+    report.counts["operator_authorized_keys"] = scan.count
+    report.check("authorized_keys_safe", not scan.unsafe, "authorized_keys_unsafe_permissions")
+    report.check("operator_has_authorized_keys", scan.count > 0, "operator_authorized_keys_missing")
+    if scan.options_lines:
+        report.warnings.add("authorized_keys_options_not_evaluated")
+    if scan.invalid_lines:
+        report.warnings.add("authorized_keys_invalid_lines")
 
     active = False
     for unit in SSHD_UNITS:
