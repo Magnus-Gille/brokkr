@@ -40,6 +40,7 @@ usage_text() {
   echo "       BROKKR_GUARDED_REBOOT_BUSY_UNITS (space-separated systemd user .service units),"
   echo "       BROKKR_GUARDED_REBOOT_MAX_LOAD (default 0.75 x CPUs), BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN (60),"
   echo "       BROKKR_GUARDED_REBOOT_ALERT_AFTER (3), BROKKR_GUARDED_REBOOT_PEERS (hosts that must answer on port 22),"
+  echo "       BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED (0 or 1, default 0: the owner verified unattended unlock of every encrypted boot volume),"
   echo "       BROKKR_STATE_DIR (default \${XDG_STATE_HOME:-~/.local/state}/brokkr)"
 }
 usage() { usage_text >&2; exit 64; }
@@ -94,6 +95,26 @@ for word in $PEERS_RAW; do
   [ "${#word}" -le 253 ] || die "invalid BROKKR_GUARDED_REBOOT_PEERS entry (longer than 253 characters)"
   PEER_LIST="${PEER_LIST:+$PEER_LIST }$word"
 done
+# A peer that is this very host says nothing about the host that monitors it, so it is refused:
+# the short name and the FQDN (and localhost) are compared, case-insensitively.
+if [ -n "$PEER_LIST" ]; then
+  own_short=$(hostname -s 2>/dev/null) || own_short=
+  if command -v timeout >/dev/null 2>&1; then own_fqdn=$(timeout 5 hostname -f 2>/dev/null) || own_fqdn=
+  else own_fqdn=$(hostname -f 2>/dev/null) || own_fqdn=; fi
+  own_names=$(printf '%s\n%s\nlocalhost\nlocalhost.localdomain\n' "$own_short" "$own_fqdn" | tr 'A-Z' 'a-z')
+  for word in $PEER_LIST; do
+    lower=$(printf '%s' "$word" | tr 'A-Z' 'a-z')
+    case $'\n'"$own_names"$'\n' in
+      *$'\n'"$lower"$'\n'*) die "BROKKR_GUARDED_REBOOT_PEERS names this host itself ($word); a peer must be another host, normally the one that monitors this one" ;;
+    esac
+  done
+fi
+
+# The owner's word that every encrypted boot volume unlocks unattended (ADR-009). Without it any
+# crypttab entry needed at boot defers the reboot and alerts; see guard_unlock.
+UNLOCK_VERIFIED=${BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED:-0}
+case "$UNLOCK_VERIFIED" in 0|1) ;; *) die "invalid BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED (0 or 1)" ;; esac
+UNLOCK_VERIFIED=$((0 + 10#$UNLOCK_VERIFIED))
 
 cpu_count() {
   local n
@@ -259,6 +280,10 @@ LATCH=0; LATCH_SINCE=0; LATCH_REASON=
 # The last guarded-reboot attempt: its boot id, time, triggers, trigger identities and status
 # (none, unresolved, ok, issues, cleared). unresolved means no post-boot result is recorded yet.
 A_BOOT_ID=; A_EPOCH=0; A_TRIGGERS=; A_IDS=; A_STATUS=none
+# Issues a post-boot check observed whose outcome record could not be appended to the audit file.
+# They are kept (with the latch) while the attempt stays unresolved, so a later healthy retry cannot
+# turn the attempt into a pass; only clear-latch drops them.
+A_OBSERVED=
 BASE_EPOCH=0; BASE_BOOT_ID=; BASE_SYS=; BASE_USER=
 H_EPOCH=0; H_ACTION=; H_SIG=
 W_TS=; W_EPOCH=0; W_ACTION=; W_TRIGGERS=; W_GUARDS=; W_DETAIL=
@@ -279,6 +304,9 @@ load_str() { # var key
   v=$(st_raw "$2")
   [[ "$v" =~ $re ]] || bad_state "$2"
   set_var "$1" "${BASH_REMATCH[1]}"
+}
+load_str_opt() { # var key: like load_str, but a key the file does not have yet is empty
+  if [ -z "$(st_raw "$2")" ]; then set_var "$1" ""; else load_str "$1" "$2"; fi
 }
 state_array() { # key -> one unescaped item per line
   awk -v start="  \"$1\": [" '
@@ -318,6 +346,7 @@ load_state() {
   load_str A_TRIGGERS attempt_triggers; load_str A_IDS attempt_identities
   load_str A_STATUS attempt_status
   case "$A_STATUS" in none|unresolved|ok|issues|cleared) ;; *) bad_state attempt_status ;; esac
+  load_str_opt A_OBSERVED attempt_observed
   load_int BASE_EPOCH baseline_epoch; load_str BASE_BOOT_ID baseline_boot_id
   load_int H_EPOCH health_epoch; load_str H_ACTION health_action; load_str H_SIG health_sig
   load_units BASE_SYS baseline_system; load_units BASE_USER baseline_user
@@ -350,7 +379,7 @@ render_state_json() {
   kv_int latch "$LATCH"; kv_int latch_since "$LATCH_SINCE"; kv_str latch_reason "$LATCH_REASON"
   kv_str attempt_boot_id "$A_BOOT_ID"; kv_int attempt_epoch "$A_EPOCH"
   kv_str attempt_triggers "$A_TRIGGERS"; kv_str attempt_identities "$A_IDS"
-  kv_str attempt_status "$A_STATUS"
+  kv_str attempt_status "$A_STATUS"; kv_str attempt_observed "$A_OBSERVED"
   kv_int baseline_epoch "$BASE_EPOCH"; kv_str baseline_boot_id "$BASE_BOOT_ID"
   kv_int health_epoch "$H_EPOCH"; kv_str health_action "$H_ACTION"; kv_str health_sig "$H_SIG"
   kv_list baseline_system "$BASE_SYS" ,
@@ -836,50 +865,68 @@ guard_peers() {
   done
 }
 
-# Every crypttab entry needed at boot (not noauto) must unlock unattended, or an unattended reboot
-# would stop the boot at a prompt. An entry counts as unattended only if its key field is a key-file
-# path or its options contain tpm2-device= without tpm2-pin=yes. Anything that can prompt makes it
-# interactive whatever else it says: fido2-device=, pkcs11-uri=, keyscript=, any *-pin=yes,
-# fido2-with-*, headless=false. An empty, none or - key without tpm2 is interactive.
+# Every crypttab entry needed at boot (not noauto) is an encrypted boot volume, and nothing in
+# crypttab proves that it unlocks unattended: a tpm2-device= may need a PIN or a changed PCR policy,
+# a key-file path may sit on a volume that is itself locked. So the job infers nothing: every such
+# entry defers the reboot and alerts ("unattended unlock not owner-verified, ADR-009") unless the
+# owner has set BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1 at deploy, asserting that unattended unlock
+# was verified. Whatever the owner says, an entry with an option that can prompt stays a hard
+# block: fido2-device=, pkcs11-uri=, keyscript=, any *-pin=yes, fido2-with-*, headless=false.
+# The awk prints "H name" for a hard block and "U name" for an entry that needs the owner's word.
 UNLOCK_AWK='
 /^[[:space:]]*#/ { next }
 NF == 0 { next }
 {
-  key = (NF >= 3) ? $3 : "none"
   opts = (NF >= 4) ? $4 : ""
   n = split(opts, o, ",")
-  noauto = 0; interactive = 0; tpm2 = 0
+  noauto = 0; hard = 0
   for (k = 1; k <= n; k++) {
     if (o[k] == "noauto") noauto = 1
-    if (o[k] ~ /^(fido2-device|pkcs11-uri|keyscript)=/) interactive = 1
-    if (o[k] ~ /-pin=yes$/) interactive = 1
-    if (o[k] ~ /^fido2-with-/) interactive = 1
-    if (o[k] == "headless=false") interactive = 1
-    if (o[k] ~ /^tpm2-device=/) tpm2 = 1
+    if (o[k] ~ /^(fido2-device|pkcs11-uri|keyscript)=/) hard = 1
+    if (o[k] ~ /-pin=yes$/) hard = 1
+    if (o[k] ~ /^fido2-with-/) hard = 1
+    if (o[k] == "headless=false") hard = 1
   }
   if (noauto) next
-  unattended = 0
-  if (key ~ /^\//) unattended = 1
-  if (tpm2) unattended = 1
-  if (interactive) unattended = 0
-  if (!unattended) print $1
+  print (hard ? "H " : "U ") $1
 }
 '
+UNLOCK_ALERT=
 guard_unlock() {
-  local names
+  local rows hard='' unverified='' kind name
+  UNLOCK_ALERT=
   [ -e "$CRYPTTAB" ] || return 0
-  if [ ! -r "$CRYPTTAB" ] || ! names=$(awk "$UNLOCK_AWK" "$CRYPTTAB"); then
+  if [ ! -r "$CRYPTTAB" ] || ! rows=$(awk "$UNLOCK_AWK" "$CRYPTTAB"); then
     G_UNLOCK=1; UNLOCK_NAMES="unreadable crypttab"
+    UNLOCK_ALERT="the crypttab cannot be read, so unattended unlock cannot be judged (failing closed)"
     add_guard unlock "cannot read $CRYPTTAB (failing closed)"; return 0
   fi
-  [ -n "$names" ] || return 0
+  while read -r kind name; do
+    [ -n "$name" ] || continue
+    name=$(clean "$name" 40)
+    case "$kind" in
+      H) hard="${hard:+$hard,}$name" ;;
+      *) unverified="${unverified:+$unverified,}$name" ;;
+    esac
+  done <<<"$rows"
+  # Entries that need the owner's word only count while the owner has not given it.
+  if [ "$UNLOCK_VERIFIED" -eq 1 ]; then unverified=''; fi
+  [ -n "$hard$unverified" ] || return 0
   G_UNLOCK=1
-  UNLOCK_NAMES=$(clean "$(printf '%s' "$names" | head -n 8 | tr '\n' ',' | sed 's/,$//')" 120)
-  add_guard unlock "an unattended reboot would stop at a passphrase prompt for crypttab entries: $UNLOCK_NAMES"
+  UNLOCK_NAMES=$hard
+  if [ -n "$unverified" ]; then UNLOCK_NAMES="${UNLOCK_NAMES:+$UNLOCK_NAMES,}$unverified"; fi
+  UNLOCK_NAMES=$(clean "$UNLOCK_NAMES" 120)
+  if [ -n "$hard" ]; then
+    UNLOCK_ALERT="unattended reboot refused: crypttab entries $(clean "$hard" 100) have an option that can prompt (fido2, pkcs11, keyscript, PIN or headless=false), whatever BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED says"
+  fi
+  if [ -n "$unverified" ]; then
+    UNLOCK_ALERT="${UNLOCK_ALERT:+$UNLOCK_ALERT; }encrypted boot volume: unattended unlock not owner-verified (ADR-009): $(clean "$unverified" 100)"
+  fi
+  add_guard unlock "$UNLOCK_ALERT"
 }
 
 evaluate_guards() {
-  GUARD_IDS=; GUARD_DETAIL=; G_KILL=0; G_UNLOCK=0; UNLOCK_NAMES=
+  GUARD_IDS=; GUARD_DETAIL=; G_KILL=0; G_UNLOCK=0; UNLOCK_NAMES=; UNLOCK_ALERT=
   if [ -e "$KILL_SWITCH" ] || [ -L "$KILL_SWITCH" ]; then
     G_KILL=1
     add_guard kill-switch "the kill switch $KILL_SWITCH exists; reboots are disabled by the owner"
@@ -1026,7 +1073,7 @@ note_deferral() {
   fi
   if [ "$G_UNLOCK" -eq 1 ] && [ "$E_UNLOCK_ALERTED" -eq 0 ]; then
     E_UNLOCK_ALERTED=1
-    queue_alert "unattended reboot refused: crypttab entries $UNLOCK_NAMES need an interactive unlock at boot (triggers: $TRIG_IDS)"
+    queue_alert "$UNLOCK_ALERT (triggers: $TRIG_IDS)"
   fi
   if [ "$E_DEFERRALS" -ge "$ALERT_AFTER" ] && [ "$E_ALERTED" -eq 0 ]; then
     E_ALERTED=1
@@ -1080,7 +1127,7 @@ reboot_attempt() {
   if [ "$MODE" != reboot ] || [ "$REPORT_ONLY" -ne 0 ]; then fatal "internal error: a reboot was attempted outside reboot mode"; fi
   if [ "$BASE_OK" -ne 1 ]; then fatal "cannot capture the running-service baseline; not rebooting"; fi
   snapshot_attempt_state
-  A_BOOT_ID=$BOOT_ID; A_EPOCH=$NOW; A_TRIGGERS=$TRIG_IDS; A_IDS=$TRIG_PAIRS; A_STATUS=unresolved
+  A_BOOT_ID=$BOOT_ID; A_EPOCH=$NOW; A_TRIGGERS=$TRIG_IDS; A_IDS=$TRIG_PAIRS; A_STATUS=unresolved; A_OBSERVED=
   episode_reset
   set_event reboot "$TRIG_IDS" "" "$TRIG_DETAIL"
   if ! write_state; then
@@ -1229,7 +1276,7 @@ verify_attempt_targets() {
 }
 
 cmd_post_boot() {
-  local pair kernel notes='' fresh='' detail pairs outcome
+  local pair kernel notes='' fresh='' detail pairs outcome fresh_issues relatch was_latched
   load_state
   read_boot_id
   [ "$A_STATUS" = unresolved ] || return 0
@@ -1253,6 +1300,10 @@ cmd_post_boot() {
   collect_health_issues 1
   kernel=$RUNNING_KERNEL
   if [ -z "$kernel" ]; then kernel=$(clean "$(uname -r 2>/dev/null || echo unknown)" 60); fi
+  fresh_issues=$ISSUES
+  # Issues an earlier run observed but could not record are never forgotten by a healthy retry: the
+  # outcome stays issues until the owner clears the latch.
+  if [ -n "$A_OBSERVED" ]; then add_issue "an earlier post-boot check observed (its outcome could not be recorded): $A_OBSERVED"; fi
   if [ -z "$ISSUES" ]; then
     outcome=ok
     detail="kernel $kernel; health OK; the recorded targets are verified${notes:+; $notes}"
@@ -1268,18 +1319,35 @@ cmd_post_boot() {
   fi
   # The outcome is appended BEFORE it is persisted. If the append fails the attempt stays unresolved
   # (exit 1), so the next nightly check latches it as missing verification instead of the host
-  # looking verified while no record says so. The notices still go out.
+  # looking verified while no record says so. Observed issues are different: they are persisted
+  # with the latch even when the append fails (the attempt still stays unresolved), so a later
+  # healthy retry cannot erase them. The notices still go out.
   if ! audit_append "$W_ACTION" "$W_DETAIL"; then
     RC=1
+    warn "the post-boot outcome could not be audited; the attempt stays unresolved"
+    if [ "$outcome" = issues ]; then
+      if [ -n "$fresh_issues" ]; then A_OBSERVED=$(clean "$fresh_issues" 200); fi
+      set_latch "the post-boot check reported issues: $(clean "$A_OBSERVED" 120)"
+      if ! write_state; then warn "cannot write the state file in $STATE_DIR"; fi
+    fi
     # Alerts are normally audited as they are sent; with the audit failing they go out as notices.
     if [ -n "$ALERTS" ]; then NOTICES="$NOTICES$(printf '%s' "$ALERTS" | sed "s/^/ALERT $HOST: /")"$'\n'; fi
     ALERTS=''
-    warn "the post-boot outcome could not be audited; the attempt stays unresolved"
     flush_queues
     return 0
   fi
+  relatch=0
+  if [ -n "$A_OBSERVED" ]; then relatch=1; fi
+  was_latched=$LATCH
   A_STATUS=$outcome
-  if [ "$outcome" = issues ]; then set_latch "the post-boot check reported issues: $(clean "$ISSUES" 120)"; fi
+  A_OBSERVED=''
+  if [ "$outcome" = issues ]; then
+    set_latch "the post-boot check reported issues: $(clean "$fresh_issues" 120)"
+    # The first latching alert could not be audited; the report only sees the latch if it is recorded.
+    if [ "$relatch" -eq 1 ] && [ "$was_latched" -eq 1 ]; then
+      queue_alert "latched: $LATCH_REASON. Automatic reboots stay off until the owner has investigated and runs guarded-reboot.sh clear-latch"
+    fi
+  fi
   commit_event 0
 }
 
@@ -1345,6 +1413,7 @@ cmd_clear_latch() {
   fi
   LATCH=0; LATCH_SINCE=0; LATCH_REASON=
   case "$A_STATUS" in unresolved|issues) A_STATUS=cleared ;; esac
+  A_OBSERVED=
   if ! write_state; then fatal "cannot write the state file in $STATE_DIR"; fi
   queue_notice "guarded-reboot latch cleared on $HOST by the owner"
   flush_queues
@@ -1381,6 +1450,9 @@ cmd_status() {
       echo "last reboot attempt: none"
     else
       echo "last reboot attempt: $(iso_utc "$A_EPOCH") status=$A_STATUS triggers=${A_TRIGGERS:--} identities=${A_IDS:--}"
+    fi
+    if [ -n "$A_OBSERVED" ]; then
+      echo "post-boot issues observed but not yet recorded in the audit file: $A_OBSERVED"
     fi
     if [ "$BASE_EPOCH" -gt 0 ]; then
       echo "service baseline: $(iso_utc "$BASE_EPOCH")"

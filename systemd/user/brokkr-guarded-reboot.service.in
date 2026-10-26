@@ -21,8 +21,12 @@ Environment=BROKKR_GUARDED_REBOOT_MODE=@MODE@
 # reboot is deferred to the next night. Quoted so the spaces survive systemd's parsing.
 Environment="BROKKR_GUARDED_REBOOT_BUSY_UNITS=@BUSY_UNITS@"
 # Space-separated host names that must accept a TCP connection on port 22 before this host may
-# reboot (for example the host that monitors it). Empty disables the guard.
+# reboot (for example the host that monitors it). Required in reboot mode; never this host itself.
 Environment="BROKKR_GUARDED_REBOOT_PEERS=@PEERS@"
+# 0 (default): any crypttab entry needed at boot defers the reboot and alerts, because nothing in
+# crypttab proves that it unlocks unattended (Grimnir ADR-009). 1: the owner has verified that every
+# encrypted boot volume unlocks without a person present; options that can prompt still block.
+Environment=BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=@UNLOCK_VERIFIED@
 # Highest 5-minute load average; empty means 0.75 x the number of CPUs.
 Environment=BROKKR_GUARDED_REBOOT_MAX_LOAD=@MAX_LOAD@
 Environment=BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN=@TTY_IDLE_MIN@

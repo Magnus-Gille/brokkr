@@ -104,12 +104,51 @@ for PEER_WORD in $PEERS_RAW; do
   [[ "$PEER_WORD" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "invalid BROKKR_GUARDED_REBOOT_PEERS entry (a host name is required)"
   PEERS="${PEERS:+$PEERS }$PEER_WORD"
 done
-# Reboot mode is the owner's explicit switch and it needs both of these stated, not defaulted: a
-# window chosen for this host (so it never reboots together with the host that monitors it), and at
-# least one peer that must be reachable first (normally that monitoring host).
+# A peer that is the host being deployed to proves nothing about the host that monitors it. The
+# target's own name is compared here; the remote preflight compares the real hostnames too.
+TARGET_HOST="$(printf '%s' "${TARGET#*@}" | tr 'A-Z' 'a-z')"
+for PEER_WORD in $PEERS; do
+  [[ "$(printf '%s' "$PEER_WORD" | tr 'A-Z' 'a-z')" != "$TARGET_HOST" && "$(printf '%s' "$PEER_WORD" | tr 'A-Z' 'a-z')" != localhost ]] \
+    || die "BROKKR_GUARDED_REBOOT_PEERS names the host being deployed to ($PEER_WORD); a peer must be another host, normally the one that monitors it"
+done
+
+# The owner's word that every encrypted boot volume unlocks unattended (ADR-009), rendered into the
+# unit. Default 0: without it the job defers every reboot of a host with an encrypted boot volume.
+UNLOCK_VERIFIED="${BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED:-0}"
+case "$UNLOCK_VERIFIED" in 0|1) ;; *) die "invalid BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED (0 or 1)" ;; esac
+
+# The peer host's own window, as configured there (this script cannot read it): both are checked
+# whenever they are given, and required in reboot mode.
+PEER_WINDOW="${BROKKR_GUARDED_REBOOT_PEER_WINDOW:-}"
+PEER_SPREAD="${BROKKR_GUARDED_REBOOT_PEER_SPREAD:-}"
+if [[ -n "$PEER_WINDOW" ]]; then
+  [[ "$PEER_WINDOW" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "invalid BROKKR_GUARDED_REBOOT_PEER_WINDOW (HH:MM, 24-hour)"
+fi
+if [[ -n "$PEER_SPREAD" ]]; then
+  [[ "$PEER_SPREAD" =~ ^[0-9]{1,3}$ ]] && [ "$((0 + 10#$PEER_SPREAD))" -le 240 ] || die "invalid BROKKR_GUARDED_REBOOT_PEER_SPREAD (minutes, 0 to 240)"
+  PEER_SPREAD="$((0 + 10#$PEER_SPREAD))"
+fi
+
+# Reboot mode is the owner's explicit switch and it needs these stated, not defaulted: a window
+# chosen for this host, at least one peer that must be reachable first (normally the host that
+# monitors it), and that peer's own window and spread, so the two hosts can be shown never to
+# reboot together.
 if [[ "$GR_MODE" == reboot ]]; then
   [[ -n "${BROKKR_GUARDED_REBOOT_WINDOW:-}" ]] || die "reboot mode needs an explicit BROKKR_GUARDED_REBOOT_WINDOW (there is no default window in reboot mode); stagger the windows, with spread, at least two hours apart"
   [[ -n "$PEERS" ]] || die "reboot mode needs BROKKR_GUARDED_REBOOT_PEERS (at least one host that must be reachable before this host reboots, normally the host that monitors it)"
+  [[ -n "$PEER_WINDOW" ]] || die "reboot mode needs BROKKR_GUARDED_REBOOT_PEER_WINDOW (HH:MM, the peer host's configured window)"
+  [[ -n "$PEER_SPREAD" ]] || die "reboot mode needs BROKKR_GUARDED_REBOOT_PEER_SPREAD (minutes, the peer host's configured spread)"
+  # On the 24-hour circle (1440 minutes) this host runs in [W, W+S] and the peer in [P, P+PS]. With
+  # d the minutes from W to P, the gap from this host's end to the peer's start is d-S and the gap
+  # from the peer's end around to this host's start is 1440-(d+PS); both must be at least 120.
+  OWN_MIN=$((10#${WINDOW%%:*} * 60 + 10#${WINDOW##*:}))
+  PEER_MIN=$((10#${PEER_WINDOW%%:*} * 60 + 10#${PEER_WINDOW##*:}))
+  WINDOW_D=$(((PEER_MIN - OWN_MIN + 1440) % 1440))
+  GAP_AFTER=$((WINDOW_D - SPREAD))
+  GAP_BEFORE=$((1440 - (WINDOW_D + PEER_SPREAD)))
+  if [ "$GAP_AFTER" -lt 120 ] || [ "$GAP_BEFORE" -lt 120 ]; then
+    die "the reboot windows are too close: this host $WINDOW +${SPREAD} min, the peer $PEER_WINDOW +${PEER_SPREAD} min; at least 120 minutes must separate the end of one from the start of the other on the 24-hour circle (now $GAP_AFTER and $GAP_BEFORE)"
+  fi
 fi
 
 # Only what the job needs. The units are shipped as templates and rendered on the node, where the
@@ -162,6 +201,21 @@ for unit in $UNITS; do
 done
 command -v bash >/dev/null 2>&1 || refuse "bash is required (the job runs under bash)"
 sudo -n true </dev/null >/dev/null 2>&1 || refuse "passwordless sudo is required (sudo -n true failed): the job appends to the root-owned audit file and runs the reboot through sudo"
+# A peer that is this very host proves nothing about the host that monitors it: compare every peer
+# with this host's short name and FQDN (and localhost), case-insensitively.
+if [ -n "$PEERS" ]; then
+  own_short=$(hostname -s 2>/dev/null || true)
+  if command -v timeout >/dev/null 2>&1; then own_fqdn=$(timeout 5 hostname -f 2>/dev/null || true); else own_fqdn=$(hostname -f 2>/dev/null || true); fi
+  for peer in $PEERS; do
+    lower_peer=$(printf '%s' "$peer" | tr 'A-Z' 'a-z')
+    for own in "$own_short" "$own_fqdn" localhost; do
+      lower_own=$(printf '%s' "$own" | tr 'A-Z' 'a-z')
+      if [ -n "$lower_own" ] && [ "$lower_peer" = "$lower_own" ]; then
+        refuse "peer $peer is this host itself ($own); a peer must be another host, normally the one that monitors this one"
+      fi
+    done
+  done
+fi
 # The audit directories must be searchable by an unprivileged reader (the daily maintenance report
 # reads the audit file as another user). An existing /var/lib/brokkr is never chmod-ed: it is
 # verified, and a closed one is refused. The directories the privileged install creates are the
@@ -222,11 +276,12 @@ elif [ "$GR_MODE" = reboot ]; then
 else
   echo "preflight: WARN: no notify configuration found; report mode runs without alerts, but reboot mode would be refused until one exists (see scripts/lib/notify.env.example)"
 fi
-# Unlock assessment (the same rule as the job's unlock guard): a crypttab entry needed at boot (not
-# noauto) is unattended only if its key field is a key-file path or its options hold tpm2-device=
-# without tpm2-pin=yes. fido2-device=, pkcs11-uri=, keyscript=, any *-pin=yes, fido2-with-*,
-# headless=false, or an empty/none key without tpm2 would stop an unattended reboot at a prompt;
-# the job's unlock guard defers and alerts for it.
+# Unlock assessment (the same rule as the job's unlock guard). Every crypttab entry needed at boot
+# (not noauto) is an encrypted boot volume, and nothing in crypttab proves that it unlocks
+# unattended, so nothing is inferred: each one defers the reboot and alerts unless the owner has
+# verified unattended unlock and deployed with BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1. An option
+# that can prompt (fido2-device=, pkcs11-uri=, keyscript=, any *-pin=yes, fido2-with-*,
+# headless=false) is a hard block even then.
 crypttab=${BROKKR_CRYPTTAB:-}
 if [ -z "$crypttab" ]; then crypttab=/etc/crypttab; fi
 if [ ! -e "$crypttab" ]; then
@@ -234,35 +289,41 @@ if [ ! -e "$crypttab" ]; then
 elif [ ! -r "$crypttab" ]; then
   echo "preflight: WARN: unlock assessment: $crypttab is not readable; the job's unlock guard will defer every reboot (failing closed)"
 else
-  names=$(awk '
+  rows=$(awk '
     /^[[:space:]]*#/ { next }
     NF == 0 { next }
     {
-      key = (NF >= 3) ? $3 : "none"
       opts = (NF >= 4) ? $4 : ""
       n = split(opts, o, ",")
-      noauto = 0; interactive = 0; tpm2 = 0
+      noauto = 0; hard = 0
       for (k = 1; k <= n; k++) {
         if (o[k] == "noauto") noauto = 1
-        if (o[k] ~ /^(fido2-device|pkcs11-uri|keyscript)=/) interactive = 1
-        if (o[k] ~ /-pin=yes$/) interactive = 1
-        if (o[k] ~ /^fido2-with-/) interactive = 1
-        if (o[k] == "headless=false") interactive = 1
-        if (o[k] ~ /^tpm2-device=/) tpm2 = 1
+        if (o[k] ~ /^(fido2-device|pkcs11-uri|keyscript)=/) hard = 1
+        if (o[k] ~ /-pin=yes$/) hard = 1
+        if (o[k] ~ /^fido2-with-/) hard = 1
+        if (o[k] == "headless=false") hard = 1
       }
       if (noauto) next
-      unattended = 0
-      if (key ~ /^\//) unattended = 1
-      if (tpm2) unattended = 1
-      if (interactive) unattended = 0
-      if (!unattended) print $1
-    }' "$crypttab" | head -n 8 | tr '\n' ' ')
-  if [ -z "$names" ]; then
-    echo "preflight: unlock assessment: every volume in $crypttab unlocks unattended or is noauto"
-  else
-    echo "preflight: WARN: unlock assessment: crypttab entries needing an interactive passphrase at boot: $names"
-    echo "preflight: WARN: the job will defer every reboot on this host and alert once per episode (an unattended reboot would hang at the prompt)"
+      print (hard ? "H " : "U ") $1
+    }' "$crypttab")
+  hard_names=$(printf '%s\n' "$rows" | sed -n 's/^H //p' | head -n 8 | tr '\n' ' ')
+  unv_names=$(printf '%s\n' "$rows" | sed -n 's/^U //p' | head -n 8 | tr '\n' ' ')
+  if [ -z "$hard_names" ] && [ -z "$unv_names" ]; then
+    echo "preflight: unlock assessment: no encrypted volume in $crypttab is needed at boot (all noauto, or none)"
   fi
+  if [ -n "$hard_names" ]; then
+    echo "preflight: WARN: unlock assessment: crypttab entries with an option that can prompt (a hard block even when unlock is verified): $hard_names"
+  fi
+  if [ -n "$unv_names" ] && [ "$UNLOCK_VERIFIED" = 0 ]; then
+    echo "preflight: WARN: unlock assessment: encrypted boot volumes whose unattended unlock is not owner-verified (ADR-009): $unv_names"
+    echo "preflight: WARN: the job will defer every reboot on this host and alert once per episode until unattended unlock has been verified and this is redeployed with BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1"
+  fi
+  if [ -n "$unv_names" ] && [ "$UNLOCK_VERIFIED" = 1 ]; then
+    echo "preflight: unlock assessment: encrypted boot volumes accepted on the owner's word (BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1): $unv_names"
+  fi
+fi
+if [ "$UNLOCK_VERIFIED" = 1 ]; then
+  echo "preflight: ***** WARNING ***** BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1: you assert that every encrypted boot volume on this host unlocks without a person present. A wrong assertion hangs the host at the passphrase prompt after its first guarded reboot, so verify it before relying on reboot mode."
 fi
 # The stock EEPROM boot service stages a bootloader update at every boot, outside any guard.
 if command -v rpi-eeprom-update >/dev/null 2>&1; then
@@ -373,7 +434,7 @@ for unit in $UNITS; do
   esac
   sed -e "s|@REVISION@|$REVISION|g" -e "s|@MODE@|$GR_MODE|g" -e "s|@BUSY_UNITS@|$BUSY_UNITS|g" \
     -e "s|@PEERS@|$PEERS|g" -e "s|@MAX_LOAD@|$MAX_LOAD|g" -e "s|@TTY_IDLE_MIN@|$TTY_IDLE_MIN|g" \
-    -e "s|@ALERT_AFTER@|$ALERT_AFTER|g" -e "s|@WINDOW@|$WINDOW|g" -e "s|@SPREAD@|$SPREAD|g" \
+    -e "s|@ALERT_AFTER@|$ALERT_AFTER|g" -e "s|@UNLOCK_VERIFIED@|$UNLOCK_VERIFIED|g" -e "s|@WINDOW@|$WINDOW|g" -e "s|@SPREAD@|$SPREAD|g" \
     "$template" >"$stage/$unit"
 done
 if grep -Eq '@[A-Z_]+@' "$stage"/brokkr-*.service "$stage"/brokkr-*.timer; then refuse "unit template has an unrendered placeholder"; fi
@@ -447,7 +508,7 @@ if [ -n "${BROKKR_DEPLOY_PATH_PREFIX:-}" ]; then job_path=$BROKKR_DEPLOY_PATH_PR
 job_run() {
   env PATH="$job_path" BROKKR_GUARDED_REBOOT_BUSY_UNITS="$BUSY_UNITS" BROKKR_GUARDED_REBOOT_PEERS="$PEERS" \
     BROKKR_GUARDED_REBOOT_MAX_LOAD="$MAX_LOAD" BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN="$TTY_IDLE_MIN" \
-    BROKKR_GUARDED_REBOOT_ALERT_AFTER="$ALERT_AFTER" "$job" "$@" </dev/null
+    BROKKR_GUARDED_REBOOT_ALERT_AFTER="$ALERT_AFTER" BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED="$UNLOCK_VERIFIED" "$job" "$@" </dev/null
 }
 job_ran=1
 echo "== first run: check --report-only"
@@ -474,6 +535,9 @@ echo "OK: guarded reboot installed in $GR_MODE mode and the first run (check --r
 if [ "$GR_MODE" = report ]; then
   echo "note: report mode only logs and alerts what it would do; after a week of review redeploy with BROKKR_GUARDED_REBOOT_MODE=reboot"
 fi
+if [ "$UNLOCK_VERIFIED" = 1 ]; then
+  echo "***** WARNING ***** BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1 is rendered into the unit: the job treats encrypted boot volumes as unlocking unattended on your word"
+fi
 REMOTE
 
 run_remote() { # run-mode script-body; stdin is forwarded to the remote script
@@ -487,6 +551,7 @@ PEERS='$PEERS'
 MAX_LOAD='$MAX_LOAD'
 TTY_IDLE_MIN='$TTY_IDLE_MIN'
 ALERT_AFTER='$ALERT_AFTER'
+UNLOCK_VERIFIED='$UNLOCK_VERIFIED'
 EXPECTED_FILES='${PAYLOAD_FILES[*]}'
 EXPECTED_COUNT='${#PAYLOAD_FILES[@]}'
 RUN_MODE='$RUN_MODE'
