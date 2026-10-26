@@ -35,8 +35,8 @@ die() { echo "brokkr guarded-reboot deploy: $*" >&2; exit 64; }
 usage() {
   echo "usage: $0 [--apply] SSH_TARGET" >&2
   echo "  env: BROKKR_EXPECTED_SOURCE, BROKKR_EXPECTED_COMMIT (full SHA)," >&2
-  echo "       optional BROKKR_GUARDED_REBOOT_MODE (report, the default, or reboot)," >&2
-  echo "       BROKKR_GUARDED_REBOOT_WINDOW (HH:MM, default 03:30), BROKKR_GUARDED_REBOOT_SPREAD (minutes, default 45)," >&2
+  echo "       optional BROKKR_GUARDED_REBOOT_MODE (report, the default, or reboot; reboot needs an explicit WINDOW and a PEER)," >&2
+  echo "       BROKKR_GUARDED_REBOOT_WINDOW (HH:MM, default 03:30 in report mode), BROKKR_GUARDED_REBOOT_SPREAD (minutes, default 45)," >&2
   echo "       BROKKR_GUARDED_REBOOT_BUSY_UNITS (space-separated systemd user .service units)," >&2
   echo "       BROKKR_GUARDED_REBOOT_PEERS (space-separated host names that must answer on port 22)," >&2
   echo "       BROKKR_GUARDED_REBOOT_MAX_LOAD, BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN, BROKKR_GUARDED_REBOOT_ALERT_AFTER" >&2

@@ -326,7 +326,7 @@ reset; with_notify; rbenv; unset BROKKR_GUARDED_REBOOT_WINDOW; run "$TARGET"
 check "reboot mode without an explicit window is refused before ssh (no default window in reboot mode)" '[[ "$RC" -ne 0 && "$OUT" == *"explicit BROKKR_GUARDED_REBOOT_WINDOW"* ]] && ! grep -q ssh "$CALLS"'
 reset; with_notify; rbenv; unset BROKKR_GUARDED_REBOOT_PEERS; run "$TARGET" --apply
 check "reboot mode without a peer is refused before ssh" '[[ "$RC" -ne 0 && "$OUT" == *"needs BROKKR_GUARDED_REBOOT_PEERS"* ]] && ! grep -q ssh "$CALLS"'
-reset; with_notify; BROKKR_GUARDED_REBOOT_PEERS= run "$TARGET"
+reset; with_notify; BROKKR_GUARDED_REBOOT_PEERS='' run "$TARGET"
 check "report mode needs neither a window nor a peer (it defaults to 03:30 and no peers)" '[[ "$RC" -eq 0 && "$OUT" == *"mode report, window 03:30"* ]]'
 
 # --- preflight refusals (both modes) -----------------------------------------------------------------------
