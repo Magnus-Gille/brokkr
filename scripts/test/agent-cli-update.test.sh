@@ -97,6 +97,11 @@ case "${1:-}" in
       opencode-ai|@opencode/cli) t=opencode ;;
       *) t=unknown ;;
     esac
+    # npm-installs-as: the next install leaves a CLI that reports another version (once).
+    # npm-installs-as-rollback: the same for the second install of the run (the rollback).
+    n=$(( $(cat "$MOCK_VER_DIR/npm-install-count" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$MOCK_VER_DIR/npm-install-count"
+    if [ -f "$MOCK_VER_DIR/npm-installs-as" ]; then ver=$(cat "$MOCK_VER_DIR/npm-installs-as"); rm -f "$MOCK_VER_DIR/npm-installs-as"; fi
+    if [ "$n" -ge 2 ] && [ -f "$MOCK_VER_DIR/npm-installs-as-rollback" ]; then ver=$(cat "$MOCK_VER_DIR/npm-installs-as-rollback"); fi
     printf '%s\n' "$ver" >"$MOCK_VER_DIR/$t" ;;
   *) exit 2 ;;
 esac
@@ -583,6 +588,21 @@ touch "$VERDIR/claude.noversion"
 echo 1.0.0 >"$VERDIR/npm-install-fail-ver"
 run
 check "smoke check needs a semver in the output; a failed rollback is a failure, not rolled-back" '[[ "$RC" -eq 1 && "$OUT" == *"claude npm"*failed* ]] && ! printf "%s\n" "$OUT" | grep -Eq "^claude .* rolled-back( |\$)"'
+
+reset
+npm_tool claude @anthropic-ai/claude-code 1.0.0
+latest @anthropic-ai/claude-code 2.0.0
+echo 1.9.9 >"$VERDIR/npm-installs-as"
+run
+check "npm install whose CLI then reports another version is a smoke failure: rolled back, not updated" '[[ "$RC" -eq 1 && "$OUT" == *"claude npm 1.0.0"*"rolled-back"* ]] && ! printf "%s\n" "$OUT" | grep -Eq "^claude .* updated( |\$)" && grep -q "claude-code@1.0.0" "$CALLS" && [[ "$(cat "$VERDIR/claude")" == 1.0.0 ]]'
+
+reset
+npm_tool claude @anthropic-ai/claude-code 1.0.0
+latest @anthropic-ai/claude-code 2.0.0
+echo 2.0.0 >"$VERDIR/claude.broken-at"
+echo 0.9.0 >"$VERDIR/npm-installs-as-rollback"
+run
+check "an npm rollback that leaves a different version than before is failed, not rolled-back" '[[ "$RC" -eq 1 && "$OUT" == *"claude npm"*failed* ]] && ! printf "%s\n" "$OUT" | grep -Eq "^claude .* rolled-back( |\$)"'
 
 # --- cooldown: configuration -------------------------------------------------------------------
 reset
@@ -1521,6 +1541,29 @@ latest @anthropic-ai/claude-code 1.1.0
 busy_unit hugin.service inactive /user.slice/hugin.service 5
 BROKKR_AGENT_CLI_BUSY_UNITS=hugin.service run
 check "inactive unit: its leftover PIDs are ignored and the run proceeds" '[[ "$RC" -eq 0 && "$OUT" == *updated* ]] && ! grep -q "ControlGroup" "$CALLS"'
+
+reset
+npm_tool claude @anthropic-ai/claude-code 1.0.0
+latest @anthropic-ai/claude-code 1.1.0
+busy_unit hugin.service failed /user.slice/hugin.service 5
+BROKKR_AGENT_CLI_BUSY_UNITS=hugin.service run
+check "failed unit: treated as stopped, the run proceeds" '[[ "$RC" -eq 0 && "$OUT" == *updated* ]]'
+
+for transitional in reloading activating deactivating refreshing; do
+  reset
+  npm_tool claude @anthropic-ai/claude-code 1.0.0
+  latest @anthropic-ai/claude-code 1.1.0
+  busy_unit hugin.service "$transitional" /user.slice/hugin.service 2
+  BROKKR_AGENT_CLI_BUSY_UNITS=hugin.service run
+  check "$transitional unit with spawned work: its cgroup is inspected and the run is deferred" '[[ "$RC" -eq 0 && "$OUT" == *deferred* ]] && no_mutation'
+done
+
+reset
+npm_tool claude @anthropic-ai/claude-code 1.0.0
+latest @anthropic-ai/claude-code 1.1.0
+busy_unit hugin.service "" /user.slice/hugin.service 1
+BROKKR_AGENT_CLI_BUSY_UNITS=hugin.service run
+check "a unit whose ActiveState comes back empty defers the run (failing closed)" '[[ "$RC" -eq 0 && "$OUT" == *deferred* ]] && no_mutation'
 
 reset
 npm_tool claude @anthropic-ai/claude-code 1.0.0

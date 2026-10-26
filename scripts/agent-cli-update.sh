@@ -267,9 +267,15 @@ check_busy_units() {
       DEFER_REASON="cannot query $unit with systemctl --user (failing closed)"
       return 1
     fi
-    [ "$state" = active ] || continue
+    # Only a stopped unit is skipped. Transitional states (reloading, activating, deactivating,
+    # refreshing) can still hold spawned work, so they are inspected like active; an empty or
+    # unrecognised answer is not taken to mean "idle".
+    case "$state" in
+      inactive|failed) continue ;;
+      '') DEFER_REASON="systemctl --user reported no state for $unit (failing closed)"; return 1 ;;
+    esac
     if ! cg=$(systemctl --user show -p ControlGroup --value "$unit" 2>/dev/null) || [ -z "$cg" ]; then
-      DEFER_REASON="cannot read the control group of active unit $unit (failing closed)"
+      DEFER_REASON="cannot read the control group of $state unit $unit (failing closed)"
       return 1
     fi
     case "$cg" in
@@ -283,7 +289,7 @@ check_busy_units() {
       return 1
     fi
     if [ "$pids" -gt 1 ]; then
-      DEFER_REASON="$unit is active with $pids processes in its cgroup (an agent task is running)"
+      DEFER_REASON="$unit is $state with $pids processes in its cgroup (an agent task is running)"
       return 1
     fi
   done
@@ -563,12 +569,13 @@ smoke_failed() { # tool [reason]
   case "$T_METHOD" in
     npm)
       echo "smoke check failed for $tool; reinstalling $NPM_PKG@$T_BEFORE"
+      # rolled-back only when the CLI really reports the previous version again.
       if run_limited "$UPDATE_TIMEOUT" npm install -g --prefix "$NPM_PREFIX" --no-fund --no-audit "$NPM_PKG@$T_BEFORE" </dev/null \
-        && T_AFTER=$(tool_version "$tool"); then
+        && T_AFTER=$(tool_version "$tool") && [ "$T_AFTER" = "$T_BEFORE" ]; then
         T_ACTION=rolled-back; T_DETAIL="smoke check failed after the update$why; restored $T_BEFORE"
       else
-        T_AFTER=
-        fail "smoke check failed and rollback to $T_BEFORE did not restore a working CLI"
+        T_AFTER=$(tool_version "$tool") || T_AFTER=
+        fail "smoke check failed$why and rollback to $T_BEFORE did not restore it (now ${T_AFTER:-no working CLI})"
       fi ;;
     opencode-installer)
       if [ -z "$T_BEFORE" ]; then
@@ -701,8 +708,10 @@ update_npm_package() { # tool
     return 0
   fi
   if ! T_AFTER=$(tool_version "$tool"); then smoke_failed "$tool"; return 0; fi
+  # The CLI on PATH must now be the version just installed; anything else (a shadowing copy,
+  # a package that did not take) is a failed update, not a success with a footnote.
+  if [ "$T_AFTER" != "$latest" ]; then smoke_failed "$tool" "installed $latest but --version reports $T_AFTER"; return 0; fi
   T_ACTION=updated
-  if [ "$T_AFTER" != "$latest" ]; then T_DETAIL="installed $latest but --version reports $T_AFTER"; fi
   return 0
 }
 
