@@ -133,6 +133,21 @@ r="$(mkroot deb-odd 6.12.48+deb13-amd64 6.12.99+deb13-amd64.old)"
 probe 6.12.48+deb13-amd64 "$r"
 check "flavour: a vmlinuz file with a suffix after the flavour is not a candidate" '[[ "$(val REBOOT)" == no ]]'
 
+# The newest installed same-flavour kernel must be NEWER than the running one, not merely
+# different: a running kernel that is newer than everything left in /boot (for example after the
+# newest package was removed or a kernel was booted by hand) is not a reboot trigger.
+r="$(mkroot newer-running 7.0.0-39-generic)"
+probe 7.0.0-40-generic "$r"
+check "running 7.0.0-40-generic with newest installed 7.0.0-39-generic: no reboot" '[[ "$(val REBOOT)" == no ]]'
+
+r="$(mkroot newer-running-two 7.0.0-4-generic 7.0.0-39-generic)"
+probe 7.0.0-40-generic "$r"
+check "running kernel newer than every installed one (numeric order): no reboot" '[[ "$(val REBOOT)" == no ]]'
+
+r="$(mkroot older-running 7.0.0-39-generic 7.0.0-40-generic)"
+probe 7.0.0-39-generic "$r"
+check "running 7.0.0-39-generic with newest installed 7.0.0-40-generic: reboot" '[[ "$(val REBOOT)" == yes ]]'
+
 # ── Guarded-reboot audit projection ──────────────────────────────────────────
 AUDIT=""
 aline() { # epoch mode action triggers guards detail

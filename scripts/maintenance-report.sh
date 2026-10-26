@@ -237,7 +237,12 @@ if [ "$RR" = no ]; then
       kr=${k##*/vmlinuz-}
       [ "$(kflav "$kr")" = "$KFLAV" ] && printf '%s\n' "$kr"
     done | sort -V | tail -n 1)
-    [ -n "$KNEWEST" ] && [ "$KNEWEST" != "$KREL" ] && RR=yes
+    # Reboot only if the newest candidate is NEWER than the running kernel (sort -V),
+    # not merely different: a running kernel newer than everything in /boot is not a trigger.
+    if [ -n "$KNEWEST" ] && [ "$KNEWEST" != "$KREL" ] &&
+       [ "$(printf '%s\n%s\n' "$KREL" "$KNEWEST" | sort -V | tail -n 1)" = "$KNEWEST" ]; then
+      RR=yes
+    fi
   fi
 fi
 RRPKGS=0; [ -f "$R/var/run/reboot-required.pkgs" ] && RRPKGS=$(wc -l < "$R/var/run/reboot-required.pkgs" | tr -d ' ')
