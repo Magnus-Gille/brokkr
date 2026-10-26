@@ -1,0 +1,35 @@
+# Brokkr · archive off-site config (example). Copy to ~/.config/brokkr/archive-offsite.conf
+# on the node that holds the archive, then `chmod 600`. scripts/archive-offsite.sh parses
+# this file (it is never sourced): KEY=value lines, only the keys below, each at most
+# once, values plain or wholly quoted with no $ or backticks. See docs/archive-offsite.md.
+
+# Read-only archive directory and its sha256sum manifest (paths relative to the archive).
+ARCHIVE_SRC=/srv/archive/example-archive
+ARCHIVE_MANIFEST=/srv/archive/example-archive.sha256
+# rclone crypt remote: standard name + directory encryption, a salt, base32768 names.
+ARCHIVE_REMOTE=example-archive-crypt
+# Remote directory name; defaults to the basename of ARCHIVE_SRC.
+#ARCHIVE_NAME=example-archive
+
+# Optional: explicit rclone binary (the deploy script renders a verified path).
+#ARCHIVE_RCLONE=/usr/local/bin/rclone
+# Optional: log file for manual runs (default ~/.local/state/brokkr/archive-offsite.log).
+# The deployed unit can write only the state directory, so its deploy refuses this key.
+#ARCHIVE_LOG=
+# Optional: push bandwidth limit, e.g. 20M.
+#ARCHIVE_BWLIMIT=
+
+# --verify: random files restored through the crypt remote per run (1-999).
+ARCHIVE_RESTORE_SAMPLES=32
+# --verify: near-site copy checked with `sha256sum --check` over ssh on that host.
+# Leave both unset to report the near-site copy as unverified (warn), or set
+# ARCHIVE_NEARSITE=off to omit the row.
+ARCHIVE_NEARSITE_SSH=operator@nas.example
+ARCHIVE_NEARSITE_DIR=/srv/backups/example-archive
+#ARCHIVE_NEARSITE=off
+# --verify: date of the last owner key-custody drill, YYYY-MM-DD (for example 2026-10-01).
+# Set it only after actually performing the drill; unset reports "no drill recorded".
+# Warns 365 days after the recorded date.
+#ARCHIVE_KEY_DRILL_DATE=
+# --verify: Heimdall panel node name; defaults to the short hostname.
+#ARCHIVE_NODE=node-a

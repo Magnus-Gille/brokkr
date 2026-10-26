@@ -1,0 +1,34 @@
+# Brokkr · monthly verification of the encrypted archive off-site copy (oneshot,
+# driven by brokkr-archive-verify.timer). User unit for the node that holds the
+# archive and its rclone crypt remote. Rendered and installed by
+# scripts/deploy-archive-verify.sh; do not copy this template by hand.
+[Unit]
+Description=Brokkr archive off-site verification
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/archive-offsite.md
+# No OnFailure=: brokkr-systemd-failure@.service is a system unit and does not
+# exist in user scope. A failed run stays visible in the service state and as a
+# failing or stale Heimdall archive-verify panel.
+
+[Service]
+Type=oneshot
+# Rendered by deploy-archive-verify.sh with an exact full revision and the
+# operator's protected-file paths.
+WorkingDirectory=%h/.local/lib/brokkr/archive-verify/releases/@REVISION@
+# Provides HEIMDALL_HUB_URL + HEIMDALL_FLEET_TOKEN; required (delivery is the point).
+EnvironmentFile=@DELIVERY_ENV@
+# Absolute path verified at install time; the user manager PATH may lack ~/.local/bin.
+Environment=ARCHIVE_RCLONE=@RCLONE@
+# The archive config is parsed (never sourced) by the script and wins over the
+# environment, so the shared delivery env cannot redirect what is verified.
+ExecStart=%h/.local/lib/brokkr/archive-verify/releases/@REVISION@/scripts/archive-offsite.sh --config @ARCHIVE_CONFIG@ --verify
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+# State, snapshot, and restore scratch live under the state dir. rclone may persist a
+# refreshed OAuth token to its config and uses its cache dir.
+ReadWritePaths=%h/.local/state/brokkr -%h/.config/rclone -%h/.cache/rclone
+# cryptcheck re-reads the whole archive and the near-site check re-hashes the NAS copy.
+TimeoutStartSec=18h
