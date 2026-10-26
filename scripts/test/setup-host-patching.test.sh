@@ -199,6 +199,28 @@ run --dry-run dr-odd
 check "dry-run unknown OS: fails the host and changes nothing" '[[ "$RC" -ne 0 && "$OUT" == *"unsupported OS"* && -z "$(written dr-odd)" && -z "$(actions dr-odd)" ]]'
 check "dry-run never calls tee, a package manager or systemctl over ssh" '! grep -E "tee |apt-get|systemctl" "$CALLS"'
 
+# ── The policy files themselves (ADR-009: exact vendor channels, no reboot) ──
+# patterns FILE: the quoted origin patterns of a drop-in, one per line, comments ignored.
+patterns() { grep -v '^[[:space:]]*//' "$ROOT/apt/$1" | grep -o '"origin=[^"]*"'; }
+EXPECT_DEBIAN='"origin=Debian,codename=${distro_codename},label=Debian"
+"origin=Debian,codename=${distro_codename}-updates,label=Debian"
+"origin=Raspberry Pi Foundation,codename=${distro_codename},label=Raspberry Pi Foundation"
+"origin=gh,label=gh,codename=stable"'
+EXPECT_UBUNTU='"origin=Ubuntu,archive=${distro_codename}-updates,label=Ubuntu"
+"origin=Tailscale,label=Tailscale,codename=${distro_codename}"'
+check "52brokkr-debian-updates admits exactly the enumerated Debian-family channels" '[[ "$(patterns 52brokkr-debian-updates)" == "$EXPECT_DEBIAN" ]]'
+check "52brokkr-ubuntu-updates admits exactly the enumerated Ubuntu channels" '[[ "$(patterns 52brokkr-ubuntu-updates)" == "$EXPECT_UBUNTU" ]]'
+check "51brokkr-claude-code admits exactly the Claude Code stable channel" \
+  '[[ "$(patterns 51brokkr-claude-code)" == "\"origin=Anthropic,label=Anthropic,codename=stable\"" ]]'
+check "every non-distribution origin pattern pins a codename or channel" \
+  '! { patterns 51brokkr-claude-code; patterns 52brokkr-debian-updates; patterns 52brokkr-ubuntu-updates; } | grep -vE "^\"origin=(Debian|Ubuntu|Raspberry Pi Foundation)," | grep -v "codename=" | grep -q .'
+check "no Tailscale pattern for Debian-family hosts" '[[ "$(patterns 52brokkr-debian-updates)" != *Tailscale* ]]'
+check "no -backports or -proposed pattern in the regular-update drop-ins" \
+  '! { patterns 52brokkr-debian-updates; patterns 52brokkr-ubuntu-updates; } | grep -Eq "backports|proposed"'
+check "the security baseline keeps Automatic-Reboot false and lists only Debian-Security" \
+  'grep -q "^Unattended-Upgrade::Automatic-Reboot \"false\";" "$ROOT/apt/50unattended-upgrades" && [[ "$(patterns 50unattended-upgrades)" == "\"origin=Debian,codename=\${distro_codename}-security,label=Debian-Security\"" ]]'
+check "no apt file enables a reboot" '! grep -E "Automatic-Reboot[^\"]*\"true\"" "$ROOT"/apt/*'
+
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

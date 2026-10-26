@@ -12,8 +12,8 @@ SSH and pushes only the files that fit it.
 | `20auto-upgrades` | Debian / Raspberry Pi OS | `/etc/apt/apt.conf.d/20auto-upgrades` | Enables the stock `apt-daily` / `apt-daily-upgrade` timers to refresh package lists and run unattended-upgrades |
 | `50unattended-upgrades` | Debian / Raspberry Pi OS | `/etc/apt/apt.conf.d/50unattended-upgrades` | Security baseline: Debian-Security archive only, `Automatic-Reboot "false"` |
 | `51brokkr-claude-code` | all | `/etc/apt/apt.conf.d/51brokkr-claude-code` | Adds the Claude Code apt repository to the allowed origins (a drop-in, so it also works beside a distribution's own `50unattended-upgrades`, as on an Ubuntu host) |
-| `52brokkr-debian-updates` | Debian / Raspberry Pi OS | `/etc/apt/apt.conf.d/52brokkr-debian-updates` | Regular updates: Debian stable and stable-updates, the Raspberry Pi archive (kernel, firmware, `rpi-eeprom`), Tailscale, `gh` |
-| `52brokkr-ubuntu-updates` | Ubuntu | `/etc/apt/apt.conf.d/52brokkr-ubuntu-updates` | Regular updates: Ubuntu `-updates` plus Tailscale, added beside the distribution's own `50unattended-upgrades` (release, `-security`, ESM) |
+| `52brokkr-debian-updates` | Debian / Raspberry Pi OS | `/etc/apt/apt.conf.d/52brokkr-debian-updates` | Regular updates: Debian stable and stable-updates, the Raspberry Pi archive (kernel, firmware, `rpi-eeprom`), `gh` (stable channel) |
+| `52brokkr-ubuntu-updates` | Ubuntu | `/etc/apt/apt.conf.d/52brokkr-ubuntu-updates` | Regular updates: Ubuntu `-updates` plus Tailscale (its release-codename channel), added beside the distribution's own `50unattended-upgrades` (release, `-security`, ESM) |
 
 On an Ubuntu host the distribution's `20auto-upgrades` and `50unattended-upgrades` are never
 overwritten. The script only verifies that the host's `20auto-upgrades` enables
@@ -27,9 +27,10 @@ overwritten. The script only verifies that the host's `20auto-upgrades` enables
   `Origins-Pattern` entries of every file in `apt.conf.d`:
   - Debian / Raspberry Pi OS (`52brokkr-debian-updates`): Debian `stable` (point releases) and
     `stable-updates`; the Raspberry Pi Foundation archive, which carries the Pi kernel, firmware
-    and `rpi-eeprom` and is not part of Debian-Security; Tailscale (a network-exposed daemon);
-    `gh` (the GitHub CLI).
-  - Ubuntu (`52brokkr-ubuntu-updates`): `-updates` and Tailscale. Not `-backports`, not
+    and `rpi-eeprom` and is not part of Debian-Security; `gh` (the GitHub CLI, channel
+    `stable`). Debian-family hosts have no Tailscale apt repository, so none is admitted there.
+  - Ubuntu (`52brokkr-ubuntu-updates`): `-updates`, and Tailscale (a network-exposed daemon) from
+    its release-codename channel (`codename=${distro_codename}`). Not `-backports`, not
     `-proposed`.
   - Claude Code (`51brokkr-claude-code`, all hosts): `origin=Anthropic,label=Anthropic,codename=stable`
     matches the Release Origin and Label (`Anthropic`) and codename (`stable`) that the Claude Code
@@ -37,8 +38,10 @@ overwritten. The script only verifies that the host's `20auto-upgrades` enables
     package current on hosts that have that repository configured. Hosts where `claude` is
     installed another way (npm, the native installer) are updated by the agent CLI updater
     instead, which deliberately leaves apt-owned installs alone (see `../docs/agent-cli-update.md`).
-  - A pattern that matches no configured repository is a no-op, so one drop-in serves every host
-    of its OS family. Phased updates are honoured; nothing is downgraded.
+  - Every vendor repository is matched by exact origin, label and codename / channel; an unlisted
+    channel is never admitted. A pattern that matches no configured repository is a no-op, so one
+    drop-in serves every host of its OS family. Phased updates are honoured; nothing is
+    downgraded.
 - **No reboot by unattended-upgrades.** `Automatic-Reboot` stays `"false"` everywhere. A reboot is
   done only by Brokkr's guarded-reboot job (workload, load and session guards, post-boot check,
   audit trail). The daily `brokkr-maintenance-os` report (07:00 on control-node) still detects

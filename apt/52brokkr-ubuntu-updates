@@ -7,10 +7,13 @@
 //   * Ubuntu -updates  - regular bug-fix updates. Deliberately NOT -backports and
 //                        NOT -proposed. Phased updates are honoured by
 //                        unattended-upgrades, so a phased package waits its turn.
-//   * Tailscale        - a network-exposed daemon that should not wait for a person.
-// A pattern that matches no configured repository is a no-op.
+//   * Tailscale        - a network-exposed daemon that should not wait for a person;
+//                        its Ubuntu repository uses the release codename as channel.
+// Every repository is matched by exact origin, label and codename / channel; a
+// channel that is not listed here is never admitted. A pattern that matches no
+// configured repository is a no-op.
 // Reboots are never done here; see the guarded-reboot job.
 Unattended-Upgrade::Origins-Pattern {
         "origin=Ubuntu,archive=${distro_codename}-updates,label=Ubuntu";
-        "origin=Tailscale,label=Tailscale";
+        "origin=Tailscale,label=Tailscale,codename=${distro_codename}";
 };
