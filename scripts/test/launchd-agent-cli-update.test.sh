@@ -42,7 +42,9 @@ cat >"$BIN/launchctl" <<'FAKE'
 printf 'launchctl %s\n' "$*" >>"$MOCK_CALLS"
 case "${1:-}" in
   bootout) exit "${MOCK_BOOTOUT_RC:-0}" ;;
-  print) printf '\tstate = waiting\n\tprogram = /x/agent-cli-update.sh\n\tlast exit code = 0\n' ;;
+  print)
+    [ "${MOCK_LAUNCHD_LOADED:-1}" = 1 ] || exit 113
+    printf '\tstate = %s\n\tprogram = /x/agent-cli-update.sh\n\tlast exit code = 0\n' "${MOCK_LAUNCHD_STATE:-waiting}" ;;
 esac
 exit 0
 FAKE
@@ -54,7 +56,7 @@ ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1" >&2; printf '        rc=%s out=%s\n' "${RC:-}" "${OUT:-}" >&2; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 run() { OUT="$(HOME="${RUN_HOME:-$HOME_DIR}" PATH="$BIN:$PATH" "$INSTALL" "$@" 2>&1)"; RC=$?; }
-reset() { rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR"; : >"$CALLS"; unset MOCK_UNAME MOCK_BOOTOUT_RC RUN_HOME; }
+reset() { rm -rf "$HOME_DIR"; mkdir -p "$HOME_DIR"; : >"$CALLS"; unset MOCK_UNAME MOCK_BOOTOUT_RC RUN_HOME MOCK_LAUNCHD_STATE MOCK_LAUNCHD_LOADED; }
 have_python() { command -v python3 >/dev/null 2>&1; }
 
 echo "launchd-agent-cli-update.test.sh"
@@ -97,6 +99,14 @@ check "a bootout of a not-loaded agent is not an error" '[[ "$RC" -eq 0 ]] && gr
 # --- run, status, uninstall -----------------------------------------------------------------------
 reset; run run
 check "run kicks a run without -k so an update in progress is not killed" '[[ "$RC" -eq 0 ]] && grep -Fxq "launchctl kickstart gui/$(id -u)/$LABEL" "$CALLS" && ! grep -q "kickstart -k" "$CALLS"'
+reset; MOCK_LAUNCHD_STATE=running run run
+check "run while an update is running refuses: no bootout, no kickstart" '[[ "$RC" -eq 1 && "$OUT" == *"running"* ]] && ! grep -q "^launchctl bootout" "$CALLS" && ! grep -q "^launchctl kickstart" "$CALLS"'
+reset; MOCK_LAUNCHD_STATE=running run install
+check "install while an update is running refuses without booting the job out" '[[ "$RC" -eq 1 && "$OUT" == *"running"* ]] && ! grep -q "^launchctl bootout" "$CALLS"'
+reset; run install; : >"$CALLS"; run run
+check "run with an unchanged plist on a loaded, idle job starts it without a bootout" '[[ "$RC" -eq 0 ]] && ! grep -q "^launchctl bootout" "$CALLS" && grep -Fxq "launchctl kickstart gui/$(id -u)/$LABEL" "$CALLS"'
+reset; run install; : >"$CALLS"; MOCK_LAUNCHD_LOADED=0 run run
+check "run on a job that is not loaded bootstraps it before the kickstart" '[[ "$RC" -eq 0 ]] && grep -q "^launchctl bootstrap" "$CALLS" && grep -Fxq "launchctl kickstart gui/$(id -u)/$LABEL" "$CALLS"'
 reset; run status
 check "status reports the agent state" '[[ "$RC" -eq 0 && "$OUT" == *"last exit code = 0"* ]]'
 reset; run install; : >"$CALLS"; run uninstall

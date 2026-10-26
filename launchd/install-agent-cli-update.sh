@@ -67,12 +67,34 @@ install_release() {
   echo "installed release → $RELEASE"
 }
 
+# Renders into a temporary file, lints it, and only then replaces the installed plist.
+# RENDER_CHANGED says whether the installed plist actually changed.
+RENDER_CHANGED=0
 render() {
+  local tmp
   mkdir -p "$DEST_DIR" "$HOME/Library/Logs/brokkr"
-  sed -e "s#__RELEASE__#${RELEASE}#g" -e "s#__HOME__#${HOME}#g" "$SRC" > "$DEST"
-  chmod 644 "$DEST"
-  echo "rendered → $DEST"
-  if command -v plutil >/dev/null 2>&1; then plutil -lint "$DEST" >/dev/null || { echo "ERROR: rendered plist is invalid" >&2; exit 1; }; fi
+  tmp="$DEST.new.$$"
+  sed -e "s#__RELEASE__#${RELEASE}#g" -e "s#__HOME__#${HOME}#g" "$SRC" > "$tmp"
+  chmod 644 "$tmp"
+  if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$tmp" >/dev/null; then
+    rm -f "$tmp"; echo "ERROR: rendered plist is invalid" >&2; exit 1
+  fi
+  if [ -f "$DEST" ] && cmp -s "$tmp" "$DEST"; then
+    rm -f "$tmp"; RENDER_CHANGED=0; echo "unchanged → $DEST"
+  else
+    mv -f "$tmp" "$DEST"; RENDER_CHANGED=1; echo "rendered → $DEST"
+  fi
+}
+
+loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
+job_state() { launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk -F' = ' '/^[[:space:]]*state = /{print $2; exit}'; }
+# A bootout stops a running job, which would cut an update off mid-install (or mid-rollback),
+# so neither install nor run touches the agent while it is running.
+refuse_if_running() {
+  if [ "$(job_state)" = running ]; then
+    echo "ERROR: $LABEL is running an update right now; retry when it has finished (launchctl print $DOMAIN/$LABEL)" >&2
+    exit 1
+  fi
 }
 
 bootstrap() {
@@ -84,9 +106,12 @@ bootstrap() {
 }
 
 case "${1:-install}" in
-  install)   resolve_release; install_release; render; bootstrap ;;
-  # No -k: a run that is already in progress is left alone rather than killed mid-install.
-  run)       resolve_release; install_release; render; bootstrap; echo "starting a run now…"; launchctl kickstart "$DOMAIN/$LABEL"; echo "started — tail ~/Library/Logs/brokkr/agent-cli-update.launchd.log; state in ~/.local/state/brokkr/agent-cli-update.json" ;;
+  install)   resolve_release; refuse_if_running; install_release; render; bootstrap ;;
+  # An idle, loaded job with an unchanged plist is only kicked: no bootout. No -k either, so a
+  # run that starts in the meantime is left alone rather than killed.
+  run)       resolve_release; refuse_if_running; install_release; render
+             if [ "$RENDER_CHANGED" = 1 ] || ! loaded; then bootstrap; fi
+             echo "starting a run now…"; launchctl kickstart "$DOMAIN/$LABEL"; echo "started — tail ~/Library/Logs/brokkr/agent-cli-update.launchd.log; state in ~/.local/state/brokkr/agent-cli-update.json" ;;
   status)    launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -E 'state|last exit|program =' || echo "not loaded" ;;
   uninstall) launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; rm -f "$DEST"; echo "removed $DEST (release copies under $RELEASE_ROOT are kept)" ;;
   *)         echo "usage: $0 {install|run|status|uninstall}" >&2; exit 2 ;;
