@@ -51,6 +51,7 @@ required to run or understand Brokkr.
 | `apt/` | Security-only unattended-upgrade policy examples |
 | `disk/`, `timemachine/`, `samba/` | Storage, capacity, Time Machine, and share checks; [NAS share retirement](docs/nas-samba-retirement.md) |
 | `scripts/offsite-photos-backup.sh` | Fail-closed `rclone crypt` backup with deletion gates |
+| `scripts/archive-offsite.sh` | Append-only `rclone crypt` push of an immutable archive and its [monthly copy/integrity/restore verification](docs/archive-offsite.md) |
 | `scripts/memory-cgroup-preflight.py` | Read-only [Pi/Linux memory-controller gate and approved bounded-unit verification](docs/pi-memory-cgroups.md) |
 | `scripts/m5-fde-preflight.sh` | Read-only M5 LUKS/Secure Boot/TPM and backup-evidence ceremony gate |
 | `scripts/m5-network-profile.py` | Default-deny M5 UFW plus pre-INPUT tailnet/SSH/Samba/inference transaction with timed rollback and independent confirmation |
@@ -117,6 +118,7 @@ Feature-specific setup and acceptance checks live in:
 
 - [`docs/offsite-photos-backup.md`](docs/offsite-photos-backup.md)
 - [`docs/backup-evidence.md`](docs/backup-evidence.md)
+- [`docs/archive-offsite.md`](docs/archive-offsite.md)
 - [`docs/control-node-deadman.md`](docs/control-node-deadman.md)
 - [`docs/heimdall-agent-watchdog.md`](docs/heimdall-agent-watchdog.md)
 - [`docs/host-incident-evidence.md`](docs/host-incident-evidence.md)
