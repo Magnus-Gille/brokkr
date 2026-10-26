@@ -20,6 +20,7 @@ mkdir -p "$REPO/scripts/lib" "$REPO/network" "$BIN" "$TMP/payload-tmp" "$TMP/nos
 cp "$ROOT/scripts/deploy-eee-off.sh" "$REPO/scripts/" 2>/dev/null
 cp "$ROOT/scripts/lib/deploy-source.sh" "$REPO/scripts/lib/"
 cp "$ROOT/network/brokkr-eee-off@.service.example" "$REPO/network/" 2>/dev/null
+cp "$ROOT/network/brokkr-eee-off-watch@.service.example" "$REPO/network/" 2>/dev/null
 echo "unrelated file that must never ship" > "$REPO/README.md"
 git init -q "$REPO"; git -C "$REPO" config user.name test; git -C "$REPO" config user.email test@example.invalid
 git -C "$REPO" add . ; git -C "$REPO" commit -qm fixture
@@ -27,6 +28,10 @@ SHA="$(git -C "$REPO" rev-parse HEAD)"
 DEPLOY="$REPO/scripts/deploy-eee-off.sh"
 MANAGED="$UNIT_DIR/brokkr-eee-off@.service"
 INSTANCE=brokkr-eee-off@eth0.service
+WATCH=brokkr-eee-off-watch@eth0.service
+WATCH_TEMPLATE="$UNIT_DIR/brokkr-eee-off-watch@.service"
+DEV_WANTS="$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants"
+BOOT_WANTS="$UNIT_DIR/multi-user.target.wants"
 LEGACY="$UNIT_DIR/eth0-eee-off.service"
 
 : >"$CALLS"
@@ -38,7 +43,7 @@ target=$1; shift
 printf 'ssh %s\n' "$target" >>"$MOCK_CALLS"
 [[ "$#" -eq 1 ]] || exit 64
 exec env PATH="$MOCK_REMOTE_PATH" MOCK_ID_ROOT="${MOCK_REMOTE_ROOT:-0}" \
-  BROKKR_ETHTOOL_SEARCH_PATH="$MOCK_NOSBIN" BROKKR_SYSTEMD_SYSTEM_DIR="$MOCK_UNIT_DIR" \
+  BROKKR_ETHTOOL_SEARCH_PATH="$MOCK_NOSBIN" BROKKR_IP_SEARCH_PATH="$MOCK_NOSBIN" BROKKR_SYSTEMD_SYSTEM_DIR="$MOCK_UNIT_DIR" \
   BROKKR_SYSFS_NET="$MOCK_SYSFS" bash -c "$1"
 FAKE
 cat >"$BIN/id" <<'FAKE'
@@ -72,33 +77,48 @@ cat >"$BIN/systemctl" <<'FAKE'
 printf 'systemctl %s\n' "$*" >>"$MOCK_CALLS"
 if [[ -n "${MOCK_SYSTEMCTL_FAIL:-}" && "$*" == "$MOCK_SYSTEMCTL_FAIL" ]]; then echo "systemctl: injected failure" >&2; exit 1; fi
 st=$MOCK_STATE
-start_unit() {
-  local u=$1 inst= tpl line
-  [[ "${MOCK_START_FAIL:-0}" != 1 ]] || return 1
-  case $u in
-    *@*.service) inst=${u#*@}; inst=${inst%.service}; tpl="$MOCK_UNIT_DIR/${u%%@*}@.service" ;;
-    *) tpl="$MOCK_UNIT_DIR/$u" ;;
+unit_template() { # unit -> sets inst and tpl
+  case $1 in
+    *@*.service) inst=${1#*@}; inst=${inst%.service}; tpl="$MOCK_UNIT_DIR/${1%%@*}@.service" ;;
+    *) inst=; tpl="$MOCK_UNIT_DIR/$1" ;;
   esac
+}
+# A Type=simple unit (the link watcher) is only marked active, never executed;
+# MOCK_WATCH_START_FAIL fails the start of a *-watch@* unit.
+start_unit() {
+  local u=$1 inst tpl line
+  [[ "${MOCK_START_FAIL:-0}" != 1 ]] || return 1
+  [[ "$u" != *-watch@* || "${MOCK_WATCH_START_FAIL:-0}" != 1 ]] || return 1
+  unit_template "$u"
   [[ -f "$tpl" ]] || return 5
+  if grep -q '^Type=simple' "$tpl"; then touch "$st/active.$u"; return 0; fi
   line=$(sed -n 's/^ExecStart=//p' "$tpl")
   line=${line//%i/$inst}
   # shellcheck disable=SC2086 # deliberate word splitting of the unit's command line
   $line || return 1
   touch "$st/active.$u"
 }
+enable_unit() { # one link per space-separated WantedBy unit
+  local u=$1 inst tpl wb w
+  touch "$st/enabled.$u"
+  unit_template "$u"
+  wb=$(sed -n 's/^WantedBy=//p' "$tpl"); wb=${wb//%i/$inst}
+  for w in $wb; do mkdir -p "$MOCK_UNIT_DIR/$w.wants"; ln -sfn "$tpl" "$MOCK_UNIT_DIR/$w.wants/$u"; done
+}
+disable_unit() {
+  rm -f "$st/enabled.$1"; find "$MOCK_UNIT_DIR" -path "*.wants/$1" -type l -exec rm -f {} +
+}
 case "${1:-}" in
-  daemon-reload) exit 0 ;;
-  enable)
-    touch "$st/enabled.$2"
-    case $2 in *@*.service) inst=${2#*@}; inst=${inst%.service}; tpl="$MOCK_UNIT_DIR/${2%%@*}@.service" ;; *) inst=; tpl="$MOCK_UNIT_DIR/$2" ;; esac
-    wb=$(sed -n 's/^WantedBy=//p' "$tpl"); wb=${wb//%i/$inst}
-    if [[ -n "$wb" ]]; then mkdir -p "$MOCK_UNIT_DIR/$wb.wants"; ln -sfn "$tpl" "$MOCK_UNIT_DIR/$wb.wants/$2"; fi ;;
+  daemon-reload|reset-failed) exit 0 ;;
+  enable) enable_unit "$2" ;;
+  reenable) disable_unit "$2"; enable_unit "$2" ;;
   disable)
     u=$2; [[ "$u" == --now ]] && { u=$3; rm -f "$st/active.$u"; }
-    rm -f "$st/enabled.$u"; find "$MOCK_UNIT_DIR" -path "*.wants/$u" -type l -exec rm -f {} + ;;
+    disable_unit "$u" ;;
   stop) rm -f "$st/active.$2" ;;
   start) start_unit "$2" || exit 1 ;;
-  restart) rm -f "$st/active.$2"; start_unit "$2" || exit 1 ;;
+  restart) u=$2; [[ "$u" == --no-block ]] && u=$3; rm -f "$st/active.$u"; start_unit "$u" || exit 1 ;;
+  is-failed) exit 1 ;;
   # An enabled.* file may hold a non-default state such as enabled-runtime.
   is-enabled)
     if [[ -e "$st/enabled.$2" ]]; then state=$(cat "$st/enabled.$2"); echo "${state:-enabled}"
@@ -125,6 +145,12 @@ case "${1:-}" in
   *) exit 64 ;;
 esac
 FAKE
+# The fake ip only plays back the lines of MOCK_IP_LINES for `ip -o monitor link`.
+cat >"$STORE/ip" <<'FAKE'
+#!/usr/bin/env bash
+if [[ -n "${MOCK_IP_LINES:-}" && -f "$MOCK_IP_LINES" ]]; then cat "$MOCK_IP_LINES"; fi
+exit 0
+FAKE
 # Fault injection: cp/mv fail when the destination matches, install fails on request.
 cat >"$BIN/mv" <<'FAKE'
 #!/usr/bin/env bash
@@ -146,7 +172,7 @@ cat >"$BIN/cp" <<'FAKE'
 if [[ -n "${MOCK_CP_FAIL:-}" && "${!#}" == *"$MOCK_CP_FAIL"* ]]; then echo "cp: injected failure" >&2; exit 1; fi
 exec /bin/cp "$@"
 FAKE
-chmod 755 "$BIN/"* "$STORE/ethtool"
+chmod 755 "$BIN/"* "$STORE/ethtool" "$STORE/ip"
 
 export MOCK_CALLS="$CALLS" MOCK_STATE="$STATE" MOCK_UNIT_DIR="$UNIT_DIR" MOCK_SYSFS="$SYSFS"
 export MOCK_NOSBIN="$TMP/nosbin" MOCK_REMOTE_PATH="$BIN:/usr/bin:/bin"
@@ -182,15 +208,17 @@ UNIT
   ln -s "$LEGACY" "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/eth0-eee-off.service"
 }
 has_ethtool() { cp "$STORE/ethtool" "$BIN/ethtool"; }
+has_ip() { cp "$STORE/ip" "$BIN/ip"; }
 reset() {
   rm -rf "${TMP:?}/etc" "${TMP:?}/sys" "${STATE:?}"
   mkdir -p "$UNIT_DIR" "$SYSFS/eth0" "$STATE"
-  rm -f "$BIN/ethtool" "$MOCK_NOSBIN/ethtool"
+  rm -f "$BIN/ethtool" "$MOCK_NOSBIN/ethtool" "$BIN/ip" "$MOCK_NOSBIN/ip"
   : >"$CALLS"
   unset MOCK_ID_ROOT MOCK_REMOTE_ROOT MOCK_SUDO_DENY MOCK_START_FAIL MOCK_ETHTOOL_NOOP MOCK_EEE_UNSUPPORTED MOCK_CP_FAIL
-  unset MOCK_MV_FAIL MOCK_INSTALL_FAIL MOCK_SYSTEMCTL_FAIL MOCK_READLINK_FAIL
+  unset MOCK_MV_FAIL MOCK_INSTALL_FAIL MOCK_SYSTEMCTL_FAIL MOCK_READLINK_FAIL MOCK_WATCH_START_FAIL MOCK_UNIT_FAILED
   export BROKKR_EXPECTED_SOURCE="$REPO" BROKKR_EXPECTED_COMMIT="$SHA"
   has_ethtool
+  has_ip
 }
 # Runs every "  sudo ..." line of the printed rollback recipe through the fakes.
 run_rollback() {
@@ -219,9 +247,32 @@ refuses() { # name expected-substring args...
   check "$name" '[[ "$RC" -ne 0 && "$OUT" == *"$want"* && "$(tree_state)" == "$before" ]] && no_mutation'
 }
 
+four_links() { [[ -L "$DEV_WANTS/$INSTANCE" && -L "$BOOT_WANTS/$INSTANCE" && -L "$DEV_WANTS/$WATCH" && -L "$BOOT_WANTS/$WATCH" ]]; }
+both_live() { [[ -e "$STATE/enabled.$INSTANCE" && -e "$STATE/active.$INSTANCE" && -e "$STATE/enabled.$WATCH" && -e "$STATE/active.$WATCH" ]]; }
+in_order() { # each fixed-start pattern first appears in $CALLS after the previous one
+  local prev=0 n pat
+  for pat in "$@"; do
+    n="$(line_of "$pat")"
+    [[ -n "$n" && "$n" -gt "$prev" ]] || return 1
+    prev=$n
+  done
+}
+# A PATH for the remote side in which no `ip` resolves, even on a host that has one.
+make_noip_path() {
+  local d f n
+  rm -rf "${TMP:?}/noip"; mkdir -p "$TMP/noip"
+  for d in "$BIN" /usr/bin /bin; do
+    for f in "$d"/*; do
+      n=${f##*/}
+      [[ "$n" != ip && ! -e "$TMP/noip/$n" ]] || continue
+      ln -s "$f" "$TMP/noip/$n"
+    done
+  done
+}
+
 echo "deploy-eee-off.test.sh"
 reset
-check "fixture precondition: the example unit and deploy script are committed" '[[ -f "$REPO/network/brokkr-eee-off@.service.example" && -f "$DEPLOY" ]]'
+check "fixture precondition: the example units and deploy script are committed" '[[ -f "$REPO/network/brokkr-eee-off@.service.example" && -f "$REPO/network/brokkr-eee-off-watch@.service.example" && -f "$DEPLOY" ]] && git -C "$REPO" ls-files --error-unmatch network/brokkr-eee-off-watch@.service.example >/dev/null'
 
 # --- local gates: nothing reaches ssh ---------------------------------------------------
 unset BROKKR_EXPECTED_COMMIT
@@ -260,6 +311,7 @@ check "dry-run mutates nothing" '[[ "$(tree_state)" == "$before" ]] && no_mutati
 check "dry-run validated through ssh and sudo -n" 'grep -q "^ssh $TARGET" "$CALLS" && grep -q "^sudo -n true" "$CALLS"'
 check "dry-run reports the ad-hoc unit it would adopt and its backup" '[[ "$OUT" == *"eth0-eee-off.service"* && "$OUT" == *"eth0-eee-off.service.previous-$SHA"* ]]'
 check "dry-run reports the current EEE status" '[[ "$OUT" == *"EEE status: enabled"* ]]'
+check "dry-run reports the pinned ip path" '[[ "$OUT" == *"ip at $BIN/ip"* ]]'
 check "dry-run payload parent is cleaned" '[[ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -print)" ]]'
 
 # --- remote refusals: identical for dry-run and --apply, nothing changes ------------------
@@ -269,6 +321,8 @@ for mode in dry-run apply; do
   refuses "$mode: remote runtime user root refuses" "must not be root" "${args[@]}"
   reset; seed_legacy; rm -f "$BIN/ethtool"
   refuses "$mode: missing ethtool refuses (never installs)" "ethtool is required" "${args[@]}"
+  reset; seed_legacy; make_noip_path
+  MOCK_REMOTE_PATH="$TMP/noip" refuses "$mode: missing ip refuses (never installs)" "ip (iproute2) is required" "${args[@]}"
   reset; seed_legacy; rm -rf "$SYSFS/eth0"
   refuses "$mode: absent interface refuses" "no network interface eth0" "${args[@]}"
   reset; seed_legacy; export MOCK_SUDO_DENY=1
@@ -296,6 +350,26 @@ for mode in dry-run apply; do
   refuses "$mode: an enabled instance of another EEE template refuses" "other-eee@eth0.service" "${args[@]}"
   reset; seed_legacy; mkdir -p "$UNIT_DIR/brokkr-eee-off@eth0.service.d"; printf '[Service]\nExecStart=\n' >"$UNIT_DIR/brokkr-eee-off@eth0.service.d/x.conf"
   refuses "$mode: a drop-in overriding the managed unit refuses" "drop-in" "${args[@]}"
+  # The link watcher is a second managed unit with the same ownership guards.
+  reset; seed_legacy; printf '[Service]\nExecStart=/bin/true\n' >"$UNIT_DIR/$WATCH"
+  refuses "$mode: a concrete watcher instance file shadowing the template refuses" "shadows the managed template" "${args[@]}"
+  for wd in brokkr-eee-off-watch@.service.d brokkr-eee-off-watch@eth0.service.d; do
+    reset; seed_legacy; mkdir -p "$UNIT_DIR/$wd"; printf '[Service]\nExecStart=\n' >"$UNIT_DIR/$wd/x.conf"
+    refuses "$mode: a drop-in $wd overriding the watcher refuses" "drop-in" "${args[@]}"
+  done
+  reset; seed_legacy; mkdir -p "$UNIT_DIR/brokkr-eee-off-.service.d"; printf '[Unit]\nConditionPathExists=/nonexistent\n' >"$UNIT_DIR/brokkr-eee-off-.service.d/x.conf"
+  refuses "$mode: an inherited drop-in brokkr-eee-off-.service.d refuses" "brokkr-eee-off-.service.d" "${args[@]}"
+  reset; seed_legacy; printf '[Service]\nExecStart=/bin/true\n' >"$TMP/elsewhere-watch.service"; ln -s "$TMP/elsewhere-watch.service" "$WATCH_TEMPLATE"
+  refuses "$mode: a symlinked watcher template refuses" "regular non-symlink file" "${args[@]}"
+  # A wants link of a managed unit must be a live link to that unit's template.
+  reset; seed_legacy; printf '[Service]\nExecStart=/bin/true\n' >"$UNIT_DIR/elsewhere.service"
+  mkdir -p "$BOOT_WANTS"; ln -s "$UNIT_DIR/elsewhere.service" "$BOOT_WANTS/$INSTANCE"
+  refuses "$mode: a boot wants link of the instance to another unit refuses" "is not a link to" "${args[@]}"
+  reset; seed_legacy; printf '[Service]\nExecStart=/bin/true\n' >"$UNIT_DIR/elsewhere.service"
+  mkdir -p "$BOOT_WANTS"; ln -s "$UNIT_DIR/elsewhere.service" "$BOOT_WANTS/$WATCH"
+  refuses "$mode: a boot wants link of the watcher to another unit refuses" "is not a link to" "${args[@]}"
+  reset; seed_legacy; printf '[Service]\nExecStart=/bin/true\n' >"$WATCH_TEMPLATE"; echo enabled-runtime >"$STATE/enabled.$WATCH"
+  refuses "$mode: a watcher instance in an unsupported enablement state refuses" "enabled-runtime" "${args[@]}"
   # The ad-hoc unit must have exactly the supported shape before it is deleted.
   reset; seed_legacy; sed -i.bak 's|^ExecStart=.*|ExecStart=/bin/echo --set-eee eth0 eee off|' "$LEGACY"; rm -f "$LEGACY.bak"
   refuses "$mode: an ad-hoc unit that only echoes the ethtool arguments refuses" "not the ad-hoc EEE-off unit" "${args[@]}"
@@ -413,9 +487,14 @@ LEGACY_BEFORE="$(cat "$LEGACY")"
 run "$TARGET" eth0 --apply
 check "apply with the ad-hoc unit present succeeds" '[[ "$RC" -eq 0 && "$OUT" == *"OK: EEE is off on eth0"* ]]'
 check "the managed template is installed with the pinned ethtool and revision" 'grep -Fxq "ExecStart=$BIN/ethtool --set-eee %i eee off" "$MANAGED" && grep -q "$SHA" "$MANAGED" && ! grep -Eq "@[A-Z_]+@" "$MANAGED"'
-check "the managed template is wanted by the interface device" 'grep -Fxq "WantedBy=sys-subsystem-net-devices-%i.device" "$MANAGED"'
+check "the managed template is wanted by the interface device and by multi-user.target" 'grep -Fxq "WantedBy=sys-subsystem-net-devices-%i.device multi-user.target" "$MANAGED"'
+check "the managed template carries a start limit" 'grep -Fxq "StartLimitBurst=5" "$MANAGED"'
 check "the managed instance is enabled and active" '[[ -e "$STATE/enabled.$INSTANCE" && -e "$STATE/active.$INSTANCE" ]]'
 check "the managed instance is wanted by the interface device" '[[ -L "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/$INSTANCE" ]]'
+check "the watcher template is installed rendered with the revision and pinned paths" '[[ -f "$WATCH_TEMPLATE" ]] && ! grep -Eq "@[A-Z_]+@" "$WATCH_TEMPLATE" && grep -Fq "$SHA" "$WATCH_TEMPLATE" && grep -Fq "$BIN/ip -o monitor link" "$WATCH_TEMPLATE" && grep -Fq "$BIN/ethtool" "$WATCH_TEMPLATE"'
+check "both units are enabled and active with all four device and boot links" 'four_links && both_live'
+check "the verification reports the watcher active and the boot re-apply" '[[ "$OUT" == *"verify: $WATCH is active"* && "$OUT" == *"OK: re-applied at every boot"* ]]'
+check "the instance is enabled, reset, and restarted, then the watcher enabled and restarted, before the ad-hoc unit is disabled" 'in_order "^sudo -n systemctl enable $INSTANCE\$" "^sudo -n systemctl reset-failed $INSTANCE\$" "^sudo -n systemctl restart $INSTANCE\$" "^sudo -n systemctl enable $WATCH\$" "^sudo -n systemctl reset-failed $WATCH\$" "^sudo -n systemctl restart $WATCH\$" "^sudo -n systemctl disable eth0-eee-off.service\$"'
 check "the ad-hoc unit's device link is gone" '[[ ! -e "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/eth0-eee-off.service" && ! -L "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/eth0-eee-off.service" ]]'
 check "the unit itself turned EEE off through ethtool" '[[ "$(cat "$STATE/eee.eth0")" == disabled ]] && [[ "$OUT" == *"EEE status: disabled"* ]]'
 check "the ad-hoc unit is disabled and removed" '[[ ! -e "$LEGACY" && ! -e "$STATE/enabled.eth0-eee-off.service" ]]'
@@ -456,6 +535,7 @@ SHA2="$(git -C "$REPO" rev-parse HEAD)"
 MANAGED_BEFORE="$(cat "$MANAGED")"
 : >"$CALLS"
 BROKKR_EXPECTED_COMMIT="$SHA2" run "$TARGET" eth0 --apply
+check "a later revision enables the already enabled instance again" 'grep -Fxq "sudo -n systemctl enable $INSTANCE" "$CALLS"'
 check "a later revision replaces the managed template" '[[ "$RC" -eq 0 ]] && grep -q "$SHA2" "$MANAGED" && [[ "$(cat "$MANAGED.previous-$SHA2")" == "$MANAGED_BEFORE" ]]'
 check "a later revision's rollback restores the previous template without disabling" '[[ "$OUT" == *"mv -f $MANAGED.previous-$SHA2 $MANAGED"* && "$OUT" != *"systemctl disable"*"$INSTANCE"* ]]'
 run_rollback; RB=$?
@@ -488,6 +568,8 @@ reset
 run "$TARGET" eth0 --apply
 check "apply without an ad-hoc unit succeeds" '[[ "$RC" -eq 0 && "$OUT" == *"OK: EEE is off on eth0"* && -e "$STATE/enabled.$INSTANCE" ]]'
 check "apply without an ad-hoc unit neither backs up nor mentions one" '[[ -z "$(find "$UNIT_DIR" -name "*.previous-*" -print)" && "$OUT" != *"eth0-eee-off.service"* ]]'
+check "apply without an ad-hoc unit installs and starts the watcher with all four links" '[[ -f "$WATCH_TEMPLATE" ]] && four_links && both_live && [[ "$OUT" == *"verify: $WATCH is active"* ]]'
+check "a fresh host enables the instance, resets its failed state, restarts it, then enables and restarts the watcher" 'in_order "^sudo -n systemctl enable $INSTANCE\$" "^sudo -n systemctl reset-failed $INSTANCE\$" "^sudo -n systemctl restart $INSTANCE\$" "^sudo -n systemctl enable $WATCH\$" "^sudo -n systemctl reset-failed $WATCH\$" "^sudo -n systemctl restart $WATCH\$"'
 
 # --- apply failures keep the ad-hoc unit in charge -------------------------------------------
 reset; seed_legacy; export MOCK_START_FAIL=1
@@ -508,6 +590,13 @@ check "a failed backup reports that nothing was changed" '[[ "$OUT" == *"no unit
 reset; seed_legacy; export MOCK_MV_FAIL="eth0-eee-off.service.previous"
 run "$TARGET" eth0 --apply
 check "a failed backup finalisation changes nothing and leaves no temporary backup" '[[ "$RC" -ne 0 && "$OUT" == *"could not finalize"* && "$OUT" == *"no unit was changed"* && -f "$LEGACY" && ! -e "$MANAGED" && -z "$(find "$UNIT_DIR" -name ".*.tmp" -print)" ]] && ! grep -Eq "^systemctl (enable|restart|disable)" "$CALLS"'
+
+# A watcher that cannot start keeps the ad-hoc unit in charge and rolls back exactly.
+reset; seed_legacy; PRE_STATE="$(unit_state)"
+MOCK_WATCH_START_FAIL=1 run "$TARGET" eth0 --apply
+check "a watcher start failure fails the deploy and keeps the ad-hoc unit enabled and in place" '[[ "$RC" -ne 0 && "$OUT" == *"$WATCH"* && "$OUT" == *Rollback* && -f "$LEGACY" && -e "$STATE/enabled.eth0-eee-off.service" ]]'
+run_rollback; RB=$?
+check "a watcher start failure's rollback recipe restores the exact pre-deploy unit state" '[[ "$RB" -eq 0 && "$(unit_state)" == "$PRE_STATE" && -f "$LEGACY" ]]'
 
 # Each partial apply prints a rollback that restores the exact pre-deploy state.
 partial() { # name expected-output env-assignment...
@@ -538,6 +627,103 @@ for recover in inactive disabled eee-on; do
   run "$TARGET" eth0 --apply
   check "re-applying the same revision recovers a $recover instance" '[[ "$RC" -eq 0 && "$OUT" == *"OK: EEE is off"* && "$OUT" != *"already in place"* && -e "$STATE/enabled.$INSTANCE" && -e "$STATE/active.$INSTANCE" && -L "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/$INSTANCE" && "$(cat "$STATE/eee.eth0")" == disabled ]]'
 done
+
+# "Already in place" also needs the boot links, the watcher enabled and active, so a
+# host that lost any of them is repaired by re-applying the same revision.
+for lost in boot-instance-link stop-watcher boot-watcher-link; do
+  reset; run "$TARGET" eth0 --apply
+  case $lost in
+    boot-instance-link) rm -f "$BOOT_WANTS/$INSTANCE" ;;
+    stop-watcher) systemctl stop "$WATCH" >/dev/null ;;
+    boot-watcher-link) rm -f "$BOOT_WANTS/$WATCH" ;;
+  esac
+  run "$TARGET" eth0 --apply
+  check "re-applying the same revision repairs a host that lost $lost" '[[ "$RC" -eq 0 && "$OUT" != *"already in place"* ]] && four_links && both_live'
+done
+
+# Migration from the previous release: the template had only the device WantedBy, no
+# watcher, and the instance was enabled through the device dependency alone.
+OLD_SHA=1111111111111111111111111111111111111111
+reset
+cat >"$MANAGED" <<UNIT
+[Unit]
+Description=Brokkr: keep Energy Efficient Ethernet off on %i (revision $OLD_SHA)
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/eee-off.md
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$BIN/ethtool --set-eee %i eee off
+
+[Install]
+WantedBy=sys-subsystem-net-devices-%i.device
+UNIT
+mkdir -p "$DEV_WANTS"; ln -s "$MANAGED" "$DEV_WANTS/$INSTANCE"
+touch "$STATE/enabled.$INSTANCE" "$STATE/active.$INSTANCE"; echo disabled >"$STATE/eee.eth0"
+PRE_STATE="$(unit_state)"; OLD_MANAGED="$(cat "$MANAGED")"
+run "$TARGET" eth0 --apply
+check "migrating from the previous release succeeds and is not a no-op" '[[ "$RC" -eq 0 && "$OUT" != *"already in place"* && "$OUT" == *"OK: EEE is off"* ]]'
+check "migration backs up the previous template" '[[ "$(cat "$MANAGED.previous-$SHA" 2>/dev/null)" == "$OLD_MANAGED" ]]'
+check "migration adds the boot link and installs and starts the watcher" '[[ -L "$BOOT_WANTS/$INSTANCE" && -f "$WATCH_TEMPLATE" ]] && four_links && both_live'
+check "the migration rollback recipe removes the added boot link and the watcher" '[[ "$OUT" == *"rm -f $UNIT_DIR/multi-user.target.wants/$INSTANCE"* && "$OUT" == *"systemctl disable $WATCH"* && "$OUT" == *"rm -f $WATCH_TEMPLATE"* ]]'
+run_rollback; RB=$?
+check "the migration rollback recipe restores the exact pre-deploy unit state" '[[ "$RB" -eq 0 && "$(unit_state)" == "$PRE_STATE" && "$(cat "$MANAGED")" == "$OLD_MANAGED" && ! -e "$BOOT_WANTS/$INSTANCE" && ! -L "$BOOT_WANTS/$INSTANCE" && ! -e "$WATCH_TEMPLATE" && ! -e "$STATE/enabled.$WATCH" && ! -e "$STATE/active.$WATCH" ]]'
+
+# --- the rendered watcher script itself -----------------------------------------------------
+# Extract it as systemd would: join continued lines, take the ExecStart= value, keep the
+# text between the first and the last quote, and turn "$$" back into "$".
+extract_watch_script() { # unit-file -> the sh -c script on stdout
+  local line cur='' value='' dd='$$' d='$' bs=$'\\'
+  [[ -f "$1" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *"$bs" ]]; then cur+="${line%"$bs"} "; continue; fi
+    cur+="$line"
+    if [[ "$cur" == ExecStart=* ]]; then value=${cur#ExecStart=}; break; fi
+    cur=
+  done <"$1"
+  [[ "$value" == *"'"* ]] || return 0
+  value=${value#*"'"}; value=${value%"'"*}
+  printf '%s' "${value//"$dd"/$d}"
+}
+WBIN="$TMP/wbin"; WLOG="$TMP/watch.log"; IPLINES="$TMP/ip.lines"; mkdir -p "$WBIN"
+cat >"$WBIN/systemctl" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$MOCK_WLOG"
+if [[ "${1:-}" == is-failed ]]; then [[ "${MOCK_UNIT_FAILED:-0}" == 1 ]]; exit; fi
+exit 0
+FAKE
+chmod 755 "$WBIN/systemctl"
+# run_watch IP-LINE... : runs the extracted script against the fake ip lines.
+run_watch() {
+  : >"$WLOG"; : >"$IPLINES"
+  local l; for l in "$@"; do printf '%s\n' "$l" >>"$IPLINES"; done
+  W_ERR="$(env PATH="$WBIN:/usr/bin:/bin" MOCK_WLOG="$WLOG" MOCK_IP_LINES="$IPLINES" \
+    sh -c "$WATCH_SCRIPT" brokkr-eee-off-watch eth0 2>&1 >/dev/null </dev/null)"
+  W_RESTARTS="$(grep -cx "restart --no-block $INSTANCE" "$WLOG" || true)"
+}
+reset; run "$TARGET" eth0 --apply
+WATCH_SCRIPT="$(extract_watch_script "$WATCH_TEMPLATE")"
+check "the rendered watcher script is extracted without placeholders or doubled dollars" '[[ -n "$WATCH_SCRIPT" ]] && ! grep -Eq "@[A-Z_]+@" <<<"$WATCH_SCRIPT" && [[ "$WATCH_SCRIPT" != *"\$\$"* ]]'
+UP='2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default'
+DOWN='2: eth0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc fq_codel state DOWN mode DEFAULT group default'
+echo disabled >"$STATE/eee.eth0"; run_watch
+check "watcher: EEE already disabled and no link event restarts nothing" '[[ -n "$WATCH_SCRIPT" && "$W_RESTARTS" == 0 ]]'
+echo 'enabled - active' >"$STATE/eee.eth0"; run_watch
+check "watcher: EEE enabled at start restarts the unit once" '[[ "$W_RESTARTS" == 1 ]]'
+run_watch "$UP"
+check "watcher: a LOWER_UP event of the interface with EEE enabled restarts the unit again" '[[ "$W_RESTARTS" == 2 ]]'
+run_watch "$DOWN"
+check "watcher: a NO-CARRIER event does not restart the unit" '[[ "$W_RESTARTS" == 1 ]]'
+run_watch "Deleted $UP"
+check "watcher: a deleted-link event does not restart the unit" '[[ "$W_RESTARTS" == 1 ]]'
+run_watch '3: eth01: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500' '4: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500'
+check "watcher: events of other interfaces (eth01, eth1) do not restart the unit" '[[ "$W_RESTARTS" == 1 ]]'
+MOCK_EEE_UNSUPPORTED=1 run_watch "$UP"
+check "watcher: an interface without EEE support restarts nothing" '[[ -n "$WATCH_SCRIPT" && "$W_RESTARTS" == 0 ]]'
+MOCK_UNIT_FAILED=1 run_watch "$UP"
+check "watcher: a failed unit is not restarted and the reason is reported" '[[ -n "$WATCH_SCRIPT" && "$W_RESTARTS" == 0 && "$W_ERR" == *"has failed"* ]]'
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"

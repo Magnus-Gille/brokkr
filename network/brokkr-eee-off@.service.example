@@ -5,8 +5,12 @@
 # verified absolute ethtool path on the node) and the REVISION placeholder,
 # installs the result as
 # /etc/systemd/system/brokkr-eee-off@.service, and enables
-# brokkr-eee-off@<iface>.service. The interface's device unit pulls it in, so EEE
-# is switched off again whenever the device appears (boot, driver reload).
+# brokkr-eee-off@<iface>.service. It is wanted by multi-user.target, so every boot
+# starts it whatever happened to the device unit's own .wants/ trigger, and by the
+# interface's device unit, so a driver reload or hotplug starts it again. The
+# companion brokkr-eee-off-watch@<iface>.service restarts it when a link change
+# turned EEE back on. The start limit stops a driver that never keeps EEE off from
+# renegotiating the link in a loop.
 #
 # EEE was NOT the cause of the link flapping that prompted this; see
 # docs/eee-off.md for why it stays off anyway.
@@ -15,6 +19,8 @@ Description=Brokkr: keep Energy Efficient Ethernet off on %i (revision @REVISION
 Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/eee-off.md
 BindsTo=sys-subsystem-net-devices-%i.device
 After=sys-subsystem-net-devices-%i.device
+StartLimitIntervalSec=10min
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
@@ -22,4 +28,4 @@ RemainAfterExit=yes
 ExecStart=@ETHTOOL@ --set-eee %i eee off
 
 [Install]
-WantedBy=sys-subsystem-net-devices-%i.device
+WantedBy=sys-subsystem-net-devices-%i.device multi-user.target

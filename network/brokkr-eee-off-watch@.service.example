@@ -1,0 +1,46 @@
+# Brokkr · re-apply "EEE off" after a link change on one wired interface.
+#
+# Systemd template: the instance name is the interface. scripts/deploy-eee-off.sh
+# fills in the ETHTOOL and IP placeholders (verified absolute paths on the node) and
+# the REVISION placeholder and installs the result as
+# /etc/systemd/system/brokkr-eee-off-watch@.service next to brokkr-eee-off@.service.
+#
+# Some drivers (r8169 among them) can turn EEE back on when the link renegotiates.
+# A carrier change is an rtnetlink event, not a udev uevent, so a udev rule cannot
+# see it, and network-manager hooks differ per host. This watcher listens with
+# `ip monitor link` instead, which works whatever manages the interface. It only
+# reads the EEE status. When it is not "disabled" after the link came up (or when
+# the watcher starts), it asks systemd to restart brokkr-eee-off@<iface>.service,
+# the only unit that sets EEE. A re-apply that renegotiates the link is a no-op the
+# second time because EEE then reads "disabled". If the driver never keeps EEE off,
+# that unit's start limit fails it, and the watcher stops restarting a failed unit,
+# so the link is not renegotiated in a loop and the failure stays visible.
+#
+# systemd turns "$$" into "$" and joins the continued lines with spaces, so the
+# script below is one sh -c line with explicit separators.
+[Unit]
+Description=Brokkr: re-apply EEE off on %i after a link change (revision @REVISION@)
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/eee-off.md
+BindsTo=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device brokkr-eee-off@%i.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5s
+ExecStart=/bin/sh -c 'iface=$$1; unit=brokkr-eee-off@$$iface.service; \
+  check() { status=$$(@ETHTOOL@ --show-eee "$$iface" 2>/dev/null | sed -n "s/^[[:space:]]*EEE status:[[:space:]]*//p" | head -n 1); \
+    case $$status in ""|disabled*|"not supported"*) return 0 ;; esac; \
+    if systemctl is-failed --quiet "$$unit"; then echo "EEE on $$iface is $$status but $$unit has failed; not restarting it" >&2; return 0; fi; \
+    echo "EEE on $$iface is $$status after $$1; restarting $$unit"; \
+    systemctl restart --no-block "$$unit" || echo "could not restart $$unit" >&2; }; \
+  { echo start; exec @IP@ -o monitor link; } | while IFS= read -r line; do \
+    case $$line in \
+      start) check "the watcher started" ;; \
+      Deleted*) ;; \
+      *": $$iface: <"*LOWER_UP*) check "a link change" ;; \
+    esac; \
+  done' brokkr-eee-off-watch %i
+
+[Install]
+WantedBy=sys-subsystem-net-devices-%i.device multi-user.target
