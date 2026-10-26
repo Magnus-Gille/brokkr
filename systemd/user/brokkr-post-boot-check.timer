@@ -1,0 +1,14 @@
+# Brokkr · run the post-boot health check once, ten minutes after the machine boots (user timer).
+[Unit]
+Description=Run the Brokkr post-boot health check after boot
+
+[Timer]
+# With lingering enabled the user manager starts at boot; OnBootSec counts from the machine boot,
+# so the check runs about ten minutes after a reboot. It does nothing unless a guarded reboot is
+# waiting for its post-boot result.
+OnBootSec=10min
+AccuracySec=1min
+Unit=brokkr-post-boot-check.service
+
+[Install]
+WantedBy=timers.target
