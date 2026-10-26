@@ -1,0 +1,14 @@
+# Brokkr · compare the running services with the pre-update baseline every morning (user timer).
+[Unit]
+Description=Run the Brokkr post-update health check daily
+
+[Timer]
+# After the stock apt-daily-upgrade window (06:00 plus up to an hour of random delay).
+OnCalendar=*-*-* 08:00
+# A check missed while the host was off runs at the next boot.
+Persistent=true
+AccuracySec=1min
+Unit=brokkr-post-update-health.service
+
+[Install]
+WantedBy=timers.target
