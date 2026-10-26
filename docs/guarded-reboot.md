@@ -185,9 +185,11 @@ so left alone it stages updates outside every guard. Therefore:
   `eeprom-cancel-failed` alert and exit 1.
 - **A staged update applies at the next boot, whatever its cause, and the kill switch does not
   cancel it.** `status` (and so the deploy summary) says so whenever one is staged. To suspend
-  firmware updates entirely, hold the package (`apt-mark hold rpi-eeprom`) and/or keep
-  `rpi-eeprom-update.service` disabled; to cancel a staged update now run
-  `sudo rpi-eeprom-update -r`.
+  firmware writes (ADR-009 §7): create the kill switch, which stops this job from staging, keep
+  `rpi-eeprom-update.service` disabled, and make sure nothing is staged — cancel with
+  `sudo rpi-eeprom-update -r` and confirm with `status`. Firmware writes count as suspended only
+  when nothing is staged. Holding the package (`apt-mark hold rpi-eeprom`) additionally stops new
+  bootloader versions from being installed.
 
 The owner has accepted the risk that comes with this: a power interruption while the bootloader
 is being written can leave the EEPROM unusable, and a failed write needs physical access to

@@ -1268,7 +1268,8 @@ cmd_status() {
     echo "EEPROM: a bootloader update is STAGED. It is applied at the next boot of any kind, and the kill"
     echo "  switch does not cancel it. This job cancels a staged update it did not stage itself at its next"
     echo "  run; to cancel it now run: sudo rpi-eeprom-update -r"
-    echo "  To suspend firmware updates: apt-mark hold rpi-eeprom and/or disable rpi-eeprom-update.service"
+    echo "  Firmware writes count as suspended only when nothing is staged: create the kill switch (no new"
+    echo "  staging), keep rpi-eeprom-update.service disabled, and cancel the staged update"
     echo "  (see docs/guarded-reboot.md for the power-interruption risk and the bootloader recovery image)"
   elif command -v rpi-eeprom-update >/dev/null 2>&1; then
     echo "EEPROM: no update is staged (updates are staged only inside an admitted guarded reboot)"

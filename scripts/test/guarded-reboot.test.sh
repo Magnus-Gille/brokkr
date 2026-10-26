@@ -896,7 +896,7 @@ reset; : >"$KILL"; run status
 check "status shows a present kill switch" '[[ "$OUT" == *"kill switch: PRESENT"* ]]'
 reset; echo "recovery 1790000000" >"$PENDING_FLAG"; run status
 check "status states that a staged EEPROM update applies at the next boot and that the kill switch does not cancel it" '[[ "$OUT" == *"bootloader update is STAGED"* && "$OUT" == *"next boot of any kind"* && "$OUT" == *"kill"*"does not cancel it"* ]]'
-check "status names the ways to suspend firmware updates and to cancel a staged one" '[[ "$OUT" == *"apt-mark hold rpi-eeprom"* && "$OUT" == *"rpi-eeprom-update.service"* && "$OUT" == *"sudo rpi-eeprom-update -r"* ]]'
+check "status names the ADR-009 way to suspend firmware writes and to cancel a staged update" '[[ "$OUT" == *"suspended only when nothing is staged"* && "$OUT" == *"kill switch"* && "$OUT" == *"rpi-eeprom-update.service"* && "$OUT" == *"sudo rpi-eeprom-update -r"* && "$OUT" != *"apt-mark hold rpi-eeprom and/or"* ]]'
 check "status points at the power-interruption risk and the recovery image" '[[ "$OUT" == *"power-interruption"* && "$OUT" == *"recovery image"* ]]'
 check "status never runs a privileged command" '! grep -q "^sudo" "$CALLS"'
 reset; with_eeprom; run status
