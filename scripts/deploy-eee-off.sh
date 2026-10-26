@@ -3,10 +3,12 @@
 # node, as a revision-bound systemd system unit. Run from the control node; the node
 # is reached over ssh as a non-root operator with passwordless sudo.
 #
-# Dry-run by default: the remote preflight (identity, sudo, interface, ethtool, EEE
+# Dry-run by default: the remote preflight (identity, sudo, interface, ethtool, ip, EEE
 # support, the ad-hoc unit to adopt, duplicate units, backup targets) runs and nothing
-# is changed. Pass --apply to install. An existing ad-hoc <iface>-eee-off.service is
-# backed up, and disabled and removed only after the managed unit has turned EEE off.
+# is changed. Pass --apply to install. The managed unit is started at every boot, on
+# device appearance and, through its link watcher, after a link change. An existing
+# ad-hoc <iface>-eee-off.service is backed up, and disabled and removed only after the
+# managed units have turned EEE off. Redeploying over an earlier release migrates it.
 # See docs/eee-off.md.
 #
 #   BROKKR_EXPECTED_SOURCE=$PWD BROKKR_EXPECTED_COMMIT=<full-sha> \
@@ -73,10 +75,14 @@ materialize_brokkr_deploy_payload "$HERE" "$REVISION"
 
 TEMPLATE_FILE="$DEPLOY_PAYLOAD_ROOT/network/brokkr-eee-off@.service.example"
 [[ -f "$TEMPLATE_FILE" && ! -L "$TEMPLATE_FILE" ]] || die "committed payload lacks regular file network/brokkr-eee-off@.service.example"
+WATCH_TEMPLATE_FILE="$DEPLOY_PAYLOAD_ROOT/network/brokkr-eee-off-watch@.service.example"
+[[ -f "$WATCH_TEMPLATE_FILE" && ! -L "$WATCH_TEMPLATE_FILE" ]] || die "committed payload lacks regular file network/brokkr-eee-off-watch@.service.example"
+WATCH_TEMPLATE_B64="$(base64 <"$WATCH_TEMPLATE_FILE" | tr -d '\n')"
 
 # Remote scripts run under sh (shipped base64-encoded, so the operator's login shell
-# never parses them) and are POSIX-only. The committed template arrives on stdin in
-# both modes. Inputs are validated above and below, so single-quoted assignment is safe.
+# never parses them) and are POSIX-only. The committed unit template arrives on stdin
+# and the watcher template base64-encoded in the prelude, in both modes. Inputs are
+# validated above and below (base64 has no quote), so single-quoted assignment is safe.
 IFS= read -r -d '' REMOTE_COMMON <<'REMOTE' || true
 set -eu
 umask 077
@@ -95,6 +101,7 @@ on_exit() {
 trap on_exit EXIT
 work=$(mktemp -d)
 cat >"$work/template"
+printf '%s' "$WATCH_TEMPLATE_B64" | base64 -d >"$work/watch-template" || refuse "could not decode the shipped watcher template"
 user=$(id -un)
 uid=$(id -u)
 if [ "$uid" = 0 ] || [ "$user" = root ]; then refuse "runtime user must not be root (privileged steps use sudo -n)"; fi
@@ -116,6 +123,14 @@ case $ethtool_path in
   '') refuse "ethtool is required on the node (install it first; this deploy never installs packages)" ;;
   /*) safe_path "$ethtool_path" || refuse "ethtool path is not a plain absolute path" ;;
   *) refuse "ethtool resolved to a non-absolute command" ;;
+esac
+# The link watcher listens with ip monitor; its path is rendered the same way.
+find_ip() { ( PATH="$PATH:${BROKKR_IP_SEARCH_PATH:-/usr/sbin:/sbin}"; command -v ip 2>/dev/null ) || true; }
+ip_path=$(find_ip)
+case $ip_path in
+  '') refuse "ip (iproute2) is required on the node for the link watcher (install it first; this deploy never installs packages)" ;;
+  /*) safe_path "$ip_path" || refuse "ip path is not a plain absolute path" ;;
+  *) refuse "ip resolved to a non-absolute command" ;;
 esac
 # The status text after "EEE status:", read unprivileged first (the get request
 # normally needs no capability) and through sudo -n otherwise.
@@ -142,7 +157,14 @@ iface_re=$(printf '%s' "$IFACE" | sed 's/[.]/[.]/g')
 # The interface as a whole token, so quoting ("eth0"), line continuations and odd
 # spacing in another unit cannot hide it, while eth01 or eth0.device do not match.
 tok_re="(^|[^A-Za-z0-9_.])$iface_re([^A-Za-z0-9_.]|\$)"
-instance_link=$unit_dir/sys-subsystem-net-devices-$IFACE.device.wants/$instance
+watch_name=brokkr-eee-off-watch@.service
+watch_instance=brokkr-eee-off-watch@$IFACE.service
+watch_managed=$unit_dir/$watch_name
+# Each unit is wanted by the device (hotplug, driver reload) and by multi-user.target
+# (every boot, even when the device's own .wants/ is not acted on).
+dev_wants=$unit_dir/sys-subsystem-net-devices-$IFACE.device.wants
+boot_wants=$unit_dir/multi-user.target.wants
+instance_link=$dev_wants/$instance
 # systemd reads unit files as root and some are root-only (mode 600), so the unit
 # directory is enumerated and read through sudo -n, never as the operator. A read or
 # listing that sudo -n refuses stops the deploy instead of counting as "no match".
@@ -191,8 +213,14 @@ absent() { [ -z "$(entry_type "$1")" ]; }
 # The committed template must be the one this script expects, then it is rendered.
 [ "$(grep -Fxc 'ExecStart=@ETHTOOL@ --set-eee %i eee off' "$work/template")" = 1 ] \
   || refuse "shipped template lacks the expected ExecStart line"
-sed -e "s|@ETHTOOL@|$ethtool_path|g" -e "s|@REVISION@|$REVISION|g" "$work/template" >"$work/$template_name"
-if grep -Eq '@[A-Z_]+@' "$work/$template_name"; then refuse "unit template has an unrendered placeholder"; fi
+[ "$(grep -Fc '@IP@ -o monitor link' "$work/watch-template")" = 1 ] \
+  && [ "$(grep -Ec '^ExecStart=/bin/sh -c ' "$work/watch-template")" = 1 ] \
+  || refuse "shipped watcher template lacks the expected monitor command"
+for f in template watch-template; do
+  case $f in template) out=$template_name ;; *) out=$watch_name ;; esac
+  sed -e "s|@ETHTOOL@|$ethtool_path|g" -e "s|@IP@|$ip_path|g" -e "s|@REVISION@|$REVISION|g" "$work/$f" >"$work/$out"
+  if grep -Eq '@[A-Z_]+@' "$work/$out"; then refuse "unit template $out has an unrendered placeholder"; fi
+done
 
 legacy_present=0
 legacy_enabled=
@@ -223,15 +251,17 @@ if [ -n "$legacy_type" ]; then
     *) refuse "$legacy_name is ${legacy_enabled:-in an unknown state}; only an enabled or disabled ad-hoc unit is adopted" ;;
   esac
 fi
-absent "$unit_dir/$instance" \
-  || refuse "$instance exists as its own unit file and shadows the managed template; remove it first"
-for d in "$unit_dir/$template_name.d" "$unit_dir/$instance.d"; do
+for u in "$instance" "$watch_instance"; do
+  absent "$unit_dir/$u" \
+    || refuse "$u exists as its own unit file and shadows the managed template; remove it first"
+done
+for d in "$unit_dir/$template_name.d" "$unit_dir/$instance.d" "$unit_dir/$watch_name.d" "$unit_dir/$watch_instance.d"; do
   absent "$d" || refuse "${d##*/} is a drop-in directory that overrides the managed unit; remove it first"
 done
 # systemd also applies drop-ins named after every dash-separated prefix of a unit
 # name, and the top-level service.d. Any of them could reset ExecStart or add a
-# condition, so the managed and the adopted unit must have none.
-for d in "$unit_dir/service.d" "$unit_dir/brokkr-.service.d" "$unit_dir/brokkr-eee-.service.d"; do
+# condition, so the managed units and the adopted unit must have none.
+for d in "$unit_dir/service.d" "$unit_dir/brokkr-.service.d" "$unit_dir/brokkr-eee-.service.d" "$unit_dir/brokkr-eee-off-.service.d"; do
   absent "$d" || refuse "${d##*/} is an inherited drop-in directory that applies to the managed unit; remove it first"
 done
 # The interface name has no dash, so these are all the prefixes of <iface>-eee-off.
@@ -304,36 +334,71 @@ if [ -n "$managed_type" ]; then
   [ "$managed_type" = f ] || refuse "$template_name is not a regular non-symlink file; inspect it manually"
   managed_present=1
 fi
-instance_enabled=$(systemctl is-enabled "$instance" 2>/dev/null || true)
+watch_present=0
+watch_type=$(entry_type "$watch_managed")
+if [ -n "$watch_type" ]; then
+  [ "$watch_type" = f ] || refuse "$watch_name is not a regular non-symlink file; inspect it manually"
+  watch_present=1
+fi
 # systemd >= 250 reports a unit without a unit file as not-found; that is only
 # expected while the managed template is absent.
-case $instance_enabled in
-  enabled|disabled|'') ;;
-  not-found) [ "$managed_present" = 0 ] || refuse "$instance is not-found although $template_name exists; inspect it manually" ;;
-  *) refuse "$instance is $instance_enabled; only an enabled, disabled, or absent instance is managed" ;;
-esac
+enablement() { # instance template-present -> sets e to enabled, disabled, or empty
+  e=$(systemctl is-enabled "$1" 2>/dev/null || true)
+  case $e in
+    enabled|disabled|'') ;;
+    not-found) [ "$2" = 0 ] || refuse "$1 is not-found although its template exists; inspect it manually"; e= ;;
+    *) refuse "$1 is $e; only an enabled, disabled, or absent instance is managed" ;;
+  esac
+}
+enablement "$instance" "$managed_present"; instance_enabled=$e
+enablement "$watch_instance" "$watch_present"; watch_enabled=$e
 # is-enabled reports any wants link; only the device dependency re-applies the
-# setting when the interface comes back.
+# setting when the interface comes back. A missing boot link is what a redeploy
+# over an earlier release adds, so it is not a refusal.
 if [ "$instance_enabled" = enabled ] && [ "$(entry_type "$instance_link")" != l ]; then
   refuse "$instance is enabled without its device dependency (${instance_link#"$unit_dir"/}); disable it first"
 fi
 instance_active=$(systemctl is-active "$instance" 2>/dev/null || true)
+watch_active=$(systemctl is-active "$watch_instance" 2>/dev/null || true)
+links_in_place() { # instance -> success when both of its wants links are live
+  [ "$(entry_type "$dev_wants/$1")" = l ] && [ "$(entry_type "$boot_wants/$1")" = l ]
+}
+entry_target() { # path -> the link target recorded by the enumeration
+  P=$1 awk -F "$tab" '$2 == ENVIRON["P"] { print $3; exit }' <<EOF
+$entries
+EOF
+}
+# A wants link of a managed unit is either absent (enable creates it) or a live link
+# to that unit's template; anything else would make enable fail or start other code.
+for pair in "$instance:$template_name" "$watch_instance:$watch_name"; do
+  for l in "$dev_wants/${pair%%:*}" "$boot_wants/${pair%%:*}"; do
+    t=$(entry_type "$l")
+    [ -n "$t" ] || continue
+    [ "$t" = l ] && [ "$(entry_target "$l")" = "$unit_dir/${pair##*:}" ] \
+      || refuse "${l#"$unit_dir"/} is not a link to $unit_dir/${pair##*:}; remove it first"
+  done
+done
 
 echo "preflight: runtime user $user (not root); passwordless sudo available"
-echo "preflight: interface $IFACE present; ethtool at $ethtool_path"
+echo "preflight: interface $IFACE present; ethtool at $ethtool_path; ip at $ip_path"
 echo "preflight: EEE status: $status"
 echo "preflight: unit directory $unit_dir"
 
+is_current() { # installed-path rendered-name -> success when byte-identical
+  c=$(root_cat "$1") || refuse "could not read ${1##*/} with sudo -n; inspect it as root"
+  [ "$c" = "$(cat "$work/$2")" ]
+}
 managed_current=0
-if [ "$managed_present" = 1 ]; then
-  managed_content=$(root_cat "$managed") || refuse "could not read $template_name with sudo -n; inspect it as root"
-  [ "$managed_content" != "$(cat "$work/$template_name")" ] || managed_current=1
-fi
-if [ "$managed_current" = 1 ] && [ "$legacy_present" = 0 ] \
-  && [ "$instance_enabled" = enabled ] && [ "$instance_active" = active ]; then
+if [ "$managed_present" = 1 ] && is_current "$managed" "$template_name"; then managed_current=1; fi
+watch_current=0
+if [ "$watch_present" = 1 ] && is_current "$watch_managed" "$watch_name"; then watch_current=1; fi
+if [ "$managed_current" = 1 ] && [ "$watch_current" = 1 ] && [ "$legacy_present" = 0 ] \
+  && [ "$instance_enabled" = enabled ] && [ "$instance_active" = active ] \
+  && [ "$watch_enabled" = enabled ] && [ "$watch_active" = active ] \
+  && links_in_place "$instance" && links_in_place "$watch_instance"; then
   case $status in
     disabled*)
-      echo "already in place: $instance is enabled and active at revision $REVISION and EEE is disabled; nothing to do"
+      echo "already in place: $instance and $watch_instance are enabled (device and boot) and active at revision $REVISION and EEE is disabled; nothing to do"
       exit 0 ;;
   esac
 fi
@@ -345,14 +410,18 @@ if [ "$legacy_present" = 1 ]; then
 else
   echo "preflight: no ad-hoc EEE-off unit for $IFACE to adopt"
 fi
-if [ "$managed_present" = 1 ]; then
-  absent "$managed.previous-$REVISION" || refuse "backup $template_name.previous-$REVISION already exists"
-  echo "preflight: existing $template_name will be backed up as $template_name.previous-$REVISION"
-fi
+for f in "$managed:$managed_present" "$watch_managed:$watch_present"; do
+  [ "${f##*:}" = 1 ] || continue
+  f=${f%:*}
+  absent "$f.previous-$REVISION" || refuse "backup ${f##*/}.previous-$REVISION already exists"
+  echo "preflight: existing ${f##*/} will be backed up as ${f##*/}.previous-$REVISION"
+done
 echo "preflight: $instance is ${instance_enabled:-unknown} and ${instance_active:-unknown}"
+echo "preflight: $watch_instance is ${watch_enabled:-unknown} and ${watch_active:-unknown}"
 if [ "$MODE" = dry-run ]; then
-  echo "dry-run: --apply would install $managed, enable and restart $instance, verify that EEE is"
-  echo "dry-run: disabled, and only then disable and remove the ad-hoc unit. Nothing was changed."
+  echo "dry-run: --apply would install $managed and $watch_managed, enable $instance and"
+  echo "dry-run: $watch_instance for the device and for multi-user.target, restart both, verify that"
+  echo "dry-run: EEE is disabled, and only then disable and remove the ad-hoc unit. Nothing was changed."
 fi
 REMOTE
 
@@ -360,24 +429,53 @@ REMOTE
 # rollback matching exactly these.
 IFS= read -r -d '' REMOTE_APPLY <<'REMOTE' || true
 legacy_backed_up=0
-managed_backed_up=0
-managed_installed=0
-instance_newly_enabled=0
-instance_restarted=0
 legacy_disabled=0
 legacy_removed=0
+managed_backed_up=0
+managed_installed=0
+watch_backed_up=0
+watch_installed=0
+instance_enable_ran=0
+instance_restarted=0
+watch_enable_ran=0
+watch_restarted=0
 tmp_backups=
+# The wants links of each unit that did not exist before this run, so a rollback of
+# an instance that was already enabled removes exactly what this run added.
+new_links() { # instance
+  for l in "$dev_wants/$1" "$boot_wants/$1"; do
+    absent "$l" && printf ' %s' "$l"
+  done
+  return 0
+}
+instance_new_links=$(new_links "$instance")
+watch_new_links=$(new_links "$watch_instance")
+# Stops and un-enables one unit as far as this run started or enabled it.
+rollback_unit() { # instance enable-ran restarted enabled-before active-before new-links
+  if [ "$3" = 1 ] && [ "$5" != active ]; then echo "  sudo systemctl stop $1   # it was inactive before this run"; fi
+  if [ "$2" = 1 ] && [ "$4" != enabled ]; then echo "  sudo systemctl disable $1"; fi
+  if [ "$2" = 1 ] && [ "$4" = enabled ]; then
+    for l in $6; do echo "  sudo rm -f $l   # added by this run; $1 was already enabled"; done
+  fi
+  return 0
+}
 print_state() {
   for tmp in $tmp_backups; do sudo -n rm -f "$tmp" || true; done
-  if [ "$managed_installed" = 0 ] && [ "$legacy_disabled" = 0 ] && [ "$legacy_removed" = 0 ]; then
+  if [ "$managed_installed" = 0 ] && [ "$watch_installed" = 0 ] && [ "$legacy_disabled" = 0 ] && [ "$legacy_removed" = 0 ]; then
     echo "State: no unit was changed on this node."
     return 0
   fi
   echo "Rollback (run on the target as $user; only steps this run completed are listed):"
-  if [ "$instance_restarted" = 1 ] && [ "$instance_active" != active ]; then
-    echo "  sudo systemctl stop $instance   # it was inactive before this run"
+  # The watcher first, so it cannot restart the managed unit during the rollback. One
+  # that was running before is stopped too and started again at the end.
+  if [ "$watch_installed" = 1 ] && [ "$watch_active" = active ]; then
+    echo "  sudo systemctl stop $watch_instance   # started again below"
   fi
-  if [ "$instance_newly_enabled" = 1 ]; then echo "  sudo systemctl disable $instance"; fi
+  rollback_unit "$watch_instance" "$watch_enable_ran" "$watch_restarted" "$watch_enabled" "$watch_active" "$watch_new_links"
+  rollback_unit "$instance" "$instance_enable_ran" "$instance_restarted" "$instance_enabled" "$instance_active" "$instance_new_links"
+  if [ "$watch_installed" = 1 ]; then
+    if [ "$watch_backed_up" = 1 ]; then echo "  sudo mv -f $watch_managed.previous-$REVISION $watch_managed"; else echo "  sudo rm -f $watch_managed"; fi
+  fi
   if [ "$managed_installed" = 1 ]; then
     if [ "$managed_backed_up" = 1 ]; then echo "  sudo mv -f $managed.previous-$REVISION $managed"; else echo "  sudo rm -f $managed"; fi
   fi
@@ -386,6 +484,9 @@ print_state() {
   if [ "$legacy_disabled" = 1 ] && [ "$legacy_enabled" = enabled ]; then echo "  sudo systemctl enable $legacy_name"; fi
   if [ "$instance_restarted" = 1 ] && [ "$instance_active" = active ] && [ "$managed_backed_up" = 1 ]; then
     echo "  sudo systemctl restart $instance   # it was active before this run; re-run the previous template"
+  fi
+  if [ "$watch_installed" = 1 ] && [ "$watch_active" = active ] && [ "$watch_backed_up" = 1 ]; then
+    echo "  sudo systemctl restart $watch_instance   # it was active before this run; run the previous template"
   fi
   if [ "$legacy_backed_up" = 1 ] && [ "$legacy_removed" = 0 ]; then
     echo "  # $legacy_name was left in place; optional: sudo rm -f $legacy.previous-$REVISION"
@@ -399,6 +500,7 @@ apply_started=1
 backup_pairs=
 if [ "$legacy_present" = 1 ]; then backup_pairs="$legacy"; fi
 if [ "$managed_present" = 1 ]; then backup_pairs="$backup_pairs $managed"; fi
+if [ "$watch_present" = 1 ]; then backup_pairs="$backup_pairs $watch_managed"; fi
 for src in $backup_pairs; do
   tmp=$unit_dir/.${src##*/}.previous-$REVISION.tmp
   tmp_backups="$tmp_backups $tmp"
@@ -408,21 +510,31 @@ for src in $backup_pairs; do
   sudo -n mv "$unit_dir/.${src##*/}.previous-$REVISION.tmp" "$src.previous-$REVISION" </dev/null \
     || refuse "could not finalize the backup of ${src##*/}; no unit was changed"
   echo "backed up ${src##*/} as ${src##*/}.previous-$REVISION"
-  case $src in "$legacy") legacy_backed_up=1 ;; *) managed_backed_up=1 ;; esac
+  case $src in "$legacy") legacy_backed_up=1 ;; "$managed") managed_backed_up=1 ;; *) watch_backed_up=1 ;; esac
 done
 tmp_backups=
 managed_installed=1
 sudo -n install -m 644 "$work/$template_name" "$managed" </dev/null
 echo "installed $managed"
+watch_installed=1
+sudo -n install -m 644 "$work/$watch_name" "$watch_managed" </dev/null
+echo "installed $watch_managed"
 sudo -n systemctl daemon-reload </dev/null
-if [ "$instance_enabled" != enabled ]; then
-  instance_newly_enabled=1
-  sudo -n systemctl enable "$instance" </dev/null
-fi
-if ! sudo -n test -L "$instance_link" </dev/null; then
-  echo "FAILED: $instance has no device dependency link after enable (or sudo -n could not check it); the ad-hoc unit was left in charge" >&2
-  exit 3
-fi
+# enable always runs: on an instance that an earlier release enabled for the device
+# only, it adds the multi-user.target link from the new [Install] section.
+enable_unit() { # instance
+  sudo -n systemctl enable "$1" </dev/null
+  for l in "$dev_wants/$1" "$boot_wants/$1"; do
+    if ! sudo -n test -L "$l" </dev/null; then
+      echo "FAILED: $1 has no ${l#"$unit_dir"/} link after enable (or sudo -n could not check it); the ad-hoc unit was left in charge" >&2
+      exit 3
+    fi
+  done
+}
+instance_enable_ran=1
+enable_unit "$instance"
+# A start limit hit by earlier re-applies would refuse the restart.
+sudo -n systemctl reset-failed "$instance" </dev/null
 instance_restarted=1
 if ! sudo -n systemctl restart "$instance" </dev/null; then
   echo "FAILED: the first run of $instance did not succeed; the ad-hoc unit was left in charge" >&2
@@ -436,6 +548,17 @@ case $status in
   *) echo "FAILED: EEE is still not disabled on $IFACE; the ad-hoc unit was left in charge" >&2; exit 3 ;;
 esac
 [ "$active" = active ] || { echo "FAILED: $instance is not active; the ad-hoc unit was left in charge" >&2; exit 3; }
+watch_enable_ran=1
+enable_unit "$watch_instance"
+sudo -n systemctl reset-failed "$watch_instance" </dev/null
+watch_restarted=1
+if ! sudo -n systemctl restart "$watch_instance" </dev/null; then
+  echo "FAILED: $watch_instance did not start; the ad-hoc unit was left in charge" >&2
+  exit 3
+fi
+active=$(systemctl is-active "$watch_instance" 2>/dev/null || true)
+echo "verify: $watch_instance is ${active:-unknown}"
+[ "$active" = active ] || { echo "FAILED: $watch_instance is not active; the ad-hoc unit was left in charge" >&2; exit 3; }
 if [ "$legacy_present" = 1 ]; then
   legacy_disabled=1
   sudo -n systemctl disable "$legacy_name" </dev/null || {
@@ -449,11 +572,13 @@ if [ "$legacy_present" = 1 ]; then
   echo "adopted: disabled and removed $legacy_name (backup $legacy_name.previous-$REVISION)"
 fi
 echo "OK: EEE is off on $IFACE and owned by $instance at revision $REVISION"
+echo "OK: re-applied at every boot (multi-user.target), on device appearance, and after a link change ($watch_instance)"
 REMOTE
 
 run_remote() { # mode script-body; stdin is forwarded to the remote script
   local MODE=$1 prelude body encoded
   prelude="IFACE='$IFACE'
+WATCH_TEMPLATE_B64='$WATCH_TEMPLATE_B64'
 REVISION='$REVISION'
 MODE='$MODE'
 "
