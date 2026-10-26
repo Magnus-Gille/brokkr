@@ -1303,6 +1303,12 @@ elif section == "groups":
     report = module.Report("host", "before")
     module.check_access_filters(report, {"allowgroups": ["wheel"]}, module.Account("u", 1000, "/h", 5), client)
     expect("a resolvable set still evaluates", (report.reasons, report.checks), (set(), {"operator_user_permitted": True}))
+    # OpenSSH reads a group entry as a comma-separated pattern list; a literal reading
+    # would let "DenyGroups other,wheel" pass, so lists are not evaluated here.
+    for config in ({"denygroups": ["other,wheel"]}, {"allowgroups": ["other,wheel"]}):
+        report = module.Report("host", "before")
+        module.check_access_filters(report, config, module.Account("u", 1000, "/h", 5), client)
+        expect(("group pattern list", config), (report.reasons, report.checks), ({"access_filter_not_evaluated"}, {"operator_user_permitted": False}))
 
 elif section == "wildcard":
     match = module.wildcard_match

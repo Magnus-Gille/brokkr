@@ -705,7 +705,12 @@ def user_pattern_verdict(pattern: str, user: str, client: IPAddress) -> bool | N
 
 
 def group_pattern_verdict(pattern: str, groups: set[str]) -> bool | None:
-    if "!" in pattern:
+    """Match one AllowGroups/DenyGroups entry; None for negation or pattern lists.
+
+    OpenSSH reads an entry as a comma-separated pattern list, so a literal reading of
+    "other,wheel" would wrongly let DenyGroups pass.
+    """
+    if "!" in pattern or "," in pattern:
         return None
     return any(wildcard_match(name, pattern) for name in groups)
 
