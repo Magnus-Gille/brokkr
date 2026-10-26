@@ -1,0 +1,16 @@
+// Brokkr-managed — installed by scripts/setup-host-patching.sh onto Ubuntu hosts
+// (Grimnir ADR-009: regular OS updates, guarded reboots).
+//
+// The distribution's own 50unattended-upgrades (release, -security, ESM) stays in
+// place and is never overwritten by Brokkr; apt merges list-valued options across
+// apt.conf.d files, so these patterns are added beside it:
+//   * Ubuntu -updates  - regular bug-fix updates. Deliberately NOT -backports and
+//                        NOT -proposed. Phased updates are honoured by
+//                        unattended-upgrades, so a phased package waits its turn.
+//   * Tailscale        - a network-exposed daemon that should not wait for a person.
+// A pattern that matches no configured repository is a no-op.
+// Reboots are never done here; see the guarded-reboot job.
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Ubuntu,archive=${distro_codename}-updates,label=Ubuntu";
+        "origin=Tailscale,label=Tailscale";
+};
