@@ -80,7 +80,7 @@ this order. A guard that cannot be evaluated counts as applying (fail closed).
 | `load` | the 5-minute load average is above the maximum (default 0.75 x CPUs) |
 | `tty` | an interactive login was used within the last 60 minutes (`who -u`: idle `.` is active now, `HH:MM` is the idle time, `old` and `?` are ignored; a row that cannot be parsed defers) |
 | `peer:<name>` | a configured peer (`BROKKR_GUARDED_REBOOT_PEERS`) does not accept a TCP connection on port 22 within 5 seconds (bash `/dev/tcp` under `timeout`) |
-| `unlock` | a crypttab entry needed at boot (not `noauto`) does not unlock unattended: defers **and alerts** (an unattended reboot would hang at a prompt). An entry counts as unattended **only** if its key field is a key-file path, or its options contain `tpm2-device=` without `tpm2-pin=yes`. `fido2-device=`, `pkcs11-uri=`, `keyscript=`, any `*-pin=yes`, any `fido2-with-*`, `headless=false`, and an empty, `none` or `-` key without tpm2 are interactive (and outweigh a key-file path). Every such entry counts, not only the root volume |
+| `unlock` | an encrypted boot volume: any crypttab entry needed at boot (not `noauto`), the root volume or not. Nothing in crypttab proves that it unlocks unattended (a `tpm2-device=` may need a PIN or a changed PCR policy, a key-file path may sit on a volume that is itself locked), so **nothing is inferred**: the reboot is deferred **and an alert** ("encrypted boot volume: unattended unlock not owner-verified (ADR-009)") is sent, unless the owner has verified unattended unlock and deployed with `BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1`. Options that can prompt (`fido2-device=`, `pkcs11-uri=`, `keyscript=`, any `*-pin=yes`, any `fido2-with-*`, `headless=false`) stay a hard block **even when verified**, with their own alert |
 | `notify` | reboot mode only: the pre-reboot notice could not be delivered (see [the sequence](#the-reboot-sequence)) |
 | `eeprom-stage` | reboot mode only: the EEPROM update could not be staged |
 
@@ -156,11 +156,16 @@ ignoring only units that **start on demand**: `Type=dbus`, a non-empty `BusName=
 nothing, so a static long-running service that vanished is an issue.
 
 **The outcome is made durable in a fixed order.** The check appends `post-boot-ok` or
-`post-boot-issues` to the audit file *before* it persists the attempt status `ok` or `issues`
-(and the latch). If the append fails the attempt stays `unresolved` (exit 1) and the notices still
-go out; the next nightly check then latches it as "post-boot verification missing" instead of the
-host looking verified while no record says so. The check sends "back up: node-a kernel
-7.0.0-39-generic; health OK" or the issue list.
+`post-boot-issues` to the audit file *before* it persists the attempt status `ok` or `issues`. If
+the append fails the attempt stays `unresolved` (exit 1) and the notices still go out; the next
+nightly check then latches it as "post-boot verification missing" instead of the host looking
+verified while no record says so. **Observed issues are the exception**: they are persisted with the
+latch even when the append fails (the attempt still stays `unresolved`, and `status` shows them as
+"observed but not yet recorded"), so a later healthy retry cannot turn the attempt into a pass. Once
+the audit works, that retry records `post-boot-issues` (naming the earlier observation), sets the
+status `issues`, re-records the latching alert, and the latch stays until the owner runs
+`clear-latch`. The check sends "back up: node-a kernel 7.0.0-39-generic; health OK" or the issue
+list.
 
 **Issues latch automatic reboots off.** So do a reboot command that exits non-zero, an EEPROM
 update that could not be cancelled after an abort, and an unresolved attempt that is more than two
@@ -300,6 +305,7 @@ Rendered into the nightly unit by the deploy (the other two units carry only the
 | `BROKKR_GUARDED_REBOOT_MAX_LOAD` | 0.75 x `nproc` | highest 5-minute load average |
 | `BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN` | 60 | minutes; 0 disables the terminal guard |
 | `BROKKR_GUARDED_REBOOT_ALERT_AFTER` | 3 | consecutive deferred nights before the alert (1 to 365) |
+| `BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED` | `0` | `1` is the owner's word that every encrypted boot volume unlocks unattended (see the `unlock` guard); `0` or `1` only |
 
 Every value is validated; an invalid one is a usage error (exit 64). Exit 0 means normal (including
 deferred, report and no trigger); exit 1 is an internal failure (a state or audit write failure, an
@@ -325,13 +331,24 @@ non-symlink file owned by the operator that no one else can write, otherwise it 
 3. Redeploy with `BROKKR_GUARDED_REBOOT_MODE=reboot`. Reboot mode is the owner's explicit switch
    and states what report mode defaults: the deploy refuses it without an explicit
    `BROKKR_GUARDED_REBOOT_WINDOW` (there is no default window in reboot mode), without at least one
-   `BROKKR_GUARDED_REBOOT_PEERS` entry, and on a host with no notify configuration (the notify guard
-   would refuse every reboot). The nightly check itself also refuses reboot mode without a peer.
+   `BROKKR_GUARDED_REBOOT_PEERS` entry, without that peer's own `BROKKR_GUARDED_REBOOT_PEER_WINDOW`
+   (`HH:MM`) and `BROKKR_GUARDED_REBOOT_PEER_SPREAD` (minutes), and on a host with no notify
+   configuration (the notify guard would refuse every reboot). The nightly check itself also
+   refuses reboot mode without a peer.
 
 Stagger the windows so that a host and the host that monitors it never reboot together, and name
-the monitoring host as a peer. Keep each host's window plus its spread at least two hours clear of
-the other's: for example `node-a` at 02:00 with a 45 minute spread (it may start up to 02:45) and
-`node-b`, which monitors it, at 05:00, each naming the other as a peer.
+the monitoring host as a peer. The deploy checks it, locally and before any ssh: on the 24-hour
+circle this host runs in [window, window + spread] and the peer in [peer window, peer window +
+peer spread], and the end of each must be at least **120 minutes** before the start of the next,
+midnight included; closer, or overlapping, windows are refused. A peer must be another host: a
+peer equal to the deploy target, `localhost`, or (compared in the remote preflight, and again by the
+job at run time, case-insensitively) this host's short name or FQDN is refused. The peer's window and
+spread are what the owner states they are configured to; the deploy cannot read them from the peer.
+For example `node-a` at 02:00 with a 45 minute spread (it may start up to 02:45) and `node-b`, which
+monitors it, at 05:00 with 45 minutes, each naming the other as a peer (135 minutes between the end
+of one and the start of the other, and 1215 the other way round); `node-a` is deployed with
+`BROKKR_GUARDED_REBOOT_PEER_WINDOW=05:00 BROKKR_GUARDED_REBOOT_PEER_SPREAD=45` and `node-b` with
+`BROKKR_GUARDED_REBOOT_WINDOW=05:00 BROKKR_GUARDED_REBOOT_PEER_WINDOW=02:00`.
 
 ## Deploy
 
@@ -353,7 +370,11 @@ BROKKR_EXPECTED_SOURCE="$PWD" BROKKR_EXPECTED_COMMIT="<full-40-char-sha>" \
 BROKKR_GUARDED_REBOOT_MODE=reboot BROKKR_GUARDED_REBOOT_WINDOW=02:00 \
 BROKKR_GUARDED_REBOOT_SPREAD=45 \
 BROKKR_GUARDED_REBOOT_BUSY_UNITS=hugin.service BROKKR_GUARDED_REBOOT_PEERS=node-b.example \
+BROKKR_GUARDED_REBOOT_PEER_WINDOW=05:00 BROKKR_GUARDED_REBOOT_PEER_SPREAD=45 \
   scripts/deploy-guarded-reboot.sh --apply operator@node-a.example
+
+# A host with an encrypted boot volume that the owner has VERIFIED to unlock without a person
+# present adds BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1 (the deploy prints a prominent warning).
 ```
 
 `BROKKR_EXPECTED_COMMIT` must be the full SHA of the clean checkout at `BROKKR_EXPECTED_SOURCE`;
@@ -361,6 +382,8 @@ the payload is the committed archive of that revision, never the working tree. O
 validated locally before anything reaches ssh: `BROKKR_GUARDED_REBOOT_MODE`,
 `BROKKR_GUARDED_REBOOT_WINDOW` (`HH:MM`, default 03:30 in report mode only), `BROKKR_GUARDED_REBOOT_SPREAD`
 (minutes, 0 to 240, default 45), `BROKKR_GUARDED_REBOOT_BUSY_UNITS`, `BROKKR_GUARDED_REBOOT_PEERS`,
+`BROKKR_GUARDED_REBOOT_PEER_WINDOW` and `BROKKR_GUARDED_REBOOT_PEER_SPREAD` (required in reboot
+mode), `BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED` (`0` or `1`, default `0`, rendered into the unit),
 `BROKKR_GUARDED_REBOOT_MAX_LOAD`, `BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN` and
 `BROKKR_GUARDED_REBOOT_ALERT_AFTER`.
 
@@ -368,9 +391,10 @@ The remote preflight (also run by the dry-run) refuses unless the user is not ro
 Linux, lingering is enabled, `sudo -n true` works, the release for that SHA does not yet exist, no
 unit backup for it exists, and an existing `/var/lib/brokkr` is a real, world-searchable directory.
 It checks the notify configuration the way `scripts/lib/notify.sh` finds it (a warning in report
-mode, a refusal in reboot mode), reports the crypttab unlock assessment (the same rule as the
-`unlock` guard: volumes that would stop an unattended boot at a prompt) and, on a Pi, the state of
-the stock EEPROM service.
+mode, a refusal in reboot mode), refuses a peer that is this host itself (short name or FQDN),
+reports the crypttab unlock assessment (the same rule as the `unlock` guard: every encrypted boot
+volume is reported as not owner-verified, and options that can prompt as a hard block) and, on a
+Pi, the state of the stock EEPROM service.
 
 `--apply` stages the payload, checks its file count and types and that the job and the notify helper
 parse under the node's `bash`, creates the audit directories, saves any existing units as
@@ -421,10 +445,18 @@ file are evidence and stay in place. Rolling back does not undo a reboot that al
   `EXITCODE` matches the new run's exit status would be taken for the new answer if the privileged
   command died before writing; `/run` is cleared by every boot, so the post-boot check never sees
   an older file, and nightly runs are hours apart.
-- **Full-disk-encrypted hosts.** The `unlock` guard refuses to reboot a host whose volumes need a
-  passphrase at boot, and alerts once per episode. A boot-chain change can break TPM-bound unlock;
-  UEFI/BIOS and Secure Boot firmware stay detect-and-report only. Revisit this policy before the
-  inference node's root volume is encrypted without unattended unlock.
+- **Encrypted hosts.** The `unlock` guard infers nothing from crypttab: any encrypted boot volume
+  defers the reboot and alerts (once per episode) until the owner has verified unattended unlock
+  and deployed with `BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=1`, which is a statement about the host,
+  not something the job can check; a wrong one hangs the host at a passphrase prompt. A boot-chain
+  change can break TPM-bound unlock, and UEFI/BIOS and Secure Boot firmware stay detect-and-report
+  only. **Before adding disk encryption to a host, revisit this policy per ADR-009** (the inference
+  node's root volume in particular): until then the guard refuses to reboot it.
+- **Post-boot outcome records.** If the audit file cannot be appended when the post-boot check ends,
+  the attempt stays unresolved (exit 1). Observed issues are still persisted with the latch
+  (`attempt_observed` in the state; `status` shows them), so a later healthy retry records
+  `post-boot-issues` and keeps the latch; only `clear-latch` clears both. A healthy outcome that
+  could not be recorded leaves nothing behind and is simply redone.
 - **Kernel flavours that share a suffix.** Matching uses the shared flavour rule above; a kernel
   whose release does not fit the version pattern has no flavour and is reported as "kernel status
   unknown" instead of being compared.

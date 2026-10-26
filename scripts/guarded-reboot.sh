@@ -40,6 +40,7 @@ usage_text() {
   echo "       BROKKR_GUARDED_REBOOT_BUSY_UNITS (space-separated systemd user .service units),"
   echo "       BROKKR_GUARDED_REBOOT_MAX_LOAD (default 0.75 x CPUs), BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN (60),"
   echo "       BROKKR_GUARDED_REBOOT_ALERT_AFTER (3), BROKKR_GUARDED_REBOOT_PEERS (hosts that must answer on port 22),"
+  echo "       BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED (0 or 1, default 0: the owner verified unattended unlock of every encrypted boot volume),"
   echo "       BROKKR_STATE_DIR (default \${XDG_STATE_HOME:-~/.local/state}/brokkr)"
 }
 usage() { usage_text >&2; exit 64; }
