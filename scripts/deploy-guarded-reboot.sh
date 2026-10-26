@@ -104,6 +104,13 @@ for PEER_WORD in $PEERS_RAW; do
   [[ "$PEER_WORD" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "invalid BROKKR_GUARDED_REBOOT_PEERS entry (a host name is required)"
   PEERS="${PEERS:+$PEERS }$PEER_WORD"
 done
+# Reboot mode is the owner's explicit switch and it needs both of these stated, not defaulted: a
+# window chosen for this host (so it never reboots together with the host that monitors it), and at
+# least one peer that must be reachable first (normally that monitoring host).
+if [[ "$GR_MODE" == reboot ]]; then
+  [[ -n "${BROKKR_GUARDED_REBOOT_WINDOW:-}" ]] || die "reboot mode needs an explicit BROKKR_GUARDED_REBOOT_WINDOW (there is no default window in reboot mode); stagger the windows, with spread, at least two hours apart"
+  [[ -n "$PEERS" ]] || die "reboot mode needs BROKKR_GUARDED_REBOOT_PEERS (at least one host that must be reachable before this host reboots, normally the host that monitors it)"
+fi
 
 # Only what the job needs. The units are shipped as templates and rendered on the node, where the
 # runtime home is known.
@@ -157,8 +164,11 @@ command -v bash >/dev/null 2>&1 || refuse "bash is required (the job runs under 
 sudo -n true </dev/null >/dev/null 2>&1 || refuse "passwordless sudo is required (sudo -n true failed): the job appends to the root-owned audit file and runs the reboot through sudo"
 # The audit directories must be searchable by an unprivileged reader (the daily maintenance report
 # reads the audit file as another user). An existing /var/lib/brokkr is never chmod-ed: it is
-# verified, and a closed one is refused.
-audit_parent=${BROKKR_AUDIT_PARENT:-}
+# verified, and a closed one is refused. The directories the privileged install creates are the
+# constants /var/lib/brokkr and /var/lib/brokkr/guarded-reboot: no environment variable changes an
+# argument of a sudo call. audit_parent below is only where the UNPRIVILEGED checks look (a test
+# seam, the same path in production).
+audit_parent=${BROKKR_AUDIT_PARENT_PROBE:-}
 if [ -z "$audit_parent" ]; then audit_parent=/var/lib/brokkr; fi
 safe_path "$audit_parent" || refuse "the audit parent directory is not an absolute plain path"
 audit_dir=$audit_parent/guarded-reboot
@@ -212,9 +222,11 @@ elif [ "$GR_MODE" = reboot ]; then
 else
   echo "preflight: WARN: no notify configuration found; report mode runs without alerts, but reboot mode would be refused until one exists (see scripts/lib/notify.env.example)"
 fi
-# Unlock assessment: a crypttab entry needed at boot (not noauto) with no key and no unattended
-# unlock option would stop an unattended reboot at a passphrase prompt; the job's unlock guard
-# defers and alerts for it.
+# Unlock assessment (the same rule as the job's unlock guard): a crypttab entry needed at boot (not
+# noauto) is unattended only if its key field is a key-file path or its options hold tpm2-device=
+# without tpm2-pin=yes. fido2-device=, pkcs11-uri=, keyscript=, any *-pin=yes, fido2-with-*,
+# headless=false, or an empty/none key without tpm2 would stop an unattended reboot at a prompt;
+# the job's unlock guard defers and alerts for it.
 crypttab=${BROKKR_CRYPTTAB:-}
 if [ -z "$crypttab" ]; then crypttab=/etc/crypttab; fi
 if [ ! -e "$crypttab" ]; then
@@ -229,15 +241,21 @@ else
       key = (NF >= 3) ? $3 : "none"
       opts = (NF >= 4) ? $4 : ""
       n = split(opts, o, ",")
-      noauto = 0; unattended = 0
+      noauto = 0; interactive = 0; tpm2 = 0
       for (k = 1; k <= n; k++) {
         if (o[k] == "noauto") noauto = 1
-        if (o[k] ~ /^(tpm2-device|fido2-device|pkcs11-uri|keyscript)=/) unattended = 1
+        if (o[k] ~ /^(fido2-device|pkcs11-uri|keyscript)=/) interactive = 1
+        if (o[k] ~ /-pin=yes$/) interactive = 1
+        if (o[k] ~ /^fido2-with-/) interactive = 1
+        if (o[k] == "headless=false") interactive = 1
+        if (o[k] ~ /^tpm2-device=/) tpm2 = 1
       }
       if (noauto) next
-      if (key != "none" && key != "-" && key != "") next
-      if (unattended) next
-      print $1
+      unattended = 0
+      if (key ~ /^\//) unattended = 1
+      if (tpm2) unattended = 1
+      if (interactive) unattended = 0
+      if (!unattended) print $1
     }' "$crypttab" | head -n 8 | tr '\n' ' ')
   if [ -z "$names" ]; then
     echo "preflight: unlock assessment: every volume in $crypttab unlocks unattended or is noauto"
@@ -271,6 +289,7 @@ enabled_timers=""
 eeprom_disabled=0
 audit_dir_done=0
 job_ran=0
+prior_states=""
 stage=
 tmp_backups=
 has_word() { case " $1 " in *" $2 "*) return 0 ;; esac; return 1; }
@@ -295,9 +314,25 @@ print_state() {
   done
   if [ -n "$replaced_units" ]; then
     echo "  systemctl --user daemon-reload"
+    # Each timer that had a previous unit gets back exactly the enabled and active state it was
+    # captured in before this run: enable --now only if it was both, never for one that was off.
     for unit in $TIMERS; do
       if has_word "$replaced_units" "$unit" && [ -e "$unit_dir/$unit.previous-$REVISION" ]; then
-        echo "  systemctl --user enable --now $unit   # restore the previous schedule"
+        p_en=unknown; p_ac=unknown
+        set -f
+        for entry in $(printf '%s' "$prior_states" | tr ' ' ',' | tr '\n' ' '); do
+          case $entry in "$unit",*) rest=${entry#*,}; p_en=${rest%%,*}; p_ac=${rest#*,} ;; esac
+        done
+        set +f
+        if [ "$p_en" = enabled ] && [ "$p_ac" = active ]; then
+          echo "  systemctl --user enable --now $unit   # it was enabled and active before this run"
+        elif [ "$p_en" = enabled ]; then
+          echo "  systemctl --user enable $unit   # it was enabled but not active before this run: leave it stopped"
+        elif [ "$p_ac" = active ]; then
+          echo "  systemctl --user start $unit   # it was active but not enabled before this run"
+        else
+          echo "  # $unit was $p_en and $p_ac before this run: it stays disabled and stopped"
+        fi
       fi
     done
   fi
@@ -344,12 +379,22 @@ done
 if grep -Eq '@[A-Z_]+@' "$stage"/brokkr-*.service "$stage"/brokkr-*.timer; then refuse "unit template has an unrendered placeholder"; fi
 if [ -e "$release" ] || [ -L "$release" ]; then refuse "release already exists for revision $REVISION"; fi
 # The audit directory: root-owned, mode 0755, created under umask 022 so a new parent is searchable too.
-# An existing parent was verified by the preflight and is not touched.
+# An existing parent was verified by the preflight and is not touched. The sudo arguments are the
+# constant paths; nothing in the environment changes them.
 if [ -d "$audit_parent" ]; then
-  (umask 022; sudo -n install -d -m 0755 "$audit_dir" </dev/null) || refuse "could not create the audit directory $audit_dir"
+  (umask 022; sudo -n install -d -m 0755 /var/lib/brokkr/guarded-reboot </dev/null) || refuse "could not create the audit directory $audit_dir"
 else
-  (umask 022; sudo -n install -d -m 0755 "$audit_parent" "$audit_dir" </dev/null) || refuse "could not create the audit directory $audit_dir"
+  (umask 022; sudo -n install -d -m 0755 /var/lib/brokkr /var/lib/brokkr/guarded-reboot </dev/null) || refuse "could not create the audit directory $audit_dir"
 fi
+# The enabled and active state of every timer exactly as it is before this run replaces anything, so
+# the rollback restores each one as it was (never starting or enabling what was off).
+prior_states=""
+for timer in $TIMERS; do
+  p_en=$(systemctl --user is-enabled "$timer" 2>/dev/null | head -n 1 | tr -d '\n' | tr -c 'A-Za-z-' '?' || true)
+  p_ac=$(systemctl --user is-active "$timer" 2>/dev/null | head -n 1 | tr -d '\n' | tr -c 'A-Za-z-' '?' || true)
+  prior_states="$prior_states$timer ${p_en:-unknown} ${p_ac:-unknown}
+"
+done
 audit_dir_done=1
 echo "audit directory $audit_dir is in place"
 mkdir -p "$unit_dir"
