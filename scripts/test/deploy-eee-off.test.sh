@@ -493,7 +493,10 @@ check "apply with the ad-hoc unit present succeeds" '[[ "$RC" -eq 0 && "$OUT" ==
 check "the managed template is installed with the pinned ethtool and revision" 'grep -Fxq "ExecStart=$BIN/ethtool --set-eee %i eee off" "$MANAGED" && grep -q "$SHA" "$MANAGED" && ! grep -Eq "@[A-Z_]+@" "$MANAGED"'
 check "the managed template is wanted by the interface device and by multi-user.target" 'grep -Fxq "WantedBy=sys-subsystem-net-devices-%i.device multi-user.target" "$MANAGED"'
 check "the managed template carries a start limit" 'grep -Fxq "StartLimitBurst=5" "$MANAGED"'
-check "both templates bound how long a boot waits for the device" 'grep -Eq "^JobTimeoutSec=[0-9]+s$" "$MANAGED" && grep -Eq "^JobTimeoutSec=[0-9]+s$" "$WATCH_TEMPLATE"'
+# A unit-wide job timeout would also count the wait behind basic.target, so a slow
+# boot (a long fsck) would cancel both jobs and leave EEE on. The device job's own
+# timeout (DefaultDeviceTimeoutSec=) bounds the wait for a missing interface.
+check "neither template sets a job timeout that a slow boot could expire" '! grep -Eq "^Job(Running)?TimeoutSec=" "$MANAGED" && ! grep -Eq "^Job(Running)?TimeoutSec=" "$WATCH_TEMPLATE"'
 check "the managed instance is enabled and active" '[[ -e "$STATE/enabled.$INSTANCE" && -e "$STATE/active.$INSTANCE" ]]'
 check "the managed instance is wanted by the interface device" '[[ -L "$UNIT_DIR/sys-subsystem-net-devices-eth0.device.wants/$INSTANCE" ]]'
 check "the watcher template is installed rendered with the revision and pinned paths" '[[ -f "$WATCH_TEMPLATE" ]] && ! grep -Eq "@[A-Z_]+@" "$WATCH_TEMPLATE" && grep -Fq "$SHA" "$WATCH_TEMPLATE" && grep -Fq "$BIN/ip -o monitor link" "$WATCH_TEMPLATE" && grep -Fq "$BIN/ethtool" "$WATCH_TEMPLATE"'
