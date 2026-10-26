@@ -93,7 +93,7 @@ trigger is fragile:
   and a device that already has a start job pulls its wants into that job instead.
 - `sys-subsystem-net-devices-<iface>.device` is a separate alias unit, created
   from `ENV{SYSTEMD_ALIAS}` in `99-systemd.rules` with the interface's name at that
-  moment. A predictable name such as `eno1` is a udev rename of the kernel's
+  moment. A predictable name such as `enp1s0` is a udev rename of the kernel's
   `eth0`, which arrives as a `move` uevent and creates the new alias unit. A
   stale `eth0` alias unit after such a rename is a known systemd bug
   ([systemd#43767](https://github.com/systemd/systemd/issues/43767)).
