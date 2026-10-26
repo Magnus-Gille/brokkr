@@ -19,6 +19,12 @@ On an Ubuntu host the distribution's `20auto-upgrades` and `50unattended-upgrade
 overwritten. The script only verifies that the host's `20auto-upgrades` enables
 `APT::Periodic::Unattended-Upgrade "1"` and fails that host if it does not.
 
+The two `52brokkr-*` regular-update drop-ins are **not** pushed by OS family alone. ADR-009
+approves regular updates on named hosts only, so the script pushes a `52brokkr-*` drop-in only to
+hosts listed in `BROKKR_REGULAR_UPDATE_HOSTS` (see "Applying changes"). Every other host gets its
+security baseline only (Debian-family: `20`, `50`, `51`; Ubuntu: `51` beside the distribution's own
+files), and a `52brokkr-*` drop-in already present there is removed and reported.
+
 ## Policy summary (ADR-009)
 
 - **Security baseline plus regular updates, applied unattended.** `50unattended-upgrades` stays the
@@ -40,7 +46,7 @@ overwritten. The script only verifies that the host's `20auto-upgrades` enables
     instead, which deliberately leaves apt-owned installs alone (see `../docs/agent-cli-update.md`).
   - Every vendor repository is matched by exact origin, label and codename / channel; an unlisted
     channel is never admitted. A pattern that matches no configured repository is a no-op, so one
-    drop-in serves every host of its OS family. Phased updates are honoured; nothing is
+    drop-in serves every approved host of its OS family. Phased updates are honoured; nothing is
     downgraded.
 - **No reboot by unattended-upgrades.** `Automatic-Reboot` stays `"false"` everywhere. A reboot is
   done only by Brokkr's guarded-reboot job (workload, load and session guards, post-boot check,
@@ -76,6 +82,15 @@ with the origins above.
 
 A node that is not one of the registry's deploy hosts (for example an Ubuntu inference node) is
 patched by naming it explicitly, with `DEPLOY_USER` set to a user that has NOPASSWD sudo there.
+
+**Approved hosts.** `BROKKR_REGULAR_UPDATE_HOSTS` is a whitespace-separated list of the hosts
+approved for regular updates. It is empty by default and is read from the operator's runtime
+environment; real host IDs are never committed to this repository. An ID matches the host as given
+on the command line or in the registry, the same without `.local`, or its short name. IDs may use
+letters, digits, dot, underscore and hyphen only; any other entry aborts the run with exit 2 before
+a host is touched (a typo must not silently strip regular updates from an approved host). The run
+reports the decision per host ("regular updates: enabled" or "not enabled"), `--dry-run` shows it
+too (including a stale drop-in it would remove), and the per-host summary line repeats it.
 
 ## Runtime coupling
 

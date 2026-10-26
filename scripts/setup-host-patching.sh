@@ -6,13 +6,23 @@
 # Idempotent: safe to re-run. Per host it first detects the OS over the same SSH
 # path (/etc/os-release ID / ID_LIKE) and pushes only the files that fit it:
 #   * Debian family (debian, raspbian, or ID_LIKE debian without ubuntu):
-#     20auto-upgrades, 50unattended-upgrades (security baseline),
-#     51brokkr-claude-code and 52brokkr-debian-updates.
+#     20auto-upgrades, 50unattended-upgrades (security baseline) and
+#     51brokkr-claude-code, plus 52brokkr-debian-updates on approved hosts.
 #   * Ubuntu: NEVER overwrites the distribution's 20auto-upgrades or
-#     50unattended-upgrades; pushes only 51brokkr-claude-code and
-#     52brokkr-ubuntu-updates, and fails the host if the distribution's
-#     20auto-upgrades does not enable APT::Periodic::Unattended-Upgrade "1".
+#     50unattended-upgrades; pushes 51brokkr-claude-code, plus
+#     52brokkr-ubuntu-updates on approved hosts, and fails the host if the
+#     distribution's 20auto-upgrades does not enable
+#     APT::Periodic::Unattended-Upgrade "1".
 #   * Anything else: the host fails and nothing is changed on it.
+#
+# Regular updates (the 52brokkr-* drop-in) are owner-approved per host, not per OS
+# family (ADR-009): BROKKR_REGULAR_UPDATE_HOSTS is a whitespace-separated list of
+# the approved hosts, matched against the host as given, without ".local", or its
+# short name; letters, digits, dot, underscore and hyphen only. It is empty by
+# default and is read from the operator's runtime environment; real IDs are never
+# committed. An invalid entry aborts the run (exit 2) before any host is touched.
+# A host that is not listed gets only its security baseline, and a 52brokkr-*
+# drop-in already present there is removed (sudo rm -f) and reported.
 # It also installs unattended-upgrades + needrestart, enables the stock apt-daily
 # timers, validates with `unattended-upgrade --dry-run`, and prints the effective
 # "Allowed origins" line so the operator sees what will really be applied.
@@ -64,6 +74,36 @@ for f in 20auto-upgrades 50unattended-upgrades 51brokkr-claude-code \
          52brokkr-debian-updates 52brokkr-ubuntu-updates; do
   [[ -f "$APT_DIR/$f" ]] || { echo -e "${RED}Missing apt config $APT_DIR/$f${NC}" >&2; exit 1; }
 done
+
+# ─── Hosts approved for regular updates (ADR-009) ────────────────────────────
+# Validated before any host is contacted: ignoring a bad entry would silently
+# strip regular updates (and remove the drop-in) from the host it was meant to
+# approve, so an invalid entry fails closed. The entry text is not echoed.
+REGULAR_HOSTS=()
+id_re='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+regular_raw="$(printf '%s' "${BROKKR_REGULAR_UPDATE_HOSTS:-}" | tr -s '[:space:]' ' ')"
+if [[ -n "${regular_raw// /}" ]]; then
+  read -r -a regular_list <<<"$regular_raw"
+  for regular_id in "${regular_list[@]}"; do
+    if [[ "$regular_id" =~ $id_re ]]; then
+      REGULAR_HOSTS+=("$regular_id")
+    else
+      echo -e "${RED}BROKKR_REGULAR_UPDATE_HOSTS has an invalid entry (letters, digits, dot, underscore, hyphen only) — nothing changed${NC}" >&2
+      exit 2
+    fi
+  done
+fi
+
+# host_is_regular HOST: is HOST approved for regular updates? Matches the host as
+# given, without .local, or its short name.
+host_is_regular() {
+  local host="$1" id
+  [[ ${#REGULAR_HOSTS[@]} -gt 0 ]] || return 1
+  for id in "${REGULAR_HOSTS[@]}"; do
+    [[ "$id" == "$host" || "$id" == "${host%.local}" || "$id" == "${host%%.*}" ]] && return 0
+  done
+  return 1
+}
 
 # ─── Derive unique deploy hosts from services.json ───────────────────────────
 # (portable: no mapfile — this script runs on the macOS laptop / bash 3.2)
@@ -118,13 +158,21 @@ detect_os() {
   echo unknown
 }
 
-# The files Brokkr owns per OS family (names under apt/ and /etc/apt/apt.conf.d/).
-files_for_os() {
+# The files Brokkr pushes per OS family (names under apt/ and /etc/apt/apt.conf.d/):
+# the security baseline for every host, plus the 52brokkr drop-in on approved hosts.
+files_for_os() {  # os_family regular(true|false)
+  local extra=""
   case "$1" in
-    debian) echo "20auto-upgrades 50unattended-upgrades 51brokkr-claude-code 52brokkr-debian-updates" ;;
-    ubuntu) echo "51brokkr-claude-code 52brokkr-ubuntu-updates" ;;
+    debian)
+      if [[ "$2" == true ]]; then extra=" 52brokkr-debian-updates"; fi
+      echo "20auto-upgrades 50unattended-upgrades 51brokkr-claude-code$extra" ;;
+    ubuntu)
+      if [[ "$2" == true ]]; then extra=" 52brokkr-ubuntu-updates"; fi
+      echo "51brokkr-claude-code$extra" ;;
   esac
 }
+# Every regular-update drop-in Brokkr ever installed; any that is not wanted is removed.
+ALL_REGULAR_DROPINS="52brokkr-debian-updates 52brokkr-ubuntu-updates"
 
 results=()
 fail_count=0
@@ -148,17 +196,37 @@ for host in "${HOSTS[@]}"; do
     fail_count=$((fail_count + 1))
     continue
   fi
-  files="$(files_for_os "$os_family")"
+  regular=false
+  host_is_regular "$host" && regular=true
+  files="$(files_for_os "$os_family" "$regular")"
   echo "  OS: $os_family"
+  if $regular; then
+    echo "  regular updates: enabled (host is listed in BROKKR_REGULAR_UPDATE_HOSTS)"
+    update_mode="regular updates"
+  else
+    echo "  regular updates: not enabled (host is not listed in BROKKR_REGULAR_UPDATE_HOSTS); security baseline only"
+    update_mode="security baseline"
+  fi
+  # Brokkr regular-update drop-ins this host must not have: all of them except the
+  # one it is approved for. Anything present is removed (a stale drop-in would
+  # keep applying regular updates on an unapproved host).
+  unwanted=""
+  for f in $ALL_REGULAR_DROPINS; do
+    [[ " $files " == *" $f "* ]] || unwanted+="${unwanted:+ }$f"
+  done
 
   if $DRY_RUN; then
+    for f in $unwanted; do
+      rc=0; ssh "$remote" "[ -e /etc/apt/apt.conf.d/$f ]" || rc=$?
+      if [[ "$rc" -eq 0 ]]; then echo "  would: remove $f (present; not approved for this host)"; fi
+    done
     echo "  would: apt-get install -y unattended-upgrades needrestart"
     if [[ "$os_family" == ubuntu ]]; then
       echo "  would: verify the distribution's 20auto-upgrades enables APT::Periodic::Unattended-Upgrade \"1\" (never overwritten)"
     fi
     echo "  would: push ${files// / + } to /etc/apt/apt.conf.d/"
     echo "  would: enable apt-daily.timer apt-daily-upgrade.timer; validate with --dry-run"
-    results+=("${YELLOW}?${NC} $host ($os_family, dry-run)")
+    results+=("${YELLOW}?${NC} $host ($os_family, $update_mode, dry-run)")
     continue
   fi
 
@@ -188,7 +256,28 @@ for host in "${HOSTS[@]}"; do
     continue
   fi
 
-  # 3. Push the version-controlled config (cat → sudo tee, NOPASSWD).
+  # 3. Remove any Brokkr regular-update drop-in this host is not approved for
+  #    (existence is checked first so the run can say what it removed).
+  for f in $unwanted; do
+    rc=0; ssh "$remote" "[ -e /etc/apt/apt.conf.d/$f ]" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      if ssh "$remote" "sudo rm -f /etc/apt/apt.conf.d/$f"; then
+        echo "  removed $f (not approved for this host)"
+      else
+        echo -e "  ${RED}failed to remove $f${NC}"
+        results+=("${RED}✗${NC} $host (stale drop-in removal)")
+        fail_count=$((fail_count + 1))
+        continue 2
+      fi
+    elif [[ "$rc" -ne 1 ]]; then
+      echo -e "  ${RED}could not check for $f (ssh rc=$rc)${NC}"
+      results+=("${RED}✗${NC} $host (stale drop-in check)")
+      fail_count=$((fail_count + 1))
+      continue 2
+    fi
+  done
+
+  # 4. Push the version-controlled config (cat → sudo tee, NOPASSWD).
   echo "  syncing apt config (${files// /, })…"
   push_ok=true
   for f in $files; do
@@ -203,7 +292,7 @@ for host in "${HOSTS[@]}"; do
     continue
   fi
 
-  # 4. Ensure the stock timers are enabled (idempotent). These drive the
+  # 5. Ensure the stock timers are enabled (idempotent). These drive the
   #    actual unattended-upgrade runs, so a failure here is a real failure.
   if ! ssh "$remote" "sudo systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1"; then
     echo -e "  ${RED}failed to enable apt timers${NC}"
@@ -212,7 +301,7 @@ for host in "${HOSTS[@]}"; do
     continue
   fi
 
-  # 5. Validate the config parses and origins resolve — the confirmation that
+  # 6. Validate the config parses and origins resolve — the confirmation that
   #    this host will actually apply the intended upgrades — and show the
   #    effective origins. A failure counts.
   echo "  validating…"
@@ -220,7 +309,7 @@ for host in "${HOSTS[@]}"; do
     origins="$(printf '%s\n' "$uu_out" | grep -i -m1 'allowed origins' || true)"
     echo "  ${origins:-Allowed origins: (no such line in unattended-upgrade -d output)}"
     echo -e "  ${GREEN}OK${NC}"
-    results+=("${GREEN}✓${NC} $host ($os_family)")
+    results+=("${GREEN}✓${NC} $host ($os_family, $update_mode)")
   else
     printf '%s\n' "$uu_out" | tail -n 5 | sed 's/^/    /'
     echo -e "  ${RED}validation failed (unattended-upgrade --dry-run) — check journalctl${NC}"

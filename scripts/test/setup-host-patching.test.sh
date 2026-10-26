@@ -78,7 +78,7 @@ OUT=""; RC=0
 run() { # args...  (env MOCK_* set by the caller via export)
   : >"$CALLS"
   OUT="$(env PATH="$BIN:$PATH" DEPLOY_USER=tester MOCK_CALLS="$CALLS" MOCK_ROOTS="$ROOTS" MOCK_RBIN="$RBIN" \
-    REGISTRY_PATH="$TMP/no-registry.json" bash "$ROOT/scripts/setup-host-patching.sh" "$@" 2>&1)"; RC=$?
+    REGISTRY_PATH="${TEST_REGISTRY:-$TMP/no-registry.json}" bash "$ROOT/scripts/setup-host-patching.sh" "$@" 2>&1)"; RC=$?
 }
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$1"; }
@@ -87,6 +87,11 @@ check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 DEBIAN_SET="20auto-upgrades 50unattended-upgrades 51brokkr-claude-code 52brokkr-debian-updates"
 UBUNTU_SET="20auto-upgrades 50unattended-upgrades 51brokkr-claude-code 52brokkr-ubuntu-updates"
+# The security baseline a host NOT approved for regular updates gets (Ubuntu: its own 20/50 + 51).
+SECURITY_SET="20auto-upgrades 50unattended-upgrades 51brokkr-claude-code"
+# ADR-009 approves regular updates on named hosts only. The hosts below are the ones the tests
+# that expect the 52 drop-in are approved for (placeholder names; real IDs are runtime env only).
+export BROKKR_REGULAR_UPDATE_HOSTS="debian raspbian derivative ubu good dr-deb dr-ubu"
 
 echo "setup-host-patching.test.sh"
 
@@ -198,6 +203,83 @@ make_host dr-odd alpine "" -
 run --dry-run dr-odd
 check "dry-run unknown OS: fails the host and changes nothing" '[[ "$RC" -ne 0 && "$OUT" == *"unsupported OS"* && -z "$(written dr-odd)" && -z "$(actions dr-odd)" ]]'
 check "dry-run never calls tee, a package manager or systemctl over ssh" '! grep -E "tee |apt-get|systemctl" "$CALLS"'
+
+# ── Regular updates only on approved hosts (BROKKR_REGULAR_UPDATE_HOSTS) ─────
+# Unlisted hosts get the security baseline only and lose a stale 52brokkr drop-in.
+STALE=$'// stale Brokkr regular-update drop-in\n'
+stale_52() { # host: both 52 files present
+  printf '%s' "$STALE" >"$(conf "$1")/52brokkr-debian-updates"
+  printf '%s' "$STALE" >"$(conf "$1")/52brokkr-ubuntu-updates"
+}
+
+make_host unl-deb debian "" -
+BROKKR_REGULAR_UPDATE_HOSTS="someone-else" run unl-deb
+check "unlisted Debian host: succeeds with the security baseline only" '[[ "$RC" -eq 0 && "$(written unl-deb)" == "$SECURITY_SET" ]]'
+check "unlisted Debian host: says regular updates are not enabled" '[[ "$OUT" == *"regular updates: not enabled"* ]]'
+make_host lst-deb debian "" -
+BROKKR_REGULAR_UPDATE_HOSTS="someone-else lst-deb" run lst-deb
+check "listed Debian host (one of several IDs): gets the Debian regular-update drop-in" '[[ "$RC" -eq 0 && "$(written lst-deb)" == "$DEBIAN_SET" && "$OUT" == *"regular updates: enabled"* ]]'
+
+make_host unl-ubu ubuntu debian "$GOOD_AUTO"
+BROKKR_REGULAR_UPDATE_HOSTS="someone-else" run unl-ubu
+check "unlisted Ubuntu host: only 51 beside the distribution files" '[[ "$RC" -eq 0 && "$(written unl-ubu)" == "$SECURITY_SET" && ! -e "$(conf unl-ubu)/52brokkr-ubuntu-updates" ]]'
+check "unlisted Ubuntu host: distribution files untouched" 'same_file "$TMP/expect50" "$(conf unl-ubu)/50unattended-upgrades" && same_file "$TMP/expect20" "$(conf unl-ubu)/20auto-upgrades"'
+make_host lst-ubu ubuntu debian "$GOOD_AUTO"
+BROKKR_REGULAR_UPDATE_HOSTS="lst-ubu" run lst-ubu
+check "listed Ubuntu host: gets the Ubuntu regular-update drop-in" '[[ "$RC" -eq 0 && "$(written lst-ubu)" == "$UBUNTU_SET" ]]'
+
+make_host stale-deb debian "" -; stale_52 stale-deb
+BROKKR_REGULAR_UPDATE_HOSTS="someone-else" run stale-deb
+check "unlisted host with stale 52 drop-ins: both are removed" '[[ "$RC" -eq 0 && "$(written stale-deb)" == "$SECURITY_SET" ]]'
+check "unlisted host with stale 52 drop-ins: the run says so" \
+  '[[ "$OUT" == *"removed 52brokkr-debian-updates"* && "$OUT" == *"removed 52brokkr-ubuntu-updates"* ]]'
+check "unlisted host with stale 52 drop-ins: removal is a sudo rm -f of exactly those files" \
+  'grep -F "sudo rm -f /etc/apt/apt.conf.d/52brokkr-debian-updates" "$CALLS" | grep -q . && ! grep -E "rm -f [^ ]*[*]" "$CALLS"'
+make_host stale-ubu ubuntu debian "$GOOD_AUTO"; stale_52 stale-ubu
+BROKKR_REGULAR_UPDATE_HOSTS="" run stale-ubu
+check "unlisted Ubuntu host with stale 52 drop-ins: removed, baseline kept" '[[ "$RC" -eq 0 && "$(written stale-ubu)" == "$SECURITY_SET" ]]'
+
+make_host stale-listed debian "" -; printf '%s' "$STALE" >"$(conf stale-listed)/52brokkr-ubuntu-updates"
+BROKKR_REGULAR_UPDATE_HOSTS="stale-listed" run stale-listed
+check "listed host: the other OS family's stale drop-in is removed, its own is current" \
+  '[[ "$RC" -eq 0 && "$(written stale-listed)" == "$DEBIAN_SET" && "$OUT" == *"removed 52brokkr-ubuntu-updates"* ]] && same_file "$ROOT/apt/52brokkr-debian-updates" "$(conf stale-listed)/52brokkr-debian-updates"'
+
+make_host empty-set debian "" -; stale_52 empty-set
+BROKKR_REGULAR_UPDATE_HOSTS="" run empty-set
+check "empty setting: no host gets regular updates and stale ones go" '[[ "$RC" -eq 0 && "$(written empty-set)" == "$SECURITY_SET" ]]'
+make_host unset-set debian "" -
+( unset BROKKR_REGULAR_UPDATE_HOSTS; run unset-set; printf '%s\n%s\n' "$RC" "$(written unset-set)" >"$TMP/unset.out" )
+check "unset setting behaves like an empty one" '[[ "$(sed -n 1p "$TMP/unset.out")" == 0 && "$(sed -n 2p "$TMP/unset.out")" == "$SECURITY_SET" ]]'
+
+# An invalid entry fails closed before any host is contacted: ignoring it would silently strip
+# regular updates (and the drop-in) from the host it was meant to approve.
+make_host inv debian "" -
+BROKKR_REGULAR_UPDATE_HOSTS='inv bad;$(id)' run inv
+check "invalid entry: exits 2 before contacting any host" '[[ "$RC" -eq 2 && ! -s "$CALLS" && -z "$(written inv)" ]]'
+check "invalid entry: says so without echoing it" '[[ "$OUT" == *"BROKKR_REGULAR_UPDATE_HOSTS has an invalid entry"* && "$OUT" != *"bad;"* ]]'
+
+# Matching: the host as given, without .local, or its short name.
+make_host box.local debian "" -
+BROKKR_REGULAR_UPDATE_HOSTS="box" run box.local
+check "an ID matches the host given with .local" '[[ "$RC" -eq 0 && "$(written box.local)" == "$DEBIAN_SET" ]]'
+make_host reg-a debian "" -; make_host reg-b debian "" -
+cat >"$TMP/registry.json" <<'JSON'
+{"components":[{"name":"a","repo":"a","host":"reg-a","deploy":true},{"name":"b","repo":"b","host":"reg-b","deploy":true}]}
+JSON
+TEST_REGISTRY="$TMP/registry.json" BROKKR_REGULAR_UPDATE_HOSTS="reg-a" run
+check "registry-derived host list: only the listed registry host gets regular updates" \
+  '[[ "$RC" -eq 0 && "$(written reg-a)" == "$DEBIAN_SET" && "$(written reg-b)" == "$SECURITY_SET" ]]'
+
+# --dry-run shows the decision per host and changes nothing (stale files are only reported).
+make_host dr-lst debian "" -; make_host dr-unl debian "" -; stale_52 dr-unl
+BROKKR_REGULAR_UPDATE_HOSTS="dr-lst" run --dry-run dr-lst dr-unl
+check "dry-run: listed host decision and push list" \
+  '[[ "$OUT" == *"regular updates: enabled"* && "$OUT" == *"would: push 20auto-upgrades + 50unattended-upgrades + 51brokkr-claude-code + 52brokkr-debian-updates to"* ]]'
+check "dry-run: unlisted host decision, baseline-only push list" \
+  '[[ "$OUT" == *"regular updates: not enabled"* && "$OUT" == *"would: push 20auto-upgrades + 50unattended-upgrades + 51brokkr-claude-code to"* ]]'
+check "dry-run: reports the stale drop-ins it would remove, and removes nothing" \
+  '[[ "$OUT" == *"would: remove 52brokkr-debian-updates"* && "$OUT" == *"would: remove 52brokkr-ubuntu-updates"* && "$(written dr-unl)" == "52brokkr-debian-updates 52brokkr-ubuntu-updates" && -z "$(written dr-lst)" ]]'
+check "dry-run: no rm, tee, package manager or systemctl over ssh" '! grep -E "rm -f|tee |apt-get|systemctl" "$CALLS"'
 
 # ── The policy files themselves (ADR-009: exact vendor channels, no reboot) ──
 # patterns FILE: the quoted origin patterns of a drop-in, one per line, comments ignored.
