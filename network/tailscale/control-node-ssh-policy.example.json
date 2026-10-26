@@ -1,0 +1,34 @@
+{
+  "hosts": {
+    "control-node": "__BROKKR_CONTROL_NODE_ADDRESS__",
+    "control-node-operator-device": "__BROKKR_OPERATOR_ADDRESS__",
+    "control-node-peer-deny-probe": "__BROKKR_PEER_DENY_PROBE_ADDRESS__"
+  },
+  "grants": [
+    {
+      "src": ["control-node-operator-device"],
+      "dst": ["control-node"],
+      "ip": ["tcp:22"]
+    }
+  ],
+  "ssh": [],
+  "tests": [
+    {
+      "src": "control-node-operator-device",
+      "proto": "tcp",
+      "accept": ["control-node:22"]
+    }
+  ],
+  "sshTests": [
+    {
+      "src": "control-node-operator-device",
+      "dst": ["control-node"],
+      "deny": ["root", "operator"]
+    },
+    {
+      "src": "control-node-peer-deny-probe",
+      "dst": ["control-node"],
+      "deny": ["root", "operator"]
+    }
+  ]
+}

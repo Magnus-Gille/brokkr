@@ -2,7 +2,7 @@ BROKKR_SSH_TARGET ?= brokkr@control-node
 BROKKR_REMOTE_DIR ?= /opt/brokkr
 export OVERLAY COMMIT
 
-.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight systemd-supervision-audit m5-network-render m5-network-preflight test shellcheck
+.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight systemd-supervision-audit m5-network-render m5-network-preflight control-node-ssh-preflight test shellcheck
 
 patching: ## Install/refresh unattended-upgrades on all Pi hosts (ARGS="--dry-run" or a host)
 	@./scripts/setup-host-patching.sh $(ARGS)
@@ -55,6 +55,9 @@ m5-network-render: ## Render the M5 default-deny plan (CONFIG=/root-owned/profil
 m5-network-preflight: ## Run the non-mutating M5 network-profile gate (CONFIG=...)
 	@test -n "$(CONFIG)" || { echo "CONFIG=/root-owned/profile is required" >&2; exit 64; }
 	@./scripts/m5-network-profile.py preflight --config "$(CONFIG)"
+
+control-node-ssh-preflight: ## Run the read-only control-node OpenSSH cutover preflight (ARGS="operator|host --phase ...")
+	@python3 scripts/control-node-ssh-cutover.py $(ARGS)
 
 maintenance-os: ## Run the OS maintenance report on the service host (ARGS="--dry-run --verbose")
 	@ssh $(BROKKR_SSH_TARGET) 'cd $(BROKKR_REMOTE_DIR) && bash scripts/maintenance-report.sh os $(ARGS)'
