@@ -10,10 +10,12 @@
 #   guarded-reboot.sh clear-latch               owner action: re-allow automatic reboots (audited)
 #
 # Deterministic by design: no model decides anything here. The only privileged actions are
-# `sudo -n` with fixed argument lists: `rpi-eeprom-update` (check only), `tee -a <audit file>`
-# and `systemctl reboot`. Nothing fetched or read from a file is ever interpolated into a
-# command. Exit 0: normal, including deferred / report / no trigger. Exit 1: internal failure
-# (state or audit write failure, unreadable required input). Exit 64: usage or configuration.
+# `sudo -n` with constant argument lists: `rpi-eeprom-update -j -m /run/brokkr-guarded-reboot-eeprom.json`
+# (status), `rpi-eeprom-update -a` (stage) and `-r` (cancel), `tee -a /var/lib/brokkr/guarded-reboot/audit.jsonl`
+# and `systemctl reboot`. No environment variable changes any of those arguments, and nothing
+# fetched or read from a file is ever interpolated into a command. Exit 0: normal, including
+# deferred / report / no trigger. Exit 1: internal failure (state or audit write failure,
+# unreadable required input). Exit 64: usage or configuration.
 #
 # Runs under bash 3.2 and 5: no associative arrays, mapfile, ${x,,}, namerefs or wait -n.
 set -euo pipefail
@@ -38,7 +40,6 @@ usage_text() {
   echo "       BROKKR_GUARDED_REBOOT_BUSY_UNITS (space-separated systemd user .service units),"
   echo "       BROKKR_GUARDED_REBOOT_MAX_LOAD (default 0.75 x CPUs), BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN (60),"
   echo "       BROKKR_GUARDED_REBOOT_ALERT_AFTER (3), BROKKR_GUARDED_REBOOT_PEERS (hosts that must answer on port 22),"
-  echo "       BROKKR_GUARDED_REBOOT_AUDIT,"
   echo "       BROKKR_STATE_DIR (default \${XDG_STATE_HOME:-~/.local/state}/brokkr)"
 }
 usage() { usage_text >&2; exit 64; }
@@ -130,7 +131,14 @@ fi
 DEFAULT_BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
 DEFAULT_LOADAVG_FILE=/proc/loadavg
 
-# Paths are absolute and plain: AUDIT_FILE reaches sudo, the others are read or tested.
+# Privileged arguments are constants. No environment variable changes any argument of a sudo
+# invocation: the audit file and the file rpi-eeprom-update writes its status to are fixed paths
+# (/run is writable by root only). The tests put a stub sudo on PATH that maps these constants into
+# their fixture tree; EEPROM_STATUS_READ below is only where the result is READ from, unprivileged.
+AUDIT_FILE=/var/lib/brokkr/guarded-reboot/audit.jsonl
+EEPROM_STATUS_FILE=/run/brokkr-guarded-reboot-eeprom.json
+
+# Paths read or tested here are absolute and plain.
 need_path() { # name value
   case "$2" in /*) ;; *) die "$1 must be an absolute path" ;; esac
   case "$2" in
@@ -144,7 +152,8 @@ CRYPTTAB=${BROKKR_CRYPTTAB:-/etc/crypttab}
 KILL_SWITCH=${BROKKR_KILL_SWITCH:-/etc/brokkr/guarded-reboot.disabled}
 CGROUP_ROOT=${BROKKR_CGROUP_ROOT:-/sys/fs/cgroup}
 EEPROM_PENDING_FLAG=${BROKKR_EEPROM_PENDING_FLAG:-/run/rpi-eeprom-update-pending}
-AUDIT_FILE=${BROKKR_GUARDED_REBOOT_AUDIT:-/var/lib/brokkr/guarded-reboot/audit.jsonl}
+EEPROM_STATUS_READ=${BROKKR_EEPROM_STATUS_FILE:-}
+if [ -z "$EEPROM_STATUS_READ" ]; then EEPROM_STATUS_READ=$EEPROM_STATUS_FILE; fi
 BOOT_ID_FILE=${BROKKR_BOOT_ID_FILE:-}
 if [ -z "$BOOT_ID_FILE" ]; then BOOT_ID_FILE=$DEFAULT_BOOT_ID_FILE; fi
 LOADAVG_FILE=${BROKKR_LOADAVG_FILE:-}
@@ -166,7 +175,7 @@ need_path BROKKR_BOOT_ID_FILE "$BOOT_ID_FILE"
 need_path BROKKR_LOADAVG_FILE "$LOADAVG_FILE"
 need_path BROKKR_CGROUP_ROOT "$CGROUP_ROOT"
 need_path BROKKR_EEPROM_PENDING_FLAG "$EEPROM_PENDING_FLAG"
-need_path BROKKR_GUARDED_REBOOT_AUDIT "$AUDIT_FILE"
+need_path BROKKR_EEPROM_STATUS_FILE "$EEPROM_STATUS_READ"
 need_path BROKKR_NOTIFY_HELPER "$NOTIFY_HELPER"
 need_path BROKKR_STATE_DIR "$STATE_DIR"
 STATE_FILE=$STATE_DIR/guarded-reboot.json
@@ -265,7 +274,8 @@ load_int() { # var key
   set_var "$1" "$((0 + 10#$v))"
 }
 load_str() { # var key
-  local v re='^"([A-Za-z0-9:,._@+=~() /;-]*)"$'
+  # Everything safe_text can emit: SAFE_CHARS and the ? it substitutes for any other character.
+  local v re='^"([A-Za-z0-9:,._@+=~() /;?-]*)"$'
   v=$(st_raw "$2")
   [[ "$v" =~ $re ]] || bad_state "$2"
   set_var "$1" "${BASH_REMATCH[1]}"
@@ -348,10 +358,8 @@ render_state_json() {
   printf '}\n'
 }
 STATE_TMP=
-EEPROM_TMP=''
 cleanup() {
   if [ -n "$STATE_TMP" ]; then rm -f "$STATE_TMP"; STATE_TMP=''; fi
-  if [ -n "$EEPROM_TMP" ]; then rm -f "$EEPROM_TMP"; EEPROM_TMP=''; fi
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
@@ -470,15 +478,26 @@ hash_stdin() {
 }
 file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
 
-detect_reboot_required() {
-  local pkgs_file="$REBOOT_REQUIRED_FILE.pkgs" ident names=
-  [ -e "$REBOOT_REQUIRED_FILE" ] || [ -L "$REBOOT_REQUIRED_FILE" ] || return 0
+reboot_flag_present() { [ -e "$REBOOT_REQUIRED_FILE" ] || [ -L "$REBOOT_REQUIRED_FILE" ]; }
+# The identity of the pending reboot-required flag: sha256 of the sorted .pkgs content, else the
+# flag file's mtime. Same sanitising as add_trigger, so it compares with a recorded identity.
+reboot_flag_identity() {
+  local pkgs_file="$REBOOT_REQUIRED_FILE.pkgs" ident
   if [ -f "$pkgs_file" ] && [ -r "$pkgs_file" ]; then
     ident=$(sort "$pkgs_file" | hash_stdin) || ident=unknown
-    names=$(head -n 20 "$pkgs_file" | tr -c 'A-Za-z0-9.+:_\n-' '?' | sort -u | head -n 8 | tr '\n' ',' | sed 's/,$//') || names=
   else
     ident=$(file_mtime "$REBOOT_REQUIRED_FILE") || ident=
     ident="mtime-${ident:-unknown}"
+  fi
+  printf '%s' "$ident" | tr -c 'A-Za-z0-9.+_~:-' '?' | cut -c1-80
+}
+
+detect_reboot_required() {
+  local pkgs_file="$REBOOT_REQUIRED_FILE.pkgs" ident names=''
+  reboot_flag_present || return 0
+  ident=$(reboot_flag_identity)
+  if [ -f "$pkgs_file" ] && [ -r "$pkgs_file" ]; then
+    names=$(head -n 20 "$pkgs_file" | tr -c 'A-Za-z0-9.+:_\n-' '?' | sort -u | head -n 8 | tr '\n' ',' | sed 's/,$//') || names=
   fi
   add_trigger reboot-required "$ident" "reboot-required flag present${names:+ (packages: $(bound "$names" 120))}"
 }
@@ -557,22 +576,38 @@ eeprom_json() { # status JSON on stdin -> "EXITCODE CURRENT LATEST"
   printf '%s\n' "$out"
 }
 
-EEPROM_TMP=
+EEPROM_STATUS_MAX_AGE=60
 EEPROM_CUR=0; EEPROM_LATEST=0; EEPROM_NOTE=
+# Root writes the status to the constant file below /run (only root can write there) and the file is
+# read unprivileged afterwards. Because the privileged path is fixed, a file left by an earlier run
+# must not pass for this run's answer: it has to be fresh (real clock, not the NOW seam) and agree
+# with the command's own exit status (0 is EXIT_SUCCESS, 1 is EXIT_UPDATE_REQUIRED).
 eeprom_read_status() { # sets EEPROM_CUR/EEPROM_LATEST; returns 1 with EEPROM_NOTE when unknown
-  local out parsed code cur latest
-  (umask 077; mkdir -p "$STATE_DIR") || { EEPROM_NOTE="cannot create the state directory"; return 1; }
-  EEPROM_TMP=$(umask 077; mktemp "$STATE_DIR/.eeprom-status.XXXXXX") || { EEPROM_NOTE="cannot create a private status file"; return 1; }
+  local out rc=0 parsed code cur latest mtime real
+  EEPROM_NOTE=
   # Exit status 1 is its normal "update required" answer; only the JSON counts.
-  out=$(sudo -n rpi-eeprom-update -j -m "$EEPROM_TMP" </dev/null 2>&1) || true
-  parsed=$(eeprom_json <"$EEPROM_TMP") || parsed=
-  rm -f "$EEPROM_TMP"; EEPROM_TMP=
+  out=$(sudo -n rpi-eeprom-update -j -m "$EEPROM_STATUS_FILE" </dev/null 2>&1) || rc=$?
+  if [ ! -f "$EEPROM_STATUS_READ" ] || [ -L "$EEPROM_STATUS_READ" ] || [ ! -r "$EEPROM_STATUS_READ" ]; then
+    EEPROM_NOTE="no status file: $(clean "$(printf '%s' "$out" | head -n 1)" 80)"
+    return 1
+  fi
+  mtime=$(file_mtime "$EEPROM_STATUS_READ") || mtime=
+  real=$(date +%s)
+  if ! [[ "$mtime" =~ ^[0-9]+$ ]] || [ "$mtime" -lt $((real - EEPROM_STATUS_MAX_AGE)) ]; then
+    EEPROM_NOTE="the status file is stale (not written by this run): $(clean "$(printf '%s' "$out" | head -n 1)" 80)"
+    return 1
+  fi
+  parsed=$(eeprom_json <"$EEPROM_STATUS_READ") || parsed=
   if ! [[ "$parsed" =~ ^(EXIT_[A-Z_]+)\ ([0-9]{1,12})\ ([0-9]{1,12})$ ]]; then
     EEPROM_NOTE="no readable JSON status: $(clean "$(printf '%s' "$out" | head -n 1)" 80)"
     return 1
   fi
   code=${BASH_REMATCH[1]}; cur=${BASH_REMATCH[2]}; latest=${BASH_REMATCH[3]}
-  if [ "$code" = EXIT_FAILED ]; then EEPROM_NOTE="rpi-eeprom-update reported EXIT_FAILED"; return 1; fi
+  case "$code:$rc" in
+    EXIT_SUCCESS:0|EXIT_UPDATE_REQUIRED:1) ;;
+    EXIT_FAILED:*) EEPROM_NOTE="rpi-eeprom-update reported EXIT_FAILED"; return 1 ;;
+    *) EEPROM_NOTE="the status $code does not match the exit status $rc of the command"; return 1 ;;
+  esac
   EEPROM_CUR=$((0 + 10#$cur)); EEPROM_LATEST=$((0 + 10#$latest))
 }
 
@@ -615,14 +650,22 @@ eeprom_cancel() { # 0 when nothing is staged afterwards
   sudo -n rpi-eeprom-update -r </dev/null >/dev/null 2>&1 || true
   ! eeprom_staged
 }
+# A staged update found at the start of a run has no reboot attempt behind it (this job stages one
+# only inside a reboot it is already executing), so it is cancelled. A cancellation that fails, or a
+# report-only run that is not allowed to cancel, leaves STRAY_BLOCK=1: the guard eeprom-stray then
+# stops any reboot until a later run cancels it, because it would be flashed by the very next boot.
+STRAY_BLOCK=0
 cancel_stray_staging() {
+  STRAY_BLOCK=0
   command -v rpi-eeprom-update >/dev/null 2>&1 || return 0
   eeprom_staged || return 0
+  if [ "$REPORT_ONLY" -ne 0 ]; then STRAY_BLOCK=1; return 0; fi
   if eeprom_cancel; then
     queue_alert "eeprom-cancelled: a staged bootloader EEPROM update was found with no reboot attempt in progress and was cancelled (rpi-eeprom-update -r)"
   else
     RC=1
-    queue_alert "eeprom-cancel-failed: a staged bootloader EEPROM update was found with no reboot attempt in progress and could not be cancelled; run sudo rpi-eeprom-update -r by hand"
+    STRAY_BLOCK=1
+    queue_alert "eeprom-cancel-failed: a staged bootloader EEPROM update was found with no reboot attempt in progress and could not be cancelled; no reboot is admitted until it is gone, run sudo rpi-eeprom-update -r by hand"
   fi
 }
 
@@ -634,7 +677,7 @@ set_latch() { # reason
   [ "$LATCH" -eq 0 ] || return 0
   LATCH=1; LATCH_SINCE=$NOW
   LATCH_REASON=$(clean "$1" 160)
-  queue_alert "latched: automatic reboots are off: $(clean "$1" 200). Investigate, then run guarded-reboot.sh clear-latch"
+  queue_alert "latched: $(clean "$1" 200). Automatic reboots stay off until the owner has investigated and runs guarded-reboot.sh clear-latch"
 }
 
 # The last attempt must have a successful post-boot result before the host is eligible again.
@@ -793,8 +836,11 @@ guard_peers() {
   done
 }
 
-# Every crypttab entry needed at boot (not noauto) whose key field is none, - or empty and whose
-# options carry no unattended unlock would stop the boot at a passphrase prompt.
+# Every crypttab entry needed at boot (not noauto) must unlock unattended, or an unattended reboot
+# would stop the boot at a prompt. An entry counts as unattended only if its key field is a key-file
+# path or its options contain tpm2-device= without tpm2-pin=yes. Anything that can prompt makes it
+# interactive whatever else it says: fido2-device=, pkcs11-uri=, keyscript=, any *-pin=yes,
+# fido2-with-*, headless=false. An empty, none or - key without tpm2 is interactive.
 UNLOCK_AWK='
 /^[[:space:]]*#/ { next }
 NF == 0 { next }
@@ -802,15 +848,21 @@ NF == 0 { next }
   key = (NF >= 3) ? $3 : "none"
   opts = (NF >= 4) ? $4 : ""
   n = split(opts, o, ",")
-  noauto = 0; unattended = 0
+  noauto = 0; interactive = 0; tpm2 = 0
   for (k = 1; k <= n; k++) {
     if (o[k] == "noauto") noauto = 1
-    if (o[k] ~ /^(tpm2-device|fido2-device|pkcs11-uri|keyscript)=/) unattended = 1
+    if (o[k] ~ /^(fido2-device|pkcs11-uri|keyscript)=/) interactive = 1
+    if (o[k] ~ /-pin=yes$/) interactive = 1
+    if (o[k] ~ /^fido2-with-/) interactive = 1
+    if (o[k] == "headless=false") interactive = 1
+    if (o[k] ~ /^tpm2-device=/) tpm2 = 1
   }
   if (noauto) next
-  if (key != "none" && key != "-" && key != "") next
-  if (unattended) next
-  print $1
+  unattended = 0
+  if (key ~ /^\//) unattended = 1
+  if (tpm2) unattended = 1
+  if (interactive) unattended = 0
+  if (!unattended) print $1
 }
 '
 guard_unlock() {
@@ -838,6 +890,9 @@ evaluate_guards() {
   fi
   if [ "$ATTEMPT_PENDING" -eq 1 ]; then
     add_guard attempt-pending "the reboot attempt of $(iso_utc "$A_EPOCH") has no post-boot result yet"
+  fi
+  if [ "$STRAY_BLOCK" -eq 1 ]; then
+    add_guard eeprom-stray "a staged bootloader EEPROM update remains (it could not be cancelled, or this run may not cancel) and the next boot would flash it"
   fi
   guard_apt_busy
   guard_busy_units
@@ -878,25 +933,28 @@ capture_baseline() {
   BASE_SYS=$sys; BASE_USER=$user; BASE_EPOCH=$NOW; BASE_BOOT_ID=$BOOT_ID; BASE_OK=1
 }
 
-# 0 when the unit starts on demand (D-Bus or socket activated, timer triggered, static or
-# indirect unit file) and may legitimately be down; 1 otherwise or when it cannot be queried.
+# 0 when the unit starts on demand and may legitimately be down: Type=dbus, a non-empty BusName=
+# (bus activated), a non-empty TriggeredBy= (socket or timer activated) or a transient unit. Being a
+# static or indirect unit file proves nothing (a static long-running service that vanished is a
+# regression). 1 otherwise or when the unit cannot be queried.
 unit_on_demand() { # scope unit
-  local out line type='' state='' trig=''
+  local out line type='' state='' trig='' bus=''
   if [ "$1" = user ]; then
-    out=$(systemctl --user show -p Type,UnitFileState,TriggeredBy "$2" 2>/dev/null) || return 1
+    out=$(systemctl --user show -p Type,BusName,UnitFileState,TriggeredBy "$2" 2>/dev/null) || return 1
   else
-    out=$(systemctl show -p Type,UnitFileState,TriggeredBy "$2" 2>/dev/null) || return 1
+    out=$(systemctl show -p Type,BusName,UnitFileState,TriggeredBy "$2" 2>/dev/null) || return 1
   fi
   while IFS= read -r line; do
     case "$line" in
       Type=*) type=${line#Type=} ;;
+      BusName=*) bus=${line#BusName=} ;;
       UnitFileState=*) state=${line#UnitFileState=} ;;
       TriggeredBy=*) trig=${line#TriggeredBy=} ;;
     esac
   done <<<"$out"
   if [ "$type" = dbus ]; then return 0; fi
-  case "$state" in static|indirect|transient) return 0 ;; esac
-  if [ -n "$trig" ]; then return 0; fi
+  if [ "$state" = transient ]; then return 0; fi
+  if [ -n "$bus" ] || [ -n "$trig" ]; then return 0; fi
   return 1
 }
 
@@ -992,30 +1050,33 @@ restore_attempt_state() {
 }
 
 EEPROM_STAGED_NOW=0
-# The reboot was admitted but did not go ahead: cancel anything staged for it, put the attempt
-# record back, and end the night as deferred with the guards that stopped it.
+# The reboot was admitted but did not go ahead. The abort is appended first (action deferred, detail
+# starting "reboot aborted"); then anything staged for the reboot is cancelled (-r), and if that
+# cancellation fails the host latches, because the staged update would be flashed by the next boot
+# of any kind. The attempt record is put back and the night counts as deferred.
 abort_reboot() {
-  local note=
-  if [ "$EEPROM_STAGED_NOW" -eq 1 ]; then
-    if eeprom_cancel; then
-      note="; the staged EEPROM update was cancelled"
-    else
-      RC=1
-      queue_alert "eeprom-cancel-failed: the EEPROM update staged for an aborted reboot could not be cancelled; run sudo rpi-eeprom-update -r by hand"
-    fi
-    EEPROM_STAGED_NOW=0
-  fi
   restore_attempt_state
-  set_event deferred "$TRIG_IDS" "$GUARD_IDS" "reboot aborted before it was executed: $GUARD_DETAIL$note"
+  set_event deferred "$TRIG_IDS" "$GUARD_IDS" "reboot aborted before it was executed: $GUARD_DETAIL"
   note_deferral
   log "decision: deferred (reboot aborted); guards: $GUARD_IDS"
-  commit_event 1
+  audit_append deferred "$W_DETAIL" || RC=1
+  if [ "$EEPROM_STAGED_NOW" -eq 1 ]; then
+    if eeprom_cancel; then
+      EEPROM_STAGED_NOW=0
+    else
+      RC=1
+      set_latch "the EEPROM update staged for an aborted reboot could not be cancelled; run sudo rpi-eeprom-update -r by hand"
+    fi
+  fi
+  commit_event 0
 }
 
-# Reboot mode, every guard clear. Order: attempt record, second guard pass, EEPROM staging (only
-# here), audit line, confirmed notice, final guard pass, reboot.
+# Reboot mode, every guard clear. Order: attempt record, second full guard pass, the attempt/intent
+# audit record (identities, planned EEPROM staging, reversal recipe), EEPROM staging and its
+# verification (only here), the confirmed notice, a final full guard pass, the reboot. An audit
+# failure therefore prevents the staging, the notice and the reboot.
 reboot_attempt() {
-  local detail rc
+  local detail rc reason staging=0 plan=''
   if [ "$MODE" != reboot ] || [ "$REPORT_ONLY" -ne 0 ]; then fatal "internal error: a reboot was attempted outside reboot mode"; fi
   if [ "$BASE_OK" -ne 1 ]; then fatal "cannot capture the running-service baseline; not rebooting"; fi
   snapshot_attempt_state
@@ -1028,24 +1089,23 @@ reboot_attempt() {
   fi
   evaluate_guards
   if [ -n "$GUARD_IDS" ]; then abort_reboot; return 0; fi
-  detail=$TRIG_DETAIL
   case ",$TRIG_IDS," in
-    *,eeprom,*)
-      if eeprom_stage; then
-        EEPROM_STAGED_NOW=1
-        detail="$detail; eeprom-staged $EEPROM_LATEST"
-      else
-        GUARD_IDS=eeprom-stage; GUARD_DETAIL="staging the EEPROM update failed"; G_KILL=0; G_UNLOCK=0
-        eeprom_cancel || true
-        abort_reboot; return 0
-      fi ;;
+    *,eeprom,*) staging=1; plan="eeprom-staging planned (version $EEPROM_LATEST)" ;;
   esac
+  detail="identities $TRIG_PAIRS; ${plan:+$plan; }reversal irreversible (mitigations: post-boot check, latch, kill switch, previous kernel kept); $TRIG_DETAIL"
   set_event reboot "$TRIG_IDS" "" "$detail"
   if ! audit_append reboot "$W_DETAIL"; then
-    if [ "$EEPROM_STAGED_NOW" -eq 1 ]; then eeprom_cancel || true; fi
     restore_attempt_state
     write_state || true
-    fatal "cannot append to the audit file; not notifying and not rebooting"
+    fatal "cannot append to the audit file; nothing was staged or announced and nothing reboots"
+  fi
+  if [ "$staging" -eq 1 ]; then
+    # Whatever the staging leaves behind is cancelled by every abort from here on.
+    EEPROM_STAGED_NOW=1
+    if ! eeprom_stage; then
+      GUARD_IDS=eeprom-stage; GUARD_DETAIL="staging the EEPROM update failed or could not be verified"; G_KILL=0; G_UNLOCK=0
+      abort_reboot; return 0
+    fi
   fi
   if ! send_notice "Rebooting $HOST for $TRIG_IDS"; then
     GUARD_IDS=notify; GUARD_DETAIL="the pre-reboot notice could not be delivered, so the alert path is not trusted"; G_KILL=0; G_UNLOCK=0
@@ -1060,21 +1120,29 @@ reboot_attempt() {
     return 0
   fi
   warn "sudo -n systemctl reboot failed (exit $rc)"
-  if [ "$EEPROM_STAGED_NOW" -eq 1 ]; then eeprom_cancel || true; EEPROM_STAGED_NOW=0; fi
-  restore_attempt_state
-  set_event alert "$TRIG_IDS" "" "the reboot command failed (exit $rc); nothing was rebooted"
-  queue_alert "the reboot command failed (exit $rc) and nothing was rebooted"
+  reason="reboot command failed (exit $rc)"
+  if [ "$EEPROM_STAGED_NOW" -eq 1 ]; then
+    if eeprom_cancel; then EEPROM_STAGED_NOW=0; else reason="$reason; the staged EEPROM update could not be cancelled"; fi
+  fi
+  # The attempt record stays (unresolved, same boot id) and the host latches at once: a reboot that
+  # was admitted but refused by the system is not something to retry tomorrow without the owner.
+  set_event alert "$TRIG_IDS" "" "$reason; nothing was rebooted"
+  set_latch "$reason"
   RC=1
   commit_event 0
 }
 
 cmd_check() {
   local audit_main=1
+  # A host must not reboot without the peer (the host that monitors it) being reachable.
+  if [ "$MODE" = reboot ] && [ -z "$PEER_LIST" ]; then
+    die "reboot mode needs at least one peer in BROKKR_GUARDED_REBOOT_PEERS"
+  fi
   load_state
   read_boot_id
   capture_baseline || true
   detect_triggers || fatal "$TRIG_ERR"
-  if [ "$REPORT_ONLY" -eq 0 ]; then cancel_stray_staging; fi
+  cancel_stray_staging
   check_attempt_gate
   if [ -z "$TRIG_IDS" ]; then
     episode_reset
@@ -1106,6 +1174,8 @@ cmd_check() {
     return 0
   fi
   log "decision: reboot; triggers: $TRIG_IDS"
+  # Alerts raised earlier in this run (a cancelled stray update) are audited before the intent record.
+  flush_queues
   reboot_attempt
 }
 
@@ -1114,8 +1184,52 @@ csv_has() { case ",$1," in *",$2,"*) return 0 ;; esac; return 1; }
 # --- post-boot: health after a guarded reboot ----------------------------------------------------
 # Only for an attempt that is still unresolved and whose boot id differs from the current one. A
 # successful result makes the host eligible again; issues latch automatic reboots off.
+#
+# The recorded targets are verified positively, one per trigger of the attempt, and an observation
+# that cannot be made is an issue (it never passes by default):
+#   kernel           the running kernel equals the recorded expected version
+#   eeprom           a successful status read whose current bootloader is at least the recorded target
+#   reboot-required  the flag is gone, or its identity changed
+verify_attempt_targets() {
+  local pair id want have cur pairs
+  pairs=$(printf '%s' "$A_IDS" | tr ',' '\n')
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    id=${pair%%=*}
+    want=${pair#*=}
+    case "$id" in
+      kernel)
+        have=$(uname -r 2>/dev/null) || have=
+        have=$(printf '%s' "$have" | tr -c 'A-Za-z0-9.+_~:-' '?' | cut -c1-80)
+        if [ -z "$have" ]; then
+          add_issue "cannot read the running kernel to verify $want"
+        elif [ "$have" != "$want" ]; then
+          add_issue "running kernel is $have, the attempt expected $want"
+        fi ;;
+      eeprom)
+        if ! command -v rpi-eeprom-update >/dev/null 2>&1; then
+          add_issue "bootloader version unknown after the reboot (rpi-eeprom-update is missing)"
+        elif ! eeprom_read_status; then
+          add_issue "bootloader version unknown after the reboot ($EEPROM_NOTE)"
+        elif ! [[ "$want" =~ ^[0-9]{1,12}$ ]]; then
+          add_issue "the recorded bootloader target is unknown ($want)"
+        elif [ "$EEPROM_CUR" -eq 0 ]; then
+          add_issue "bootloader version unknown after the reboot (the running version is unavailable)"
+        elif [ "$EEPROM_CUR" -lt "$((0 + 10#$want))" ]; then
+          add_issue "bootloader is $EEPROM_CUR, the attempt expected at least $want"
+        fi ;;
+      reboot-required)
+        if reboot_flag_present; then
+          cur=$(reboot_flag_identity)
+          if [ "$cur" = "$want" ]; then add_issue "the reboot-required flag is still present with the same identity ($want)"; fi
+        fi ;;
+      *) add_issue "the attempt recorded a trigger this job cannot verify ($id)" ;;
+    esac
+  done <<<"$pairs"
+}
+
 cmd_post_boot() {
-  local pair kernel notes='' still='' fresh='' detail pairs
+  local pair kernel notes='' fresh='' detail pairs outcome
   load_state
   read_boot_id
   [ "$A_STATUS" = unresolved ] || return 0
@@ -1125,36 +1239,48 @@ cmd_post_boot() {
     pairs=$(printf '%s' "$TRIG_PAIRS" | tr ',' '\n')
     while IFS= read -r pair; do
       [ -n "$pair" ] || continue
-      if csv_has "$A_IDS" "$pair"; then
-        still="${still:+$still,}$pair"
-      else
-        fresh="${fresh:+$fresh,}$pair"
-      fi
+      if ! csv_has "$A_IDS" "$pair"; then fresh="${fresh:+$fresh,}$pair"; fi
     done <<<"$pairs"
-    if [ -n "$still" ]; then add_issue "trigger identity still pending after the reboot: $still"; fi
     if [ -n "$fresh" ]; then notes="new trigger since the reboot: $fresh"; fi
   else
     add_issue "cannot re-check the reboot triggers: $TRIG_ERR"
   fi
-  if [ "$REPORT_ONLY" -eq 0 ]; then cancel_stray_staging; fi
+  verify_attempt_targets
+  cancel_stray_staging
+  if [ "$STRAY_BLOCK" -eq 1 ] && [ "$REPORT_ONLY" -eq 0 ]; then
+    add_issue "a staged bootloader EEPROM update remains and could not be cancelled"
+  fi
   collect_health_issues 1
   kernel=$RUNNING_KERNEL
   if [ -z "$kernel" ]; then kernel=$(clean "$(uname -r 2>/dev/null || echo unknown)" 60); fi
   if [ -z "$ISSUES" ]; then
-    A_STATUS=ok
-    detail="kernel $kernel; health OK; reboot triggers cleared${notes:+; $notes}"
+    outcome=ok
+    detail="kernel $kernel; health OK; the recorded targets are verified${notes:+; $notes}"
     set_event post-boot-ok "" "" "$detail"
     queue_notice "back up: $HOST kernel $kernel; health OK"
     log "post-boot: ok; kernel $kernel"
   else
-    A_STATUS=issues
+    outcome=issues
     detail="kernel $kernel; $ISSUES${notes:+; $notes}"
     set_event post-boot-issues "" "" "$detail"
     queue_notice "back up: $HOST kernel $kernel; issues: $(clean "$ISSUES" 300)"
-    set_latch "the post-boot check reported issues: $(clean "$ISSUES" 120)"
     log "post-boot: issues; $ISSUES"
   fi
-  commit_event 1
+  # The outcome is appended BEFORE it is persisted. If the append fails the attempt stays unresolved
+  # (exit 1), so the next nightly check latches it as missing verification instead of the host
+  # looking verified while no record says so. The notices still go out.
+  if ! audit_append "$W_ACTION" "$W_DETAIL"; then
+    RC=1
+    # Alerts are normally audited as they are sent; with the audit failing they go out as notices.
+    if [ -n "$ALERTS" ]; then NOTICES="$NOTICES$(printf '%s' "$ALERTS" | sed "s/^/ALERT $HOST: /")"$'\n'; fi
+    ALERTS=''
+    warn "the post-boot outcome could not be audited; the attempt stays unresolved"
+    flush_queues
+    return 0
+  fi
+  A_STATUS=$outcome
+  if [ "$outcome" = issues ]; then set_latch "the post-boot check reported issues: $(clean "$ISSUES" 120)"; fi
+  commit_event 0
 }
 
 # --- health: the daily check that the night's updates broke nothing ------------------------------
