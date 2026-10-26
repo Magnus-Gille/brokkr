@@ -131,6 +131,11 @@ cat >"$BIN/mv" <<'FAKE'
 if [[ -n "${MOCK_MV_FAIL:-}" && "${!#}" == *"$MOCK_MV_FAIL"* ]]; then echo "mv: injected failure" >&2; exit 1; fi
 exec /bin/mv "$@"
 FAKE
+cat >"$BIN/readlink" <<'FAKE'
+#!/usr/bin/env bash
+if [[ "${MOCK_READLINK_FAIL:-0}" == 1 ]]; then echo "readlink: injected failure" >&2; exit 1; fi
+exec /usr/bin/readlink "$@"
+FAKE
 cat >"$BIN/install" <<'FAKE'
 #!/usr/bin/env bash
 if [[ "${MOCK_INSTALL_FAIL:-0}" == 1 ]]; then echo "install: injected failure" >&2; exit 1; fi
@@ -183,7 +188,7 @@ reset() {
   rm -f "$BIN/ethtool" "$MOCK_NOSBIN/ethtool"
   : >"$CALLS"
   unset MOCK_ID_ROOT MOCK_REMOTE_ROOT MOCK_SUDO_DENY MOCK_START_FAIL MOCK_ETHTOOL_NOOP MOCK_EEE_UNSUPPORTED MOCK_CP_FAIL
-  unset MOCK_MV_FAIL MOCK_INSTALL_FAIL MOCK_SYSTEMCTL_FAIL
+  unset MOCK_MV_FAIL MOCK_INSTALL_FAIL MOCK_SYSTEMCTL_FAIL MOCK_READLINK_FAIL
   export BROKKR_EXPECTED_SOURCE="$REPO" BROKKR_EXPECTED_COMMIT="$SHA"
   has_ethtool
 }
@@ -390,6 +395,10 @@ for mode in dry-run apply; do
       refuses "$mode: a link into a root-only directory whose read sudo -n denies refuses" "could not read hidden.service with sudo -n" "${args[@]}"
     chmod 755 "$TMP/etc/private"
   fi
+  # A link target that cannot be read inside the privileged enumeration refuses, so
+  # an extra link to the ad-hoc unit cannot be missed.
+  reset; seed_legacy; mkdir -p "$UNIT_DIR/other.target.wants"; ln -s ../eth0-eee-off.service "$UNIT_DIR/other.target.wants/alias.service"
+  MOCK_READLINK_FAIL=1 refuses "$mode: a link target that cannot be read refuses" "could not list" "${args[@]}"
   reset; seed_legacy; ln -s "$TMP/etc/nonexistent.service" "$UNIT_DIR/ghost.service"
   run "${args[@]}"
   check "$mode: a genuinely dangling link is skipped" '[[ "$RC" -eq 0 ]]'

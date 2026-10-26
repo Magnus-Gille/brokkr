@@ -160,7 +160,8 @@ for f; do
   case $f in *"$nl"*|*"$tab"*) echo "unsupported file name" >&2; exit 3 ;; esac
   if [ -L "$f" ]; then
     if [ -e "$f" ]; then t=l; else t=x; fi
-    printf "%s\t%s\t%s\n" "$t" "$f" "$(readlink "$f")"
+    target=$(readlink "$f") || exit 3
+    printf "%s\t%s\t%s\n" "$t" "$f" "$target"
   elif [ -d "$f" ]; then printf "d\t%s\n" "$f"
   elif [ -f "$f" ]; then printf "f\t%s\n" "$f"
   else printf "o\t%s\n" "$f"
