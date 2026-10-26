@@ -1,0 +1,3 @@
+// Brokkr: let unattended-upgrades keep the apt-installed claude-code current.
+// The Claude Code apt repository publishes Release Origin/Label "Anthropic", codename "stable".
+Unattended-Upgrade::Origins-Pattern { "origin=Anthropic,label=Anthropic,codename=stable"; };

@@ -1,0 +1,1202 @@
+#!/usr/bin/env bash
+# Brokkr · keep the coding-agent CLIs (claude, codex, pi, opencode) at their latest release.
+# Runs ON the host: from a launchd LaunchAgent on the macOS workstation (launchd/) and from a
+# systemd user timer on Linux fleet nodes (systemd/user/, installed by
+# scripts/deploy-agent-cli-update.sh). See docs/agent-cli-update.md.
+#
+# Each tool found on PATH is classified from its fully resolved binary path, and only that
+# install method's own updater runs. A tool that is not installed is skipped (never installed),
+# an apt-owned one is left to unattended-upgrades, and anything unrecognised is a failure rather
+# than a guess. After a mutation the tool must still print a version; an npm, opencode-installer
+# or pi-release install that does not is rolled back to the previous version. The script runs
+# under macOS /bin/bash 3.2 and Linux bash 5: no associative arrays, mapfile, ${x,,}, namerefs or
+# wait -n.
+#
+# Release-age cooldown: a release is only installed once it has been published for
+# BROKKR_AGENT_CLI_MIN_AGE_HOURS (default 48), so a bad release can be pulled upstream before it
+# reaches the fleet. Every method decides from release metadata (the npm registry, or GitHub
+# releases), never from "whatever the vendor's updater would fetch"; a newer version that is too
+# young, or whose age cannot be evaluated, leaves the tool `held` (not a failure).
+#
+#   scripts/agent-cli-update.sh [--dry-run] [--tool NAME]... [--adopt pi]
+#
+# Exit 0: everything ok, current, held, absent, external, or the run was deferred. Exit 1: a tool
+# failed or was rolled back (the others are still attempted) or the state file could not be
+# written. Exit 64: usage or configuration error.
+set -euo pipefail
+
+# Bounds so one hung child cannot block every later scheduled run (used only where a
+# timeout command exists; stock macOS has none).
+VERSION_TIMEOUT=60
+LOOKUP_TIMEOUT=120
+UPDATE_TIMEOUT=1200
+KNOWN_TOOLS="claude codex pi opencode"
+
+die() { echo "brokkr agent-cli-update: $*" >&2; exit 64; }
+usage_text() {
+  echo "usage: $0 [--dry-run] [--tool NAME]... [--adopt pi]"
+  echo "  tools: $KNOWN_TOOLS (default; or BROKKR_AGENT_CLI_TOOLS, space separated)"
+  echo "  --dry-run  classify and look versions up; run no install/update and write no state"
+  echo "  --adopt pi install pi as a checksum-verified release binary (migration from npm; only pi)"
+  echo "  env: BROKKR_AGENT_CLI_MIN_AGE_HOURS (0..720, default 48; 0 disables the release-age cooldown),"
+  echo "       BROKKR_AGENT_CLI_BUSY_UNITS (space-separated systemd user units; defer while one has spawned work),"
+  echo "       BROKKR_STATE_DIR (default \${XDG_STATE_HOME:-~/.local/state}/brokkr)"
+}
+usage() { usage_text >&2; exit 64; }
+
+DRY_RUN=0
+ADOPT=
+TOOL_ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --tool)
+      [ "$#" -ge 2 ] || usage
+      TOOL_ARGS[${#TOOL_ARGS[@]}]=$2
+      shift ;;
+    --adopt)
+      [ "$#" -ge 2 ] || usage
+      ADOPT=$2
+      shift ;;
+    -h|--help) usage_text; exit 0 ;;
+    *) usage ;;
+  esac
+  shift
+done
+case "$ADOPT" in
+  ''|pi) ;;
+  *) die "--adopt supports only pi, not '$ADOPT'" ;;
+esac
+
+case "${HOME:-}" in /*) ;; *) die "HOME must be set to an absolute path" ;; esac
+# Install paths are compared after symlink resolution, so also accept the resolved HOME.
+HOME_REAL=$(cd "$HOME" 2>/dev/null && pwd -P) || die "HOME is not accessible"
+
+# --- configuration (validated before anything runs) ---------------------------------------------
+TOOLS=()
+add_tool() {
+  local t=$1 i=0
+  case "$t" in
+    claude|codex|pi|opencode) ;;
+    *) die "unknown tool '$t' (known: $KNOWN_TOOLS)" ;;
+  esac
+  while [ "$i" -lt "${#TOOLS[@]}" ]; do
+    [ "${TOOLS[$i]}" != "$t" ] || return 0
+    i=$((i + 1))
+  done
+  TOOLS[${#TOOLS[@]}]=$t
+}
+TOOL_WORDS=()
+if [ "${#TOOL_ARGS[@]}" -gt 0 ]; then
+  # --tool replaces the environment/default list.
+  TOOL_WORDS=("${TOOL_ARGS[@]}")
+elif [ "$ADOPT" = pi ]; then
+  # A migration is one deliberate action: --adopt pi alone touches only pi.
+  TOOL_WORDS=(pi)
+else
+  TOOL_LIST=${BROKKR_AGENT_CLI_TOOLS-$KNOWN_TOOLS}
+  case "$TOOL_LIST" in
+    *[!A-Za-z0-9._\ -]*) die "invalid BROKKR_AGENT_CLI_TOOLS (space-separated tool names)" ;;
+  esac
+  IFS=' ' read -r -a TOOL_WORDS <<<"$TOOL_LIST"
+fi
+[ "${#TOOL_WORDS[@]}" -gt 0 ] || die "no tools selected"
+i=0
+while [ "$i" -lt "${#TOOL_WORDS[@]}" ]; do
+  add_tool "${TOOL_WORDS[$i]}"
+  i=$((i + 1))
+done
+if [ "$ADOPT" = pi ]; then
+  i=0
+  adopt_selected=0
+  while [ "$i" -lt "${#TOOLS[@]}" ]; do
+    if [ "${TOOLS[$i]}" = pi ]; then adopt_selected=1; fi
+    i=$((i + 1))
+  done
+  [ "$adopt_selected" -eq 1 ] || die "--adopt pi needs pi among the selected tools"
+fi
+
+# A unit name must not start with '-': it is passed to systemctl as a plain argument.
+UNIT_RE='^[A-Za-z0-9@_.][A-Za-z0-9@._-]*\.service$'
+BUSY_RAW=${BROKKR_AGENT_CLI_BUSY_UNITS-}
+case "$BUSY_RAW" in
+  *[!A-Za-z0-9@._\ -]*) die "invalid BROKKR_AGENT_CLI_BUSY_UNITS (space-separated .service unit names)" ;;
+esac
+BUSY_WORDS=()
+IFS=' ' read -r -a BUSY_WORDS <<<"$BUSY_RAW"
+BUSY_UNITS=()
+i=0
+while [ "$i" -lt "${#BUSY_WORDS[@]}" ]; do
+  [[ "${BUSY_WORDS[$i]}" =~ $UNIT_RE ]] || die "invalid BROKKR_AGENT_CLI_BUSY_UNITS entry '${BUSY_WORDS[$i]}' (a .service unit name is required)"
+  BUSY_UNITS[${#BUSY_UNITS[@]}]=${BUSY_WORDS[$i]}
+  i=$((i + 1))
+done
+
+# Release-age cooldown (0 disables it) and the clock it is measured against. The digits are
+# checked before any arithmetic: bash evaluates names inside $(( )) recursively.
+MIN_AGE_HOURS=${BROKKR_AGENT_CLI_MIN_AGE_HOURS-48}
+if ! [[ "$MIN_AGE_HOURS" =~ ^[0-9]{1,3}$ ]] || [ "$((10#$MIN_AGE_HOURS))" -gt 720 ]; then
+  die "invalid BROKKR_AGENT_CLI_MIN_AGE_HOURS (an integer from 0 to 720)"
+fi
+MIN_AGE_HOURS=$((10#$MIN_AGE_HOURS))
+if [ -n "${BROKKR_NOW_EPOCH+set}" ]; then
+  [[ "$BROKKR_NOW_EPOCH" =~ ^[0-9]{1,12}$ ]] || die "invalid BROKKR_NOW_EPOCH (epoch seconds)"
+  NOW_EPOCH=$((10#$BROKKR_NOW_EPOCH))
+else
+  NOW_EPOCH=$(date +%s)
+fi
+
+# Release endpoints; overridable so tests never reach the network. curl is limited to https.
+URL_RE='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$'
+NPM_REGISTRY=${BROKKR_NPM_REGISTRY:-https://registry.npmjs.org}
+GITHUB_API=${BROKKR_GITHUB_API:-https://api.github.com}
+GITHUB_DOWNLOAD=${BROKKR_GITHUB_DOWNLOAD:-https://github.com}
+NPM_REGISTRY=${NPM_REGISTRY%/}; GITHUB_API=${GITHUB_API%/}; GITHUB_DOWNLOAD=${GITHUB_DOWNLOAD%/}
+[[ "$NPM_REGISTRY" =~ $URL_RE ]] || die "invalid BROKKR_NPM_REGISTRY (an https:// base URL)"
+[[ "$GITHUB_API" =~ $URL_RE ]] || die "invalid BROKKR_GITHUB_API (an https:// base URL)"
+[[ "$GITHUB_DOWNLOAD" =~ $URL_RE ]] || die "invalid BROKKR_GITHUB_DOWNLOAD (an https:// base URL)"
+
+# pi-release layout: <version>/pi/pi below PI_ROOT (the release tarball's top-level pi/ directory
+# extracted inside <version>/), reached through the PI_LINK symlink.
+PI_REL=.local/lib/brokkr/agent-cli/pi
+PI_ROOT=$HOME/$PI_REL
+PI_LINK_DIR=$HOME/.local/bin
+PI_LINK=$PI_LINK_DIR/pi
+PI_KEEP=3
+
+CGROUP_ROOT=${BROKKR_CGROUP_ROOT:-/sys/fs/cgroup}
+STATE_DIR=${BROKKR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/brokkr}
+case "$STATE_DIR" in /*) ;; *) die "the state directory must be an absolute path" ;; esac
+STATE_FILE=$STATE_DIR/agent-cli-update.json
+
+TIMEOUT_BIN=
+for candidate in timeout gtimeout; do
+  if TIMEOUT_BIN=$(command -v "$candidate" 2>/dev/null); then break; fi
+  TIMEOUT_BIN=
+done
+
+# --- helpers ---------------------------------------------------------------------------------------
+run_limited() { # seconds command... ; no timeout command means no bound
+  local secs=$1
+  shift
+  if [ -n "$TIMEOUT_BIN" ]; then "$TIMEOUT_BIN" "$secs" "$@"; else "$@"; fi
+}
+
+# Scratch space of a pi-release install: the stage directory and the temporary symlink. They are
+# removed however the script ends, including on a signal (the traps turn a signal into an exit,
+# which runs the EXIT trap).
+PI_STAGE=
+PI_TMPLINK=
+cleanup_pi_scratch() {
+  if [ -n "$PI_STAGE" ]; then rm -rf "$PI_STAGE"; PI_STAGE=; fi
+  if [ -n "$PI_TMPLINK" ]; then rm -f "$PI_TMPLINK"; PI_TMPLINK=; fi
+}
+trap cleanup_pi_scratch EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Prints the first MAJOR.MINOR.PATCH that "$1 --version" reports. It fails when the command
+# exits non-zero or prints none, which doubles as the post-update smoke check.
+tool_version() {
+  local out ver
+  out=$(run_limited "$VERSION_TIMEOUT" "$1" --version </dev/null 2>&1) || return 1
+  ver=$(printf '%s\n' "$out" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1) || true
+  [ -n "$ver" ] || return 1
+  printf '%s\n' "$ver"
+}
+
+SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$'
+is_semver() { [[ "$1" =~ $SEMVER_RE ]]; }
+
+# Free text from the filesystem is reduced to a safe set before it reaches the log line.
+safe_text() { printf '%s' "$1" | tr -c 'A-Za-z0-9@/._+: -' '?'; }
+
+# The npm packages a tool may be installed from. opencode has two: @opencode/cli is the v2 line and
+# opencode-ai the legacy 1.x line, which is still released under its own name.
+npm_expected() { # tool -> text for messages
+  case "$1" in
+    claude) echo '@anthropic-ai/claude-code' ;;
+    codex) echo '@openai/codex' ;;
+    pi) echo '@earendil-works/pi-coding-agent' ;;
+    opencode) echo '@opencode/cli or opencode-ai' ;;
+  esac
+}
+package_allowed() { # tool package
+  case "$1:$2" in
+    claude:@anthropic-ai/claude-code|codex:@openai/codex|pi:@earendil-works/pi-coding-agent) return 0 ;;
+    opencode:@opencode/cli|opencode:opencode-ai) return 0 ;;
+  esac
+  return 1
+}
+
+# True when $1 lies below $HOME/$2/ (as written or with HOME resolved).
+under_home() {
+  case "$1" in
+    "$HOME/$2/"*|"$HOME_REAL/$2/"*) return 0 ;;
+  esac
+  return 1
+}
+
+# --- busy guard -----------------------------------------------------------------------------------
+# Counts PIDs across every cgroup.procs below a cgroup directory. Fails when nothing can be read.
+count_cgroup_pids() {
+  local dir=$1 files f n total=0
+  [ -d "$dir" ] && [ -r "$dir" ] && [ -x "$dir" ] || return 1
+  files=$(find "$dir" -type f -name cgroup.procs 2>/dev/null) || return 1
+  [ -n "$files" ] || return 1
+  while IFS= read -r f; do
+    n=$(wc -l <"$f" 2>/dev/null) || return 1
+    total=$((total + n))
+  done <<EOF
+$files
+EOF
+  printf '%s\n' "$total"
+}
+
+# A service's own cgroup holds its main process; more than one PID means it has spawned work
+# (an agent task). Sets DEFER_REASON and returns 1 when the run must not touch anything. Anything
+# unreadable also defers: an unattended update must not guess that nothing is running.
+DEFER_REASON=
+check_busy_units() {
+  local i=0 unit state cg dir pids
+  while [ "$i" -lt "${#BUSY_UNITS[@]}" ]; do
+    unit=${BUSY_UNITS[$i]}
+    i=$((i + 1))
+    if ! state=$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null); then
+      DEFER_REASON="cannot query $unit with systemctl --user (failing closed)"
+      return 1
+    fi
+    # Only a stopped unit is skipped. Transitional states (reloading, activating, deactivating,
+    # refreshing) can still hold spawned work, so they are inspected like active; an empty or
+    # unrecognised answer is not taken to mean "idle".
+    case "$state" in
+      inactive|failed) continue ;;
+      '') DEFER_REASON="systemctl --user reported no state for $unit (failing closed)"; return 1 ;;
+    esac
+    if ! cg=$(systemctl --user show -p ControlGroup --value "$unit" 2>/dev/null) || [ -z "$cg" ]; then
+      DEFER_REASON="cannot read the control group of $state unit $unit (failing closed)"
+      return 1
+    fi
+    case "$cg" in
+      */../*|*/..|*//*) DEFER_REASON="unsafe control group for $unit (failing closed)"; return 1 ;;
+      /*) ;;
+      *) DEFER_REASON="unsafe control group for $unit (failing closed)"; return 1 ;;
+    esac
+    dir=$CGROUP_ROOT$cg
+    if ! pids=$(count_cgroup_pids "$dir"); then
+      DEFER_REASON="cannot read cgroup $dir of unit $unit (failing closed)"
+      return 1
+    fi
+    if [ "$pids" -gt 1 ]; then
+      DEFER_REASON="$unit is $state with $pids processes in its cgroup (an agent task is running)"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# --- per-tool results ----------------------------------------------------------------------------
+NRES=0
+R_NAME=(); R_METHOD=(); R_PATH=(); R_BEFORE=(); R_AFTER=(); R_ACTION=(); R_DETAIL=()
+record() { # name method path before after action detail
+  R_NAME[$NRES]=$1; R_METHOD[$NRES]=$2; R_PATH[$NRES]=$3; R_BEFORE[$NRES]=$4
+  R_AFTER[$NRES]=$5; R_ACTION[$NRES]=$6; R_DETAIL[$NRES]=$7
+  NRES=$((NRES + 1))
+}
+dash() { if [ -n "$1" ]; then printf '%s' "$1"; else printf '%s' -; fi; }
+report_line() { # name method before after action detail
+  printf '%s %s %s -> %s %s' "$1" "$(dash "$2")" "$(dash "$3")" "$(dash "$4")" "$5"
+  if [ -n "$6" ]; then printf ' %s' "$6"; fi
+  printf '\n'
+}
+count_action() {
+  local n=0 i=0
+  while [ "$i" -lt "$NRES" ]; do
+    if [ "${R_ACTION[$i]}" = "$1" ]; then n=$((n + 1)); fi
+    i=$((i + 1))
+  done
+  printf '%s' "$n"
+}
+
+# Fields of the tool being processed.
+T_METHOD=; T_PATH=; T_BEFORE=; T_AFTER=; T_ACTION=; T_DETAIL=
+NPM_PREFIX=; NPM_PKG=; BREW_KIND=; BREW_NAME=
+fail() { T_ACTION=failed; T_DETAIL=$1; }
+hold() { T_ACTION=held; T_AFTER=$T_BEFORE; T_DETAIL=$1; }
+hold_unknown() { hold "cannot evaluate release age ($1)"; }
+
+# --- release metadata and the cooldown ----------------------------------------------------------------
+# Only plain MAJOR.MINOR.PATCH versions are ever candidates; anything with a - or + suffix is a
+# prerelease or a build and is ignored. Components are bounded so the arithmetic below cannot overflow.
+PLAIN_RE='^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}$'
+is_plain() { [[ "$1" =~ $PLAIN_RE ]]; }
+
+# True when version $1 is newer than $2, compared component by component as numbers.
+ver_gt() {
+  local a=$1 b=$2 ax bx
+  is_plain "$a" && is_plain "$b" || return 1
+  while :; do
+    ax=$((10#${a%%.*})); bx=$((10#${b%%.*}))
+    if [ "$ax" -ne "$bx" ]; then [ "$ax" -gt "$bx" ]; return; fi
+    case $a in *.*) a=${a#*.}; b=${b#*.} ;; *) return 1 ;; esac
+  done
+}
+
+# The JSON reader for release metadata: python3 in isolated mode when present, else node. Both
+# programs are fixed strings; the metadata arrives on stdin and the kind as the one argument, so
+# nothing fetched is ever evaluated. Output: "v <key> <epoch>" for a published version or tag (drafts
+# and prereleases are skipped) and "t <name> <value>" for an npm dist-tag or a Homebrew version. Keys
+# and values are limited to [A-Za-z0-9._+-]; anything else is dropped. A document of the wrong shape
+# makes the reader exit non-zero.
+JSON_PY='
+import datetime, json, re, sys
+kind = sys.argv[1]
+word = re.compile(r"[A-Za-z0-9._+-]+\Z")
+stamp = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?Z\Z")
+def good(s):
+    return isinstance(s, str) and word.match(s) is not None
+def epoch(s):
+    m = stamp.match(s) if isinstance(s, str) else None
+    if m is None:
+        return None
+    try:
+        parts = [int(g) for g in m.groups()]
+        return int(datetime.datetime(*parts, tzinfo=datetime.timezone.utc).timestamp())
+    except ValueError:
+        return None
+data = json.load(sys.stdin)
+if kind == "npm":
+    for k, v in data["time"].items():
+        e = epoch(v)
+        if good(k) and e is not None:
+            print("v", k, e)
+    for k, v in data["dist-tags"].items():
+        if good(k) and good(v):
+            print("t", k, v)
+elif kind == "github":
+    # A releases list, or one release object (releases/latest, releases/tags/<tag>).
+    for r in (data if isinstance(data, list) else [data]):
+        e = epoch(r["published_at"])
+        if r["draft"] is False and r["prerelease"] is False and good(r["tag_name"]) and e is not None:
+            print("v", r["tag_name"], e)
+elif kind == "brew-cask" or kind == "brew-formula":
+    v = data["casks"][0]["version"] if kind == "brew-cask" else data["formulae"][0]["versions"]["stable"]
+    if good(v):
+        print("t", "version", v)
+else:
+    sys.exit(2)
+'
+JSON_JS='
+const fs = require("fs");
+const kind = process.argv[1];
+const word = /^[A-Za-z0-9._+-]+$/;
+const stamp = /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?Z$/;
+const good = (s) => typeof s === "string" && word.test(s);
+function epoch(s) {
+  const m = typeof s === "string" ? stamp.exec(s) : null;
+  if (m === null) return null;
+  const n = m.slice(1).map(Number);
+  const t = Date.UTC(n[0], n[1] - 1, n[2], n[3], n[4], n[5]);
+  if (!Number.isFinite(t) || new Date(t).toISOString().slice(0, 19) !== s.slice(0, 19)) return null;
+  return Math.floor(t / 1000);
+}
+const data = JSON.parse(fs.readFileSync(0, "utf8"));
+const out = [];
+if (kind === "npm") {
+  for (const k of Object.keys(data.time)) {
+    const e = epoch(data.time[k]);
+    if (good(k) && e !== null) out.push("v " + k + " " + e);
+  }
+  for (const k of Object.keys(data["dist-tags"])) {
+    if (good(k) && good(data["dist-tags"][k])) out.push("t " + k + " " + data["dist-tags"][k]);
+  }
+} else if (kind === "github") {
+  for (const r of (Array.isArray(data) ? data : [data])) {
+    const e = epoch(r.published_at);
+    if (r.draft === false && r.prerelease === false && good(r.tag_name) && e !== null) out.push("v " + r.tag_name + " " + e);
+  }
+} else if (kind === "brew-cask" || kind === "brew-formula") {
+  const v = kind === "brew-cask" ? data.casks[0].version : data.formulae[0].versions.stable;
+  if (good(v)) out.push("t version " + v);
+} else {
+  process.exit(2);
+}
+if (out.length > 0) process.stdout.write(out.join("\n") + "\n");
+'
+have_json_reader() { command -v python3 >/dev/null 2>&1 || command -v node >/dev/null 2>&1; }
+# node is tried when python3 is missing or fails (the macOS python3 stub without Command Line Tools
+# exits non-zero); the output is buffered so a reader that fails half-way contributes nothing.
+json_reader() { # kind ; metadata on stdin
+  local doc out
+  doc=$(cat)
+  if command -v python3 >/dev/null 2>&1 && out=$(printf '%s' "$doc" | python3 -I -c "$JSON_PY" "$1"); then
+    printf '%s\n' "$out"; return 0
+  fi
+  command -v node >/dev/null 2>&1 || return 1
+  out=$(printf '%s' "$doc" | node -e "$JSON_JS" "$1") || return 1
+  printf '%s\n' "$out"
+}
+
+# Release data read by load_releases: versions with their publish time, and npm dist-tags.
+REL_N=0; REL_VER=(); REL_EPOCH=(); TAG_N=0; TAG_NAME=(); TAG_VAL=(); LOAD_ERR=
+# Fetches one metadata document and loads it. GitHub tags must start with the given prefix, which is
+# stripped. Returns 1 with LOAD_ERR set when the document cannot be fetched or read; callers hold the
+# tool then, because a release whose age is unknown is never treated as old enough.
+load_releases() { # kind url [tag-prefix]
+  local kind=$1 url=$2 prefix=${3-} body out k key val ver
+  REL_N=0; REL_VER=(); REL_EPOCH=(); TAG_N=0; TAG_NAME=(); TAG_VAL=(); LOAD_ERR=
+  if ! have_json_reader; then LOAD_ERR="python3 or node is needed to read release metadata"; return 1; fi
+  if ! body=$(run_limited "$LOOKUP_TIMEOUT" curl -fsSL --proto =https --max-time 60 "$url" </dev/null 2>/dev/null); then
+    LOAD_ERR="release metadata could not be fetched"; return 1
+  fi
+  if ! out=$(printf '%s' "$body" | json_reader "$kind" 2>/dev/null); then
+    LOAD_ERR="release metadata could not be read"; return 1
+  fi
+  while IFS=' ' read -r k key val; do
+    case $k in
+      v)
+        case $key in "$prefix"*) ver=${key#"$prefix"} ;; *) continue ;; esac
+        is_plain "$ver" || continue
+        [[ "$val" =~ ^[0-9]{1,12}$ ]] || continue
+        REL_VER[$REL_N]=$ver; REL_EPOCH[$REL_N]=$((10#$val)); REL_N=$((REL_N + 1)) ;;
+      t)
+        TAG_NAME[$TAG_N]=$key; TAG_VAL[$TAG_N]=$val; TAG_N=$((TAG_N + 1)) ;;
+    esac
+  done <<<"$out"
+  return 0
+}
+
+tag_value() { # dist-tag name -> its version, or fail
+  local i=0
+  while [ "$i" -lt "$TAG_N" ]; do
+    if [ "${TAG_NAME[$i]}" = "$1" ]; then printf '%s\n' "${TAG_VAL[$i]}"; return 0; fi
+    i=$((i + 1))
+  done
+  return 1
+}
+epoch_of() { # version -> its publish epoch, or fail
+  local i=0
+  while [ "$i" -lt "$REL_N" ]; do
+    if [ "${REL_VER[$i]}" = "$1" ]; then printf '%s\n' "${REL_EPOCH[$i]}"; return 0; fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# A release has cleared the cooldown when it was published at least MIN_AGE_HOURS ago (always, at 0).
+aged() { [ "$MIN_AGE_HOURS" -eq 0 ] || [ $((NOW_EPOCH - $1)) -ge $((MIN_AGE_HOURS * 3600)) ]; }
+young_text() { # version epoch
+  local secs=$((NOW_EPOCH - $2))
+  if [ "$secs" -lt 0 ]; then secs=0; fi
+  printf '%s is only %sh old, below the %sh release-age cooldown' "$1" $((secs / 3600)) "$MIN_AGE_HOURS"
+}
+
+# Picks among the loaded releases the highest version newer than $1 (which may be empty) that has
+# cleared the cooldown. PICK is none (nothing newer at all), young (newer ones exist but every one
+# is inside the cooldown) or ready (PICK_VER/PICK_EPOCH). NEWEST_* is the highest newer version,
+# eligible or not, for the message.
+PICK=; PICK_VER=; PICK_EPOCH=; NEWEST_VER=; NEWEST_EPOCH=
+pick_highest() { # installed-or-empty
+  local i=0 v e
+  PICK=none; PICK_VER=; PICK_EPOCH=; NEWEST_VER=; NEWEST_EPOCH=
+  while [ "$i" -lt "$REL_N" ]; do
+    v=${REL_VER[$i]}; e=${REL_EPOCH[$i]}
+    i=$((i + 1))
+    if [ -n "$1" ] && ! ver_gt "$v" "$1"; then continue; fi
+    if [ -z "$NEWEST_VER" ] || ver_gt "$v" "$NEWEST_VER"; then NEWEST_VER=$v; NEWEST_EPOCH=$e; fi
+    if aged "$e" && { [ -z "$PICK_VER" ] || ver_gt "$v" "$PICK_VER"; }; then PICK_VER=$v; PICK_EPOCH=$e; fi
+  done
+  if [ -z "$NEWEST_VER" ]; then PICK=none; elif [ -z "$PICK_VER" ]; then PICK=young; else PICK=ready; fi
+  return 0
+}
+# The most recently published release (ties: the higher version), as PICK_VER/PICK_EPOCH. This is
+# what an updater that only knows "latest" will install. Fails when there is no release.
+pick_newest_published() {
+  local i=0 v e
+  PICK_VER=; PICK_EPOCH=
+  while [ "$i" -lt "$REL_N" ]; do
+    v=${REL_VER[$i]}; e=${REL_EPOCH[$i]}
+    i=$((i + 1))
+    if [ -z "$PICK_VER" ] || [ "$e" -gt "$PICK_EPOCH" ] || { [ "$e" -eq "$PICK_EPOCH" ] && ver_gt "$v" "$PICK_VER"; }; then
+      PICK_VER=$v; PICK_EPOCH=$e
+    fi
+  done
+  [ -n "$PICK_VER" ]
+}
+# Gate for a method with one target version: sets T_ACTION and fails when nothing is to be
+# installed, because the target is not newer than $3 (the installed version, possibly empty) or has
+# not cleared the cooldown (or its age is unknown).
+gate_target() { # target epoch-or-empty installed-or-empty
+  if [ -n "$3" ] && ! ver_gt "$1" "$3"; then T_ACTION=current; T_AFTER=$T_BEFORE; return 1; fi
+  if [ "$MIN_AGE_HOURS" -gt 0 ]; then
+    if [ -z "$2" ]; then hold_unknown "no publish time for $1"; return 1; fi
+    if ! aged "$2"; then hold "$(young_text "$1" "$2")"; return 1; fi
+  fi
+  return 0
+}
+
+classify() { # tool real-path -> T_METHOD
+  local tool=$1 real=$2 rest
+  T_METHOD=unknown
+  if [ "$tool" = pi ] && under_home "$real" "$PI_REL"; then T_METHOD=pi-release; return 0; fi
+  if [ "$tool" = claude ] && under_home "$real" .local/share/claude/versions; then T_METHOD=native; return 0; fi
+  # Homebrew first: node-based formulae keep a private lib/node_modules under
+  # Cellar/<name>/<ver>/libexec, and npm must never install into the Cellar.
+  case "$real" in
+    */Caskroom/*/*)
+      rest=${real#*/Caskroom/}
+      BREW_KIND=cask; BREW_NAME=${rest%%/*}; T_METHOD=brew
+      return 0 ;;
+    */Cellar/*/*)
+      rest=${real#*/Cellar/}
+      BREW_KIND=formula; BREW_NAME=${rest%%/*}; T_METHOD=brew
+      return 0 ;;
+    */lib/node_modules/*) T_METHOD=npm; return 0 ;;
+  esac
+  if [ "$tool" = codex ] && under_home "$real" .codex/packages/standalone; then T_METHOD=codex-standalone; return 0; fi
+  if [ "$tool" = opencode ] && under_home "$real" .opencode; then T_METHOD=opencode-installer; return 0; fi
+  if command -v dpkg-query >/dev/null 2>&1 && dpkg-query -S "$real" >/dev/null 2>&1; then T_METHOD=apt; return 0; fi
+  return 0
+}
+
+# The post-update smoke check failed: npm and opencode-installer installs go back to the
+# previous version; every other method is reported, not guessed at. $2 says why, when the CLI
+# still ran but reported the wrong version.
+smoke_failed() { # tool [reason]
+  local tool=$1 why=
+  if [ -n "${2-}" ]; then why=" ($2)"; fi
+  case "$T_METHOD" in
+    npm)
+      echo "smoke check failed for $tool; reinstalling $NPM_PKG@$T_BEFORE"
+      # rolled-back only when the CLI really reports the previous version again.
+      if run_limited "$UPDATE_TIMEOUT" npm install -g --prefix "$NPM_PREFIX" --no-fund --no-audit "$NPM_PKG@$T_BEFORE" </dev/null \
+        && T_AFTER=$(tool_version "$tool") && [ "$T_AFTER" = "$T_BEFORE" ]; then
+        T_ACTION=rolled-back; T_DETAIL="smoke check failed after the update$why; restored $T_BEFORE"
+      else
+        T_AFTER=$(tool_version "$tool") || T_AFTER=
+        fail "smoke check failed$why and rollback to $T_BEFORE did not restore it (now ${T_AFTER:-no working CLI})"
+      fi ;;
+    opencode-installer)
+      if [ -z "$T_BEFORE" ]; then
+        fail "smoke check failed; previous version unknown, no rollback possible"
+      else
+        echo "smoke check failed for $tool; running: opencode upgrade $T_BEFORE"
+        if run_limited "$UPDATE_TIMEOUT" opencode upgrade "$T_BEFORE" </dev/null && T_AFTER=$(tool_version "$tool"); then
+          T_ACTION=rolled-back; T_DETAIL="smoke check failed after the update$why; restored $T_BEFORE"
+        else
+          T_AFTER=
+          fail "smoke check failed and rollback to $T_BEFORE did not restore a working CLI"
+        fi
+      fi ;;
+    native)
+      if [ -n "$T_BEFORE" ]; then
+        fail "smoke check failed; no automatic rollback (manual rollback: claude install $T_BEFORE)"
+      else
+        fail "smoke check failed; no automatic rollback"
+      fi ;;
+    *) fail "smoke check failed; no automatic rollback" ;;
+  esac
+  return 0
+}
+
+# The CLI ran after a gated update but reports another version than the one the gate approved.
+# opencode goes back to the previous version; the others cannot be pinned or rolled back here.
+wrong_version() { # tool target command-label
+  local tool=$1 target=$2 label=$3
+  case "$T_METHOD" in
+    opencode-installer) smoke_failed "$tool" "reports $T_AFTER, expected $target" ;;
+    native)
+      if [ -n "$T_BEFORE" ]; then
+        fail "claude --version reports $T_AFTER, expected $target; roll back manually with: claude install $T_BEFORE"
+      else
+        fail "claude --version reports $T_AFTER, expected $target; no earlier version is known to roll back to"
+      fi ;;
+    *) fail "$label installed $T_AFTER, expected $target" ;;
+  esac
+  return 0
+}
+
+# Runs a command that installs the version the gate approved, then checks the CLI reports exactly
+# that version. The command's own idea of "latest" is never trusted: methods that cannot be pinned
+# are gated beforehand and verified here afterwards.
+gated_update() { # tool target command...
+  local tool=$1 target=$2 rc=0 label
+  shift 2
+  label="$1 $2"
+  if [ "$DRY_RUN" -eq 1 ]; then T_ACTION=would-update; T_AFTER=$target; T_DETAIL="would run: $*"; return 0; fi
+  run_limited "$UPDATE_TIMEOUT" "$@" </dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then fail "update command failed (exit $rc)"; return 0; fi
+  if ! T_AFTER=$(tool_version "$tool"); then smoke_failed "$tool"; return 0; fi
+  if [ "$T_AFTER" != "$target" ]; then wrong_version "$tool" "$target" "$label"; return 0; fi
+  T_ACTION=updated
+  return 0
+}
+
+# Runs a command without a gated target (only a Homebrew package with the cooldown disabled), then
+# smoke-checks the result.
+update_with_command() { # tool command...
+  local tool=$1 rc=0
+  shift
+  if [ "$DRY_RUN" -eq 1 ]; then T_ACTION=would-update; T_DETAIL="would run: $*"; return 0; fi
+  run_limited "$UPDATE_TIMEOUT" "$@" </dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then fail "update command failed (exit $rc)"; return 0; fi
+  if ! T_AFTER=$(tool_version "$tool"); then smoke_failed "$tool"; return 0; fi
+  if [ "$T_AFTER" = "$T_BEFORE" ]; then T_ACTION=current; else T_ACTION=updated; fi
+  return 0
+}
+
+# Appends a note to the detail of a tool that is working as it should (never to a failure).
+note_detail() {
+  case "$T_ACTION" in current|updated|would-update|held) ;; *) return 0 ;; esac
+  if [ -n "$T_DETAIL" ]; then T_DETAIL="$T_DETAIL; $1"; else T_DETAIL=$1; fi
+  return 0
+}
+
+update_npm() { # tool
+  update_npm_package "$1"
+  # opencode-ai is the legacy 1.x line: it is still released under its own name, so it keeps
+  # updating in place, but its owner should know v2 is a different package.
+  if [ "$1" = opencode ] && [ "$NPM_PKG" = opencode-ai ]; then note_detail "legacy 1.x line; v2 is @opencode/cli"; fi
+  return 0
+}
+
+update_npm_package() { # tool
+  local tool=$1 rest first remainder expected pj base rc=0 latest
+  NPM_PREFIX=${T_PATH%%/lib/node_modules/*}
+  rest=${T_PATH#*/lib/node_modules/}
+  case "$rest" in
+    @*/*) first=${rest%%/*}; remainder=${rest#*/}; NPM_PKG=$first/${remainder%%/*} ;;
+    *) NPM_PKG=${rest%%/*} ;;
+  esac
+  expected=$(npm_expected "$tool")
+  if [ "$tool" = pi ] && [ "$NPM_PKG" = @mariozechner/pi-coding-agent ]; then
+    fail "legacy package; migrate to @earendil-works/pi-coding-agent"; return 0
+  fi
+  if ! package_allowed "$tool" "$NPM_PKG"; then
+    fail "package $(safe_text "$NPM_PKG") is not the expected $expected"; return 0
+  fi
+  if [ -z "$NPM_PREFIX" ]; then fail "cannot determine the npm prefix"; return 0; fi
+  if [ ! -w "$NPM_PREFIX/lib/node_modules" ]; then fail "npm prefix not writable (root-managed)"; return 0; fi
+  if ! command -v node >/dev/null 2>&1; then fail "node not found on PATH"; return 0; fi
+  if ! command -v npm >/dev/null 2>&1; then fail "npm not found on PATH"; return 0; fi
+  pj=$NPM_PREFIX/lib/node_modules/$NPM_PKG/package.json
+  # The path is an argument, never interpolated into the JavaScript.
+  if ! T_BEFORE=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).version' "$pj" 2>/dev/null) \
+    || ! is_semver "$T_BEFORE"; then
+    T_BEFORE=
+    fail "cannot read the installed version from package.json"; return 0
+  fi
+  if ! load_releases npm "$NPM_REGISTRY/${NPM_PKG//\//%2f}"; then hold_unknown "$LOAD_ERR"; return 0; fi
+  base=${T_BEFORE%%[-+]*}
+  pick_highest "$base"
+  case "$PICK" in
+    none) T_ACTION=current; T_AFTER=$T_BEFORE; return 0 ;;
+    young) hold "newer release $(young_text "$NEWEST_VER" "$NEWEST_EPOCH")"; return 0 ;;
+  esac
+  latest=$PICK_VER
+  if [ "$DRY_RUN" -eq 1 ]; then
+    T_ACTION=would-update; T_AFTER=$latest
+    T_DETAIL="would run: npm install -g --prefix $(safe_text "$NPM_PREFIX") $NPM_PKG@$latest"
+    return 0
+  fi
+  run_limited "$UPDATE_TIMEOUT" npm install -g --prefix "$NPM_PREFIX" --no-fund --no-audit "$NPM_PKG@$latest" </dev/null || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    T_AFTER=$(tool_version "$tool") || T_AFTER=
+    fail "npm install failed (exit $rc)"
+    if [ -z "$T_AFTER" ]; then T_DETAIL="$T_DETAIL; the CLI no longer reports a version"; fi
+    return 0
+  fi
+  if ! T_AFTER=$(tool_version "$tool"); then smoke_failed "$tool"; return 0; fi
+  # The CLI on PATH must now be the version just installed; anything else (a shadowing copy,
+  # a package that did not take) is a failed update, not a success with a footnote.
+  if [ "$T_AFTER" != "$latest" ]; then smoke_failed "$tool" "installed $latest but --version reports $T_AFTER"; return 0; fi
+  T_ACTION=updated
+  return 0
+}
+
+# Homebrew: only the codex cask/formula has a release source whose age can be read (the GitHub
+# release of the version Homebrew offers). Any other package is held, never updated blind, unless
+# the cooldown is disabled.
+update_brew() { # tool
+  local tool=$1 info out target tepoch=
+  if ! [[ "$BREW_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9@._+-]*$ ]]; then fail "unexpected Homebrew package name"; return 0; fi
+  if ! command -v brew >/dev/null 2>&1; then fail "brew not found on PATH"; return 0; fi
+  if [ "$tool" != codex ] || [ "$BREW_NAME" != codex ]; then
+    if [ "$MIN_AGE_HOURS" -gt 0 ]; then
+      hold "release age unknown for Homebrew package $BREW_NAME"
+    elif [ "$BREW_KIND" = cask ]; then
+      update_with_command "$tool" brew upgrade --cask "$BREW_NAME"
+    else
+      update_with_command "$tool" brew upgrade "$BREW_NAME"
+    fi
+    return 0
+  fi
+  if ! have_json_reader; then hold_unknown "python3 or node is needed to read release metadata"; return 0; fi
+  if [ "$BREW_KIND" = cask ]; then
+    info=$(run_limited "$LOOKUP_TIMEOUT" brew info --json=v2 --cask "$BREW_NAME" </dev/null 2>/dev/null) || info=
+    out=$(printf '%s' "$info" | json_reader brew-cask 2>/dev/null) || out=
+  else
+    info=$(run_limited "$LOOKUP_TIMEOUT" brew info --json=v2 --formula "$BREW_NAME" </dev/null 2>/dev/null) || info=
+    out=$(printf '%s' "$info" | json_reader brew-formula 2>/dev/null) || out=
+  fi
+  target=${out#t version }
+  if ! is_plain "$target" || [ "$out" != "t version $target" ]; then
+    hold_unknown "Homebrew did not report a plain version for $BREW_NAME"; return 0
+  fi
+  if [ -n "$T_BEFORE" ] && ! ver_gt "$target" "$T_BEFORE"; then T_ACTION=current; T_AFTER=$T_BEFORE; return 0; fi
+  if [ "$MIN_AGE_HOURS" -gt 0 ]; then
+    # Only the release Homebrew offers: openai/codex publishes many large prereleases, so the full
+    # list is tens of megabytes.
+    if ! load_releases github "$GITHUB_API/repos/openai/codex/releases/tags/rust-v$target" rust-v; then hold_unknown "$LOAD_ERR"; return 0; fi
+    tepoch=$(epoch_of "$target") || tepoch=
+  fi
+  gate_target "$target" "$tepoch" "$T_BEFORE" || return 0
+  if [ "$BREW_KIND" = cask ]; then
+    gated_update "$tool" "$target" brew upgrade --cask "$BREW_NAME"
+  else
+    gated_update "$tool" "$target" brew upgrade "$BREW_NAME"
+  fi
+  return 0
+}
+
+# claude's own installer, driven to an exact version: the target is the registry's stable dist-tag.
+update_native() { # tool
+  local target tepoch=
+  if ! load_releases npm "$NPM_REGISTRY/@anthropic-ai%2fclaude-code"; then hold_unknown "$LOAD_ERR"; return 0; fi
+  if ! target=$(tag_value stable) || ! is_plain "$target"; then hold_unknown "no stable release in the registry metadata"; return 0; fi
+  tepoch=$(epoch_of "$target") || tepoch=
+  gate_target "$target" "$tepoch" "$T_BEFORE" || return 0
+  gated_update "$1" "$target" claude install "$target"
+  return 0
+}
+
+# codex update cannot be pinned, so it runs only when the newest published release has cleared the
+# cooldown, and the version it leaves behind must be that release. GitHub's releases/latest is
+# exactly that release (newest non-draft, non-prerelease) and avoids the multi-megabyte full list;
+# a latest release whose tag is not a plain rust-v version is held.
+update_codex_standalone() { # tool
+  local target tepoch
+  if ! load_releases github "$GITHUB_API/repos/openai/codex/releases/latest" rust-v; then hold_unknown "$LOAD_ERR"; return 0; fi
+  if ! pick_newest_published; then hold_unknown "no stable release found"; return 0; fi
+  target=$PICK_VER; tepoch=$PICK_EPOCH
+  gate_target "$target" "$tepoch" "$T_BEFORE" || return 0
+  gated_update "$1" "$target" codex update
+  return 0
+}
+
+# opencode's installer takes an exact version. Its major picks the release line: 2.x and later are
+# published as @opencode/cli, the legacy 1.x line as opencode-ai.
+update_opencode_installer() { # tool
+  local pkg
+  if [ -z "$T_BEFORE" ]; then fail "cannot read the installed version"; return 0; fi
+  if [ "$((10#${T_BEFORE%%.*}))" -ge 2 ]; then pkg=@opencode/cli; else pkg=opencode-ai; fi
+  if ! load_releases npm "$NPM_REGISTRY/${pkg//\//%2f}"; then hold_unknown "$LOAD_ERR"; return 0; fi
+  pick_highest "$T_BEFORE"
+  case "$PICK" in
+    none) T_ACTION=current; T_AFTER=$T_BEFORE; return 0 ;;
+    young) hold "newer release $(young_text "$NEWEST_VER" "$NEWEST_EPOCH")"; return 0 ;;
+  esac
+  gated_update "$1" "$PICK_VER" opencode upgrade "$PICK_VER"
+  return 0
+}
+
+# --- pi-release: checksum-verified release binaries -------------------------------------------------
+# <PI_ROOT>/<version>/pi/pi is the release tarball's pi/ directory unpacked under its version, and
+# PI_LINK is a symlink to the version in use. An update unpacks the new version beside the old one,
+# swaps the symlink atomically and keeps the old directory, so going back is moving one link.
+
+# Prints the version when $1 is exactly <PI_ROOT>/<plain version>/pi/pi (HOME as written or resolved).
+pi_target_version() { # path
+  local rest ver
+  case "$1" in
+    "$HOME/$PI_REL/"*) rest=${1#"$HOME/$PI_REL/"} ;;
+    "$HOME_REAL/$PI_REL/"*) rest=${1#"$HOME_REAL/$PI_REL/"} ;;
+    *) return 1 ;;
+  esac
+  ver=${rest%%/*}
+  is_plain "$ver" && [ "$rest" = "$ver/pi/pi" ] || return 1
+  printf '%s\n' "$ver"
+}
+
+# True when PI_LINK is a symlink into the pi-release tree.
+pi_link_in_tree() {
+  local target
+  [ -L "$PI_LINK" ] || return 1
+  target=$(readlink "$PI_LINK") || return 1
+  pi_target_version "$target" >/dev/null
+}
+
+# The platform part of the release asset name; fails for anything the releases do not cover.
+pi_platform() {
+  local os arch
+  os=$(uname -s 2>/dev/null) || os=
+  arch=$(uname -m 2>/dev/null) || arch=
+  case "$os/$arch" in
+    Darwin/arm64) echo darwin-arm64 ;;
+    Darwin/x86_64) echo darwin-x64 ;;
+    Linux/x86_64) echo linux-x64 ;;
+    Linux/aarch64|Linux/arm64) echo linux-arm64 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The pi that the checks and the smoke test run: the link itself while adopting (an older pi may
+# legitimately come first on PATH then), otherwise whatever PATH finds.
+pi_probe() { if [ "$ADOPT" = pi ]; then tool_version "$PI_LINK"; else tool_version pi; fi; }
+
+# Downloads the archive and SHA256SUMS into the stage and checks the archive's SHA-256 against the
+# one line that names it. Calls fail and returns 1 on any problem.
+SUMS_RE='^([0-9A-Fa-f]{64}) [ *](.+)$'
+pi_download() { # version stage asset
+  local ver=$1 stage=$2 asset=$3 base f line want='' got n=0
+  base=$GITHUB_DOWNLOAD/earendil-works/pi/releases/download/v$ver
+  for f in "$asset" SHA256SUMS; do
+    if ! run_limited "$UPDATE_TIMEOUT" curl -fsSL --proto =https --max-time 600 -o "$stage/$f" "$base/$f" </dev/null; then
+      fail "cannot download $f for pi $ver"; return 1
+    fi
+  done
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    if [[ "$line" =~ $SUMS_RE ]] && [ "${BASH_REMATCH[2]}" = "$asset" ]; then
+      n=$((n + 1)); want=${BASH_REMATCH[1]}
+    elif [[ "$line" == *" $asset" || "$line" == *"*$asset" ]]; then
+      n=$((n + 1)); want=
+    fi
+  done <"$stage/SHA256SUMS"
+  if [ "$n" -ne 1 ] || [ -z "$want" ]; then
+    fail "SHA256SUMS must name $asset exactly once with a 64-digit SHA-256"; return 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    got=$(sha256sum "$stage/$asset" 2>/dev/null) || got=
+  elif command -v shasum >/dev/null 2>&1; then
+    got=$(shasum -a 256 "$stage/$asset" 2>/dev/null) || got=
+  else
+    fail "neither sha256sum nor shasum is available to verify the download"; return 1
+  fi
+  got=$(printf '%s' "${got%% *}" | tr 'A-F' 'a-f')
+  want=$(printf '%s' "$want" | tr 'A-F' 'a-f')
+  if [ -z "$got" ] || [ "$got" != "$want" ]; then fail "checksum mismatch for $asset"; return 1; fi
+  return 0
+}
+
+# The archive may hold only regular files and directories below pi/: no absolute path, no ..
+# component, no link, device or other special member. Judged from the listings, before extracting.
+pi_check_archive() { # archive
+  local names types p t
+  if ! names=$(tar -tzf "$1" 2>/dev/null) || ! types=$(tar -tzvf "$1" 2>/dev/null) || [ -z "$names" ]; then
+    fail "cannot list the pi archive"; return 1
+  fi
+  if [ "$(printf '%s\n' "$names" | wc -l)" -ne "$(printf '%s\n' "$types" | wc -l)" ]; then
+    fail "the pi archive listing is inconsistent"; return 1
+  fi
+  while IFS= read -r p; do
+    case "$p" in
+      pi/|pi/*) ;;
+      *) fail "unexpected path in the pi archive: $(safe_text "$p")"; return 1 ;;
+    esac
+    case "/$p/" in
+      */../*) fail "unsafe path in the pi archive: $(safe_text "$p")"; return 1 ;;
+    esac
+  done <<<"$names"
+  while IFS= read -r t; do
+    case "$t" in
+      -*|d*) ;;
+      *) fail "the pi archive has a member that is neither a regular file nor a directory"; return 1 ;;
+    esac
+  done <<<"$types"
+  return 0
+}
+
+# Keeps the PI_KEEP newest version directories plus $1 (the version now in use) and $2 (the one
+# before it); anything that is not a plain-version directory is left alone.
+pi_prune() { # current previous-or-empty
+  local list v n=0
+  list=$(find "$PI_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed 's|.*/||' \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1nr -k2,2nr -k3,3nr) || list=
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    n=$((n + 1))
+    if [ "$n" -le "$PI_KEEP" ] || [ "$v" = "$1" ] || [ "$v" = "$2" ]; then continue; fi
+    rm -rf "${PI_ROOT:?}/$v" || echo "warning: could not remove the old pi version directory $v" >&2
+  done <<<"$list"
+  return 0
+}
+
+# Points PI_LINK at $1 by renaming a temporary symlink over it, or removes it when $1 is empty.
+pi_set_link() { # target-or-empty
+  if [ -z "$1" ]; then rm -f "$PI_LINK"; return; fi
+  PI_TMPLINK=$PI_LINK_DIR/.pi.new.$$
+  rm -f "$PI_TMPLINK"
+  ln -s "$1" "$PI_TMPLINK" && mv -f "$PI_TMPLINK" "$PI_LINK" || return 1
+  PI_TMPLINK=
+}
+
+# Installs release $1: download, verify, validate, unpack in a private stage, move the stage to its
+# version directory, swap the symlink, smoke-check, and go back to the previous link if that fails.
+pi_install() { # version
+  pi_install_steps "$1"
+  cleanup_pi_scratch
+  return 0
+}
+pi_install_steps() { # version
+  local ver=$1 plat asset stage dest prev='' prev_ver='' got
+  if ! plat=$(pi_platform); then
+    fail "unsupported platform $(safe_text "$(uname -s 2>/dev/null) $(uname -m 2>/dev/null)")"; return 0
+  fi
+  asset=pi-$plat.tar.gz
+  dest=$PI_ROOT/$ver
+  if [ "$DRY_RUN" -eq 1 ]; then
+    T_ACTION=would-update; T_AFTER=$ver
+    T_DETAIL="would install pi $ver from $(safe_text "$GITHUB_DOWNLOAD/earendil-works/pi/releases/download/v$ver/$asset")"
+    return 0
+  fi
+  if ! mkdir -p "$PI_ROOT" "$PI_LINK_DIR"; then fail "cannot create the pi install directories"; return 0; fi
+  if [ -d "$PI_LINK" ]; then fail "$(safe_text "$PI_LINK") is a directory"; return 0; fi
+  if ! stage=$(umask 077; mktemp -d "$PI_ROOT/.stage.XXXXXX"); then fail "cannot create a staging directory"; return 0; fi
+  PI_STAGE=$stage
+  pi_download "$ver" "$stage" "$asset" || return 0
+  pi_check_archive "$stage/$asset" || return 0
+  if ! (umask 022; tar -xzf "$stage/$asset" -C "$stage"); then fail "cannot unpack the pi archive"; return 0; fi
+  rm -f "$stage/$asset" "$stage/SHA256SUMS"
+  if [ ! -f "$stage/pi/pi" ] || [ -L "$stage/pi/pi" ] || [ ! -x "$stage/pi/pi" ]; then
+    fail "the pi archive has no executable pi/pi"; return 0
+  fi
+  if ! got=$(tool_version "$stage/pi/pi") || [ "$got" != "$ver" ]; then
+    fail "the unpacked pi reports ${got:-no version}, expected $ver"; return 0
+  fi
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    # A directory left by an earlier run is reused only when it really is this release.
+    if [ -L "$dest" ] || ! got=$(tool_version "$dest/pi/pi") || [ "$got" != "$ver" ]; then
+      fail "$(safe_text "$dest") exists but does not hold pi $ver; remove it first"; return 0
+    fi
+  else
+    chmod 755 "$stage"
+    if ! mv "$stage" "$dest"; then fail "cannot move the staged pi to $(safe_text "$dest")"; return 0; fi
+    PI_STAGE=
+  fi
+  if [ -L "$PI_LINK" ]; then prev=$(readlink "$PI_LINK") || prev=; fi
+  prev_ver=$(pi_target_version "$prev") || prev_ver=
+  if ! pi_set_link "$dest/pi/pi"; then fail "cannot switch $(safe_text "$PI_LINK") to pi $ver"; return 0; fi
+  got=$(pi_probe) || got=
+  if [ "$got" = "$ver" ]; then
+    T_PATH=$dest/pi/pi; T_AFTER=$ver; T_ACTION=updated
+    pi_prune "$ver" "$prev_ver"
+    return 0
+  fi
+  # The new pi does not run as the release it claims to be: put the previous link back.
+  echo "smoke check failed for pi; restoring ${prev:-no link}"
+  if pi_set_link "$prev"; then
+    if [ -z "$prev" ]; then
+      T_AFTER=; T_ACTION=rolled-back; T_DETAIL="smoke check failed after the install; removed the new link"
+    elif T_AFTER=$(pi_probe); then
+      T_ACTION=rolled-back; T_DETAIL="smoke check failed after the update (reports ${got:-no version}, expected $ver); restored ${prev_ver:-the previous link}"
+    else
+      T_AFTER=; fail "smoke check failed and restoring the previous pi did not give a working CLI"
+    fi
+  else
+    T_AFTER=; fail "smoke check failed and the previous pi link could not be restored"
+  fi
+  return 0
+}
+
+update_pi_release() {
+  local installed
+  if ! installed=$(pi_target_version "$T_PATH"); then
+    fail "cannot determine the installed pi version from its install path"; return 0
+  fi
+  if ! pi_link_in_tree; then
+    fail "pi runs from the pi-release tree but $(safe_text "$PI_LINK") is not the symlink to it"; return 0
+  fi
+  if ! load_releases github "$GITHUB_API/repos/earendil-works/pi/releases?per_page=10" v; then hold_unknown "$LOAD_ERR"; return 0; fi
+  pick_highest "$installed"
+  case "$PICK" in
+    none) T_ACTION=current; T_AFTER=$T_BEFORE; return 0 ;;
+    young) hold "newer release $(young_text "$NEWEST_VER" "$NEWEST_EPOCH")"; return 0 ;;
+  esac
+  pi_install "$PICK_VER"
+  return 0
+}
+
+# --adopt pi: install the cooldown-selected release even when pi is absent or comes from elsewhere
+# (the migration from npm). The only thing it will not touch is another pi at PI_LINK: that install
+# has to be removed first, so two copies never fight over the name.
+adopt_pi() {
+  local bin real prev installed='' ptxt='<prefix>' prefix
+  T_METHOD=pi-release
+  bin=$(command -v pi 2>/dev/null) || bin=
+  case "$bin" in
+    /*)
+      real=$(readlink -f "$bin" 2>/dev/null) || real=
+      T_PATH=$real
+      T_BEFORE=$(tool_version pi) || T_BEFORE= ;;
+  esac
+  if [ -L "$PI_LINK" ]; then
+    prev=$(readlink "$PI_LINK") || prev=
+    installed=$(pi_target_version "$prev") || installed=
+  fi
+  if [ -z "$installed" ] && { [ -L "$PI_LINK" ] || [ -e "$PI_LINK" ]; }; then
+    real=$(readlink -f "$PI_LINK" 2>/dev/null) || real=
+    case "$real" in
+      */lib/node_modules/*) prefix=${real%%/lib/node_modules/*}; ptxt=$(safe_text "$prefix") ;;
+    esac
+    fail "$(safe_text "$PI_LINK") is not a symlink into the pi-release tree; remove the existing pi install first (e.g. npm uninstall -g --prefix $ptxt @earendil-works/pi-coding-agent)"
+    return 0
+  fi
+  if ! load_releases github "$GITHUB_API/repos/earendil-works/pi/releases?per_page=10" v; then hold_unknown "$LOAD_ERR"; return 0; fi
+  pick_highest "$installed"
+  case "$PICK" in
+    none)
+      if [ -n "$installed" ]; then T_ACTION=current; T_AFTER=$T_BEFORE; else hold_unknown "no stable pi release found"; fi
+      return 0 ;;
+    young) hold "newer release $(young_text "$NEWEST_VER" "$NEWEST_EPOCH")"; return 0 ;;
+  esac
+  pi_install "$PICK_VER"
+  if [ "$T_ACTION" = updated ]; then adopt_shadow_note; fi
+  return 0
+}
+
+# After an adoption the new pi must be the one PATH finds; if another pi comes first, say which.
+adopt_shadow_note() {
+  local cur real new
+  cur=$(command -v pi 2>/dev/null) || cur=
+  if [ -z "$cur" ]; then note_detail "warning: pi is not on PATH; add $(safe_text "$PI_LINK_DIR")"; return 0; fi
+  real=$(readlink -f "$cur" 2>/dev/null) || real=$cur
+  new=$(readlink -f "$PI_LINK" 2>/dev/null) || new=$PI_LINK
+  if [ "$real" != "$new" ]; then
+    note_detail "warning: pi on PATH resolves to $(safe_text "$cur") ($(safe_text "$real")) and shadows $(safe_text "$PI_LINK"); remove it or put $(safe_text "$PI_LINK_DIR") first on PATH"
+  fi
+  return 0
+}
+
+process_tool() { # tool -> T_* fields
+  local tool=$1 bin real
+  T_METHOD=; T_PATH=; T_BEFORE=; T_AFTER=; T_ACTION=; T_DETAIL=
+  if [ "$tool" = pi ] && [ "$ADOPT" = pi ]; then adopt_pi; return 0; fi
+  bin=$(command -v "$tool" 2>/dev/null) || bin=
+  if [ -z "$bin" ]; then T_ACTION=absent; return 0; fi
+  T_METHOD=unknown
+  case "$bin" in /*) ;; *) fail "resolves to a non-file command"; return 0 ;; esac
+  real=$(readlink -f "$bin" 2>/dev/null) || real=
+  if [ -z "$real" ]; then T_PATH=$bin; fail "cannot resolve the real path of the binary"; return 0; fi
+  T_PATH=$real
+  classify "$tool" "$real"
+  case "$T_METHOD" in
+    npm) update_npm "$tool"; return 0 ;;
+  esac
+  T_BEFORE=$(tool_version "$tool") || T_BEFORE=
+  case "$T_METHOD" in
+    native) update_native "$tool" ;;
+    brew) update_brew "$tool" ;;
+    codex-standalone) update_codex_standalone "$tool" ;;
+    opencode-installer) update_opencode_installer "$tool" ;;
+    pi-release) update_pi_release ;;
+    apt) T_ACTION=external; T_AFTER=$T_BEFORE; T_DETAIL="managed by apt/unattended-upgrades" ;;
+    *) fail "unknown install method" ;;
+  esac
+  return 0
+}
+
+# --- state file ------------------------------------------------------------------------------------
+# JSON strings in pure shell: escape \ and ", and every control character as \u00XX. Callers run
+# this under LC_ALL=C so bytes, not locale characters, are walked; other bytes pass through.
+JSTR=
+json_str() {
+  local s=$1 out='' c i=0 n code
+  n=${#s}
+  while [ "$i" -lt "$n" ]; do
+    c=${s:$i:1}
+    case "$c" in
+      '\') out="$out\\\\" ;;
+      '"') out="$out\\\"" ;;
+      [[:cntrl:]])
+        code=$(printf '%d' "'$c")
+        out="$out$(printf '\\u%04x' "$code")" ;;
+      *) out="$out$c" ;;
+    esac
+    i=$((i + 1))
+  done
+  JSTR="\"$out\""
+}
+
+RESULT=ok
+RESULT_DETAIL=
+RUN_TS=
+RUN_HOST=
+render_state_json() {
+  local i=0 sep j1 j2 j3 j4 j5 j6 j7
+  printf '{\n'
+  json_str "$RUN_TS"; printf '  "timestamp": %s,\n' "$JSTR"
+  json_str "$RUN_HOST"; printf '  "hostname": %s,\n' "$JSTR"
+  json_str "$RESULT"; printf '  "result": %s,\n' "$JSTR"
+  json_str "$RESULT_DETAIL"; printf '  "detail": %s,\n' "$JSTR"
+  if [ "$NRES" -eq 0 ]; then
+    printf '  "tools": []\n'
+  else
+    printf '  "tools": [\n'
+    while [ "$i" -lt "$NRES" ]; do
+      json_str "${R_NAME[$i]}"; j1=$JSTR
+      json_str "${R_METHOD[$i]}"; j2=$JSTR
+      json_str "${R_PATH[$i]}"; j3=$JSTR
+      json_str "${R_BEFORE[$i]}"; j4=$JSTR
+      json_str "${R_AFTER[$i]}"; j5=$JSTR
+      json_str "${R_ACTION[$i]}"; j6=$JSTR
+      json_str "${R_DETAIL[$i]}"; j7=$JSTR
+      sep=,
+      if [ "$i" -eq $((NRES - 1)) ]; then sep=; fi
+      printf '    {"name": %s, "method": %s, "path": %s, "before": %s, "after": %s, "action": %s, "detail": %s}%s\n' \
+        "$j1" "$j2" "$j3" "$j4" "$j5" "$j6" "$j7" "$sep"
+      i=$((i + 1))
+    done
+    printf '  ]\n'
+  fi
+  printf '}\n'
+}
+
+# Written atomically (temp file in the same directory, then rename) and privately.
+write_state() {
+  local tmp
+  (umask 077; mkdir -p "$STATE_DIR") || return 1
+  tmp=$(umask 077; mktemp "$STATE_DIR/.agent-cli-update.json.XXXXXX") || return 1
+  if ! (LC_ALL=C; render_state_json) >"$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! mv -f "$tmp" "$STATE_FILE"; then rm -f "$tmp"; return 1; fi
+}
+
+finish() { # prints the summary, records the state, and exits
+  local summary rc=0
+  summary="summary: result=$RESULT tools=$NRES updated=$(count_action updated)"
+  if [ "$DRY_RUN" -eq 1 ]; then summary="$summary would-update=$(count_action would-update)"; fi
+  summary="$summary current=$(count_action current) held=$(count_action held) external=$(count_action external) absent=$(count_action absent)"
+  summary="$summary failed=$(count_action failed) rolled-back=$(count_action rolled-back)"
+  echo "$summary"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "dry-run: nothing was installed or updated and no state file was written"
+  elif ! write_state; then
+    echo "brokkr agent-cli-update: cannot write the state file in $STATE_DIR" >&2
+    rc=1
+  fi
+  if [ "$RESULT" = failed ]; then rc=1; fi
+  exit "$rc"
+}
+
+# --- run ---------------------------------------------------------------------------------------------
+RUN_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+RUN_HOST=$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)
+echo "brokkr agent-cli-update: $RUN_TS tools: ${TOOLS[*]}"
+
+if [ "${#BUSY_UNITS[@]}" -gt 0 ] && ! check_busy_units; then
+  RESULT=deferred
+  RESULT_DETAIL=$DEFER_REASON
+  echo "deferred: $DEFER_REASON; no agent CLI was touched"
+  finish
+fi
+
+i=0
+while [ "$i" -lt "${#TOOLS[@]}" ]; do
+  process_tool "${TOOLS[$i]}"
+  record "${TOOLS[$i]}" "$T_METHOD" "$T_PATH" "$T_BEFORE" "$T_AFTER" "$T_ACTION" "$T_DETAIL"
+  report_line "${TOOLS[$i]}" "$T_METHOD" "$T_BEFORE" "$T_AFTER" "$T_ACTION" "$T_DETAIL"
+  case "$T_ACTION" in failed|rolled-back) RESULT=failed ;; esac
+  i=$((i + 1))
+done
+finish

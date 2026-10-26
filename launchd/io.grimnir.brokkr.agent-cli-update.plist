@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Brokkr · agent CLI updater — LaunchAgent (runs on the workstation, per-user).
+  Keeps claude, codex, pi and opencode at their latest release, four times a day.
+  Each tool is updated through the mechanism that installed it; see
+  scripts/agent-cli-update.sh and docs/agent-cli-update.md.
+
+  __RELEASE__ / __HOME__ are substituted by launchd/install-agent-cli-update.sh, which
+  copies the updater as committed at the checkout's HEAD into
+  ~/.local/lib/brokkr/agent-cli-update/releases/<full-sha>/ (= __RELEASE__), so branch
+  switches in the checkout never change what this agent runs.
+  Install: ./launchd/install-agent-cli-update.sh   (see launchd/README.md)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.grimnir.brokkr.agent-cli-update</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__RELEASE__/scripts/agent-cli-update.sh</string>
+    </array>
+
+    <!-- 04:17, 10:17, 16:17 and 22:17 local. launchd runs one missed firing when the
+         Mac wakes. RunAtLoad is false so installing the agent never starts an update
+         unexpectedly; use install-agent-cli-update.sh run for an immediate run. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>4</integer>
+            <key>Minute</key>
+            <integer>17</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>10</integer>
+            <key>Minute</key>
+            <integer>17</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>16</integer>
+            <key>Minute</key>
+            <integer>17</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>22</integer>
+            <key>Minute</key>
+            <integer>17</integer>
+        </dict>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- launchd hands agents a minimal PATH. The per-user install locations of the CLIs
+         come first, then Homebrew for Apple Silicon and Intel, then system paths. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:__HOME__/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/brokkr/agent-cli-update.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/brokkr/agent-cli-update.launchd.log</string>
+</dict>
+</plist>

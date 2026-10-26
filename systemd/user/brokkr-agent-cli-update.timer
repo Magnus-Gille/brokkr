@@ -1,0 +1,15 @@
+# Brokkr · update the coding-agent CLIs four times a day (user timer).
+[Unit]
+Description=Run Brokkr agent CLI updater four times a day
+
+[Timer]
+# 04:17, 10:17, 16:17 and 22:17, each spread by up to 20 minutes so a fleet does not
+# hit the npm registry at the same moment. A run deferred by the busy guard is simply
+# retried at the next firing.
+OnCalendar=*-*-* 04,10,16,22:17:00
+RandomizedDelaySec=20min
+Persistent=true
+Unit=brokkr-agent-cli-update.service
+
+[Install]
+WantedBy=timers.target
