@@ -397,6 +397,8 @@ fi
 # cannot reboot, stage or cancel anything.
 job=$release/scripts/guarded-reboot.sh
 job_path=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# BROKKR_DEPLOY_PATH_PREFIX is a test seam: stub commands put in front of the unit's PATH.
+if [ -n "${BROKKR_DEPLOY_PATH_PREFIX:-}" ]; then job_path=$BROKKR_DEPLOY_PATH_PREFIX:$job_path; fi
 job_run() {
   env PATH="$job_path" BROKKR_GUARDED_REBOOT_BUSY_UNITS="$BUSY_UNITS" BROKKR_GUARDED_REBOOT_PEERS="$PEERS" \
     BROKKR_GUARDED_REBOOT_MAX_LOAD="$MAX_LOAD" BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN="$TTY_IDLE_MIN" \
