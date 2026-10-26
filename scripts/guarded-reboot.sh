@@ -259,6 +259,10 @@ LATCH=0; LATCH_SINCE=0; LATCH_REASON=
 # The last guarded-reboot attempt: its boot id, time, triggers, trigger identities and status
 # (none, unresolved, ok, issues, cleared). unresolved means no post-boot result is recorded yet.
 A_BOOT_ID=; A_EPOCH=0; A_TRIGGERS=; A_IDS=; A_STATUS=none
+# Issues a post-boot check observed whose outcome record could not be appended to the audit file.
+# They are kept (with the latch) while the attempt stays unresolved, so a later healthy retry cannot
+# turn the attempt into a pass; only clear-latch drops them.
+A_OBSERVED=
 BASE_EPOCH=0; BASE_BOOT_ID=; BASE_SYS=; BASE_USER=
 H_EPOCH=0; H_ACTION=; H_SIG=
 W_TS=; W_EPOCH=0; W_ACTION=; W_TRIGGERS=; W_GUARDS=; W_DETAIL=
@@ -279,6 +283,9 @@ load_str() { # var key
   v=$(st_raw "$2")
   [[ "$v" =~ $re ]] || bad_state "$2"
   set_var "$1" "${BASH_REMATCH[1]}"
+}
+load_str_opt() { # var key: like load_str, but a key the file does not have yet is empty
+  if [ -z "$(st_raw "$2")" ]; then set_var "$1" ""; else load_str "$1" "$2"; fi
 }
 state_array() { # key -> one unescaped item per line
   awk -v start="  \"$1\": [" '
@@ -318,6 +325,7 @@ load_state() {
   load_str A_TRIGGERS attempt_triggers; load_str A_IDS attempt_identities
   load_str A_STATUS attempt_status
   case "$A_STATUS" in none|unresolved|ok|issues|cleared) ;; *) bad_state attempt_status ;; esac
+  load_str_opt A_OBSERVED attempt_observed
   load_int BASE_EPOCH baseline_epoch; load_str BASE_BOOT_ID baseline_boot_id
   load_int H_EPOCH health_epoch; load_str H_ACTION health_action; load_str H_SIG health_sig
   load_units BASE_SYS baseline_system; load_units BASE_USER baseline_user
@@ -350,7 +358,7 @@ render_state_json() {
   kv_int latch "$LATCH"; kv_int latch_since "$LATCH_SINCE"; kv_str latch_reason "$LATCH_REASON"
   kv_str attempt_boot_id "$A_BOOT_ID"; kv_int attempt_epoch "$A_EPOCH"
   kv_str attempt_triggers "$A_TRIGGERS"; kv_str attempt_identities "$A_IDS"
-  kv_str attempt_status "$A_STATUS"
+  kv_str attempt_status "$A_STATUS"; kv_str attempt_observed "$A_OBSERVED"
   kv_int baseline_epoch "$BASE_EPOCH"; kv_str baseline_boot_id "$BASE_BOOT_ID"
   kv_int health_epoch "$H_EPOCH"; kv_str health_action "$H_ACTION"; kv_str health_sig "$H_SIG"
   kv_list baseline_system "$BASE_SYS" ,
@@ -1080,7 +1088,7 @@ reboot_attempt() {
   if [ "$MODE" != reboot ] || [ "$REPORT_ONLY" -ne 0 ]; then fatal "internal error: a reboot was attempted outside reboot mode"; fi
   if [ "$BASE_OK" -ne 1 ]; then fatal "cannot capture the running-service baseline; not rebooting"; fi
   snapshot_attempt_state
-  A_BOOT_ID=$BOOT_ID; A_EPOCH=$NOW; A_TRIGGERS=$TRIG_IDS; A_IDS=$TRIG_PAIRS; A_STATUS=unresolved
+  A_BOOT_ID=$BOOT_ID; A_EPOCH=$NOW; A_TRIGGERS=$TRIG_IDS; A_IDS=$TRIG_PAIRS; A_STATUS=unresolved; A_OBSERVED=
   episode_reset
   set_event reboot "$TRIG_IDS" "" "$TRIG_DETAIL"
   if ! write_state; then
@@ -1229,7 +1237,7 @@ verify_attempt_targets() {
 }
 
 cmd_post_boot() {
-  local pair kernel notes='' fresh='' detail pairs outcome
+  local pair kernel notes='' fresh='' detail pairs outcome fresh_issues relatch was_latched
   load_state
   read_boot_id
   [ "$A_STATUS" = unresolved ] || return 0
@@ -1253,6 +1261,10 @@ cmd_post_boot() {
   collect_health_issues 1
   kernel=$RUNNING_KERNEL
   if [ -z "$kernel" ]; then kernel=$(clean "$(uname -r 2>/dev/null || echo unknown)" 60); fi
+  fresh_issues=$ISSUES
+  # Issues an earlier run observed but could not record are never forgotten by a healthy retry: the
+  # outcome stays issues until the owner clears the latch.
+  if [ -n "$A_OBSERVED" ]; then add_issue "an earlier post-boot check observed (its outcome could not be recorded): $A_OBSERVED"; fi
   if [ -z "$ISSUES" ]; then
     outcome=ok
     detail="kernel $kernel; health OK; the recorded targets are verified${notes:+; $notes}"
@@ -1268,18 +1280,35 @@ cmd_post_boot() {
   fi
   # The outcome is appended BEFORE it is persisted. If the append fails the attempt stays unresolved
   # (exit 1), so the next nightly check latches it as missing verification instead of the host
-  # looking verified while no record says so. The notices still go out.
+  # looking verified while no record says so. Observed issues are different: they are persisted
+  # with the latch even when the append fails (the attempt still stays unresolved), so a later
+  # healthy retry cannot erase them. The notices still go out.
   if ! audit_append "$W_ACTION" "$W_DETAIL"; then
     RC=1
+    warn "the post-boot outcome could not be audited; the attempt stays unresolved"
+    if [ "$outcome" = issues ]; then
+      if [ -n "$fresh_issues" ]; then A_OBSERVED=$(clean "$fresh_issues" 200); fi
+      set_latch "the post-boot check reported issues: $(clean "$A_OBSERVED" 120)"
+      if ! write_state; then warn "cannot write the state file in $STATE_DIR"; fi
+    fi
     # Alerts are normally audited as they are sent; with the audit failing they go out as notices.
     if [ -n "$ALERTS" ]; then NOTICES="$NOTICES$(printf '%s' "$ALERTS" | sed "s/^/ALERT $HOST: /")"$'\n'; fi
     ALERTS=''
-    warn "the post-boot outcome could not be audited; the attempt stays unresolved"
     flush_queues
     return 0
   fi
+  relatch=0
+  if [ -n "$A_OBSERVED" ]; then relatch=1; fi
+  was_latched=$LATCH
   A_STATUS=$outcome
-  if [ "$outcome" = issues ]; then set_latch "the post-boot check reported issues: $(clean "$ISSUES" 120)"; fi
+  A_OBSERVED=''
+  if [ "$outcome" = issues ]; then
+    set_latch "the post-boot check reported issues: $(clean "$fresh_issues" 120)"
+    # The first latching alert could not be audited; the report only sees the latch if it is recorded.
+    if [ "$relatch" -eq 1 ] && [ "$was_latched" -eq 1 ]; then
+      queue_alert "latched: $LATCH_REASON. Automatic reboots stay off until the owner has investigated and runs guarded-reboot.sh clear-latch"
+    fi
+  fi
   commit_event 0
 }
 
@@ -1345,6 +1374,7 @@ cmd_clear_latch() {
   fi
   LATCH=0; LATCH_SINCE=0; LATCH_REASON=
   case "$A_STATUS" in unresolved|issues) A_STATUS=cleared ;; esac
+  A_OBSERVED=
   if ! write_state; then fatal "cannot write the state file in $STATE_DIR"; fi
   queue_notice "guarded-reboot latch cleared on $HOST by the owner"
   flush_queues
@@ -1381,6 +1411,9 @@ cmd_status() {
       echo "last reboot attempt: none"
     else
       echo "last reboot attempt: $(iso_utc "$A_EPOCH") status=$A_STATUS triggers=${A_TRIGGERS:--} identities=${A_IDS:--}"
+    fi
+    if [ -n "$A_OBSERVED" ]; then
+      echo "post-boot issues observed but not yet recorded in the audit file: $A_OBSERVED"
     fi
     if [ "$BASE_EPOCH" -gt 0 ]; then
       echo "service baseline: $(iso_utc "$BASE_EPOCH")"

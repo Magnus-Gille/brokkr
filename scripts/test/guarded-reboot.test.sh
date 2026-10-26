@@ -894,7 +894,28 @@ check "outcome durability: the notice still goes out" 'notice_has "back up: node
 rm -f "$MOCK/audit-fail"; advance 10800; run check
 check "outcome durability: the next check latches the unverified attempt as missing verification" '[[ "$(state_raw latch)" -eq 1 ]] && audit_line_of alert | grep -q "post-boot verification missing"'
 attempt; after_reboot; set_running system alpha.service; : >"$MOCK/audit-fail"; run post-boot
-check "outcome durability: failing issues are not persisted either (no latch, still unresolved), and the issue notice goes out" '[[ "$RC" -eq 1 && "$(state_raw attempt_status)" == "\"unresolved\"" && "$(state_raw latch)" -eq 0 ]] && notice_has "issues: system services not running again: beta.service"'
+check "outcome durability: observed issues are latched and kept even though the record could not be appended; the attempt stays unresolved, exit 1" '[[ "$RC" -eq 1 && "$(state_raw attempt_status)" == "\"unresolved\"" && "$(state_raw latch)" -eq 1 ]] && [[ "$(state_raw attempt_observed)" == *"beta.service"* ]] && ! audit_has "post-boot-issues"'
+check "outcome durability: the issue notice and the latch alert still go out as notices" 'notice_has "issues: system services not running again: beta.service" && notice_has "ALERT node-a: latched: "'
+check "outcome durability: status shows the unrecorded observation" 'run status; [[ "$OUT" == *"LATCH: automatic reboots are OFF"* && "$OUT" == *"observed but not yet recorded"* && "$OUT" == *"status=unresolved"* ]]'
+night; trigger_rr; run check
+check "outcome durability: with the latch set the next night is held (guard latched), not reboot-eligible" '[[ "$OUT" == *"latched"* && "$(reboots)" -eq 1 ]]'
+# The audit recovers and the retry is healthy: the attempt is still not a pass.
+rm -f "$MOCK/audit-fail" "$RR_FILE" "$RR_FILE.pkgs"; set_running system alpha.service beta.service
+run post-boot
+check "outcome durability: a healthy retry after the audit recovers still records issues and keeps the latch" '[[ "$RC" -eq 0 && "$(state_raw attempt_status)" == "\"issues\"" && "$(state_raw latch)" -eq 1 ]] && audit_line_of post-boot-issues | grep -q "an earlier post-boot check observed" && ! audit_has "post-boot-ok"'
+check "outcome durability: the observation is cleared once recorded, and the latching alert is recorded now that the audit works" '[[ "$(state_raw attempt_observed)" == "\"\"" ]] && audit_line_of alert | grep -q "\"detail\":\"latched: "'
+run post-boot
+check "outcome durability: only clear-latch clears it; another post-boot run does nothing" '[[ -z "$OUT" && "$(state_raw latch)" -eq 1 ]]'
+run clear-latch
+check "outcome durability: clear-latch clears the latch and the observation, and the attempt is acknowledged" '[[ "$RC" -eq 0 && "$(state_raw latch)" -eq 0 && "$(state_raw attempt_status)" == "\"cleared\"" ]]'
+# A healthy outcome whose record cannot be appended leaves no trace to carry over.
+attempt; after_reboot; : >"$MOCK/audit-fail"; run post-boot
+check "outcome durability: a healthy outcome that cannot be recorded persists nothing" '[[ "$RC" -eq 1 && "$(state_raw attempt_status)" == "\"unresolved\"" && "$(state_raw latch)" -eq 0 && "$(state_raw attempt_observed)" == "\"\"" ]]'
+rm -f "$MOCK/audit-fail"; run post-boot
+check "outcome durability: and the healthy retry then records ok" '[[ "$(state_raw attempt_status)" == "\"ok\"" && "$(state_raw latch)" -eq 0 ]]'
+# A state file written before attempt_observed existed still loads.
+attempt; after_reboot; sed -i.bak '/"attempt_observed"/d' "$STATE_FILE"; rm -f "$STATE_FILE.bak"; run post-boot
+check "outcome durability: a state file without attempt_observed still loads" '[[ "$RC" -eq 0 && "$(audit_actions)" == "reboot post-boot-ok " ]]'
 
 # On-demand exemptions: only Type=dbus, a BusName, a TriggeredBy or a transient unit may be down.
 # A static or indirect unit file proves nothing about whether the service is long-running.
