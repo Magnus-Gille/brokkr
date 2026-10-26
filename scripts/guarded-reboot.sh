@@ -409,8 +409,11 @@ audit_append() { # action detail   (triggers and guards come from EV_TRIGGERS / 
 send_notice() { # message
   local msg
   msg=$(clean "$1" 500)
-  if [ ! -f "$NOTIFY_HELPER" ] || [ -L "$NOTIFY_HELPER" ]; then
-    warn "notify helper $NOTIFY_HELPER is missing; not sent: $msg"
+  # The helper is sourced, so it is code: a regular, non-symlink file owned by the current user
+  # that no one else can write.
+  if [ ! -f "$NOTIFY_HELPER" ] || [ -L "$NOTIFY_HELPER" ] || [ ! -O "$NOTIFY_HELPER" ] \
+    || [ -n "$(find "$NOTIFY_HELPER" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print 2>/dev/null)" ]; then
+    warn "notify helper $NOTIFY_HELPER is missing, a symlink, not owned by this user or writable by others; not sent: $msg"
     return 1
   fi
   if ! (

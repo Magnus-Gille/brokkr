@@ -278,7 +278,8 @@ by the hermetic tests: `BROKKR_NOW_EPOCH`, `BROKKR_BOOT_DIR`, `BROKKR_REBOOT_REQ
 `BROKKR_CGROUP_ROOT`, `BROKKR_EEPROM_PENDING_FLAG`, `BROKKR_GUARDED_REBOOT_AUDIT`,
 `BROKKR_STATE_DIR` and `BROKKR_NOTIFY_HELPER` (the notify helper, default
 `scripts/lib/notify.sh`, which must provide `notify_telegram_confirmed`: only a confirmed
-delivery counts as sent).
+delivery counts as sent). The helper is sourced, so it is treated as code: it must be a regular,
+non-symlink file owned by the operator that no one else can write, otherwise it is not trusted.
 
 ## Rollout: report, then reboot
 

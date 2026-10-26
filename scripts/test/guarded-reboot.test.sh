@@ -667,6 +667,11 @@ reset; reboot_mode; trigger_rr; export BROKKR_NOTIFY_HELPER="$TMP/notify-old.sh"
 check "fail-closed alert path: a notify helper without notify_telegram_confirmed is not trusted" '[[ "$(reboots)" -eq 0 && "$OUT" == *"guards: notify"* ]]'
 reset; reboot_mode; trigger_rr; export BROKKR_NOTIFY_HELPER="$TMP/does-not-exist.sh"; run check
 check "fail-closed alert path: a missing notify helper stops the reboot" '[[ "$(reboots)" -eq 0 && "$OUT" == *"guards: notify"* ]]'
+reset; reboot_mode; trigger_rr; cp "$TMP/notify-stub.sh" "$TMP/notify-open.sh"; chmod 666 "$TMP/notify-open.sh"; export BROKKR_NOTIFY_HELPER="$TMP/notify-open.sh"; run check
+check "the sourced notify helper is code: one that others can write is not trusted" '[[ "$(reboots)" -eq 0 && "$OUT" == *"guards: notify"* && "$OUT" == *"writable by others"* ]] && ! grep -q "^notify " "$CALLS"'
+reset; reboot_mode; trigger_rr; ln -sf "$TMP/notify-stub.sh" "$TMP/notify-link.sh"; export BROKKR_NOTIFY_HELPER="$TMP/notify-link.sh"; run check
+check "the sourced notify helper is code: a symlink is not trusted" '[[ "$(reboots)" -eq 0 && "$OUT" == *"guards: notify"* ]]'
+rm -f "$TMP/notify-open.sh" "$TMP/notify-link.sh"
 
 reset; reboot_mode; trigger_rr; : >"$MOCK/audit-fail"; run check
 check "fail-closed audit: an audit write failure stops everything, exit 1" '[[ "$RC" -eq 1 && "$(reboots)" -eq 0 && "$OUT" == *"not rebooting"* ]]'
