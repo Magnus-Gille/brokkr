@@ -56,7 +56,10 @@ v8 flavours and is permanently wrong. The maintenance report applies the same ru
 (a constant argument: only root can write below `/run`), which writes
 `{"EXITCODE", "BOOTLOADER_CURRENT", "BOOTLOADER_LATEST", ...}` as JSON. The job reads that file
 unprivileged afterwards with `python3 -I` (or `node`) from stdin; nothing is scraped from the text
-output and stdin is closed so the tool's "install now?" prompt can never be offered. Because the
+output and stdin is closed so the tool's "install now?" prompt can never be offered. Root creates
+the file under the caller's umask, so the command runs under umask 022 and the file stays readable
+whatever umask started the job; an existing file keeps its mode, so a file the job cannot read is
+reported as "not readable" (remove it once; `/run` is also cleared by every boot). Because the
 path is fixed, a file left by an earlier run must not pass for this run's answer: it has to be
 fresh (written within the last minute by the real clock) and agree with the command's own exit
 status (0 is `EXIT_SUCCESS`, 1 is `EXIT_UPDATE_REQUIRED`). A latest version newer than the current

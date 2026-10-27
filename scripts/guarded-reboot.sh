@@ -620,10 +620,16 @@ EEPROM_CUR=0; EEPROM_LATEST=0; EEPROM_NOTE=
 eeprom_read_status() { # sets EEPROM_CUR/EEPROM_LATEST; returns 1 with EEPROM_NOTE when unknown
   local out rc=0 parsed code cur latest mtime real
   EEPROM_NOTE=
-  # Exit status 1 is its normal "update required" answer; only the JSON counts.
-  out=$(sudo -n rpi-eeprom-update -j -m "$EEPROM_STATUS_FILE" </dev/null 2>&1) || rc=$?
-  if [ ! -f "$EEPROM_STATUS_READ" ] || [ -L "$EEPROM_STATUS_READ" ] || [ ! -r "$EEPROM_STATUS_READ" ]; then
+  # Exit status 1 is its normal "update required" answer; only the JSON counts. Root creates the file
+  # under the caller's umask, so umask 022 keeps it readable whatever umask started this job (the
+  # deploy's first run inherits 077); an existing file keeps its mode, hence the separate note below.
+  out=$(umask 022; sudo -n rpi-eeprom-update -j -m "$EEPROM_STATUS_FILE" </dev/null 2>&1) || rc=$?
+  if [ ! -f "$EEPROM_STATUS_READ" ] || [ -L "$EEPROM_STATUS_READ" ]; then
     EEPROM_NOTE="no status file: $(clean "$(printf '%s' "$out" | head -n 1)" 80)"
+    return 1
+  fi
+  if [ ! -r "$EEPROM_STATUS_READ" ]; then
+    EEPROM_NOTE="the status file is not readable (an existing file keeps its mode; remove $EEPROM_STATUS_FILE once)"
     return 1
   fi
   mtime=$(file_mtime "$EEPROM_STATUS_READ") || mtime=
