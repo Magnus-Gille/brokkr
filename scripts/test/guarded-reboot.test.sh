@@ -57,6 +57,7 @@ case "$*" in
   "true") exit 0 ;;
   "rpi-eeprom-update -j -m /run/brokkr-guarded-reboot-eeprom.json")
     # The status path is a constant argument below /run; the stub maps it into the test tree.
+    printf 'umask %s\n' "$(umask)" >>"$MOCK_DIR/eeprom-umask"
     exec "$MOCK_BIN/rpi-eeprom-update" -j -m "$BROKKR_EEPROM_STATUS_FILE" ;;
   "rpi-eeprom-update -a"|"rpi-eeprom-update -r")
     shift
@@ -173,6 +174,8 @@ case "${1:-}" in
     case "$mode" in
       nojson) echo "sudo: a password is required" >&2; exit 1 ;;
       garbage) echo 'not json' >"$out"; exit 0 ;;
+      # unreadable: a status file left behind with a mode the unprivileged job cannot read.
+      unreadable) printf '{"EXITCODE": "EXIT_SUCCESS", "BOOTLOADER_CURRENT": %s, "BOOTLOADER_LATEST": %s}\n' "$cur" "$latest" >"$out"; chmod 000 "$out"; exit 0 ;;
       failed) printf '{"EXITCODE": "EXIT_FAILED", "BOOTLOADER_CURRENT": %s, "BOOTLOADER_LATEST": %s}\n' "$cur" "$latest" >"$out"; exit 2 ;;
     esac
     if [ "$latest" -gt "$cur" ]; then code=EXIT_UPDATE_REQUIRED; rc=1; else code=EXIT_SUCCESS; rc=0; fi
@@ -464,6 +467,14 @@ reset; with_eeprom; echo nojson >"$MOCK/eeprom.mode"; run check
 check "eeprom: no readable JSON is recorded as unknown, not a trigger" '[[ "$RC" -eq 0 && "$OUT" == *"decision: none"* && "$OUT" == *"eeprom status unknown"* ]]'
 reset; with_eeprom; echo garbage >"$MOCK/eeprom.mode"; run check
 check "eeprom: garbage JSON is unknown, not a trigger" '[[ "$OUT" == *"decision: none"* && "$OUT" == *"eeprom status unknown"* ]]'
+reset; eeprom_available; saved_umask=$(umask); umask 077; run check; umask "$saved_umask"
+check "eeprom: the status command runs under umask 022 even when the job starts under 077 (the deploy's first run)" '[[ "$(cat "$MOCK/eeprom-umask")" == "umask 0022" && "$OUT" == *"triggers: eeprom"* ]]'
+if [ "$(id -u)" -ne 0 ]; then
+  reset; with_eeprom; echo unreadable >"$MOCK/eeprom.mode"; run check
+  check "eeprom: an unreadable status file is unknown with its own note, not a missing file" '[[ "$OUT" == *"decision: none"* && "$OUT" == *"eeprom status unknown (the status file is not readable"* && "$OUT" != *"no status file"* ]]'
+else
+  skip "eeprom: unreadable status file (root reads any mode)"
+fi
 reset; echo failed >"$MOCK/eeprom.mode"; eeprom_available; run check
 check "eeprom: EXIT_FAILED is unknown, not a trigger" '[[ "$OUT" == *"decision: none"* && "$OUT" == *"eeprom status unknown"* ]]'
 reset; set_eeprom 0 1790000001; run check
