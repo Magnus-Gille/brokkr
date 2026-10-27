@@ -12,9 +12,10 @@ git -C "$SOURCE" checkout --detach -q "$BASE_SHA"
 # Exercise the current implementation while retaining a detached worktree.
 cp "$REPO_SOURCE/scripts/deploy-nas.sh" "$SOURCE/scripts/deploy-nas.sh"
 cp "$REPO_SOURCE/scripts/lib/deploy-source.sh" "$SOURCE/scripts/lib/deploy-source.sh"
+cp "$REPO_SOURCE/scripts/prepare-heimdall-runtime-env.sh" "$SOURCE/scripts/prepare-heimdall-runtime-env.sh"
 git -C "$SOURCE" config user.name test
 git -C "$SOURCE" config user.email test@example.invalid
-git -C "$SOURCE" add scripts/deploy-nas.sh scripts/lib/deploy-source.sh
+git -C "$SOURCE" add scripts/deploy-nas.sh scripts/lib/deploy-source.sh scripts/prepare-heimdall-runtime-env.sh
 git -C "$SOURCE" commit -qm 'fixture deploy binding'
 SOURCE_SHA="$(git -C "$SOURCE" rev-parse HEAD)"
 STALE_SOURCE="$TMP/stale-source"
@@ -65,6 +66,12 @@ cat >"$TMP/bin/id" <<'EOF'
 exit "${MOCK_ID_RC:-0}"
 EOF
 
+cat >"$TMP/bin/chown" <<'EOF'
+#!/usr/bin/env bash
+printf 'chown %s\n' "$*" >>"$MOCK_CALLS"
+exit 0
+EOF
+
 cat >"$TMP/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 safe_args="${*//$MOCK_HEIMDALL_SOURCE_ENV/<protected-source>}"
@@ -97,6 +104,10 @@ case "${1:-}" in
       chmod "${4:-755}" "${!#}"
       exit 0
     fi
+    if [[ "${2:-}" == -d && "$*" == *"$MOCK_RUNTIME_HOME"* ]]; then
+      mkdir -p "${!#}"
+      exit 0
+    fi
     destination="${!#}"
     if [[ "$destination" == /etc/systemd/system/* ]]; then
       source="${@: -2:1}"
@@ -119,6 +130,7 @@ case "${1:-}" in
     if [[ "$3" == "$MOCK_RELEASE_TARGET" ]]; then chmod "$2" "$3"; fi
     ;;
   grep) "$@" ;;
+  */prepare-heimdall-runtime-env.sh) "$@" ;;
   sh) exit 0 ;;
   env) shift; while [[ "$1" == *=* ]]; do shift; done; "$@" ;;
   systemd-analyze) exit "${MOCK_UNIT_VERIFY_RC:-0}" ;;
@@ -215,7 +227,8 @@ check "health unit is rendered for the explicit runtime layout" 'grep -Fqx "User
 check "failure services are rendered for the explicit runtime layout" 'grep -Fqx "User=$BROKKR_RUNTIME_USER" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure@.service" && grep -Fqx "WorkingDirectory=$BROKKR_DEPLOY_TARGET" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure-sweep.service" && grep -Fqx "ExecStart=$BROKKR_DEPLOY_TARGET/scripts/systemd-failure-monitor.sh --sweep" "$MOCK_INSTALLED_UNITS/brokkr-systemd-failure-sweep.service"'
 check "registry and executable/unit validation happen before systemd mutation" 'grep -q "sudo systemd-analyze verify" "$CALLS" && [[ "$(grep -n "sudo systemd-analyze verify" "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n "/etc/systemd/system/brokkr-health.service" "$CALLS" | head -1 | cut -d: -f1)" ]]'
 check "protected Heimdall values and source path are not printed" '[[ "$OUT" != *secret-sentinel* && "$OUT" != *"$BROKKR_HEIMDALL_SOURCE_ENV"* ]] && ! grep -Fq secret-sentinel "$CALLS" && ! grep -Fq "$BROKKR_HEIMDALL_SOURCE_ENV" "$CALLS"'
-check "protected source provisions only explicit Heimdall and Tailscale assignments" 'grep -Fq "BROKKR_TAILSCALE_(KEY_EXPIRY_POLICY|EXPECTED_DNS_NAME|EXPIRY_WARN_SECS)" "$CALLS"'
+check "protected source provisions only explicit Heimdall and Tailscale assignments" '[[ "$(wc -l <"$MOCK_RUNTIME_ENV" | tr -d " ")" == 4 ]] && grep -Fxq "HEIMDALL_HUB_URL=https://heimdall.example/api/panels" "$MOCK_RUNTIME_ENV" && grep -Fxq "HEIMDALL_FLEET_TOKEN=secret-sentinel" "$MOCK_RUNTIME_ENV" && grep -Fxq "BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored" "$MOCK_RUNTIME_ENV" && grep -Fxq "BROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net" "$MOCK_RUNTIME_ENV" && [[ "$(mode "$MOCK_RUNTIME_ENV")" == 600 ]]'
+check "first deploy reports the token as provisioned from the protected source" '[[ "$OUT" == *"Heimdall token provisioned from protected source"* ]]'
 
 : >"$CALLS"
 printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
@@ -262,6 +275,80 @@ rm -f "$runtime_env"
 run
 check "omitted source with no runtime env remains an explicit unconfigured success" '[[ "$RC" -eq 0 && "$OUT" == *"runtime environment not configured; pushes will be skipped"* && "$OUT" != *"environment preserved"* ]]'
 export BROKKR_HEIMDALL_SOURCE_ENV="$MOCK_HEIMDALL_SOURCE_ENV"
+
+# --- Heimdall producer-token preservation (heimdall#101) ---------------------
+# The runtime env may hold this node's own producer token under the same key as
+# the legacy shared token in the source; a redeploy must not put the legacy one back.
+printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=legacy-sentinel\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
+write_env() { printf 'HEIMDALL_HUB_URL=https://stale.example/api/panels\nHEIMDALL_FLEET_TOKEN=%s\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=disabled\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=stale.example.ts.net\n' "$1" >"$runtime_env"; chmod 600 "$runtime_env"; }
+no_leak() { [[ "$OUT" != *producer-sentinel* && "$OUT" != *legacy-sentinel* ]] && ! grep -Eq 'producer-sentinel|legacy-sentinel' "$CALLS" && ! grep -Fq "$MOCK_HEIMDALL_SOURCE_ENV" "$CALLS" && [[ "$OUT" != *"$MOCK_HEIMDALL_SOURCE_ENV"* ]]; }
+leftover_temp() { find "$(dirname "$runtime_env")" -name '.env.*' | grep -q .; }
+
+write_env producer-sentinel
+: >"$CALLS"
+run
+check "existing producer token is preserved by default while URL and policy refresh from the source" '[[ "$RC" -eq 0 && "$OUT" == *"Heimdall token preserved from existing runtime env"* ]] && grep -Fxq "HEIMDALL_FLEET_TOKEN=producer-sentinel" "$runtime_env" && ! grep -Fq legacy-sentinel "$runtime_env" && grep -Fxq "HEIMDALL_HUB_URL=https://heimdall.example/api/panels" "$runtime_env" && grep -Fxq "BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored" "$runtime_env" && grep -Fxq "BROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net" "$runtime_env" && ! grep -Fq stale "$runtime_env" && [[ "$(wc -l <"$runtime_env" | tr -d " ")" == 4 ]] && [[ "$(mode "$runtime_env")" == 600 ]] && ! leftover_temp'
+check "preserved-token deploy prints no token value or source path and keeps them off argv" 'no_leak'
+check "runtime env is handed to the runtime user" 'grep -Fq "chown $BROKKR_RUNTIME_USER " "$CALLS"'
+
+rm -f "$runtime_env"
+: >"$CALLS"
+run
+check "token is provisioned from the source when the runtime env has none" '[[ "$RC" -eq 0 && "$OUT" == *"Heimdall token provisioned from protected source"* ]] && grep -Fxq "HEIMDALL_FLEET_TOKEN=legacy-sentinel" "$runtime_env" && ! leftover_temp'
+check "provisioning leaks no token value or source path" 'no_leak'
+
+printf 'HEIMDALL_HUB_URL=https://stale.example/api/panels\n' >"$runtime_env"
+chmod 600 "$runtime_env"
+run
+check "a runtime env without a token assignment is provisioned from the source" '[[ "$RC" -eq 0 && "$OUT" == *"Heimdall token provisioned from protected source"* ]] && grep -Fxq "HEIMDALL_FLEET_TOKEN=legacy-sentinel" "$runtime_env"'
+
+write_env producer-sentinel
+: >"$CALLS"
+BROKKR_REPLACE_HEIMDALL_TOKEN=1 run
+check "BROKKR_REPLACE_HEIMDALL_TOKEN=1 replaces the runtime token from the source" '[[ "$RC" -eq 0 && "$OUT" == *"Heimdall token provisioned from protected source"* ]] && grep -Fxq "HEIMDALL_FLEET_TOKEN=legacy-sentinel" "$runtime_env" && ! grep -Fq producer-sentinel "$runtime_env" && ! leftover_temp'
+check "replacement leaks no token value or source path" 'no_leak'
+
+for bad_flag in 0 yes true 2 ' '; do
+  write_env producer-sentinel
+  cp "$runtime_env" "$TMP/env.before"
+  : >"$CALLS"
+  BROKKR_REPLACE_HEIMDALL_TOKEN="$bad_flag" run
+  check "invalid BROKKR_REPLACE_HEIMDALL_TOKEN value '$bad_flag' is refused before ssh with the env unchanged" '[[ "$RC" -ne 0 && "$OUT" == *"BROKKR_REPLACE_HEIMDALL_TOKEN"* ]] && ! grep -q "ssh\|rsync" "$CALLS" && cmp -s "$runtime_env" "$TMP/env.before"'
+done
+
+printf 'HEIMDALL_FLEET_TOKEN=producer-sentinel\nHEIMDALL_FLEET_TOKEN=other-sentinel\n' >"$runtime_env"
+chmod 600 "$runtime_env"
+cp "$runtime_env" "$TMP/env.before"
+: >"$CALLS"
+run
+check "duplicate token assignments in the runtime env fail closed with exit 2 and the file unchanged" '[[ "$RC" -eq 2 && "$OUT" == *"duplicate"* ]] && cmp -s "$runtime_env" "$TMP/env.before" && ! leftover_temp && ! grep -q "systemctl" "$CALLS" && [[ "$OUT" != *producer-sentinel* && "$OUT" != *other-sentinel* ]]'
+: >"$CALLS"
+BROKKR_REPLACE_HEIMDALL_TOKEN=1 run
+check "duplicate runtime tokens are refused even when replacement is requested" '[[ "$RC" -eq 2 ]] && cmp -s "$runtime_env" "$TMP/env.before"'
+
+printf 'HEIMDALL_HUB_URL=https://stale.example/api/panels\nHEIMDALL_FLEET_TOKEN=\n' >"$runtime_env"
+chmod 600 "$runtime_env"
+cp "$runtime_env" "$TMP/env.before"
+: >"$CALLS"
+run
+check "empty token assignment in the runtime env fails closed with exit 2 and the file unchanged" '[[ "$RC" -eq 2 && "$OUT" == *"empty"* ]] && cmp -s "$runtime_env" "$TMP/env.before" && ! leftover_temp && ! grep -q "systemctl" "$CALLS"'
+
+rm -f "$runtime_env"
+printf 'HEIMDALL_FLEET_TOKEN=producer-sentinel\n' >"$TMP/env.target"
+ln -s "$TMP/env.target" "$runtime_env"
+: >"$CALLS"
+run
+check "symlinked runtime env is refused with exit 2 and its target unchanged" '[[ "$RC" -eq 2 && -L "$runtime_env" ]] && [[ "$(cat "$TMP/env.target")" == "HEIMDALL_FLEET_TOKEN=producer-sentinel" ]] && ! grep -q "systemctl" "$CALLS"'
+rm -f "$runtime_env"
+
+write_env producer-sentinel
+cp "$runtime_env" "$TMP/env.before"
+: >"$CALLS"
+export MOCK_RUNTIME_MODE=644
+run
+check "unsafe runtime env mode is refused with exit 2 and the file unchanged when a source is supplied" '[[ "$RC" -eq 2 ]] && cmp -s "$runtime_env" "$TMP/env.before" && ! grep -q "systemctl" "$CALLS"'
+unset MOCK_RUNTIME_MODE
+rm -f "$runtime_env"
 
 : >"$CALLS"
 export MOCK_PROTECTED_SOURCE_TESTS=1 MOCK_SOURCE_MODE=644

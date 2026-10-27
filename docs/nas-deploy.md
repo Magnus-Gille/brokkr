@@ -28,7 +28,19 @@ valid `BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=` (`disabled` or `monitored`) and
 integer `BROKKR_TAILSCALE_EXPIRY_WARN_SECS=` override; the default is 14 days.
 The deployer copies only these allow-listed assignments into the runtime user's
 `~/.config/brokkr/env` with mode
-`0600`; it never prints their values or the source path. Omitting the source
+`0600`; it never prints their values or the source path. Heimdall issues each
+producer its own token under the same `HEIMDALL_FLEET_TOKEN` key, so when the
+existing runtime environment already holds exactly one non-empty token
+assignment, that token is **preserved** and only the URL and Tailscale policy
+assignments are refreshed from the source. The source token is used only when
+the runtime environment has none, or when the deploy sets
+`BROKKR_REPLACE_HEIMDALL_TOKEN=1` (unset, or exactly `1`; any other value is
+refused before SSH). The deployer prints `Heimdall token preserved from existing
+runtime env` or `Heimdall token provisioned from protected source`. The existing
+file must be a regular, non-symlink, runtime-user-owned file with mode `0400` or
+`0600`; a duplicate or empty token assignment aborts with exit status 2 and the
+file unchanged, even when replacement is requested. The new file is built beside
+the old one and renamed into place. Omitting the source
 preserves an existing runtime environment when it is a non-empty, non-symlink,
 runtime-user-owned and readable regular file with mode `0400` or `0600`. The
 deployer validates the non-secret Tailscale policy shape without printing the

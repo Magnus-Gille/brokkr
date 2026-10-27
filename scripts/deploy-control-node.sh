@@ -28,6 +28,8 @@ RUNTIME_HOME="${BROKKR_RUNTIME_HOME:-/home/$RUNTIME_USER}"
 REGISTRY_PATH="${BROKKR_REGISTRY_PATH:-/opt/grimnir/services.json}"
 HEIMDALL_URL="${BROKKR_HEIMDALL_URL:-}"
 HEIMDALL_TOKEN_SOURCE="${BROKKR_HEIMDALL_TOKEN_SOURCE:-}"
+# Opt-in to overwrite a node's existing Heimdall token from the source.
+REPLACE_TOKEN="${BROKKR_REPLACE_HEIMDALL_TOKEN:-}"
 
 die() { echo "brokkr deploy: $*" >&2; exit 64; }
 valid_path() {
@@ -50,6 +52,11 @@ valid_path "$RUNTIME_HOME" || die "invalid BROKKR_RUNTIME_HOME"
 valid_path "$REGISTRY_PATH" || die "invalid BROKKR_REGISTRY_PATH"
 valid_path "$HEIMDALL_TOKEN_SOURCE" || die "BROKKR_HEIMDALL_TOKEN_SOURCE must be an absolute server-side path"
 [[ "$HEIMDALL_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || die "BROKKR_HEIMDALL_URL must be an explicit non-secret http(s) panel endpoint"
+case "$REPLACE_TOKEN" in
+  '') REPLACE_TOKEN=0 ;;
+  1) ;;
+  *) die "BROKKR_REPLACE_HEIMDALL_TOKEN must be unset or exactly 1" ;;
+esac
 
 echo "==> Preparing control-node release target"
 ssh "$CONTROL_NODE" "
@@ -120,19 +127,29 @@ ssh "$CONTROL_NODE" "
     exit 2
   fi
 
-  # A syntactically valid URL and token file are insufficient: only an
-  # authenticated 2xx panel readback proves delivery will work from this host.
-  # The helper reads the server-side token source itself and puts the credential
-  # only on curl's stdin configuration, never in argv or output.
-  if ! sudo '$DEPLOY_TARGET/scripts/verify-heimdall-delivery.sh' '$HEIMDALL_URL' '$HEIMDALL_TOKEN_SOURCE'; then
-    echo 'ERROR: Heimdall endpoint preflight failed; refusing to enable timers' >&2
-    exit 2
+  # Heimdall issues each producer its own token under the same key, so an
+  # existing runtime token is preserved unless the operator opted in to replace
+  # it. An existing runtime env must itself be a protected regular file; the
+  # helper rejects duplicate/empty assignments. Never print its contents.
+  runtime_env='$RUNTIME_HOME/.config/brokkr/env'
+  if sudo test -e \$runtime_env || sudo test -L \$runtime_env; then
+    if ! sudo test -f \$runtime_env || sudo test -L \$runtime_env \
+      || ! sudo -u '$RUNTIME_USER' test -O \$runtime_env; then
+      echo 'ERROR: existing Heimdall runtime environment is not a regular file owned by the runtime user' >&2
+      exit 2
+    fi
+    runtime_mode=\$(sudo stat -c '%a' \$runtime_env)
+    case \$runtime_mode in 400|600) ;; *) echo 'ERROR: existing Heimdall runtime environment has unsafe permissions' >&2; exit 2 ;; esac
   fi
 
+  # A syntactically valid URL and token file are insufficient: only an
+  # authenticated 2xx panel readback proves delivery will work from this host.
+  # The helper builds the new runtime env beside the old one, verifies the token
+  # that will actually be used (the preserved one, not just the source), and
+  # only then renames it into place. The credential reaches curl solely on its
+  # stdin configuration, never in argv or output.
   sudo install -d -m 0700 -o '$RUNTIME_USER' -g '$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr'
-  sudo sh -c \"umask 077; { printf '%s\\n' 'HEIMDALL_HUB_URL=$HEIMDALL_URL'; grep -E '^HEIMDALL_FLEET_TOKEN=' '$HEIMDALL_TOKEN_SOURCE'; } > '$RUNTIME_HOME/.config/brokkr/env'\"
-  sudo chown '$RUNTIME_USER:$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr/env'
-  sudo chmod 0600 '$RUNTIME_HOME/.config/brokkr/env'
+  sudo '$DEPLOY_TARGET/scripts/prepare-heimdall-runtime-env.sh' control-node \$runtime_env '$RUNTIME_USER' '$HEIMDALL_TOKEN_SOURCE' '$REPLACE_TOKEN' '$HEIMDALL_URL'
 
   sudo env BROKKR_RUNTIME_USER='$RUNTIME_USER' BROKKR_RUNTIME_HOME='$RUNTIME_HOME' BROKKR_DEPLOY_TARGET='$DEPLOY_TARGET' BROKKR_REGISTRY_PATH='$REGISTRY_PATH' \
     '$DEPLOY_TARGET/scripts/render-systemd-failure-units.sh' /etc/systemd/system

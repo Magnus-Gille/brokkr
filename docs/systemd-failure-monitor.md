@@ -83,13 +83,35 @@ The installer derives the runtime user's mode-`0600` environment file from the
 explicit URL and token source. A missing, malformed, or unsafe source aborts
 before any timer is enabled.
 
+Heimdall issues each producer its own write token under the same
+`HEIMDALL_FLEET_TOKEN` key, so the source token may be a legacy shared value
+that the node no longer uses. When the runtime environment file already holds
+exactly one non-empty `HEIMDALL_FLEET_TOKEN=` assignment, a redeploy therefore
+**preserves that token** and refreshes only `HEIMDALL_HUB_URL`; the source token
+seeds the file only when it has none. To deliberately overwrite the node's
+token from the source, set `BROKKR_REPLACE_HEIMDALL_TOKEN=1` for that deploy
+(unset, or exactly `1`; any other value is refused before SSH). The deploy prints
+one secret-free line, either `Heimdall token preserved from existing runtime env`
+or `Heimdall token provisioned from protected source`. An existing runtime
+environment must be a regular, non-symlink file owned by the runtime user with
+mode `0400` or `0600`; a duplicate or empty token assignment in it aborts with
+exit status 2 and the file unchanged (also when replacement is requested; repair
+or remove the file first). The new file is built beside the old one and renamed
+into place, so a failed deploy never leaves a truncated environment.
+
 Before it writes runtime state or enables a timer, the installer also proves
 that the explicit runtime user exists, its non-symlink home is writable, and
 that user can read the selected registry. Finally it performs an authenticated
 `GET /api/panels?service=brokkr` readback from the control node. Only a 2xx
 result passes; unreachable, redirected, or unauthorized endpoints abort without
-enabling timers. The server-side probe sends the token to curl through stdin
-configuration, never command arguments or output, and does not mutate panels.
+enabling timers. The probe runs against the staged runtime environment, so it
+authenticates with the token that will actually be installed (the preserved
+producer token, not merely the source token), and the environment file is
+replaced only after it passes. The server-side probe sends the token to curl
+through stdin configuration, never command arguments or output, and does not
+mutate panels. Note the read-back cannot prove write permission: a read-only
+legacy credential still passes it, which is why an existing token is preserved
+rather than overwritten by default.
 
 ## Install after merge
 
