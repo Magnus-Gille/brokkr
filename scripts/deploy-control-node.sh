@@ -148,7 +148,8 @@ ssh "$CONTROL_NODE" "
   # that will actually be used (the preserved one, not just the source), and
   # only then renames it into place. The credential reaches curl solely on its
   # stdin configuration, never in argv or output.
-  sudo install -d -m 0700 -o '$RUNTIME_USER' -g '$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr'
+  # The helper creates the 0700 config directory as the runtime user: root must
+  # not operate on paths inside that user-writable directory.
   sudo '$DEPLOY_TARGET/scripts/prepare-heimdall-runtime-env.sh' control-node \$runtime_env '$RUNTIME_USER' '$HEIMDALL_TOKEN_SOURCE' '$REPLACE_TOKEN' '$HEIMDALL_URL'
 
   sudo env BROKKR_RUNTIME_USER='$RUNTIME_USER' BROKKR_RUNTIME_HOME='$RUNTIME_HOME' BROKKR_DEPLOY_TARGET='$DEPLOY_TARGET' BROKKR_REGISTRY_PATH='$REGISTRY_PATH' \

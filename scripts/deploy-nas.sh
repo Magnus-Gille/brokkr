@@ -165,7 +165,8 @@ ssh "$NAS" "
       runtime_mode=\$(sudo stat -c '%a' \$runtime_env)
       case \$runtime_mode in 400|600) ;; *) echo 'ERROR: existing Heimdall runtime environment has unsafe permissions' >&2; exit 2 ;; esac
     fi
-    sudo install -d -m 0700 -o '$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr'
+    # The helper creates the 0700 config directory as the runtime user: root
+    # must not operate on paths inside that user-writable directory.
     sudo '$DEPLOY_TARGET/scripts/prepare-heimdall-runtime-env.sh' nas \$runtime_env '$RUNTIME_USER' '$HEIMDALL_SOURCE_ENV' '$REPLACE_TOKEN'
     echo '   Heimdall runtime environment written from protected source'
   elif sudo test -e \$runtime_env || sudo test -L \$runtime_env; then

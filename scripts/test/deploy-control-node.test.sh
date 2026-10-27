@@ -61,6 +61,11 @@ case "${1:-}" in
     "$@"
     ;;
   -u)
+    if [[ "${3:-}" == -- ]]; then
+      shift 3
+      MOCK_AS_USER=1 "$@"
+      exit $?
+    fi
     case "$*" in
       *"$MOCK_RELEASE_TARGET"*) exit "${MOCK_RELEASE_OWNER_RC:-0}" ;;
       *"$MOCK_RUNTIME_HOME"*) exit "${MOCK_RUNTIME_HOME_RC:-0}" ;;
@@ -70,8 +75,6 @@ case "${1:-}" in
   install)
     if [[ "${2:-}" == -d && "$*" == *"$MOCK_RELEASE_TARGET"* ]]; then
       [[ "${MOCK_RELEASE_PREP_RC:-0}" -eq 0 ]] || exit "$MOCK_RELEASE_PREP_RC"
-      mkdir -p "${!#}"
-    elif [[ "${2:-}" == -d && "$*" == *"$MOCK_RUNTIME_HOME"* ]]; then
       mkdir -p "${!#}"
     fi
     ;;
@@ -96,11 +99,18 @@ cat >"$TMP/bin/id" <<'EOF'
 #!/usr/bin/env bash
 exit "${MOCK_ID_RC:-0}"
 EOF
-cat >"$TMP/bin/chown" <<'EOF'
+# Record who (root vs the runtime user, via the sudo mock) runs each
+# filesystem-mutating command, then run the real one. Root operating on a path
+# in the runtime user's writable directory would be a symlink-swap escalation.
+cat >"$TMP/bin/fswrap" <<'EOF'
 #!/usr/bin/env bash
-printf 'chown %s\n' "$*" >>"$MOCK_CALLS"
-exit 0
+who=root
+[[ -z "${MOCK_AS_USER:-}" ]] || who=user
+name="$(basename "$0")"
+printf '%s %s %s\n' "$who" "$name" "$*" >>"$MOCK_FSLOG"
+PATH=/usr/bin:/bin exec "$name" "$@"
 EOF
+for fscmd in chown chmod mv mktemp; do cp "$TMP/bin/fswrap" "$TMP/bin/$fscmd"; done
 cat >"$TMP/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"$MOCK_CALLS"
@@ -120,7 +130,9 @@ exit 0
 EOF
 chmod +x "$TMP/bin/"*
 
-export PATH="$TMP/bin:$PATH" MOCK_CALLS="$CALLS" MOCK_BIN="$TMP/bin" MOCK_HOME="$TMP/home"
+FSLOG="$TMP/fslog"
+: >"$FSLOG"
+export PATH="$TMP/bin:$PATH" MOCK_CALLS="$CALLS" MOCK_FSLOG="$FSLOG" MOCK_BIN="$TMP/bin" MOCK_HOME="$TMP/home"
 export BROKKR_SSH_TARGET=brokkr@control-node
 export BROKKR_DEPLOY_TARGET="$TMP/release" BROKKR_RUNTIME_USER=operator BROKKR_RUNTIME_HOME="$TMP/runtime-home" BROKKR_REGISTRY_PATH=/srv/grimnir/services.json
 export MOCK_RUNTIME_HOME="$BROKKR_RUNTIME_HOME" MOCK_REGISTRY_PATH="$BROKKR_REGISTRY_PATH" MOCK_RELEASE_TARGET="$BROKKR_DEPLOY_TARGET"
@@ -138,7 +150,7 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1" >&2; }
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 # shellcheck disable=SC2034 # checks consume OUT and RC through eval.
-run() { OUT="$(cd "$SOURCE" && bash "$DEPLOY" 2>&1)"; RC=$?; }
+run() { : >"$FSLOG"; OUT="$(cd "$SOURCE" && bash "$DEPLOY" 2>&1)"; RC=$?; }
 
 echo "deploy-control-node.test.sh"
 
@@ -289,7 +301,10 @@ run
 check "existing producer token is preserved by default while the URL is refreshed" '[[ "$RC" -eq 0 && "$OUT" == *"Heimdall token preserved from existing runtime env"* ]] && grep -Fxq "HEIMDALL_FLEET_TOKEN=producer-sentinel" "$ENV_FILE" && ! grep -Fq legacy-sentinel "$ENV_FILE" && grep -Fxq "HEIMDALL_HUB_URL=$BROKKR_HEIMDALL_URL" "$ENV_FILE" && [[ "$(wc -l <"$ENV_FILE" | tr -d " ")" == 2 ]] && [[ "$(mode "$ENV_FILE")" == 600 ]] && ! leftover_temp'
 check "preserved-token deploy prints no token value or source path and keeps them off argv" 'no_leak'
 check "preflight authenticates with the token actually written (not the legacy source)" 'grep -q "curl .*service=brokkr" "$CALLS" && grep -q "systemctl enable" "$CALLS"'
-check "runtime env is handed to the runtime user" 'grep -Fq "chown $BROKKR_RUNTIME_USER:$BROKKR_RUNTIME_USER" "$CALLS"'
+check "root never chowns, chmods, renames or creates temp files inside the runtime user's config directory" '! grep -E "^root (chown|chmod|mv|mktemp) .*/\.config/brokkr" "$FSLOG"'
+check "no root-run chown is issued at all (ownership comes from the runtime user writing the file)" '! grep -q "^root chown" "$FSLOG"'
+check "root-created preflight staging lives outside the runtime user directory" 'grep -q "^root mktemp -d .*brokkr-heimdall-stage" "$FSLOG" && ! grep -E "^root mktemp .*/runtime-home" "$FSLOG" && [[ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name "brokkr-heimdall-stage.*" -print)" ]]'
+check "the temp file and the final rename are performed as the runtime user in its config directory" 'grep -Eq "^user mktemp .*/\.config/brokkr/\.env\." "$FSLOG" && grep -Eq "^user mv -f .*/\.config/brokkr/\.env\.[^ ]+ .*/\.config/brokkr/env$" "$FSLOG" && grep -Fq "sudo -u $BROKKR_RUNTIME_USER -- sh -c" "$CALLS"'
 
 write_env producer-sentinel
 cp "$ENV_FILE" "$TMP/env.before"

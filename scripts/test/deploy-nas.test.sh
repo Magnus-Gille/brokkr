@@ -66,11 +66,18 @@ cat >"$TMP/bin/id" <<'EOF'
 exit "${MOCK_ID_RC:-0}"
 EOF
 
-cat >"$TMP/bin/chown" <<'EOF'
+# Record who (root vs the runtime user, via the sudo mock) runs each
+# filesystem-mutating command, then run the real one. Root operating on a path
+# in the runtime user's writable directory would be a symlink-swap escalation.
+cat >"$TMP/bin/fswrap" <<'EOF'
 #!/usr/bin/env bash
-printf 'chown %s\n' "$*" >>"$MOCK_CALLS"
-exit 0
+who=root
+[[ -z "${MOCK_AS_USER:-}" ]] || who=user
+name="$(basename "$0")"
+printf '%s %s %s\n' "$who" "$name" "$*" >>"$MOCK_FSLOG"
+PATH=/usr/bin:/bin exec "$name" "$@"
 EOF
+for fscmd in chown chmod mv mktemp; do cp "$TMP/bin/fswrap" "$TMP/bin/$fscmd"; done
 
 cat >"$TMP/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
@@ -87,6 +94,11 @@ case "${1:-}" in
     "$@"
     ;;
   -u)
+    if [[ "${3:-}" == -- ]]; then
+      shift 3
+      MOCK_AS_USER=1 "$@"
+      exit $?
+    fi
     case "$*" in
       *"$MOCK_RELEASE_TARGET"*)
         if [[ "$*" == *' -O '* ]]; then exit "${MOCK_RELEASE_OWNER_RC:-0}"; fi
@@ -102,10 +114,6 @@ case "${1:-}" in
       [[ "${MOCK_RELEASE_PREP_RC:-0}" -eq 0 ]] || exit "$MOCK_RELEASE_PREP_RC"
       mkdir -p "${!#}"
       chmod "${4:-755}" "${!#}"
-      exit 0
-    fi
-    if [[ "${2:-}" == -d && "$*" == *"$MOCK_RUNTIME_HOME"* ]]; then
-      mkdir -p "${!#}"
       exit 0
     fi
     destination="${!#}"
@@ -140,7 +148,9 @@ esac
 EOF
 
 chmod +x "$TMP/bin/"*
-export PATH="$TMP/bin:$PATH" MOCK_BIN="$TMP/bin" MOCK_CALLS="$CALLS" MOCK_REMOTE_HOME="$TMP/home"
+FSLOG="$TMP/fslog"
+: >"$FSLOG"
+export PATH="$TMP/bin:$PATH" MOCK_BIN="$TMP/bin" MOCK_CALLS="$CALLS" MOCK_FSLOG="$FSLOG" MOCK_REMOTE_HOME="$TMP/home"
 export MOCK_INSTALLED_UNITS="$TMP/installed-units"
 export BROKKR_SSH_TARGET=operator@nas-host
 export BROKKR_DEPLOY_TARGET="$TMP/releases/nas/brokkr" BROKKR_RUNTIME_USER=operator
@@ -167,6 +177,7 @@ mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 # shellcheck disable=SC2034 # checks consume OUT and RC through eval.
 run() {
   local deploy=${1:-$DEPLOY}
+  : >"$FSLOG"
   OUT="$(cd "$SOURCE" && bash "$deploy" 2>&1)"
   RC=$?
 }
@@ -289,7 +300,9 @@ write_env producer-sentinel
 run
 check "existing producer token is preserved by default while URL and policy refresh from the source" '[[ "$RC" -eq 0 && "$OUT" == *"Heimdall token preserved from existing runtime env"* ]] && grep -Fxq "HEIMDALL_FLEET_TOKEN=producer-sentinel" "$runtime_env" && ! grep -Fq legacy-sentinel "$runtime_env" && grep -Fxq "HEIMDALL_HUB_URL=https://heimdall.example/api/panels" "$runtime_env" && grep -Fxq "BROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored" "$runtime_env" && grep -Fxq "BROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net" "$runtime_env" && ! grep -Fq stale "$runtime_env" && [[ "$(wc -l <"$runtime_env" | tr -d " ")" == 4 ]] && [[ "$(mode "$runtime_env")" == 600 ]] && ! leftover_temp'
 check "preserved-token deploy prints no token value or source path and keeps them off argv" 'no_leak'
-check "runtime env is handed to the runtime user" 'grep -Fq "chown $BROKKR_RUNTIME_USER " "$CALLS"'
+check "root never chowns, chmods, renames or creates temp files inside the runtime user's config directory" '! grep -E "^root (chown|chmod|mv|mktemp) .*/\.config/brokkr" "$FSLOG"'
+check "no root-run chown is issued at all (ownership comes from the runtime user writing the file)" '! grep -q "^root chown" "$FSLOG"'
+check "the temp file and the final rename are performed as the runtime user in its config directory" 'grep -Eq "^user mktemp .*/\.config/brokkr/\.env\." "$FSLOG" && grep -Eq "^user mv -f .*/\.config/brokkr/\.env\.[^ ]+ .*/\.config/brokkr/env$" "$FSLOG" && grep -Fq "sudo -u $BROKKR_RUNTIME_USER -- sh -c" "$CALLS"'
 
 rm -f "$runtime_env"
 : >"$CALLS"
