@@ -1,0 +1,17 @@
+# Brokkr · daily check that the night's package updates broke nothing (oneshot, driven by
+# brokkr-post-update-health.timer). User unit for fleet nodes (Grimnir ADR-009). Rendered and
+# installed by scripts/deploy-guarded-reboot.sh; do not copy this template by hand.
+[Unit]
+Description=Brokkr post-update health check
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/guarded-reboot.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/lib/brokkr/guarded-reboot/releases/@REVISION@
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+Environment=BROKKR_GUARDED_REBOOT_MODE=@MODE@
+ExecStart=%h/.local/lib/brokkr/guarded-reboot/releases/@REVISION@/scripts/guarded-reboot.sh health
+Nice=10
+IOSchedulingClass=idle
+# No NoNewPrivileges= or other sandboxing: the audit append goes through sudo (see the nightly unit).
+TimeoutStartSec=5min

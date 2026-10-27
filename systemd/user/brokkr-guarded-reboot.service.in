@@ -1,0 +1,42 @@
+# Brokkr · guarded reboot, the nightly decision (oneshot, driven by brokkr-guarded-reboot.timer).
+# User unit for fleet nodes (Grimnir ADR-009). Rendered and installed by
+# scripts/deploy-guarded-reboot.sh; do not copy this template by hand.
+[Unit]
+Description=Brokkr guarded reboot (nightly decision)
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/guarded-reboot.md
+# No OnFailure=: brokkr-systemd-failure@.service is a system unit and does not exist in user
+# scope. A failed run stays visible in the service state, the journal and
+# ~/.local/state/brokkr/guarded-reboot.json.
+
+[Service]
+Type=oneshot
+# Rendered by deploy-guarded-reboot.sh with an exact full revision.
+WorkingDirectory=%h/.local/lib/brokkr/guarded-reboot/releases/@REVISION@
+# The user manager's PATH is minimal. sudo, rpi-eeprom-update and systemctl live in /usr/sbin or
+# /usr/bin depending on the distribution.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# report logs and alerts what a reboot would have done; reboot is the owner's explicit switch.
+Environment=BROKKR_GUARDED_REBOOT_MODE=@MODE@
+# Space-separated systemd user units (for example hugin.service). While one has spawned work the
+# reboot is deferred to the next night. Quoted so the spaces survive systemd's parsing.
+Environment="BROKKR_GUARDED_REBOOT_BUSY_UNITS=@BUSY_UNITS@"
+# Space-separated host names that must accept a TCP connection on port 22 before this host may
+# reboot (for example the host that monitors it). Required in reboot mode; never this host itself.
+Environment="BROKKR_GUARDED_REBOOT_PEERS=@PEERS@"
+# 0 (default): any crypttab entry needed at boot defers the reboot and alerts, because nothing in
+# crypttab proves that it unlocks unattended (Grimnir ADR-009). 1: the owner has verified that every
+# encrypted boot volume unlocks without a person present; options that can prompt still block.
+Environment=BROKKR_GUARDED_REBOOT_UNLOCK_VERIFIED=@UNLOCK_VERIFIED@
+# Highest 5-minute load average; empty means 0.75 x the number of CPUs.
+Environment=BROKKR_GUARDED_REBOOT_MAX_LOAD=@MAX_LOAD@
+Environment=BROKKR_GUARDED_REBOOT_TTY_IDLE_MIN=@TTY_IDLE_MIN@
+Environment=BROKKR_GUARDED_REBOOT_ALERT_AFTER=@ALERT_AFTER@
+ExecStart=%h/.local/lib/brokkr/guarded-reboot/releases/@REVISION@/scripts/guarded-reboot.sh check
+Nice=10
+IOSchedulingClass=idle
+# Deliberately NO NoNewPrivileges= and no other sandboxing directive (PrivateTmp=, Protect*=,
+# Restrict*=, ...): the job runs `sudo -n` for its few fixed privileged commands (the audit append,
+# the EEPROM status, staging and the reboot itself), and in a user unit those directives put the
+# service in a user namespace or set no_new_privs, where sudo's setuid cannot work.
+# Bounded: the notice and the peer checks have their own short timeouts.
+TimeoutStartSec=5min

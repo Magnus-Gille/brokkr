@@ -2,6 +2,8 @@
 # ─── Grimnir shared Telegram-notify helper ───────────────────────────────────
 #
 # notify_telegram "message"  → pushes a one-line operator alert.
+# notify_telegram_confirmed "message"  → the same, but returns 0 only when delivery was
+#   confirmed (HTTP 200); for callers that must not act on a lost alert (guarded reboot).
 #
 # Preferred path, only when RATATOSKR_URL is explicitly configured: the
 # Ratatoskr bot's /api/send endpoint, reached over the
@@ -50,7 +52,11 @@ _notify_cfg_get() {
   grep -E "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"\r' || true
 }
 
-notify_telegram() {
+# Delivers one message and reports whether delivery was confirmed: 0 only when the endpoint
+# that took the request answered HTTP 200, 1 otherwise (including "not configured"). It says
+# why on stderr and never exits the caller. notify_telegram wraps it as best-effort; callers
+# that must not proceed on a lost alert (the guarded reboot) use notify_telegram_confirmed.
+_notify_deliver() {
   local msg="$1"
   [[ -z "$msg" ]] && return 0
 
@@ -76,11 +82,11 @@ notify_telegram() {
 
   if [[ -z "$chat_id" ]]; then
     echo "  notify: no Telegram chat id available — skipping alert" >&2
-    return 0
+    return 1
   fi
   if [[ ! "$chat_id" =~ ^-?[0-9]+$ ]]; then
     echo "  notify: TELEGRAM_ALLOWED_USERS first entry '$chat_id' is not numeric — skipping alert" >&2
-    return 0
+    return 1
   fi
 
   # `|| text_json='""'` keeps the contract: if node is missing/crashes, the
@@ -108,16 +114,31 @@ notify_telegram() {
   # Fallback: direct Telegram Bot API. Pass the token-bearing URL via curl's
   # --config (stdin) so the bot token never appears in the process argv (ps).
   if [[ -n "$bot_token" ]]; then
-    printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$bot_token" | \
-    curl -sS -m 8 -o /dev/null --config - \
-      --data-urlencode "chat_id=${chat_id}" \
-      --data-urlencode "text=${msg}" 2>/dev/null || true
-  else
-    if [[ -n "$url" ]]; then
-      echo "  notify: Ratatoskr unreachable (HTTP ${code}) and no bot token for fallback" >&2
-    else
-      echo "  notify: no Ratatoskr URL or direct bot token configured — skipping alert" >&2
-    fi
+    code="$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$bot_token" | \
+      curl -sS -m 8 -o /dev/null -w '%{http_code}' --config - \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${msg}" 2>/dev/null || echo 000)"
+    [[ "$code" == "200" ]] && return 0
+    echo "  notify: direct Telegram request failed (HTTP ${code})" >&2
+    return 1
   fi
+  if [[ -n "$url" ]]; then
+    echo "  notify: Ratatoskr unreachable (HTTP ${code}) and no bot token for fallback" >&2
+  else
+    echo "  notify: no Ratatoskr URL or direct bot token configured — skipping alert" >&2
+  fi
+  return 1
+}
+
+# Best-effort by contract: a lost alert never fails (or aborts) the calling script.
+notify_telegram() {
+  _notify_deliver "$1" || true
   return 0
+}
+
+# For callers that must not act when the alert cannot be delivered: 0 only when delivery was
+# confirmed (HTTP 200), non-zero otherwise. An empty message is not a delivery.
+notify_telegram_confirmed() {
+  [[ -n "$1" ]] || return 1
+  _notify_deliver "$1"
 }

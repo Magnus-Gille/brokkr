@@ -1,0 +1,16 @@
+# Brokkr · decide about a guarded reboot once a night (user timer).
+[Unit]
+Description=Run the Brokkr guarded reboot decision nightly
+
+[Timer]
+# Rendered by deploy-guarded-reboot.sh: the window (HH:MM) and the spread are per host, so a host and
+# the host that monitors it never reboot in the same window.
+OnCalendar=*-*-* @WINDOW@:00
+RandomizedDelaySec=@SPREAD@min
+# A missed window must never fire right after boot: the next night is the next chance.
+Persistent=false
+AccuracySec=1min
+Unit=brokkr-guarded-reboot.service
+
+[Install]
+WantedBy=timers.target
