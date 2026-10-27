@@ -113,6 +113,25 @@ then forwards the same explicit values to `deploy-control-node.sh`. It never
 sources JSON or derives the commit from `HEAD`; sensitive endpoint and
 token-source locators are not printed.
 
+The release sync is `rsync --delete`, so the deploy target must be a directory
+of its own. Job deploys (the agent CLI updater, the guarded reboot, link health,
+the pi binary) keep their releases below `<runtime_home>/.local/lib/brokkr/<job>`;
+a `deploy_target` that is that job library, contains it, or sits inside it is
+refused before the host is contacted, and again on the host after both paths are
+resolved physically (through symlinked ancestors), so an alias cannot reach the
+library. Every deploy also writes
+`.brokkr-release` into the target, with the deployed `commit=` and one
+`entry <name>` line per top-level payload entry. On the next deploy, an
+existing target may hold only entries that this payload has or that the previous
+manifest recorded (plus `.git` and `.local`, which the sync never touches);
+anything else stops the deploy before rsync and is named in the error. Names are
+compared whole and limited to letters, digits, `.`, `_` and `-`: an entry with any
+other character (a space, a newline) stops the deploy, as does a manifest that is
+a symlink, not a regular file, or has a line that is not `commit=<full sha>` or
+`entry <name>`. A target without a manifest is accepted only when it holds
+nothing but payload entries.
+The manifest's `commit=` line is also the rollback reference.
+
 For a one-off deployment, the underlying script remains available with every
 input explicit; the profile wrapper is the reviewed, repeatable path.
 
