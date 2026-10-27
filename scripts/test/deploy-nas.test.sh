@@ -363,6 +363,37 @@ check "unsafe runtime env mode is refused with exit 2 and the file unchanged whe
 unset MOCK_RUNTIME_MODE
 rm -f "$runtime_env"
 
+# systemd EnvironmentFile= tolerates leading whitespace, `export` and blanks
+# around `=`; none of those spellings may be miscounted as absent or unique.
+noncanonical_cases=(
+  ' HEIMDALL_FLEET_TOKEN=producer-sentinel\n'
+  '\tHEIMDALL_FLEET_TOKEN=producer-sentinel\n'
+  'export HEIMDALL_FLEET_TOKEN=producer-sentinel\n'
+  'HEIMDALL_FLEET_TOKEN = producer-sentinel\n'
+  'HEIMDALL_FLEET_TOKEN=producer-sentinel\n  HEIMDALL_FLEET_TOKEN=other-sentinel\n'
+)
+case_n=0
+for case_text in "${noncanonical_cases[@]}"; do
+  case_n=$((case_n + 1))
+  # shellcheck disable=SC2059 # the case text is a printf format by design.
+  printf "HEIMDALL_HUB_URL=https://stale.example/api/panels\n$case_text" >"$runtime_env"
+  chmod 600 "$runtime_env"
+  cp "$runtime_env" "$TMP/env.before"
+  : >"$CALLS"
+  run
+  check "non-canonical runtime token spelling #$case_n is refused with exit 2 and the file unchanged" '[[ "$RC" -eq 2 && "$OUT" == *"non-canonical"* ]] && cmp -s "$runtime_env" "$TMP/env.before" && ! leftover_temp && ! grep -q "systemctl" "$CALLS" && no_leak && [[ "$OUT" != *other-sentinel* ]]'
+  : >"$CALLS"
+  BROKKR_REPLACE_HEIMDALL_TOKEN=1 run
+  check "non-canonical runtime token spelling #$case_n is refused even when replacement is requested" '[[ "$RC" -eq 2 && "$OUT" == *"non-canonical"* ]] && cmp -s "$runtime_env" "$TMP/env.before"'
+done
+rm -f "$runtime_env"
+
+printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=legacy-sentinel\n  HEIMDALL_FLEET_TOKEN=other-sentinel\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
+: >"$CALLS"
+run
+check "a source with a hidden indented duplicate token is refused without writing the env" '[[ "$RC" -eq 2 && "$OUT" == *"non-canonical"* && ! -e "$runtime_env" ]] && ! grep -q "systemctl" "$CALLS" && no_leak && [[ "$OUT" != *other-sentinel* ]]'
+printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=legacy-sentinel\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
+
 : >"$CALLS"
 export MOCK_PROTECTED_SOURCE_TESTS=1 MOCK_SOURCE_MODE=644
 run

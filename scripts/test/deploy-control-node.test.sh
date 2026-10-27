@@ -290,6 +290,7 @@ export MOCK_RELEASE_TARGET="$BROKKR_DEPLOY_TARGET"
 # the legacy shared token in the source; a redeploy must not put the legacy one back.
 write_env() { printf 'HEIMDALL_HUB_URL=http://stale.example/api/panels\nHEIMDALL_FLEET_TOKEN=%s\n' "$1" >"$ENV_FILE"; chmod 600 "$ENV_FILE"; }
 no_leak() { [[ "$OUT" != *producer-sentinel* && "$OUT" != *legacy-sentinel* ]] && ! grep -Eq 'producer-sentinel|legacy-sentinel' "$CALLS" && ! grep -Fq "$BROKKR_HEIMDALL_TOKEN_SOURCE" "$CALLS" && [[ "$OUT" != *"$BROKKR_HEIMDALL_TOKEN_SOURCE"* ]]; }
+no_stage_dirs() { [[ -z "$(find /run/ /tmp/ -maxdepth 1 -name 'brokkr-heimdall-stage.*' -print 2>/dev/null)" ]]; }
 leftover_temp() { find "$(dirname "$ENV_FILE")" -name '.env.*' | grep -q .; }
 printf 'HEIMDALL_FLEET_TOKEN=legacy-sentinel\n' >"$TMP/heimdall-token.env"
 export BROKKR_HEIMDALL_URL=http://heimdall.example/api/panels
@@ -303,7 +304,7 @@ check "preserved-token deploy prints no token value or source path and keeps the
 check "preflight authenticates with the token actually written (not the legacy source)" 'grep -q "curl .*service=brokkr" "$CALLS" && grep -q "systemctl enable" "$CALLS"'
 check "root never chowns, chmods, renames or creates temp files inside the runtime user's config directory" '! grep -E "^root (chown|chmod|mv|mktemp) .*/\.config/brokkr" "$FSLOG"'
 check "no root-run chown is issued at all (ownership comes from the runtime user writing the file)" '! grep -q "^root chown" "$FSLOG"'
-check "root-created preflight staging lives outside the runtime user directory" 'grep -q "^root mktemp -d .*brokkr-heimdall-stage" "$FSLOG" && ! grep -E "^root mktemp .*/runtime-home" "$FSLOG" && [[ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -name "brokkr-heimdall-stage.*" -print)" ]]'
+check "root-created preflight staging lives outside the runtime user directory" 'grep -q "^root mktemp -d .*brokkr-heimdall-stage" "$FSLOG" && ! grep -E "^root mktemp .*/runtime-home" "$FSLOG" && no_stage_dirs'
 check "the temp file and the final rename are performed as the runtime user in its config directory" 'grep -Eq "^user mktemp .*/\.config/brokkr/\.env\." "$FSLOG" && grep -Eq "^user mv -f .*/\.config/brokkr/\.env\.[^ ]+ .*/\.config/brokkr/env$" "$FSLOG" && grep -Fq "sudo -u $BROKKR_RUNTIME_USER -- sh -c" "$CALLS"'
 
 write_env producer-sentinel
@@ -312,6 +313,7 @@ cp "$ENV_FILE" "$TMP/env.before"
 export MOCK_CURL_EXPECT=legacy-sentinel
 run
 check "preflight rejecting the preserved token refuses before touching the env or enabling timers" '[[ "$RC" -ne 0 && "$OUT" == *"endpoint preflight failed"* ]] && cmp -s "$ENV_FILE" "$TMP/env.before" && ! leftover_temp && ! grep -q "systemctl enable" "$CALLS"'
+check "failed preflight removes its staging directory" 'grep -q "^root mktemp -d .*brokkr-heimdall-stage" "$FSLOG" && no_stage_dirs'
 check "failed preflight leaks no token value" 'no_leak'
 
 rm -f "$ENV_FILE"
@@ -370,7 +372,48 @@ cp "$ENV_FILE" "$TMP/env.before"
 export MOCK_ENV_MODE=644
 run
 check "unsafe runtime env mode is refused with exit 2 and the file unchanged" '[[ "$RC" -eq 2 ]] && cmp -s "$ENV_FILE" "$TMP/env.before" && ! grep -q "systemctl enable" "$CALLS"'
-unset MOCK_ENV_MODE MOCK_CURL_EXPECT
+unset MOCK_ENV_MODE
+
+# systemd EnvironmentFile= tolerates leading whitespace, `export` and blanks
+# around `=`; none of those spellings may be miscounted as absent or unique.
+export MOCK_CURL_EXPECT=legacy-sentinel
+noncanonical_cases=(
+  ' HEIMDALL_FLEET_TOKEN=producer-sentinel\n'
+  '\tHEIMDALL_FLEET_TOKEN=producer-sentinel\n'
+  'export HEIMDALL_FLEET_TOKEN=producer-sentinel\n'
+  'HEIMDALL_FLEET_TOKEN = producer-sentinel\n'
+  'HEIMDALL_FLEET_TOKEN=producer-sentinel\n  HEIMDALL_FLEET_TOKEN=other-sentinel\n'
+)
+case_n=0
+for case_text in "${noncanonical_cases[@]}"; do
+  case_n=$((case_n + 1))
+  # shellcheck disable=SC2059 # the case text is a printf format by design.
+  printf "HEIMDALL_HUB_URL=http://stale.example/api/panels\n$case_text" >"$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  cp "$ENV_FILE" "$TMP/env.before"
+  : >"$CALLS"
+  run
+  check "non-canonical runtime token spelling #$case_n is refused with exit 2 and the file unchanged" '[[ "$RC" -eq 2 && "$OUT" == *"non-canonical"* ]] && cmp -s "$ENV_FILE" "$TMP/env.before" && ! leftover_temp && ! grep -q "systemctl enable" "$CALLS" && no_leak && [[ "$OUT" != *other-sentinel* ]]'
+  : >"$CALLS"
+  BROKKR_REPLACE_HEIMDALL_TOKEN=1 run
+  check "non-canonical runtime token spelling #$case_n is refused even when replacement is requested" '[[ "$RC" -eq 2 && "$OUT" == *"non-canonical"* ]] && cmp -s "$ENV_FILE" "$TMP/env.before"'
+done
+
+rm -f "$ENV_FILE"
+printf 'HEIMDALL_FLEET_TOKEN=legacy-sentinel\n  HEIMDALL_FLEET_TOKEN=other-sentinel\n' >"$TMP/heimdall-token.env"
+: >"$CALLS"
+run
+check "a source with a hidden indented duplicate token is refused without writing the env" '[[ "$RC" -eq 2 && "$OUT" == *"non-canonical"* && ! -e "$ENV_FILE" ]] && ! grep -q "systemctl enable" "$CALLS" && no_leak && [[ "$OUT" != *other-sentinel* ]]'
+printf 'HEIMDALL_FLEET_TOKEN=legacy-sentinel\n' >"$TMP/heimdall-token.env"
+
+# An inherited TMPDIR must never decide where root stages the probe copy.
+write_env producer-sentinel
+export MOCK_CURL_EXPECT=producer-sentinel
+mkdir -p "$TMP/hostile-tmp"
+: >"$CALLS"
+TMPDIR="$TMP/hostile-tmp" run
+check "a hostile TMPDIR is ignored for preflight staging" '[[ "$RC" -eq 0 ]] && grep -Eq "^root mktemp -d (/run|/tmp)/brokkr-heimdall-stage\." "$FSLOG" && ! grep -q "hostile-tmp/brokkr-heimdall-stage" "$FSLOG" && [[ -z "$(find "$TMP/hostile-tmp" -name "brokkr-heimdall-stage.*" -print)" ]] && no_stage_dirs'
+unset MOCK_CURL_EXPECT
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"

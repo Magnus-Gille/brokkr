@@ -94,7 +94,9 @@ token from the source, set `BROKKR_REPLACE_HEIMDALL_TOKEN=1` for that deploy
 one secret-free line, either `Heimdall token preserved from existing runtime env`
 or `Heimdall token provisioned from protected source`. An existing runtime
 environment must be a regular, non-symlink file owned by the runtime user with
-mode `0400` or `0600`; a duplicate or empty token assignment in it aborts with
+mode `0400` or `0600`; only the canonical `HEIMDALL_FLEET_TOKEN=value` spelling
+is understood, so leading whitespace, an `export` prefix or blanks around `=`
+(in it or in the source) are refused; a duplicate or empty token assignment in it aborts with
 exit status 2 and the file unchanged (also when replacement is requested; repair
 or remove the file first). The new file is built beside the old one and renamed
 into place, so a failed deploy never leaves a truncated environment.

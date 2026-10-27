@@ -38,7 +38,8 @@ the runtime environment has none, or when the deploy sets
 refused before SSH). The deployer prints `Heimdall token preserved from existing
 runtime env` or `Heimdall token provisioned from protected source`. The existing
 file must be a regular, non-symlink, runtime-user-owned file with mode `0400` or
-`0600`; a duplicate or empty token assignment aborts with exit status 2 and the
+`0600`; a non-canonical spelling (leading whitespace, `export`, blanks around
+`=`), a duplicate or an empty token assignment aborts with exit status 2 and the
 file unchanged, even when replacement is requested. The new file is built beside
 the old one and renamed into place. Omitting the source
 preserves an existing runtime environment when it is a non-empty, non-symlink,

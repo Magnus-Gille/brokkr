@@ -43,19 +43,56 @@ if [[ "$PROFILE" == control-node ]]; then
   [[ "$HEIMDALL_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || fail "invalid Heimdall panel endpoint"
 fi
 
-# Print the number of token assignments read from stdin; a read error is fatal.
-count_tokens() {
+# Print the number of regex matches read from stdin; a read error is fatal.
+count_matches() {
   local n rc=0
-  n="$(grep -Ec '^HEIMDALL_FLEET_TOKEN=')" || rc=$?
+  n="$(grep -Ec "$1")" || rc=$?
   [[ "$rc" -le 1 ]] || return 2
   printf '%s' "$n"
+}
+
+# systemd EnvironmentFile= (and shells) also accept leading whitespace, an
+# `export` prefix and blanks around `=`. Only the canonical `KEY=value` form is
+# understood here, so any other spelling of the token key is refused rather than
+# miscounted as absent or unique. Print the canonical assignment count from the
+# content in $1; $2 labels the (secret-free) refusal.
+ANY_TOKEN_RE='^[[:space:]]*(export[[:space:]]+)?HEIMDALL_FLEET_TOKEN[[:space:]]*='
+canonical_token_count() {
+  local any canonical
+  any="$(printf '%s\n' "$1" | count_matches "$ANY_TOKEN_RE")" || fail "$2 is unreadable"
+  canonical="$(printf '%s\n' "$1" | count_matches '^HEIMDALL_FLEET_TOKEN=')" || fail "$2 is unreadable"
+  [[ "$any" -eq "$canonical" ]] \
+    || fail "$2 has a non-canonical fleet token assignment (leading whitespace, export, or blanks around =)"
+  printf '%s' "$canonical"
 }
 
 # Run a command as the runtime user (stdin is passed through).
 as_user() { sudo -u "$RUNTIME_USER" -- "$@"; }
 
+# Pick a root-trusted parent for the preflight staging directory. TMPDIR is
+# deliberately ignored: it is inherited and could point into a directory the
+# runtime user controls. The parent must be root-owned and not group/other
+# writable (unless sticky, as /tmp is).
+trusted_stage_parent() {
+  local cand info uid mode
+  for cand in /run /tmp; do
+    [[ -d "$cand" ]] || continue
+    info="$(stat -L -c '%u %a' "$cand" 2>/dev/null || stat -L -f '%u %Mp%Lp' "$cand" 2>/dev/null)" || continue
+    uid="${info%% *}"
+    mode=$((8#${info##* }))
+    [[ "$uid" == 0 ]] || continue
+    if (( (mode & 01000) != 0 || (mode & 022) == 0 )); then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
 [[ -f "$SOURCE" && ! -L "$SOURCE" ]] || fail "Heimdall token source is not a regular file"
-source_count="$(count_tokens <"$SOURCE")" || fail "Heimdall token source is unreadable"
+source_content="$(cat -- "$SOURCE")" || fail "Heimdall token source is unreadable"
+source_count="$(canonical_token_count "$source_content" "Heimdall token source")"
+unset source_content
 [[ "$source_count" -eq 1 ]] || fail "Heimdall token source must contain exactly one non-empty fleet token"
 source_line="$(grep -E '^HEIMDALL_FLEET_TOKEN=' "$SOURCE")"
 source_token="${source_line#HEIMDALL_FLEET_TOKEN=}"
@@ -70,7 +107,7 @@ if [[ -e "$RUNTIME_ENV" || -L "$RUNTIME_ENV" ]]; then
   # Root only stats the path above. The content is read as the runtime user, so
   # a symlink swapped in after the check cannot make root read another file.
   env_content="$(as_user cat -- "$RUNTIME_ENV")" || fail "existing Heimdall runtime environment is unreadable"
-  env_count="$(printf '%s\n' "$env_content" | count_tokens)" || fail "existing Heimdall runtime environment is unreadable"
+  env_count="$(canonical_token_count "$env_content" "existing Heimdall runtime environment")"
   case "$env_count" in
     0) ;;
     1)
@@ -109,7 +146,8 @@ unset token managed
 # credential Heimdall no longer accepts for writes. Probe exactly the content
 # about to be installed, staged in a private root-owned directory.
 if [[ "$PROFILE" == control-node ]]; then
-  stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/brokkr-heimdall-stage.XXXXXX")"
+  stage_parent="$(trusted_stage_parent)" || fail "no root-trusted directory available for preflight staging"
+  stage_dir="$(mktemp -d "$stage_parent/brokkr-heimdall-stage.XXXXXX")"
   trap 'rm -rf "$stage_dir"' EXIT
   printf '%s\n' "$content" >"$stage_dir/env"
   bash "$VERIFY_HELPER" "$HEIMDALL_URL" "$stage_dir/env" \
