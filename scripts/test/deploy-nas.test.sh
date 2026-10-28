@@ -394,6 +394,48 @@ run
 check "a source with a hidden indented duplicate token is refused without writing the env" '[[ "$RC" -eq 2 && "$OUT" == *"non-canonical"* && ! -e "$runtime_env" ]] && ! grep -q "systemctl" "$CALLS" && no_leak && [[ "$OUT" != *other-sentinel* ]]'
 printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=legacy-sentinel\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' >"$BROKKR_HEIMDALL_SOURCE_ENV"
 
+# Token values must be a single unquoted b64token (verify-heimdall-delivery.sh's
+# alphabet); quoted, blank or otherwise unsupported values are refused, in the
+# runtime env and in the source, in normal and in replacement mode.
+valid_source() { printf 'HEIMDALL_HUB_URL=https://heimdall.example/api/panels\nHEIMDALL_FLEET_TOKEN=%s\nBROKKR_TAILSCALE_KEY_EXPIRY_POLICY=monitored\nBROKKR_TAILSCALE_EXPECTED_DNS_NAME=nas.example.ts.net\n' "$1" >"$BROKKR_HEIMDALL_SOURCE_ENV"; }
+unsupported_values=(
+  '""'
+  "''"
+  '   '
+  '"producer-sentinel"'
+  'producer-sentinel '
+  'producer\\sentinel'
+  'producer sentinel'
+)
+case_n=0
+for value in "${unsupported_values[@]}"; do
+  case_n=$((case_n + 1))
+  # shellcheck disable=SC2059 # the value is a printf format by design (backslash case).
+  printf "HEIMDALL_HUB_URL=https://stale.example/api/panels\nHEIMDALL_FLEET_TOKEN=$value\n" >"$runtime_env"
+  chmod 600 "$runtime_env"
+  cp "$runtime_env" "$TMP/env.before"
+  valid_source legacy-sentinel
+  for flag in "" 1; do
+    : >"$CALLS"
+    BROKKR_REPLACE_HEIMDALL_TOKEN="$flag" run
+    check "unsupported runtime token value #$case_n is refused with exit 2 and the file unchanged (replace='${flag:-0}')" '[[ "$RC" -eq 2 && "$OUT" == *"unsupported"* ]] && cmp -s "$runtime_env" "$TMP/env.before" && ! leftover_temp && ! grep -q "systemctl" "$CALLS" && no_leak'
+  done
+  # shellcheck disable=SC2059
+  valid_source "$(printf "$value")"
+  write_env producer-sentinel
+  cp "$runtime_env" "$TMP/env.before"
+  for flag in "" 1; do
+    : >"$CALLS"
+    BROKKR_REPLACE_HEIMDALL_TOKEN="$flag" run
+    check "unsupported source token value #$case_n is refused with exit 2 and the env unchanged (replace='${flag:-0}')" '[[ "$RC" -eq 2 && "$OUT" == *"unsupported"* ]] && cmp -s "$runtime_env" "$TMP/env.before" && ! grep -q "systemctl" "$CALLS" && no_leak'
+  done
+  rm -f "$runtime_env"
+  : >"$CALLS"
+  run
+  check "unsupported source token value #$case_n is refused when the runtime env has no token" '[[ "$RC" -eq 2 && "$OUT" == *"unsupported"* && ! -e "$runtime_env" ]] && no_leak'
+done
+valid_source legacy-sentinel
+
 : >"$CALLS"
 export MOCK_PROTECTED_SOURCE_TESTS=1 MOCK_SOURCE_MODE=644
 run

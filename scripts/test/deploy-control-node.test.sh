@@ -110,7 +110,55 @@ name="$(basename "$0")"
 printf '%s %s %s\n' "$who" "$name" "$*" >>"$MOCK_FSLOG"
 PATH=/usr/bin:/bin exec "$name" "$@"
 EOF
-for fscmd in chown chmod mv mktemp; do cp "$TMP/bin/fswrap" "$TMP/bin/$fscmd"; done
+for fscmd in chown chmod mv; do cp "$TMP/bin/fswrap" "$TMP/bin/$fscmd"; done
+# The preflight staging directory is requested under a production parent (/run
+# or /tmp). Log the request, but create it beneath the private fixture root so
+# an unprivileged runner never touches the real /run.
+cat >"$TMP/bin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+who=root
+[[ -z "${MOCK_AS_USER:-}" ]] || who=user
+printf '%s mktemp %s\n' "$who" "$*" >>"$MOCK_FSLOG"
+args=()
+for a in "$@"; do
+  case "$a" in
+    /run/brokkr-heimdall-stage.*|/tmp/brokkr-heimdall-stage.*)
+      mkdir -p "$MOCK_STAGE_ROOT${a%/*}"
+      a="$MOCK_STAGE_ROOT$a"
+      ;;
+  esac
+  args+=("$a")
+done
+PATH=/usr/bin:/bin exec mktemp "${args[@]}"
+EOF
+# Deterministic metadata for the candidate staging parents. MOCK_STAT_RUN and
+# MOCK_STAT_TMP hold "uid mode type" (or "fail"); MOCK_STAT_STYLE selects the
+# GNU (Linux, the CI path) or BSD (macOS) stat dialect the helper must speak.
+# Anything else goes to the real stat.
+cat >"$TMP/bin/stat" <<'EOF'
+#!/usr/bin/env bash
+cand="${!#}"
+case "$cand" in
+  /run|/tmp)
+    if [[ "$cand" == /run ]]; then spec="${MOCK_STAT_RUN-0 755 directory}"; else spec="${MOCK_STAT_TMP-0 1777 directory}"; fi
+    [[ "$spec" != fail ]] || exit 1
+    read -r uid mode type <<<"$spec"
+    case "${MOCK_STAT_STYLE:-gnu}" in
+      gnu)
+        [[ "$1 $2 $3" == "-L -c %u %a %F" ]] || exit 1
+        printf '%s %s %s\n' "$uid" "$mode" "$type"
+        ;;
+      bsd)
+        [[ "$1 $2 $3" == "-L -f %u %Mp%Lp %HT" ]] || exit 1
+        [[ "$type" != directory ]] || type=Directory
+        printf '%s %04d %s\n' "$uid" "$mode" "$type"
+        ;;
+    esac
+    exit 0
+    ;;
+esac
+PATH=/usr/bin:/bin exec stat "$@"
+EOF
 cat >"$TMP/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"$MOCK_CALLS"
@@ -132,6 +180,7 @@ chmod +x "$TMP/bin/"*
 
 FSLOG="$TMP/fslog"
 : >"$FSLOG"
+export MOCK_STAGE_ROOT="$TMP/stage-root"
 export PATH="$TMP/bin:$PATH" MOCK_CALLS="$CALLS" MOCK_FSLOG="$FSLOG" MOCK_BIN="$TMP/bin" MOCK_HOME="$TMP/home"
 export BROKKR_SSH_TARGET=brokkr@control-node
 export BROKKR_DEPLOY_TARGET="$TMP/release" BROKKR_RUNTIME_USER=operator BROKKR_RUNTIME_HOME="$TMP/runtime-home" BROKKR_REGISTRY_PATH=/srv/grimnir/services.json
@@ -226,7 +275,7 @@ printf 'HEIMDALL_FLEET_TOKEN=unsafe"token\n' >"$TMP/heimdall-token.env"
 rm -f "$ENV_FILE"  # a source token is only used when the runtime env has none
 : >"$CALLS"
 run
-check "adversarial token syntax refuses before curl or timer enablement" '[[ "$RC" -ne 0 && "$OUT" == *"endpoint preflight failed"* ]] && ! grep -q "curl\|systemctl enable" "$CALLS" && [[ "$OUT" != *"unsafe\"token"* ]]'
+check "adversarial token syntax refuses before curl or timer enablement" '[[ "$RC" -ne 0 && "$OUT" == *"unsupported fleet token value"* ]] && ! grep -q "curl\|systemctl enable" "$CALLS" && [[ "$OUT" != *"unsafe\"token"* ]]'
 
 printf 'HEIMDALL_FLEET_TOKEN=one\nHEIMDALL_FLEET_TOKEN=two\n' >"$TMP/heimdall-token.env"
 : >"$CALLS"
@@ -290,7 +339,7 @@ export MOCK_RELEASE_TARGET="$BROKKR_DEPLOY_TARGET"
 # the legacy shared token in the source; a redeploy must not put the legacy one back.
 write_env() { printf 'HEIMDALL_HUB_URL=http://stale.example/api/panels\nHEIMDALL_FLEET_TOKEN=%s\n' "$1" >"$ENV_FILE"; chmod 600 "$ENV_FILE"; }
 no_leak() { [[ "$OUT" != *producer-sentinel* && "$OUT" != *legacy-sentinel* ]] && ! grep -Eq 'producer-sentinel|legacy-sentinel' "$CALLS" && ! grep -Fq "$BROKKR_HEIMDALL_TOKEN_SOURCE" "$CALLS" && [[ "$OUT" != *"$BROKKR_HEIMDALL_TOKEN_SOURCE"* ]]; }
-no_stage_dirs() { [[ -z "$(find /run/ /tmp/ -maxdepth 1 -name 'brokkr-heimdall-stage.*' -print 2>/dev/null)" ]]; }
+no_stage_dirs() { [[ -z "$(find "$MOCK_STAGE_ROOT" -name 'brokkr-heimdall-stage.*' -print 2>/dev/null)" ]]; }
 leftover_temp() { find "$(dirname "$ENV_FILE")" -name '.env.*' | grep -q .; }
 printf 'HEIMDALL_FLEET_TOKEN=legacy-sentinel\n' >"$TMP/heimdall-token.env"
 export BROKKR_HEIMDALL_URL=http://heimdall.example/api/panels
@@ -405,6 +454,83 @@ printf 'HEIMDALL_FLEET_TOKEN=legacy-sentinel\n  HEIMDALL_FLEET_TOKEN=other-senti
 run
 check "a source with a hidden indented duplicate token is refused without writing the env" '[[ "$RC" -eq 2 && "$OUT" == *"non-canonical"* && ! -e "$ENV_FILE" ]] && ! grep -q "systemctl enable" "$CALLS" && no_leak && [[ "$OUT" != *other-sentinel* ]]'
 printf 'HEIMDALL_FLEET_TOKEN=legacy-sentinel\n' >"$TMP/heimdall-token.env"
+
+# Token values must be a single unquoted b64token (verify-heimdall-delivery.sh's
+# alphabet); quoted, blank or otherwise unsupported values are refused, in the
+# runtime env and in the source, in normal and in replacement mode.
+unsupported_values=(
+  '""'
+  "''"
+  '   '
+  '"producer-sentinel"'
+  'producer-sentinel '
+  'producer\\sentinel'
+  'producer sentinel'
+)
+case_n=0
+for value in "${unsupported_values[@]}"; do
+  case_n=$((case_n + 1))
+  # shellcheck disable=SC2059 # the value is a printf format by design (backslash case).
+  printf "HEIMDALL_HUB_URL=http://stale.example/api/panels\nHEIMDALL_FLEET_TOKEN=$value\n" >"$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  cp "$ENV_FILE" "$TMP/env.before"
+  printf 'HEIMDALL_FLEET_TOKEN=legacy-sentinel\n' >"$TMP/heimdall-token.env"
+  for flag in "" 1; do
+    : >"$CALLS"
+    BROKKR_REPLACE_HEIMDALL_TOKEN="$flag" run
+    check "unsupported runtime token value #$case_n is refused with exit 2 and the file unchanged (replace='${flag:-0}')" '[[ "$RC" -eq 2 && "$OUT" == *"unsupported"* ]] && cmp -s "$ENV_FILE" "$TMP/env.before" && ! leftover_temp && ! grep -q "systemctl enable" "$CALLS" && no_leak'
+  done
+  # shellcheck disable=SC2059
+  printf "HEIMDALL_FLEET_TOKEN=$value\n" >"$TMP/heimdall-token.env"
+  write_env producer-sentinel
+  cp "$ENV_FILE" "$TMP/env.before"
+  for flag in "" 1; do
+    : >"$CALLS"
+    BROKKR_REPLACE_HEIMDALL_TOKEN="$flag" run
+    check "unsupported source token value #$case_n is refused with exit 2 and the env unchanged (replace='${flag:-0}')" '[[ "$RC" -eq 2 && "$OUT" == *"unsupported"* ]] && cmp -s "$ENV_FILE" "$TMP/env.before" && ! grep -q "systemctl enable" "$CALLS" && no_leak'
+  done
+  rm -f "$ENV_FILE"
+  : >"$CALLS"
+  run
+  check "unsupported source token value #$case_n is refused when the runtime env has no token" '[[ "$RC" -eq 2 && "$OUT" == *"unsupported"* && ! -e "$ENV_FILE" ]] && no_leak'
+done
+printf 'HEIMDALL_FLEET_TOKEN=legacy-sentinel\n' >"$TMP/heimdall-token.env"
+
+# Staging-parent selection, exercised deterministically through the stat shim in
+# both stat dialects (GNU is what Linux CI uses). Each row: /run metadata, /tmp
+# metadata, expected outcome.
+stage_rows=(
+  '0 755 directory|0 1777 directory|/run'
+  '0 777 directory|0 1777 directory|/tmp'
+  '0 770 directory|0 1777 directory|/tmp'
+  '1000 755 directory|0 1777 directory|/tmp'
+  'fail|0 1777 directory|/tmp'
+  '0 755 regular|0 1777 directory|/tmp'
+  '0 777 directory|0 777 directory|refuse'
+  '1000 755 directory|1000 1777 directory|refuse'
+  'fail|fail|refuse'
+)
+export MOCK_CURL_EXPECT=producer-sentinel
+for stat_style in gnu bsd; do
+  row_n=0
+  for row in "${stage_rows[@]}"; do
+    row_n=$((row_n + 1))
+    IFS='|' read -r run_spec tmp_spec expect <<<"$row"
+    write_env producer-sentinel
+    cp "$ENV_FILE" "$TMP/env.before"
+    : >"$CALLS"
+    MOCK_STAT_STYLE="$stat_style" MOCK_STAT_RUN="$run_spec" MOCK_STAT_TMP="$tmp_spec" run
+    if [[ "$expect" == refuse ]]; then
+      check "staging parent row $row_n ($stat_style stat): no trusted parent refuses before probing or writing" '[[ "$RC" -eq 2 && "$OUT" == *"no root-trusted directory"* ]] && cmp -s "$ENV_FILE" "$TMP/env.before" && ! grep -q "^root mktemp -d .*brokkr-heimdall-stage" "$FSLOG" && ! grep -q "curl \|systemctl enable" "$CALLS" && no_stage_dirs'
+    else
+      other=/tmp
+      if [[ "$expect" == /tmp ]]; then other=/run; fi
+      export other_parent="$other"
+      check "staging parent row $row_n ($stat_style stat): $expect is chosen" '[[ "$RC" -eq 0 ]] && grep -q "^root mktemp -d $expect/brokkr-heimdall-stage\." "$FSLOG" && ! grep -q "^root mktemp -d $other_parent/brokkr-heimdall-stage" "$FSLOG" && no_stage_dirs'
+    fi
+  done
+done
+unset MOCK_CURL_EXPECT
 
 # An inherited TMPDIR must never decide where root stages the probe copy.
 write_env producer-sentinel

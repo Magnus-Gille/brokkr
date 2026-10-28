@@ -74,12 +74,18 @@ as_user() { sudo -u "$RUNTIME_USER" -- "$@"; }
 # runtime user controls. The parent must be root-owned and not group/other
 # writable (unless sticky, as /tmp is).
 trusted_stage_parent() {
-  local cand info uid mode
+  local cand info uid mode type
   for cand in /run /tmp; do
-    [[ -d "$cand" ]] || continue
-    info="$(stat -L -c '%u %a' "$cand" 2>/dev/null || stat -L -f '%u %Mp%Lp' "$cand" 2>/dev/null)" || continue
+    # "uid mode type" in GNU (Linux) or BSD (macOS) dialect; stat -L follows a
+    # symlinked /tmp. The type check replaces a separate -d test.
+    info="$(stat -L -c '%u %a %F' "$cand" 2>/dev/null || stat -L -f '%u %Mp%Lp %HT' "$cand" 2>/dev/null)" || continue
     uid="${info%% *}"
-    mode=$((8#${info##* }))
+    info="${info#* }"
+    mode="${info%% *}"
+    type="${info#* }"
+    case "$type" in directory|Directory) ;; *) continue ;; esac
+    [[ "$mode" =~ ^[0-7]+$ ]] || continue
+    mode=$((8#$mode))
     [[ "$uid" == 0 ]] || continue
     if (( (mode & 01000) != 0 || (mode & 022) == 0 )); then
       printf '%s' "$cand"
@@ -89,6 +95,12 @@ trusted_stage_parent() {
   return 1
 }
 
+# Only a single unquoted b64token is a usable token value. This is the same
+# alphabet verify-heimdall-delivery.sh accepts for the credential it puts in
+# curl's stdin config, so a value that passes here cannot be rejected there for
+# its syntax. Quotes, blanks (including trailing ones) and backslashes are refused.
+valid_token_value() { [[ "$1" =~ ^[[:alnum:]._~+/\-]+={0,2}$ ]]; }
+
 [[ -f "$SOURCE" && ! -L "$SOURCE" ]] || fail "Heimdall token source is not a regular file"
 source_content="$(cat -- "$SOURCE")" || fail "Heimdall token source is unreadable"
 source_count="$(canonical_token_count "$source_content" "Heimdall token source")"
@@ -97,6 +109,7 @@ unset source_content
 source_line="$(grep -E '^HEIMDALL_FLEET_TOKEN=' "$SOURCE")"
 source_token="${source_line#HEIMDALL_FLEET_TOKEN=}"
 [[ -n "$source_token" ]] || fail "Heimdall token source must contain exactly one non-empty fleet token"
+valid_token_value "$source_token" || fail "Heimdall token source has an unsupported fleet token value (quotes, blanks or characters outside the token alphabet)"
 unset source_line
 
 # Inspect the existing runtime env first. Anything ambiguous fails closed with
@@ -115,6 +128,7 @@ if [[ -e "$RUNTIME_ENV" || -L "$RUNTIME_ENV" ]]; then
       existing_token="${env_line#HEIMDALL_FLEET_TOKEN=}"
       unset env_line
       [[ -n "$existing_token" ]] || fail "existing Heimdall runtime environment has an empty fleet token"
+      valid_token_value "$existing_token" || fail "existing Heimdall runtime environment has an unsupported fleet token value (quotes, blanks or characters outside the token alphabet)"
       ;;
     *) fail "existing Heimdall runtime environment has duplicate fleet token assignments" ;;
   esac
