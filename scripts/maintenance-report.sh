@@ -342,8 +342,10 @@ if command -v journalctl >/dev/null 2>&1; then
     esac
   fi
 fi
-echo "JOURNAL_ACCESS=$JACCESS"; echo "JOURNAL_STORAGE=$JSTORAGE"; echo "JOURNAL_DIR=$JDIR"
-echo "JOURNAL_MAX=$JMAX"; echo "JOURNAL_USE=$JUSE"; echo "JOURNAL_SPAN_S=$JSPAN"; echo "JOURNAL_PENDING=$JPENDING"
+# printf, not echo: an escape-interpreting echo (dash) would let a "\n" in a config value forge
+# another KEY=value line.
+printf 'JOURNAL_ACCESS=%s\nJOURNAL_STORAGE=%s\nJOURNAL_DIR=%s\n' "$JACCESS" "$JSTORAGE" "$JDIR"
+printf 'JOURNAL_MAX=%s\nJOURNAL_USE=%s\nJOURNAL_SPAN_S=%s\nJOURNAL_PENDING=%s\n' "$JMAX" "$JUSE" "$JSPAN" "$JPENDING"
 
 # ── Guarded-reboot audit projection (Grimnir ADR-009) ────────────────────────
 # The guarded-reboot job appends one JSON object per line to a root-owned,

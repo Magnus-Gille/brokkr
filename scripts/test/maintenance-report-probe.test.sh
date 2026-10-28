@@ -530,6 +530,15 @@ jprobe "$r"
 check "journal: an assignment in another section or before any section is ignored" '[[ "$(val JOURNAL_MAX)" == 1G ]]'
 check "journal: a comment that starts with a path is not a file header" '[[ "$(val JOURNAL_STORAGE)" == persistent ]]'
 
+# A config value with a literal backslash escape must stay one field: an escape-interpreting echo
+# (dash) would turn "\n" into a forged JOURNAL_PENDING line, and the report reads the first one.
+printf '%s\n' '# /etc/systemd/journald.conf.d/60-brokkr-persistent.conf' '[Journal]' 'Storage=persistent' \
+  'SystemMaxUse=1G\nJOURNAL_PENDING=yes' >"$TMP/journald.escape.conf"
+jreset; J_GROUPS="adm"; J_CONF="$TMP/journald.escape.conf"
+jprobe "$r"
+check "journal: a backslash escape in a config value cannot forge a probe field" \
+  '[[ "$(grep -c "^JOURNAL_PENDING=" <<<"$BLOB")" -eq 1 && -z "$(val JOURNAL_PENDING)" && "$(val JOURNAL_MAX)" == "1G\\nJOURNAL_PENDING=yes" ]] && only_pairs'
+
 # A configuration file or drop-in directory whose ctime is newer than the running journald is a
 # staged change that is not in force. ctime, not mtime: touch -t and cp -p cannot set it back, and
 # a drop-in directory's ctime moves when a file is removed from it.
