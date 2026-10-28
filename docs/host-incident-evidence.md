@@ -29,11 +29,15 @@ To read them, the probe user must be root or in `adm` or `systemd-journal`;
 otherwise the window shows as `unknown(no journal access)`.
 
 journald reads its configuration only when it starts. The probe therefore
-compares each journald configuration file with the running journald. A staged
-change, such as `--apply` without `--restart` below, shows as
-`;journald-restart-pending` in the status. Until journald restarts, the running
-cap may still be the old one, so a short window then alerts with the restart
-hint, whatever the new cap says.
+compares the change time (ctime) of each journald configuration file and of
+the `journald.conf.d` directories with the start of the running journald. ctime
+cannot be backdated, and a directory's ctime also changes when a drop-in is
+removed from it. A staged change, such as `--apply` without `--restart` below,
+shows as `;journald-restart-pending` in the status. Until journald restarts, the
+running cap may still be the old one, so a short window then alerts with the
+restart hint, whatever the new cap says. Rerunning `--apply` while the
+installed policy is already identical leaves the file untouched, so it does
+not raise this hint.
 
 ```bash
 ./scripts/setup-persistent-journal.sh --dry-run

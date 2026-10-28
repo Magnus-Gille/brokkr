@@ -300,18 +300,21 @@ if command -v journalctl >/dev/null 2>&1; then
       END { printf "S=%s\nM=%s\n", st, mx }')
     JSTORAGE=$(printf '%s\n' "$JCFG" | sed -n 's/^S=//p')
     JMAX=$(printf '%s\n' "$JCFG" | sed -n 's/^M=//p')
-    # journald reads its configuration only when it starts. A file newer than the running
-    # journald is a staged change that is not in force yet (setup-persistent-journal.sh --apply
-    # without --restart), so the running cap may still be the old one. Unknown start: no verdict.
-    if command -v systemctl >/dev/null 2>&1; then
+    # journald reads its configuration only when it starts. A file, or a drop-in directory, that
+    # changed after the running journald started is a staged change that is not in force yet
+    # (setup-persistent-journal.sh --apply without --restart), so the running cap may still be the
+    # old one. ctime, not mtime: touch -t and cp -p cannot set it back, and a drop-in directory's
+    # ctime moves when a file is removed from it. Unknown start or no stat: no verdict.
+    if command -v systemctl >/dev/null 2>&1 && command -v stat >/dev/null 2>&1; then
       JSTART=$(systemctl show --timestamp=unix -p ActiveEnterTimestamp --value systemd-journald.service 2>/dev/null | sed -n 's/^@\([0-9]\{1,12\}\)$/\1/p')
       if [ -n "$JSTART" ]; then
         JPENDING=no
         set -f  # a header path is a literal path, never a glob
-        for f in $(printf '%s\n' "$JCONF" | sed -n 's/^# \(\/[^[:space:]]*\)$/\1/p'); do
-          [ -f "$R$f" ] || continue
-          m=$(date -r "$R$f" +%s 2>/dev/null) || continue
-          [ "$(awk -v m="$m" -v s="$JSTART" 'BEGIN { print (m ~ /^[0-9]+$/ && m + 0 > s + 0) ? 1 : 0 }')" = 1 ] && JPENDING=yes
+        for f in $(printf '%s\n' "$JCONF" | sed -n 's/^# \(\/[^[:space:]]*\)$/\1/p') \
+          /etc/systemd/journald.conf.d /usr/local/lib/systemd/journald.conf.d /usr/lib/systemd/journald.conf.d; do
+          [ -e "$R$f" ] || continue
+          c=$(stat -c %Z "$R$f" 2>/dev/null) || continue
+          [ "$(awk -v c="$c" -v s="$JSTART" 'BEGIN { print (c ~ /^[0-9]+$/ && c + 0 > s + 0) ? 1 : 0 }')" = 1 ] && JPENDING=yes
         done
         set +f
       fi

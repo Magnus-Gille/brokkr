@@ -353,7 +353,19 @@ case "$*" in
 esac
 exit 0
 FAKE
-chmod +x "$JBIN/id" "$JBIN/systemd-analyze" "$JBIN/journalctl" "$JBIN/systemctl"
+REAL_STAT="$(command -v stat)"
+cat >"$JBIN/stat" <<FAKE
+#!/bin/sh
+# stat -c %Z PATH: the ctime listed for PATH in MOCK_CTIMES ("path epoch" lines), else the real one
+# (GNU stat, or BSD stat on macOS).
+[ "\$1" = -c ] && [ "\$2" = %Z ] && [ -e "\$3" ] || exit 1
+if [ -n "\$MOCK_CTIMES" ]; then
+  c=\$(awk -v p="\$3" '\$1 == p { print \$2; exit }' "\$MOCK_CTIMES")
+  [ -n "\$c" ] && { echo "\$c"; exit 0; }
+fi
+"$REAL_STAT" -c %Z "\$3" 2>/dev/null || "$REAL_STAT" -f %c "\$3"
+FAKE
+chmod +x "$JBIN/id" "$JBIN/systemd-analyze" "$JBIN/journalctl" "$JBIN/systemctl" "$JBIN/stat"
 
 # cat-config prints every file in precedence order, a "# path" header before each one.
 JCONF_TWO="$TMP/journald.two.conf"
@@ -377,11 +389,11 @@ jprobe() {
   BLOB="$(env -i PATH="${2:-$PBIN:$JBIN}" MOCK_UNAME_R=6.12.48+deb13-amd64 BROKKR_PROBE_ROOT="$1" \
     MOCK_UID="${J_UID-}" MOCK_GROUPS="${J_GROUPS-}" MOCK_JCONF="${J_CONF-}" \
     MOCK_JDISK="${J_DISK-}" MOCK_JFIRST="${J_FIRST-}" MOCK_JFIRST_ALL="${J_FIRST_ALL-}" \
-    MOCK_JDIR="$1/var/log/journal" MOCK_JSTART="${J_START-}" \
+    MOCK_JDIR="$1/var/log/journal" MOCK_JSTART="${J_START-}" MOCK_CTIMES="${J_CTIMES-}" \
     /bin/sh -c "$(cat "$PROBE")" 2>/dev/null)"
   JRC=$?
 }
-jreset() { J_UID=1000; J_GROUPS=users; J_CONF=""; J_DISK=""; J_FIRST=""; J_FIRST_ALL=""; J_START=""; }
+jreset() { J_UID=1000; J_GROUPS=users; J_CONF=""; J_DISK=""; J_FIRST=""; J_FIRST_ALL=""; J_START=""; J_CTIMES=""; }
 # Every stdout line of the probe must stay a KEY=value pair, whatever the journal tools print.
 only_pairs() { ! grep -qvE '^[A-Z][A-Z0-9_]*=' <<<"$BLOB"; }
 in_range() { [[ "$1" =~ ^[0-9]+$ && "$1" -ge "$2" && "$1" -le "$3" ]]; }
@@ -513,24 +525,41 @@ jprobe "$r"
 check "journal: an assignment in another section or before any section is ignored" '[[ "$(val JOURNAL_MAX)" == 1G ]]'
 check "journal: a comment that starts with a path is not a file header" '[[ "$(val JOURNAL_STORAGE)" == persistent ]]'
 
-# A configuration file newer than the running journald is a staged change that is not in force.
+# A configuration file or drop-in directory whose ctime is newer than the running journald is a
+# staged change that is not in force. ctime, not mtime: touch -t and cp -p cannot set it back, and
+# a drop-in directory's ctime moves when a file is removed from it.
 rp="$(mkroot jpending 6.12.48+deb13-amd64)"; mkdir -p "$rp/var/log/journal" "$rp/etc/systemd/journald.conf.d"
-: >"$rp/etc/systemd/journald.conf"; touch -t 202001010000 "$rp/etc/systemd/journald.conf"
-: >"$rp/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
-jreset; J_GROUPS="adm"; J_CONF="$JCONF_TWO"; J_DISK=246.4M; J_FIRST="$((NOW - 3 * 86400)).1 host x: y"; J_START="@$((NOW - 3600))"
+: >"$rp/etc/systemd/journald.conf"; : >"$rp/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
+JCT="$TMP/ctimes"; OLD=$((NOW - 7200))
+ctimes() { # main-conf drop-in drop-in-dir
+  printf '%s %s\n' "$rp/etc/systemd/journald.conf" "$1" "$rp/etc/systemd/journald.conf.d/60-brokkr-persistent.conf" "$2" \
+    "$rp/etc/systemd/journald.conf.d" "$3" >"$JCT"
+}
+jreset; J_GROUPS="adm"; J_CONF="$JCONF_TWO"; J_DISK=246.4M; J_FIRST="$((NOW - 3 * 86400)).1 host x: y"
+J_START="@$((NOW - 3600))"; J_CTIMES="$JCT"
+ctimes "$OLD" "$OLD" "$OLD"; jprobe "$rp"
+check "journal: every file and drop-in directory older than the running journald: JOURNAL_PENDING=no" '[[ "$JRC" -eq 0 && "$(val JOURNAL_PENDING)" == no ]] && only_pairs'
+ctimes "$OLD" "$((NOW - 60))" "$OLD"; jprobe "$rp"
+check "journal: a drop-in changed after journald started: JOURNAL_PENDING=yes" '[[ "$(val JOURNAL_PENDING)" == yes ]]'
+ctimes "$OLD" "$OLD" "$((NOW - 60))"; jprobe "$rp"
+check "journal: a drop-in directory changed after journald started (a file was removed): JOURNAL_PENDING=yes" '[[ "$(val JOURNAL_PENDING)" == yes ]]'
+J_CTIMES=""; touch -t 202001010000 "$rp/etc/systemd/journald.conf" "$rp/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
 jprobe "$rp"
-check "journal: a drop-in newer than the running journald: JOURNAL_PENDING=yes" '[[ "$JRC" -eq 0 && "$(val JOURNAL_PENDING)" == yes ]] && only_pairs'
-touch -t 202001010000 "$rp/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
-jprobe "$rp"
-check "journal: every file older than the running journald: JOURNAL_PENDING=no" '[[ "$(val JOURNAL_PENDING)" == no ]]'
+check "journal: a backdated mtime does not hide a change made after journald started" '[[ "$(val JOURNAL_PENDING)" == yes ]]'
+J_START="@$((NOW + 3600))"; jprobe "$rp"
+check "journal: journald started after every change: JOURNAL_PENDING=no" '[[ "$(val JOURNAL_PENDING)" == no ]]'
 rm -f "$rp/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
-jprobe "$rp"
+J_START="@$((NOW - 3600))"; J_CTIMES="$JCT"; ctimes "$OLD" "$OLD" "$OLD"; jprobe "$rp"
 check "journal: a listed file that is missing is skipped" '[[ "$JRC" -eq 0 && "$(val JOURNAL_PENDING)" == no ]]'
 for start in "" "n/a" "@abc" "@99999999999999" "1793000000"; do
   J_START="$start"; jprobe "$rp"
   check "journal: journald start '$start' is unknown: JOURNAL_PENDING empty" '[[ "$JRC" -eq 0 && -z "$(val JOURNAL_PENDING)" ]] && only_pairs'
 done
+mkdir -p "$TMP/jbin-nostat"
+for t in journalctl systemd-analyze id systemctl; do ln -sf "$JBIN/$t" "$TMP/jbin-nostat/$t"; done
 jreset; J_GROUPS="adm"; J_CONF="$JCONF_TWO"; J_START="@$((NOW - 3600))"
+jprobe "$rp" "$PBIN:$TMP/jbin-nostat"
+check "journal: no stat: JOURNAL_PENDING empty (unknown, not no)" '[[ "$JRC" -eq 0 && -z "$(val JOURNAL_PENDING)" ]] && only_pairs'
 jprobe "$rp" "$PBIN:$TMP/jbin-nosa"
 check "journal: no systemctl or systemd-analyze: JOURNAL_PENDING empty" '[[ "$JRC" -eq 0 && -z "$(val JOURNAL_PENDING)" ]] && grep -q "^JOURNAL_PENDING=" <<<"$BLOB"'
 
