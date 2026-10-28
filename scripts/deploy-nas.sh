@@ -26,6 +26,8 @@ RUNTIME_USER="${BROKKR_RUNTIME_USER:-}"
 RUNTIME_HOME="${BROKKR_RUNTIME_HOME:-}"
 REGISTRY_PATH="${BROKKR_REGISTRY_PATH:-}"
 HEIMDALL_SOURCE_ENV="${BROKKR_HEIMDALL_SOURCE_ENV:-}"
+# Opt-in to overwrite a node's existing Heimdall token from the source.
+REPLACE_TOKEN="${BROKKR_REPLACE_HEIMDALL_TOKEN:-}"
 
 die() { echo "brokkr NAS deploy: $*" >&2; exit 64; }
 valid_path() {
@@ -54,6 +56,11 @@ valid_path "$REGISTRY_PATH" || die "invalid BROKKR_REGISTRY_PATH"
 if [[ -n "$HEIMDALL_SOURCE_ENV" ]]; then
   valid_path "$HEIMDALL_SOURCE_ENV" || die "invalid BROKKR_HEIMDALL_SOURCE_ENV"
 fi
+case "$REPLACE_TOKEN" in
+  '') REPLACE_TOKEN=0 ;;
+  1) ;;
+  *) die "BROKKR_REPLACE_HEIMDALL_TOKEN must be unset or exactly 1" ;;
+esac
 
 echo "==> Preparing NAS release target"
 ssh "$NAS" "
@@ -145,11 +152,23 @@ ssh "$NAS" "
       echo 'ERROR: Tailscale policy source assignments are missing or invalid' >&2
       exit 2
     fi
-    sudo install -d -m 0700 -o '$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr'
-    sudo sh -c \"umask 077; grep -E '^HEIMDALL_(HUB_URL|FLEET_TOKEN)=|^BROKKR_TAILSCALE_(KEY_EXPIRY_POLICY|EXPECTED_DNS_NAME|EXPIRY_WARN_SECS)=' '$HEIMDALL_SOURCE_ENV' > '$RUNTIME_HOME/.config/brokkr/env'\"
-    sudo chown '$RUNTIME_USER' '$RUNTIME_HOME/.config/brokkr/env'
-    sudo chmod 0600 '$RUNTIME_HOME/.config/brokkr/env'
-    echo '   Heimdall runtime environment provisioned from protected source'
+    # Heimdall issues each producer its own token under the same key, so an
+    # existing runtime token is preserved unless the operator opted in to
+    # replace it. The URL and Tailscale policy still refresh from the source.
+    # The helper rejects duplicate/empty tokens and swaps the file in atomically.
+    if sudo test -e \$runtime_env || sudo test -L \$runtime_env; then
+      if ! sudo test -f \$runtime_env || sudo test -L \$runtime_env \
+        || ! sudo -u '$RUNTIME_USER' test -O \$runtime_env; then
+        echo 'ERROR: existing Heimdall runtime environment is not a regular file owned by the runtime user' >&2
+        exit 2
+      fi
+      runtime_mode=\$(sudo stat -c '%a' \$runtime_env)
+      case \$runtime_mode in 400|600) ;; *) echo 'ERROR: existing Heimdall runtime environment has unsafe permissions' >&2; exit 2 ;; esac
+    fi
+    # The helper creates the 0700 config directory as the runtime user: root
+    # must not operate on paths inside that user-writable directory.
+    sudo '$DEPLOY_TARGET/scripts/prepare-heimdall-runtime-env.sh' nas \$runtime_env '$RUNTIME_USER' '$HEIMDALL_SOURCE_ENV' '$REPLACE_TOKEN'
+    echo '   Heimdall runtime environment written from protected source'
   elif sudo test -e \$runtime_env || sudo test -L \$runtime_env; then
     if ! sudo test -f \$runtime_env || sudo test -L \$runtime_env \
       || ! sudo -u '$RUNTIME_USER' test -O \$runtime_env \
