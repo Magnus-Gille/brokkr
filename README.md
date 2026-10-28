@@ -109,6 +109,9 @@ BROKKR_HEIMDALL_SOURCE_ENV=/etc/brokkr/heimdall-source.env \
 BROKKR_EXPECTED_SOURCE="$(pwd -P)" \
 BROKKR_EXPECTED_COMMIT=<accepted-full-commit-sha> \
   ./scripts/deploy-nas.sh
+# An existing Heimdall token in the runtime env is preserved across deploys; add
+# BROKKR_REPLACE_HEIMDALL_TOKEN=1 only to overwrite it from the source
+# (see docs/nas-deploy.md and docs/systemd-failure-monitor.md).
 
 REGISTRY_PATH=/opt/grimnir/services.json DEPLOY_USER=brokkr \
   ./scripts/guarded-deploy.sh "$(pwd -P)" <accepted-full-commit-sha> -- \
