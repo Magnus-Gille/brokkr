@@ -38,7 +38,9 @@ case "${1:-}" in
   install) exit 0 ;;
   stat) if [[ "${!#}" == *"/release" ]]; then printf '750\n'; else printf '600\n'; fi ;;
   chmod) exit 0 ;;
-  grep) printf '1\n' ;;
+  # Every path "exists", so the target reads as an earlier release: its manifest validator (grep
+  # -aEv) selects no malformed line; any other grep is the token-source count.
+  grep) [[ "${2:-}" == -aEv ]] && exit 1; printf '1\n' ;;
   systemctl) exit 0 ;;
   *) if [[ "$1" == */verify-heimdall-delivery.sh ]]; then exit 0; fi; exit 0 ;;
 esac

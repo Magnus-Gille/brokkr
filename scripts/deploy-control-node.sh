@@ -58,6 +58,37 @@ case "$REPLACE_TOKEN" in
   *) die "BROKKR_REPLACE_HEIMDALL_TOKEN must be unset or exactly 1" ;;
 esac
 
+# The release sync below runs rsync --delete. Job deploys (agent CLI updater, guarded reboot, link
+# health, the pi binary) keep their releases below <runtime home>/.local/lib/brokkr/<job>, so the
+# target must neither be that job library, contain it, nor sit inside it.
+JOB_LIBRARY="${RUNTIME_HOME%/}/.local/lib/brokkr"
+case "${DEPLOY_TARGET%/}/" in
+  "$JOB_LIBRARY/"*) die "BROKKR_DEPLOY_TARGET $DEPLOY_TARGET is or is inside the job release library $JOB_LIBRARY; choose a dedicated target" ;;
+esac
+case "$JOB_LIBRARY/" in
+  "${DEPLOY_TARGET%/}/"*) die "BROKKR_DEPLOY_TARGET $DEPLOY_TARGET contains the job release library $JOB_LIBRARY; choose a dedicated target" ;;
+esac
+
+# The release manifest records this payload's commit and top-level entries. On the next deploy only
+# entries an earlier release recorded (or this payload has) may be replaced or removed by the sync;
+# anything else in the target belongs to someone else and stops the deploy before rsync. Names are
+# limited to these characters (spelled out, not a locale-dependent range) and compared whole.
+RELEASE_MANIFEST=.brokkr-release
+NAME_CHARS='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-'
+PAYLOAD_ENTRIES=""
+PAYLOAD_LISTING="$DEPLOY_PAYLOAD_PARENT/top-level-entries"
+find "$DEPLOY_PAYLOAD_ROOT" -mindepth 1 -maxdepth 1 -print0 >"$PAYLOAD_LISTING" || die "could not list the payload's top-level entries"
+while IFS= read -r -d '' entry_path; do
+  entry=${entry_path##*/}
+  [[ "$entry" =~ ^[$NAME_CHARS]+$ ]] || die "a payload top-level entry has an unsupported name"
+  [[ "$entry" != "$RELEASE_MANIFEST" ]] || continue
+  PAYLOAD_ENTRIES="$PAYLOAD_ENTRIES $entry"
+done <"$PAYLOAD_LISTING"
+{
+  printf 'commit=%s\n' "$BROKKR_EXPECTED_COMMIT"
+  for entry in $PAYLOAD_ENTRIES; do printf 'entry %s\n' "$entry"; done
+} >"$DEPLOY_PAYLOAD_ROOT/$RELEASE_MANIFEST"
+
 echo "==> Preparing control-node release target"
 ssh "$CONTROL_NODE" "
   set -euo pipefail
@@ -71,11 +102,81 @@ ssh "$CONTROL_NODE" "
     echo 'ERROR: runtime user or home is not usable' >&2
     exit 2
   fi
+
+  # The local overlap check is lexical. Resolve the target and the job release library physically
+  # (through symlinked ancestors, up to the longest existing ancestor) so an alias cannot reach it.
+  # A dangling symlink on the way cannot be resolved (creating the target could bring it to life
+  # inside the library), so it fails the check instead of counting as a missing directory.
+  physical() {
+    p=\${1%/}; rest=
+    while [ -n \"\$p\" ] && [ ! -e \"\$p\" ]; do
+      if [ -L \"\$p\" ]; then return 1; fi
+      rest=\"/\${p##*/}\$rest\"; p=\${p%/*}
+    done
+    [ -n \"\$p\" ] || p=/
+    ( cd -P -- \"\$p\" 2>/dev/null && r=\$(pwd -P) && { [ \"\$r\" != / ] || r=; } && printf '%s%s\n' \"\$r\" \"\${rest:-/}\" )
+  }
+  if ! target_phys=\$(physical '$DEPLOY_TARGET') || ! library_phys=\$(physical '$JOB_LIBRARY'); then
+    echo 'ERROR: could not resolve the physical path of the release target or the job release library (a dangling symlink or an untraversable directory); refusing' >&2
+    exit 2
+  fi
+  case \"\${target_phys%/}/\" in (\"\${library_phys%/}/\"*)
+    echo \"ERROR: release target \$target_phys is or is inside the job release library \$library_phys\" >&2
+    exit 2 ;;
+  esac
+  case \"\${library_phys%/}/\" in (\"\${target_phys%/}/\"*)
+    echo \"ERROR: release target \$target_phys contains the job release library \$library_phys\" >&2
+    exit 2 ;;
+  esac
+
   if sudo test -e '$DEPLOY_TARGET' || sudo test -L '$DEPLOY_TARGET'; then
     if ! sudo test -d '$DEPLOY_TARGET' || sudo test -L '$DEPLOY_TARGET' \
       || ! sudo -u '$RUNTIME_USER' test -O '$DEPLOY_TARGET' \
       || ! sudo -u '$RUNTIME_USER' test -w '$DEPLOY_TARGET'; then
       echo 'ERROR: existing release target is not a runtime-user-owned writable directory' >&2
+      exit 2
+    fi
+    # rsync --delete removes whatever the payload lacks: only entries this payload has or the
+    # previous release manifest recorded may be replaced or removed.
+    if sudo test -L '$DEPLOY_TARGET/$RELEASE_MANIFEST' \
+      || { sudo test -e '$DEPLOY_TARGET/$RELEASE_MANIFEST' && ! sudo test -f '$DEPLOY_TARGET/$RELEASE_MANIFEST'; }; then
+      echo 'ERROR: the release manifest in the existing target is not a regular file' >&2
+      exit 2
+    fi
+    allowed=' .git .local $RELEASE_MANIFEST$PAYLOAD_ENTRIES '
+    if sudo test -f '$DEPLOY_TARGET/$RELEASE_MANIFEST'; then
+      # Validate the raw bytes, never a shell variable (which silently drops NULs). NULs are counted
+      # first because grep implementations differ on them (BSD grep ends the match at a NUL). grep
+      # then reads the whole file: status 0 means it selected a malformed line, 1 means every line
+      # is well formed, anything else is an error. Hex digits and name characters are spelled out,
+      # so no locale range applies.
+      nul_bytes=\$(sudo cat '$DEPLOY_TARGET/$RELEASE_MANIFEST' | tr -cd '\\000' | wc -c) || { echo 'ERROR: cannot read the release manifest' >&2; exit 2; }
+      if [ \"\$((nul_bytes))\" -ne 0 ]; then
+        echo 'ERROR: the release manifest in the existing target is malformed (it contains NUL bytes)' >&2
+        exit 2
+      fi
+      if sudo grep -aEv '^(commit=[0123456789abcdef]{40}([0123456789abcdef]{24})?|entry [$NAME_CHARS]+)?\$' '$DEPLOY_TARGET/$RELEASE_MANIFEST' >/dev/null; then
+        echo 'ERROR: the release manifest in the existing target is malformed' >&2
+        exit 2
+      else
+        manifest_rc=\$?
+        if [ \"\$manifest_rc\" -ne 1 ]; then echo 'ERROR: could not validate the release manifest' >&2; exit 2; fi
+      fi
+      manifest=\$(sudo cat '$DEPLOY_TARGET/$RELEASE_MANIFEST') || { echo 'ERROR: cannot read the release manifest' >&2; exit 2; }
+      allowed=\"\$allowed\$(printf '%s\n' \"\$manifest\" | sed -n 's/^entry //p' | tr '\\n' ' ') \"
+    fi
+    # A name outside the allowed characters (a space, a newline, ...) cannot be compared safely.
+    odd=\$(sudo find '$DEPLOY_TARGET' -mindepth 1 -maxdepth 1 -name '*[!$NAME_CHARS]*')
+    if [ -n \"\$odd\" ]; then
+      echo 'ERROR: existing release target holds an entry with an unsupported name (rsync --delete could remove it); inspect it by hand' >&2
+      exit 2
+    fi
+    foreign=\$(sudo find '$DEPLOY_TARGET' -mindepth 1 -maxdepth 1 | while IFS= read -r path; do
+      name=\${path##*/}
+      case \"\$allowed\" in (*\" \$name \"*) ;; (*) printf ' %s' \"\$name\" ;; esac
+    done)
+    if [ -n \"\$foreign\" ]; then
+      echo \"ERROR: existing release target holds entries no Brokkr release recorded (rsync --delete would remove them):\$foreign\" >&2
       exit 2
     fi
   else

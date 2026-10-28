@@ -9,7 +9,7 @@
   "properties": {
     "schema_version": { "const": 1 },
     "ssh_target": { "type": "string", "pattern": "^(?:[a-z_][a-z0-9_-]{0,31}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,251}$", "$comment": "must be a shell-safe SSH target" },
-    "deploy_target": { "type": "string", "pattern": "^/[A-Za-z0-9._/@:+-]+$", "$comment": "must be an absolute canonical path" },
+    "deploy_target": { "type": "string", "pattern": "^/[A-Za-z0-9._/@:+-]+$", "$comment": "must be an absolute canonical path to a directory of its own: not the job release library <runtime_home>/.local/lib/brokkr, inside it or containing it, because the release sync runs rsync --delete" },
     "runtime_user": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]{0,31}$" },
     "runtime_home": { "type": "string", "pattern": "^/[A-Za-z0-9._/@:+-]+$", "$comment": "must be an absolute canonical path" },
     "registry_path": { "type": "string", "pattern": "^/[A-Za-z0-9._/@:+-]+$", "$comment": "must be an absolute canonical path" },
