@@ -399,5 +399,194 @@ check "an entry matching no active node is reported" out_has "BROKKR_ALERT_UNREA
 BROKKR_ALERT_UNREACHABLE_NODES='' run_os --dry-run
 check "an empty setting (default) raises no configuration alert" not out_has "BROKKR_ALERT_UNREACHABLE_NODES"
 
+# ── Journal retention ────────────────────────────────────────────────────────
+# The probe emits JOURNAL_* keys (how far back the journal reaches, its size cap and current
+# size). The report shows them for every host and alerts, for a deploy-tier host only, when the
+# window is shorter than JOURNAL_MIN_DAYS (8) AND the journal is at JOURNAL_CAP_PCT (90 %) of its
+# cap: only a window that is short because it is full loses weekly jobs' logs. The probe side is
+# covered by maintenance-report-probe.test.sh.
+DAY=86400
+jset() { # host access storage dir max use span_s
+  local host="$1"; shift
+  set_probe "$host" "$(printf 'JOURNAL_ACCESS=%s\nJOURNAL_STORAGE=%s\nJOURNAL_DIR=%s\nJOURNAL_MAX=%s\nJOURNAL_USE=%s\nJOURNAL_SPAN_S=%s\n' "$@")"$'\n'
+}
+status_has() { call_has_text memory_write maintenance/os/other-host "$1" latest; }
+ran_without_journal_alert() { # the run's exit status: it succeeded and said nothing about the journal window
+  [[ "$1" -eq 0 ]] && ! grep -q 'journal keeps only' "$TMP/os.out"
+}
+J_ALERT_TAIL="weekly jobs lose their logs; raise SystemMaxUse or quieten the noisiest unit"
+
+clear_probe inference-fixture.example
+
+# size_bytes: journald size strings to bytes, nothing for anything else.
+SIZE_FN="$(sed -n '/^size_bytes() {$/,/^}$/p' "$ROOT/scripts/maintenance-report.sh")"
+check "size_bytes is defined at the top level of the script" test -n "$SIZE_FN"
+size_is() { # input expected-output
+  ( set -euo pipefail; eval "$SIZE_FN"; out="$(size_bytes "$1")"; [[ "$out" == "$2" ]] )
+}
+size_ok() { # input: the call returns 0 whatever the input is
+  ( set -euo pipefail; eval "$SIZE_FN"; size_bytes "$1" >/dev/null )
+}
+check "size_bytes: 256M" size_is 256M 268435456
+check "size_bytes: 1G" size_is 1G 1073741824
+check "size_bytes: a bare number is bytes" size_is 4096 4096
+check "size_bytes: an optional trailing B" size_is 4096B 4096
+check "size_bytes: 1K" size_is 1K 1024
+check "size_bytes: 1MB" size_is 1MB 1048576
+check "size_bytes: 1T" size_is 1T 1099511627776
+check "size_bytes: 1P" size_is 1P 1125899906842624
+check "size_bytes: a fractional size is floored (246.4M)" size_is 246.4M 258369126
+check "size_bytes: 1.5K" size_is 1.5K 1536
+check "size_bytes: 0" size_is 0 0
+check "size_bytes: 12 integer digits are accepted" size_is 123456789012 123456789012
+check "size_bytes: leading zeros are plain decimal" size_is 0256M 268435456
+for bad in "" 256m 25% abc 1e9 "1 M" -5M +5M 1.M .5M 0x10 M B 256MiB 256MM '$(rm -rf /)' '`id`' '256M;id' $'256M\nfoo' $'256M\n' 1234567890123 12345678901234M 123456789012G 1E 9P; do
+  check "size_bytes rejects '$bad' with no output and a zero status" size_is "$bad" ""
+  check "size_bytes never fails under set -euo pipefail for '$bad'" size_ok "$bad"
+done
+check "size_bytes: exactly 8 PiB is the largest accepted size" size_is 8P 9007199254740992
+
+# A deploy-tier host whose journal is short because it is at its cap alerts, with the figures.
+jset other-host full persistent yes 256M 246.4M "$((3 * DAY))"
+run_os --dry-run
+check "journal: a 3-day window at 96% of the cap alerts a deploy-tier host" \
+  out_has "📜 other-host journal keeps only 3.0 days at its cap (246.4M/256M): $J_ALERT_TAIL"
+check "journal: the alert run reports that action is needed" out_has "Action needed (alert sent)."
+check "journal: the console shows the journal line" out_has "  journal=3.0d(246.4M/256M)"
+run_os
+check "journal: the Munin status carries the journal window and sizes" status_has "journal=3.0d(246.4M/256M)"
+check "journal: the journal summary sits after disk= in the status line" status_has "disk=50%, journal=3.0d(246.4M/256M), "
+check "journal: the Munin status is still written when the journal alerts" status_has "other-host: security_pending=0"
+
+# Short but still filling (a just-raised cap or a new host): no alert.
+jset other-host full persistent yes 1G 300M "$((3 * DAY))"
+run_os --dry-run
+check "journal: a short window well below the cap does not alert" not out_has "journal keeps only"
+check "journal: ... and the run is healthy" out_has "All hosts patched & healthy."
+run_os
+check "journal: ... but the status shows the window" status_has "journal=3.0d(300M/1G)"
+
+# A window of 8 days or more is long enough, however full the journal is.
+jset other-host full persistent yes 256M 250M "$((12 * DAY))"
+run_os --dry-run
+check "journal: a 12-day window at the cap does not alert" not out_has "journal keeps only"
+run_os
+check "journal: ... and the status shows 12.0d" status_has "journal=12.0d(250M/256M)"
+jset other-host full persistent yes 256M 250M "$((8 * DAY))"
+run_os --dry-run
+check "journal: exactly 8 days is long enough (the limit is strict)" not out_has "journal keeps only"
+jset other-host full persistent yes 256M 250M "$((8 * DAY - 1))"
+run_os --dry-run
+check "journal: one second under 8 days alerts, and the days are floored (7.9, never 8.0)" \
+  out_has "other-host journal keeps only 7.9 days at its cap (250M/256M)"
+
+# The cap threshold is 90%: exactly 90% alerts, a hair under does not.
+jset other-host full persistent yes 100M 90M "$((2 * DAY))"
+run_os --dry-run
+check "journal: exactly 90% of the cap alerts" out_has "other-host journal keeps only 2.0 days at its cap (90M/100M)"
+jset other-host full persistent yes 100M 89.9M "$((2 * DAY))"
+run_os --dry-run
+check "journal: just under 90% of the cap does not alert" not out_has "journal keeps only"
+
+# Node tier is recorded, never alerted for the journal.
+jset other-host full persistent yes 256M 100M "$((20 * DAY))"
+jset inference-fixture.example full persistent yes 256M 246.4M "$((3 * DAY))"
+run_os --dry-run
+check "journal: a short at-cap window on a node-tier host does not alert" not out_has "journal keeps only"
+check "journal: ... and the node line still shows it on the console" out_has "journal=3.0d(246.4M/256M)"
+run_os
+check "journal: ... and its Munin status records it" \
+  call_has_text memory_write maintenance/os/inference-fixture "journal=3.0d(246.4M/256M)" latest
+clear_probe inference-fixture.example
+
+# Without journal access the figures are not trustworthy: unknown, never an alert.
+jset other-host partial persistent yes 256M 246.4M "$((3 * DAY))"
+run_os --dry-run
+check "journal: partial access does not alert" not out_has "journal keeps only"
+run_os
+check "journal: partial access shows unknown(no journal access)" status_has "journal=unknown(no journal access)"
+check "journal: partial access does not show the figures" not status_has "246.4M"
+
+# Storage: persistent, or auto/empty with /var/log/journal present. Volatile is reported, not alerted.
+jset other-host full volatile no 256M 246.4M "$((3 * DAY))"
+run_os --dry-run
+check "journal: volatile storage does not alert" not out_has "journal keeps only"
+run_os
+check "journal: volatile storage shows volatile" status_has "journal=volatile"
+jset other-host full auto no 256M 246.4M "$((3 * DAY))"
+run_os
+check "journal: Storage=auto without /var/log/journal is volatile" status_has "journal=volatile"
+jset other-host full "" no 256M 246.4M "$((3 * DAY))"
+run_os
+check "journal: unset Storage without /var/log/journal is volatile" status_has "journal=volatile"
+jset other-host full none yes 256M 246.4M "$((3 * DAY))"
+run_os
+check "journal: Storage=none is not persistent even with a journal directory" status_has "journal=volatile"
+jset other-host full "" yes 256M 246.4M "$((3 * DAY))"
+run_os --dry-run
+check "journal: unset Storage with /var/log/journal counts as persistent (alerts)" \
+  out_has "other-host journal keeps only 3.0 days at its cap (246.4M/256M)"
+jset other-host full auto yes 256M 246.4M "$((3 * DAY))"
+run_os --dry-run
+check "journal: Storage=auto with /var/log/journal counts as persistent (alerts)" \
+  out_has "other-host journal keeps only 3.0 days at its cap (246.4M/256M)"
+
+# Missing pieces degrade to unknown / placeholders and never alert.
+jset other-host full persistent yes 256M 246.4M ""
+run_os --dry-run
+check "journal: no span: no alert" not out_has "journal keeps only"
+run_os
+check "journal: no span shows unknown" status_has "journal=unknown, "
+jset other-host full persistent yes "" 246.4M "$((3 * DAY))"
+run_os --dry-run
+check "journal: no cap (the journald default applies): no alert" not out_has "journal keeps only"
+run_os
+check "journal: no cap shows the default" status_has "journal=3.0d(246.4M/default)"
+jset other-host full persistent yes 256M "" "$((3 * DAY))"
+run_os --dry-run
+check "journal: no usage figure: no alert" not out_has "journal keeps only"
+run_os
+check "journal: no usage figure shows ?" status_has "journal=3.0d(?/256M)"
+jset other-host full persistent yes 256M 246.4M "000000259200"
+run_os
+check "journal: a zero-padded span is read as decimal" status_has "journal=3.0d(246.4M/256M)"
+
+# Older or truncated probe output without any JOURNAL_* key.
+set_probe other-host
+if run_os --dry-run; then nojournal_rc=0; else nojournal_rc=$?; fi
+check "journal: a probe without JOURNAL_* keys does not fail the run" test "$nojournal_rc" -eq 0
+check "journal: ... and raises no journal alert" not out_has "journal keeps only"
+run_os
+check "journal: ... and the status says unknown(no journal access)" status_has "journal=unknown(no journal access)"
+
+# Hostile or garbled values: nothing is executed, echoed, or alerted.
+set_probe other-host $'JOURNAL_ACCESS=full\nJOURNAL_STORAGE=persistent\nJOURNAL_DIR=yes\nJOURNAL_MAX=1e9\nJOURNAL_USE=$(rm -rf /)\nJOURNAL_SPAN_S=abc\n'
+if run_os --dry-run; then hostile_rc=0; else hostile_rc=$?; fi
+check "journal: hostile values do not fail the run" test "$hostile_rc" -eq 0
+check "journal: hostile values are not echoed to the console" not grep -q 'rm -rf' "$TMP/os.out"
+check "journal: hostile values raise no journal alert" not out_has "journal keeps only"
+run_os
+check "journal: hostile values are not echoed into Munin" not grep -q 'rm -rf' "$TMP/calls.jsonl"
+check "journal: hostile values are not echoed to stderr" not grep -q 'rm -rf' "$TMP/os.err"
+check "journal: garbage span shows unknown" status_has "journal=unknown, "
+set_probe other-host $'JOURNAL_ACCESS=full\nJOURNAL_STORAGE=persistent\nJOURNAL_DIR=yes\nJOURNAL_MAX=1e9\nJOURNAL_USE=$(rm -rf /)\nJOURNAL_SPAN_S=259200\n'
+if run_os --dry-run; then hostile_rc=0; else hostile_rc=$?; fi
+check "journal: a valid span with hostile sizes does not fail the run" test "$hostile_rc" -eq 0
+check "journal: ... and raises no journal alert" not out_has "journal keeps only"
+run_os
+check "journal: ... shows ? and default instead of the raw text" status_has "journal=3.0d(?/default)"
+check "journal: ... and nothing hostile reaches Munin" not grep -Eq 'rm -rf|1e9' "$TMP/calls.jsonl"
+set_probe other-host $'JOURNAL_ACCESS=$(rm -rf /)\nJOURNAL_STORAGE=persistent\nJOURNAL_DIR=yes\nJOURNAL_MAX=256M\nJOURNAL_USE=246.4M\nJOURNAL_SPAN_S=259200\n'
+if run_os --dry-run; then hostile_rc=0; else hostile_rc=$?; fi
+check "journal: an unknown JOURNAL_ACCESS value is not full: no alert, no failure" ran_without_journal_alert "$hostile_rc"
+for span in 99999999999999 -5 3.5 '2 3' '$((1+1))'; do
+  set_probe other-host "JOURNAL_ACCESS=full"$'\n'"JOURNAL_STORAGE=persistent"$'\n'"JOURNAL_DIR=yes"$'\n'"JOURNAL_MAX=256M"$'\n'"JOURNAL_USE=246.4M"$'\n'"JOURNAL_SPAN_S=$span"$'\n'
+  if run_os --dry-run; then hostile_rc=0; else hostile_rc=$?; fi
+  check "journal: span '$span' is ignored: run succeeds, no alert" ran_without_journal_alert "$hostile_rc"
+done
+set_probe other-host $'JOURNAL_ACCESS=full\nJOURNAL_STORAGE=persistent\nJOURNAL_DIR=yes\nJOURNAL_MAX=256M\nJOURNAL_USE=246.4M\nJOURNAL_SPAN_S=259200\nJOURNAL_SPAN_S=9999999\nJOURNAL_USE=1M\n'
+run_os --dry-run
+check "journal: the first occurrence of a key wins" out_has "other-host journal keeps only 3.0 days at its cap (246.4M/256M)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

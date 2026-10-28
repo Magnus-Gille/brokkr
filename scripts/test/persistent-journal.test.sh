@@ -73,7 +73,7 @@ check "non-root apply is refused before mutation" '[[ "$RC" -eq 64 && "$OUT" == 
 export MOCK_UID=0
 run --apply
 check "root apply installs the tracked bounded policy" '[[ "$RC" -eq 0 && "$OUT" == *"next boot"* && -f "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && ! -L "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && "$(stat -c %a "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" 2>/dev/null || stat -f %Lp "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf")" == 644 && ! -s "$CALLS" ]]'
-check "installed policy keeps persistent storage and a finite cap" 'grep -Fqx "Storage=persistent" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemMaxUse=256M" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemKeepFree=1G" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf"'
+check "installed policy keeps persistent storage and a finite cap" 'grep -Fqx "Storage=persistent" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemMaxUse=1G" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemKeepFree=1G" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf"'
 
 : >"$CALLS"
 export MOCK_JOURNALCTL_CREATE=1 MOCK_JOURNALCTL_EXIT=0

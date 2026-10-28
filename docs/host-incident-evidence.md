@@ -13,8 +13,19 @@ does not claim to diagnose the historical one.
 ## Preserve journal history
 
 Review the tracked policy first. It makes the system journal persistent and
-caps it at 256 MiB while keeping at least 1 GiB free, a conservative policy for
-small SD-card-backed hosts.
+caps it at 1 GiB while keeping at least 1 GiB free. The cap has to hold more
+than a week of history, so that a weekly job's output survives until its next
+run. The earlier 256 MiB cap filled in under three days on the control node,
+where one chatty service wrote about 88 MiB a day. `SystemKeepFree` still
+protects small SD-card-backed hosts.
+
+The daily maintenance report (`maintenance-report.sh os`) shows each host's
+journal window as `journal=<days>d(<used>/<cap>)`. For a deploy-tier host it
+alerts when the window is shorter than 8 days *and* usage is at least 90% of
+the cap. A journal that is still filling, after a raised cap or on a new host,
+does not alert. To read the figures, the probe user must be root or in `adm`
+or `systemd-journal`; otherwise the window shows as
+`unknown(no journal access)`.
 
 ```bash
 ./scripts/setup-persistent-journal.sh --dry-run

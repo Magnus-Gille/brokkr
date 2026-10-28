@@ -14,6 +14,10 @@
 #         per-host, scheduled step). Pushes an action-needed Telegram alert when
 #         a reboot is pending, security updates are still outstanding, disk is
 #         tight, a host lacks the patcher, or a firmware update is available.
+#         It also reports journal retention (how far back the persistent
+#         journal reaches and how full its cap is) and alerts only for a
+#         deploy-tier host whose journal is both shorter than 8 days and at
+#         its cap: weekly jobs lose their logs before the next run.
 #         Reboot-needed means /var/run/reboot-required or a newer installed
 #         kernel of the SAME flavour than the running one (needrestart's raw
 #         kernel status is not used: false positive on Raspberry Pi 5). It also
@@ -95,6 +99,11 @@ TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RUN_DATE="$(date -u +%Y-%m-%d)"
 LOCAL_HOST="$(hostname -s)"
 DISK_WARN_PCT=85
+# 8 days: the last output of a weekly job must survive in the journal until the next run.
+JOURNAL_MIN_DAYS=8
+# 90%: only a journal window that is short because the journal is at its size cap is a problem;
+# a just-raised cap or a new host is still filling and keeps everything it has logged.
+JOURNAL_CAP_PCT=90
 
 # ─── Args ────────────────────────────────────────────────────────────────────
 MODE="${1:-}"; shift || true
@@ -257,6 +266,44 @@ DISK=$(df -P / | awk 'NR==2{gsub(/%/,"",$5); print $5}')
 echo "REBOOT=$RR"; echo "REBOOT_PKGS=$RRPKGS"; echo "UU_INSTALLED=$UU"
 echo "SEC_PENDING=${SEC:-0}"; echo "ALL_PENDING=${ALLUP:-0}"; echo "DISK=${DISK:-0}"; echo "KERNEL=$(uname -r)"
 
+# ── Journal retention (Brokkr journald policy) ───────────────────────────────
+# How far back the journal reaches and whether it is at its size cap. A short
+# window that is cap-bound loses weekly jobs' logs before anyone looks. Read
+# unprivileged; the report decides what to alert. Without root or membership of
+# adm/systemd-journal, journalctl shows only part of the journal, so the figures
+# are marked partial. The last Storage= / SystemMaxUse= assignment wins
+# (cat-config prints the files in precedence order). Every step tolerates a
+# missing tool, and none of them can fail the probe or print anything but the
+# KEY=value lines at the end.
+JACCESS=partial
+if command -v id >/dev/null 2>&1; then
+  [ "$(id -u 2>/dev/null)" = 0 ] && JACCESS=full
+  case " $(id -Gn 2>/dev/null) " in *" adm "*|*" systemd-journal "*) JACCESS=full ;; esac
+fi
+JSTORAGE=; JMAX=; JUSE=; JSPAN=
+if command -v journalctl >/dev/null 2>&1; then
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    JCONF=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null)
+    # journald accepts blanks around "=", so "SystemMaxUse = 1G" is an assignment too.
+    JSTORAGE=$(printf '%s\n' "$JCONF" | sed -n 's/^[[:space:]]*Storage[[:space:]]*=[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | tail -n 1)
+    JMAX=$(printf '%s\n' "$JCONF" | sed -n 's/^[[:space:]]*SystemMaxUse[[:space:]]*=[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | tail -n 1)
+  fi
+  JUSE=$(journalctl --disk-usage 2>/dev/null | sed -n 's/.* take up \([0-9.]*[A-Z]*\) .*/\1/p')
+  # The first line is the oldest entry (epoch seconds with -o short-unix). Anything else
+  # ("-- No entries --", text, over 12 digits, a time in the future) is no span. awk does the
+  # subtraction so that a zero-padded number is never read as an octal literal by the shell.
+  # --system: system units are what weekly jobs log to. A quiet user's active journal file can
+  # start weeks back and would make a cap-bound system window look long.
+  JOLDEST=$(journalctl --system -q --no-pager -o short-unix 2>/dev/null | head -n 1 | cut -d. -f1)
+  case "$JOLDEST" in
+    ''|*[!0-9]*|?????????????*) ;;
+    *) JSPAN=$(awk -v n="$(date +%s)" -v o="$JOLDEST" 'BEGIN { if (n ~ /^[0-9]+$/ && o + 0 <= n + 0) printf "%.0f", n - o }') ;;
+  esac
+fi
+JDIR=no; [ -d "$R/var/log/journal" ] && JDIR=yes
+echo "JOURNAL_ACCESS=$JACCESS"; echo "JOURNAL_STORAGE=$JSTORAGE"; echo "JOURNAL_DIR=$JDIR"
+echo "JOURNAL_MAX=$JMAX"; echo "JOURNAL_USE=$JUSE"; echo "JOURNAL_SPAN_S=$JSPAN"
+
 # ── Guarded-reboot audit projection (Grimnir ADR-009) ────────────────────────
 # The guarded-reboot job appends one JSON object per line to a root-owned,
 # world-readable audit file; this only READS it (unprivileged, sed/awk only, no
@@ -404,6 +451,25 @@ resolve_remote() {
   if [[ "$bare" != "$host" ]] && ssh "${SSH_OPTS[@]}" "$DEPLOY_USER@$bare" true 2>/dev/null; then
     echo "$DEPLOY_USER@$bare"; return 0; fi
   return 1
+}
+
+# journald size string -> whole bytes on stdout: digits with an optional fraction, an optional
+# K/M/G/T/P/E suffix (base 1024) and an optional trailing B ("256M", "246.4M", "1G", "4096",
+# "4096B"). Prints nothing for anything else (lower case, "%", text, more than 12 integer digits)
+# and for sizes above 2^53 (8 PiB: not a journal, and it keeps the byte arithmetic of the caller
+# inside 64 bits). Always returns 0, so it is safe under set -euo pipefail.
+size_bytes() {
+  local s="${1:-}" re='^[0-9]{1,12}(\.[0-9]+)?[KMGTPE]?B?$'
+  [[ ${#s} -le 40 && "$s" =~ $re ]] || return 0
+  awk -v s="$s" 'BEGIN {
+    m["K"] = 1024; m["M"] = 1048576; m["G"] = 1073741824
+    m["T"] = 1099511627776; m["P"] = 1125899906842624; m["E"] = 1152921504606846976
+    sub(/B$/, "", s)
+    u = substr(s, length(s)); mult = 1
+    if (u ~ /[KMGTPE]/) { mult = m[u]; s = substr(s, 1, length(s) - 1) }
+    v = s * mult
+    if (v <= 9007199254740992) printf "%.0f\n", int(v)
+  }' || true
 }
 
 # Epoch seconds -> ISO-8601 UTC for the guarded-reboot projection (GNU date -d,
@@ -558,6 +624,22 @@ run_os() {
     fw_lat=$(grep -m1 '^FW_LAT=' <<<"$blob" | cut -d= -f2- || true)
     fw_detail=$(grep -m1 '^FW_DETAIL=' <<<"$blob" | cut -d= -f2- || true)
 
+    # Journal retention. Every value is untrusted text from the host: access is "full" only on an
+    # exact match, storage is only compared, the span is reduced to at most 12 digits, and a size
+    # is shown or compared only after size_bytes accepted it (anything else prints as ? / default).
+    local j_access j_storage j_dir j_max j_use j_span j_max_b j_use_b
+    j_access=$(grep -m1 '^JOURNAL_ACCESS=' <<<"$blob" | cut -d= -f2- || true)
+    j_storage=$(grep -m1 '^JOURNAL_STORAGE=' <<<"$blob" | cut -d= -f2- || true)
+    j_dir=$(grep -m1 '^JOURNAL_DIR=' <<<"$blob" | cut -d= -f2- || true)
+    j_max=$(grep -m1 '^JOURNAL_MAX=' <<<"$blob" | cut -d= -f2- || true)
+    j_use=$(grep -m1 '^JOURNAL_USE=' <<<"$blob" | cut -d= -f2- || true)
+    j_span=$(grep -m1 '^JOURNAL_SPAN_S=' <<<"$blob" | cut -d= -f2- || true)
+    case "$j_span" in *[!0-9]*|''|?????????????*) j_span="" ;; esac
+    if [[ -n "$j_span" ]]; then j_span=$((10#$j_span)); fi
+    j_max_b=$(size_bytes "$j_max"); j_use_b=$(size_bytes "$j_use")
+    if [[ -z "$j_max_b" ]]; then j_max=""; fi
+    if [[ -z "$j_use_b" ]]; then j_use=""; fi
+
     # Guarded-reboot audit projection (Grimnir ADR-009). The values come from an
     # audit file on the host: treat them as untrusted text — numbers are reduced
     # to digits-or-zero, flags are set only by an exact "1", and the last action
@@ -600,8 +682,28 @@ run_os() {
       else fw_desc="${fw_detail:-pending}"; fi
     fi
 
+    # Journal summary: "<days>d(<size>/<cap>)", or why there is no trustworthy figure. A journal
+    # is persistent when journald says so, or when Storage is auto/unset and /var/log/journal
+    # exists (auto stores to disk only then). Days are floored to a tenth, so a window just under
+    # the limit never reads as the limit.
+    local j_persist=false j_days="" j_desc j_tenths
+    case "$j_storage" in
+      persistent) j_persist=true ;;
+      ''|auto) if [[ "$j_dir" == yes ]]; then j_persist=true; fi ;;
+    esac
+    if [[ -n "$j_span" ]]; then
+      j_tenths=$((j_span * 10 / 86400))
+      j_days="$((j_tenths / 10)).$((j_tenths % 10))"
+    fi
+    if [[ "$j_access" != full ]]; then j_desc="unknown(no journal access)"
+    elif ! $j_persist; then j_desc="volatile"
+    elif [[ -z "$j_span" ]]; then j_desc="unknown"
+    else j_desc="${j_days}d(${j_use:-?}/${j_max:-default})"
+    fi
+
     printf "  reboot=%s(%s) security_pending=%s all_pending=%s uu=%s disk=%s%% kernel=%s\n" \
       "$rr" "$rrpkgs" "$sec" "$all" "$uu" "$disk" "$kern"
+    printf "  journal=%s\n" "$j_desc"
     printf "  firmware[%s]=%s pending=%s%s\n" \
       "$fw_mech" "$fw_status" "$fw_pending" "${fw_desc:+ ($fw_desc)}"
 
@@ -615,7 +717,7 @@ run_os() {
     fi
     printf "  guarded_reboot=%s\n" "$gr_desc"
 
-    local line="  $short: security_pending=$sec, all_pending=$all, reboot=$rr, disk=${disk}%, uu_installed=$uu, kernel=$kern, firmware=$fw_mech:$fw_status${fw_desc:+ ($fw_desc)}, guarded_reboot=$gr_desc"
+    local line="  $short: security_pending=$sec, all_pending=$all, reboot=$rr, disk=${disk}%, journal=$j_desc, uu_installed=$uu, kernel=$kern, firmware=$fw_mech:$fw_status${fw_desc:+ ($fw_desc)}, guarded_reboot=$gr_desc"
     summary+=$'\n'"$line"
 
     # Per-host Munin state
@@ -653,6 +755,14 @@ run_os() {
       [[ "${sec:-0}" -gt 0 ]] 2>/dev/null && { alerts+=$'\n'"🔒 $short has $sec security update(s) still pending"; any_action=true; }
       [[ "${uu:-0}" -eq 0 ]] 2>/dev/null && { alerts+=$'\n'"❗ $short: unattended-upgrades NOT installed"; any_action=true; }
       [[ "${disk:-0}" -ge "$DISK_WARN_PCT" ]] 2>/dev/null && { alerts+=$'\n'"💾 $short disk at ${disk}%"; any_action=true; }
+      # A journal that reaches back less than JOURNAL_MIN_DAYS because it is at JOURNAL_CAP_PCT of
+      # its cap loses weekly jobs' logs before the next run. Needs full access, a persistent
+      # journal and a known window, usage and cap; a window that is short but still filling is not.
+      if [[ "$j_access" == full ]] && $j_persist && [[ -n "$j_span" && -n "$j_use_b" && -n "$j_max_b" ]] \
+         && [[ "$j_max_b" -gt 0 && "$j_span" -lt $((JOURNAL_MIN_DAYS * 86400)) ]] \
+         && [[ $((j_use_b * 100)) -ge $((j_max_b * JOURNAL_CAP_PCT)) ]]; then
+        alerts+=$'\n'"📜 $short journal keeps only ${j_days} days at its cap (${j_use}/${j_max}): weekly jobs lose their logs; raise SystemMaxUse or quieten the noisiest unit"; any_action=true
+      fi
     fi
     # Firmware-pending alerts fire for EVERY tier — surfacing a pending firmware
     # update is the point of the node sweep (brokkr#9, #12).
