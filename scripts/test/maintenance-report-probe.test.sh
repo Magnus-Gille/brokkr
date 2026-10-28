@@ -356,14 +356,19 @@ FAKE
 REAL_STAT="$(command -v stat)"
 cat >"$JBIN/stat" <<FAKE
 #!/bin/sh
-# stat -c %Z PATH: the ctime listed for PATH in MOCK_CTIMES ("path epoch" lines), else the real one
-# (GNU stat, or BSD stat on macOS).
-[ "\$1" = -c ] && [ "\$2" = %Z ] && [ -e "\$3" ] || exit 1
+# stat [-L] -c %Z PATH: the ctime listed in MOCK_CTIMES ("PATH epoch" for the path itself, and
+# "L:PATH epoch" for -L on a symlink, i.e. its target), else the real one (GNU stat, or BSD stat
+# on macOS). -L on something that is not a symlink is the path itself.
+deref=
+[ "\$1" = -L ] && { deref=-L; shift; }
+[ "\$1" = -c ] && [ "\$2" = %Z ] && [ -n "\$3" ] || exit 1
+if [ -n "\$deref" ]; then [ -e "\$3" ] || exit 1; else [ -e "\$3" ] || [ -L "\$3" ] || exit 1; fi
+key="\$3"; [ -n "\$deref" ] && [ -L "\$3" ] && key="L:\$3"
 if [ -n "\$MOCK_CTIMES" ]; then
-  c=\$(awk -v p="\$3" '\$1 == p { print \$2; exit }' "\$MOCK_CTIMES")
+  c=\$(awk -v p="\$key" '\$1 == p { print \$2; exit }' "\$MOCK_CTIMES")
   [ -n "\$c" ] && { echo "\$c"; exit 0; }
 fi
-"$REAL_STAT" -c %Z "\$3" 2>/dev/null || "$REAL_STAT" -f %c "\$3"
+"$REAL_STAT" \$deref -c %Z "\$3" 2>/dev/null || "$REAL_STAT" \$deref -f %c "\$3"
 FAKE
 chmod +x "$JBIN/id" "$JBIN/systemd-analyze" "$JBIN/journalctl" "$JBIN/systemctl" "$JBIN/stat"
 
@@ -551,6 +556,35 @@ check "journal: journald started after every change: JOURNAL_PENDING=no" '[[ "$(
 rm -f "$rp/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
 J_START="@$((NOW - 3600))"; J_CTIMES="$JCT"; ctimes "$OLD" "$OLD" "$OLD"; jprobe "$rp"
 check "journal: a listed file that is missing is skipped" '[[ "$JRC" -eq 0 && "$(val JOURNAL_PENDING)" == no ]]'
+
+# Removing journald.conf, or the whole journald.conf.d, changes only /etc/systemd. It is consulted
+# when either is missing there, and not otherwise (another config edit in /etc/systemd is no change).
+rr="$(mkroot jremoved 6.12.48+deb13-amd64)"; mkdir -p "$rr/var/log/journal" "$rr/etc/systemd/journald.conf.d"
+JCR="$TMP/ctimes-removed"
+jreset; J_GROUPS="adm"; J_CONF="$JCONF_TWO"; J_START="@$((NOW - 3600))"; J_CTIMES="$JCR"
+printf '%s %s\n' "$rr/etc/systemd" "$((NOW - 60))" "$rr/etc/systemd/journald.conf.d" "$OLD" >"$JCR"
+jprobe "$rr"
+check "journal: journald.conf removed after journald started (/etc/systemd changed): JOURNAL_PENDING=yes" '[[ "$JRC" -eq 0 && "$(val JOURNAL_PENDING)" == yes ]]'
+printf '%s %s\n' "$rr/etc/systemd" "$OLD" "$rr/etc/systemd/journald.conf.d" "$OLD" >"$JCR"
+jprobe "$rr"
+check "journal: journald.conf removed before journald started: JOURNAL_PENDING=no" '[[ "$(val JOURNAL_PENDING)" == no ]]'
+: >"$rr/etc/systemd/journald.conf"
+printf '%s %s\n' "$rr/etc/systemd" "$((NOW - 60))" "$rr/etc/systemd/journald.conf" "$OLD" "$rr/etc/systemd/journald.conf.d" "$OLD" >"$JCR"
+jprobe "$rr"
+check "journal: with journald.conf and journald.conf.d present, another change in /etc/systemd does not count" '[[ "$(val JOURNAL_PENDING)" == no ]]'
+
+# A symlinked drop-in: editing its target changes neither the link nor the directory.
+mkdir -p "$rr/opt"; : >"$rr/opt/journald-target.conf"
+ln -s "$rr/opt/journald-target.conf" "$rr/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
+LNK="$rr/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
+printf '%s %s\n' "$rr/etc/systemd" "$OLD" "$rr/etc/systemd/journald.conf" "$OLD" "$rr/etc/systemd/journald.conf.d" "$OLD" \
+  "$LNK" "$OLD" "L:$LNK" "$((NOW - 60))" >"$JCR"
+jprobe "$rr"
+check "journal: a symlinked drop-in whose target changed after journald started: JOURNAL_PENDING=yes" '[[ "$(val JOURNAL_PENDING)" == yes ]]'
+printf '%s %s\n' "$rr/etc/systemd" "$OLD" "$rr/etc/systemd/journald.conf" "$OLD" "$rr/etc/systemd/journald.conf.d" "$OLD" \
+  "$LNK" "$OLD" "L:$LNK" "$OLD" >"$JCR"
+jprobe "$rr"
+check "journal: a symlinked drop-in whose link and target are older than journald: JOURNAL_PENDING=no" '[[ "$(val JOURNAL_PENDING)" == no ]]'
 for start in "" "n/a" "@abc" "@99999999999999" "1793000000"; do
   J_START="$start"; jprobe "$rp"
   check "journal: journald start '$start' is unknown: JOURNAL_PENDING empty" '[[ "$JRC" -eq 0 && -z "$(val JOURNAL_PENDING)" ]] && only_pairs'

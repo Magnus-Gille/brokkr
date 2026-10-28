@@ -304,17 +304,23 @@ if command -v journalctl >/dev/null 2>&1; then
     # changed after the running journald started is a staged change that is not in force yet
     # (setup-persistent-journal.sh --apply without --restart), so the running cap may still be the
     # old one. ctime, not mtime: touch -t and cp -p cannot set it back, and a drop-in directory's
-    # ctime moves when a file is removed from it. Unknown start or no stat: no verdict.
+    # ctime moves when a file is removed from it. A symlink counts with its target (stat -L).
+    # Removing /etc/systemd/journald.conf or the whole journald.conf.d changes only /etc/systemd,
+    # so /etc/systemd counts while either is missing (otherwise its other files would count too).
+    # Unknown start or no stat: no verdict.
     if command -v systemctl >/dev/null 2>&1 && command -v stat >/dev/null 2>&1; then
       JSTART=$(systemctl show --timestamp=unix -p ActiveEnterTimestamp --value systemd-journald.service 2>/dev/null | sed -n 's/^@\([0-9]\{1,12\}\)$/\1/p')
       if [ -n "$JSTART" ]; then
         JPENDING=no
+        JPARENT=
+        { [ -e "$R/etc/systemd/journald.conf" ] && [ -e "$R/etc/systemd/journald.conf.d" ]; } || JPARENT=/etc/systemd
         set -f  # a header path is a literal path, never a glob
         for f in $(printf '%s\n' "$JCONF" | sed -n 's/^# \(\/[^[:space:]]*\)$/\1/p') \
-          /etc/systemd/journald.conf.d /usr/local/lib/systemd/journald.conf.d /usr/lib/systemd/journald.conf.d; do
-          [ -e "$R$f" ] || continue
-          c=$(stat -c %Z "$R$f" 2>/dev/null) || continue
-          [ "$(awk -v c="$c" -v s="$JSTART" 'BEGIN { print (c ~ /^[0-9]+$/ && c + 0 > s + 0) ? 1 : 0 }')" = 1 ] && JPENDING=yes
+          /etc/systemd/journald.conf.d /usr/local/lib/systemd/journald.conf.d /usr/lib/systemd/journald.conf.d $JPARENT; do
+          [ -e "$R$f" ] || [ -L "$R$f" ] || continue
+          for c in $(stat -c %Z "$R$f" 2>/dev/null) $(stat -L -c %Z "$R$f" 2>/dev/null); do
+            [ "$(awk -v c="$c" -v s="$JSTART" 'BEGIN { print (c ~ /^[0-9]+$/ && c + 0 > s + 0) ? 1 : 0 }')" = 1 ] && JPENDING=yes
+          done
         done
         set +f
       fi
@@ -729,6 +735,9 @@ run_os() {
       persistent) j_persist=true ;;
       ''|auto) if [[ "$j_dir" == yes ]]; then j_persist=true; fi ;;
     esac
+    # A staged Storage= change is not in force either: while a restart is pending and the
+    # persistent directory exists, journald may still be writing it.
+    if [[ "$j_pending" == yes && "$j_dir" == yes ]]; then j_persist=true; fi
     if [[ -n "$j_span" ]]; then
       j_tenths=$((j_span * 10 / 86400))
       j_days="$((j_tenths / 10)).$((j_tenths % 10))"

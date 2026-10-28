@@ -39,6 +39,17 @@ restart hint, whatever the new cap says. Rerunning `--apply` while the
 installed policy is already identical leaves the file untouched, so it does
 not raise this hint.
 
+The comparison is a heuristic: journald does not expose the configuration it
+loaded.
+- A symlinked file counts with its target.
+- `/etc/systemd` itself counts only while `journald.conf` or `journald.conf.d`
+  is missing there, which covers their removal. Any other change directly in
+  `/etc/systemd` then counts as well.
+- A package that removes a whole `journald.conf.d` under `/usr/lib` or
+  `/usr/local/lib` is not detected.
+- With a restart pending and `/var/log/journal` present, the window is judged
+  as persistent even if the staged `Storage=` says otherwise.
+
 ```bash
 ./scripts/setup-persistent-journal.sh --dry-run
 sudo ./scripts/setup-persistent-journal.sh --apply

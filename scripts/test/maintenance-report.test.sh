@@ -615,5 +615,16 @@ run_os --dry-run
 check "journal: a pending restart on a node-tier host does not alert" not out_has "inference-fixture journal keeps only"
 clear_probe inference-fixture.example
 
+# A staged Storage= change is not in force either: with a restart pending and the persistent
+# directory present, journald may still be writing it, so the window is judged as persistent.
+jset other-host full volatile yes 1G 246.4M $((3 * DAY)); printf 'JOURNAL_PENDING=yes\n' >>"$TMP/probe-out/other-host"
+run_os --dry-run
+check "journal: a staged Storage=volatile with a restart pending still gets the restart hint" out_has "other-host journal keeps only 3.0 days and its $J_PENDING_TAIL"
+run_os
+check "journal: ... and the status shows the window with the pending marker, not volatile" status_has "journal=3.0d(246.4M/1G;journald-restart-pending)"
+jset other-host full volatile no 1G 246.4M $((3 * DAY)); printf 'JOURNAL_PENDING=yes\n' >>"$TMP/probe-out/other-host"
+run_os
+check "journal: a pending restart without a persistent directory stays volatile" status_has "journal=volatile"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
