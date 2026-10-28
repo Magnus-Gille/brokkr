@@ -328,6 +328,9 @@ exit 0
 FAKE
 cat >"$JBIN/journalctl" <<'FAKE'
 #!/bin/sh
+# Only the persistent directory under the probe root answers (-D DIR): the default paths would
+# also include the runtime journal in /run.
+case " $* " in *" -D $MOCK_JDIR "*) ;; *) exit 0 ;; esac
 case "$*" in
   *--disk-usage*)
     [ -n "$MOCK_JDISK" ] && echo "Archived and active journals take up $MOCK_JDISK in the file system."
@@ -343,7 +346,14 @@ case "$*" in
 esac
 exit 0
 FAKE
-chmod +x "$JBIN/id" "$JBIN/systemd-analyze" "$JBIN/journalctl"
+cat >"$JBIN/systemctl" <<'FAKE'
+#!/bin/sh
+case "$*" in
+  *--timestamp=unix*ActiveEnterTimestamp*systemd-journald.service*) [ -n "$MOCK_JSTART" ] && echo "$MOCK_JSTART" ;;
+esac
+exit 0
+FAKE
+chmod +x "$JBIN/id" "$JBIN/systemd-analyze" "$JBIN/journalctl" "$JBIN/systemctl"
 
 # cat-config prints every file in precedence order, a "# path" header before each one.
 JCONF_TWO="$TMP/journald.two.conf"
@@ -367,16 +377,17 @@ jprobe() {
   BLOB="$(env -i PATH="${2:-$PBIN:$JBIN}" MOCK_UNAME_R=6.12.48+deb13-amd64 BROKKR_PROBE_ROOT="$1" \
     MOCK_UID="${J_UID-}" MOCK_GROUPS="${J_GROUPS-}" MOCK_JCONF="${J_CONF-}" \
     MOCK_JDISK="${J_DISK-}" MOCK_JFIRST="${J_FIRST-}" MOCK_JFIRST_ALL="${J_FIRST_ALL-}" \
+    MOCK_JDIR="$1/var/log/journal" MOCK_JSTART="${J_START-}" \
     /bin/sh -c "$(cat "$PROBE")" 2>/dev/null)"
   JRC=$?
 }
-jreset() { J_UID=1000; J_GROUPS=users; J_CONF=""; J_DISK=""; J_FIRST=""; J_FIRST_ALL=""; }
+jreset() { J_UID=1000; J_GROUPS=users; J_CONF=""; J_DISK=""; J_FIRST=""; J_FIRST_ALL=""; J_START=""; }
 # Every stdout line of the probe must stay a KEY=value pair, whatever the journal tools print.
 only_pairs() { ! grep -qvE '^[A-Z][A-Z0-9_]*=' <<<"$BLOB"; }
 in_range() { [[ "$1" =~ ^[0-9]+$ && "$1" -ge "$2" && "$1" -le "$3" ]]; }
 has_all_journal_keys() {
   local k
-  for k in JOURNAL_ACCESS JOURNAL_STORAGE JOURNAL_DIR JOURNAL_MAX JOURNAL_USE JOURNAL_SPAN_S; do
+  for k in JOURNAL_ACCESS JOURNAL_STORAGE JOURNAL_DIR JOURNAL_MAX JOURNAL_USE JOURNAL_SPAN_S JOURNAL_PENDING; do
     grep -q "^$k=" <<<"$BLOB" || return 1
   done
 }
@@ -440,7 +451,7 @@ check "journal: journalctl, systemd-analyze and id absent: the probe still succe
 check "journal: absent tools: every journal value is empty, access is partial" \
   '[[ "$(val JOURNAL_ACCESS)" == partial && -z "$(val JOURNAL_STORAGE)" && -z "$(val JOURNAL_MAX)" && -z "$(val JOURNAL_USE)" && -z "$(val JOURNAL_SPAN_S)" ]]'
 check "journal: absent tools: JOURNAL_DIR still reflects the fixture root" '[[ "$(val JOURNAL_DIR)" == yes ]]'
-check "journal: absent tools: all six keys are printed, and only KEY=value pairs" 'has_all_journal_keys && only_pairs'
+check "journal: absent tools: every journal key is printed, and only KEY=value pairs" 'has_all_journal_keys && only_pairs'
 
 # journalctl without systemd-analyze: usage and span are still read, storage and cap stay empty.
 mkdir -p "$TMP/jbin-nosa"; ln -sf "$JBIN/journalctl" "$TMP/jbin-nosa/journalctl"; ln -sf "$JBIN/id" "$TMP/jbin-nosa/id"
@@ -484,6 +495,44 @@ jprobe "$r2"
 check "journal: var/log/journal is a plain file, not a directory: JOURNAL_DIR=no" '[[ "$(val JOURNAL_DIR)" == no ]]'
 jprobe "$r"
 check "journal: var/log/journal is a directory: JOURNAL_DIR=yes" '[[ "$(val JOURNAL_DIR)" == yes ]]'
+
+# Measurements come only from the persistent directory: without it there is no usage or span,
+# even though journalctl's default paths (runtime journal in /run) would answer.
+jreset; J_GROUPS="adm"; J_CONF="$JCONF_TWO"; J_DISK=246.4M; J_FIRST="$((NOW - 3 * 86400)).1 host x: y"
+jprobe "$r2"
+check "journal: no persistent directory: no usage and no span from the runtime journal" '[[ "$JRC" -eq 0 && -z "$(val JOURNAL_USE)" && -z "$(val JOURNAL_SPAN_S)" ]]'
+jprobe "$r"
+check "journal: usage and span are read from <root>/var/log/journal" '[[ "$(val JOURNAL_USE)" == 246.4M ]] && in_range "$(val JOURNAL_SPAN_S)" 259200 259260'
+
+# Only [Journal] assignments count, and every file starts outside any section.
+printf '%s\n' '# /etc/systemd/journald.conf' '[Journal]' 'SystemMaxUse=1G' '[Unknown]' 'SystemMaxUse=8G' 'Storage=volatile' \
+  '' '# /etc/systemd/journald.conf.d/10-nosection.conf' 'SystemMaxUse=4G' \
+  '' '# /etc/systemd/journald.conf.d/20-comment.conf' '[Journal]' '# /etc/ if the original file is shipped in /usr/), or by creating "drop-ins" in' 'Storage=persistent' >"$TMP/journald.sections.conf"
+jreset; J_GROUPS="adm"; J_CONF="$TMP/journald.sections.conf"
+jprobe "$r"
+check "journal: an assignment in another section or before any section is ignored" '[[ "$(val JOURNAL_MAX)" == 1G ]]'
+check "journal: a comment that starts with a path is not a file header" '[[ "$(val JOURNAL_STORAGE)" == persistent ]]'
+
+# A configuration file newer than the running journald is a staged change that is not in force.
+rp="$(mkroot jpending 6.12.48+deb13-amd64)"; mkdir -p "$rp/var/log/journal" "$rp/etc/systemd/journald.conf.d"
+: >"$rp/etc/systemd/journald.conf"; touch -t 202001010000 "$rp/etc/systemd/journald.conf"
+: >"$rp/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
+jreset; J_GROUPS="adm"; J_CONF="$JCONF_TWO"; J_DISK=246.4M; J_FIRST="$((NOW - 3 * 86400)).1 host x: y"; J_START="@$((NOW - 3600))"
+jprobe "$rp"
+check "journal: a drop-in newer than the running journald: JOURNAL_PENDING=yes" '[[ "$JRC" -eq 0 && "$(val JOURNAL_PENDING)" == yes ]] && only_pairs'
+touch -t 202001010000 "$rp/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
+jprobe "$rp"
+check "journal: every file older than the running journald: JOURNAL_PENDING=no" '[[ "$(val JOURNAL_PENDING)" == no ]]'
+rm -f "$rp/etc/systemd/journald.conf.d/60-brokkr-persistent.conf"
+jprobe "$rp"
+check "journal: a listed file that is missing is skipped" '[[ "$JRC" -eq 0 && "$(val JOURNAL_PENDING)" == no ]]'
+for start in "" "n/a" "@abc" "@99999999999999" "1793000000"; do
+  J_START="$start"; jprobe "$rp"
+  check "journal: journald start '$start' is unknown: JOURNAL_PENDING empty" '[[ "$JRC" -eq 0 && -z "$(val JOURNAL_PENDING)" ]] && only_pairs'
+done
+jreset; J_GROUPS="adm"; J_CONF="$JCONF_TWO"; J_START="@$((NOW - 3600))"
+jprobe "$rp" "$PBIN:$TMP/jbin-nosa"
+check "journal: no systemctl or systemd-analyze: JOURNAL_PENDING empty" '[[ "$JRC" -eq 0 && -z "$(val JOURNAL_PENDING)" ]] && grep -q "^JOURNAL_PENDING=" <<<"$BLOB"'
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"

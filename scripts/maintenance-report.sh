@@ -17,7 +17,9 @@
 #         It also reports journal retention (how far back the persistent
 #         journal reaches and how full its cap is) and alerts only for a
 #         deploy-tier host whose journal is both shorter than 8 days and at
-#         its cap: weekly jobs lose their logs before the next run.
+#         its cap: weekly jobs lose their logs before the next run. A staged
+#         journald.conf change that journald has not loaded yet is marked
+#         restart-pending, and a short window then alerts with that hint.
 #         Reboot-needed means /var/run/reboot-required or a newer installed
 #         kernel of the SAME flavour than the running one (needrestart's raw
 #         kernel status is not used: false positive on Raspberry Pi 5). It also
@@ -271,38 +273,68 @@ echo "SEC_PENDING=${SEC:-0}"; echo "ALL_PENDING=${ALLUP:-0}"; echo "DISK=${DISK:
 # window that is cap-bound loses weekly jobs' logs before anyone looks. Read
 # unprivileged; the report decides what to alert. Without root or membership of
 # adm/systemd-journal, journalctl shows only part of the journal, so the figures
-# are marked partial. The last Storage= / SystemMaxUse= assignment wins
-# (cat-config prints the files in precedence order). Every step tolerates a
-# missing tool, and none of them can fail the probe or print anything but the
-# KEY=value lines at the end.
+# are marked partial. Every step tolerates a missing tool, and none of them can
+# fail the probe or print anything but the KEY=value lines at the end.
 JACCESS=partial
 if command -v id >/dev/null 2>&1; then
   [ "$(id -u 2>/dev/null)" = 0 ] && JACCESS=full
   case " $(id -Gn 2>/dev/null) " in *" adm "*|*" systemd-journal "*) JACCESS=full ;; esac
 fi
-JSTORAGE=; JMAX=; JUSE=; JSPAN=
+JSTORAGE=; JMAX=; JUSE=; JSPAN=; JPENDING=
+JDIR=no; [ -d "$R/var/log/journal" ] && JDIR=yes
 if command -v journalctl >/dev/null 2>&1; then
   if command -v systemd-analyze >/dev/null 2>&1; then
     JCONF=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null)
-    # journald accepts blanks around "=", so "SystemMaxUse = 1G" is an assignment too.
-    JSTORAGE=$(printf '%s\n' "$JCONF" | sed -n 's/^[[:space:]]*Storage[[:space:]]*=[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | tail -n 1)
-    JMAX=$(printf '%s\n' "$JCONF" | sed -n 's/^[[:space:]]*SystemMaxUse[[:space:]]*=[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | tail -n 1)
+    # cat-config prints the files in precedence order, each after a "# /path" header line, so
+    # the last assignment wins. Only [Journal] assignments count, every file starts outside any
+    # section, and journald accepts blanks around "=".
+    JCFG=$(printf '%s\n' "$JCONF" | awk '
+      /^# \/[^ \t]*$/ { sec = ""; next }
+      /^[ \t]*[#;]/ { next }
+      /^[ \t]*\[/ { s = $0; gsub(/[ \t]/, "", s); sec = s; next }
+      sec != "[Journal]" { next }
+      { eq = index($0, "="); if (!eq) next
+        k = substr($0, 1, eq - 1); v = substr($0, eq + 1)
+        gsub(/^[ \t]+|[ \t]+$/, "", k); gsub(/^[ \t]+|[ \t]+$/, "", v)
+        if (k == "Storage") st = v; else if (k == "SystemMaxUse") mx = v }
+      END { printf "S=%s\nM=%s\n", st, mx }')
+    JSTORAGE=$(printf '%s\n' "$JCFG" | sed -n 's/^S=//p')
+    JMAX=$(printf '%s\n' "$JCFG" | sed -n 's/^M=//p')
+    # journald reads its configuration only when it starts. A file newer than the running
+    # journald is a staged change that is not in force yet (setup-persistent-journal.sh --apply
+    # without --restart), so the running cap may still be the old one. Unknown start: no verdict.
+    if command -v systemctl >/dev/null 2>&1; then
+      JSTART=$(systemctl show --timestamp=unix -p ActiveEnterTimestamp --value systemd-journald.service 2>/dev/null | sed -n 's/^@\([0-9]\{1,12\}\)$/\1/p')
+      if [ -n "$JSTART" ]; then
+        JPENDING=no
+        set -f  # a header path is a literal path, never a glob
+        for f in $(printf '%s\n' "$JCONF" | sed -n 's/^# \(\/[^[:space:]]*\)$/\1/p'); do
+          [ -f "$R$f" ] || continue
+          m=$(date -r "$R$f" +%s 2>/dev/null) || continue
+          [ "$(awk -v m="$m" -v s="$JSTART" 'BEGIN { print (m ~ /^[0-9]+$/ && m + 0 > s + 0) ? 1 : 0 }')" = 1 ] && JPENDING=yes
+        done
+        set +f
+      fi
+    fi
   fi
-  JUSE=$(journalctl --disk-usage 2>/dev/null | sed -n 's/.* take up \([0-9.]*[A-Z]*\) .*/\1/p')
-  # The first line is the oldest entry (epoch seconds with -o short-unix). Anything else
-  # ("-- No entries --", text, over 12 digits, a time in the future) is no span. awk does the
-  # subtraction so that a zero-padded number is never read as an octal literal by the shell.
-  # --system: system units are what weekly jobs log to. A quiet user's active journal file can
-  # start weeks back and would make a cap-bound system window look long.
-  JOLDEST=$(journalctl --system -q --no-pager -o short-unix 2>/dev/null | head -n 1 | cut -d. -f1)
-  case "$JOLDEST" in
-    ''|*[!0-9]*|?????????????*) ;;
-    *) JSPAN=$(awk -v n="$(date +%s)" -v o="$JOLDEST" 'BEGIN { if (n ~ /^[0-9]+$/ && o + 0 <= n + 0) printf "%.0f", n - o }') ;;
-  esac
+  # Measure the persistent directory only (-D): the default paths also hold the runtime journal
+  # in /run, which SystemMaxUse does not cover.
+  if [ "$JDIR" = yes ]; then
+    JUSE=$(journalctl -D "$R/var/log/journal" --disk-usage 2>/dev/null | sed -n 's/.* take up \([0-9.]*[A-Z]*\) .*/\1/p')
+    # The first line is the oldest entry (epoch seconds with -o short-unix). Anything else
+    # ("-- No entries --", text, over 12 digits, a time in the future) is no span. awk does the
+    # subtraction so that a zero-padded number is never read as an octal literal by the shell.
+    # --system: system units are what weekly jobs log to. A quiet user's active journal file can
+    # start weeks back and would make a cap-bound system window look long.
+    JOLDEST=$(journalctl -D "$R/var/log/journal" --system -q --no-pager -o short-unix 2>/dev/null | head -n 1 | cut -d. -f1)
+    case "$JOLDEST" in
+      ''|*[!0-9]*|?????????????*) ;;
+      *) JSPAN=$(awk -v n="$(date +%s)" -v o="$JOLDEST" 'BEGIN { if (n ~ /^[0-9]+$/ && o + 0 <= n + 0) printf "%.0f", n - o }') ;;
+    esac
+  fi
 fi
-JDIR=no; [ -d "$R/var/log/journal" ] && JDIR=yes
 echo "JOURNAL_ACCESS=$JACCESS"; echo "JOURNAL_STORAGE=$JSTORAGE"; echo "JOURNAL_DIR=$JDIR"
-echo "JOURNAL_MAX=$JMAX"; echo "JOURNAL_USE=$JUSE"; echo "JOURNAL_SPAN_S=$JSPAN"
+echo "JOURNAL_MAX=$JMAX"; echo "JOURNAL_USE=$JUSE"; echo "JOURNAL_SPAN_S=$JSPAN"; echo "JOURNAL_PENDING=$JPENDING"
 
 # ── Guarded-reboot audit projection (Grimnir ADR-009) ────────────────────────
 # The guarded-reboot job appends one JSON object per line to a root-owned,
@@ -627,7 +659,10 @@ run_os() {
     # Journal retention. Every value is untrusted text from the host: access is "full" only on an
     # exact match, storage is only compared, the span is reduced to at most 12 digits, and a size
     # is shown or compared only after size_bytes accepted it (anything else prints as ? / default).
-    local j_access j_storage j_dir j_max j_use j_span j_max_b j_use_b
+    # A restart counts as pending only on an exact "yes".
+    local j_access j_storage j_dir j_max j_use j_span j_max_b j_use_b j_pending
+    j_pending=$(grep -m1 '^JOURNAL_PENDING=' <<<"$blob" | cut -d= -f2- || true)
+    [[ "$j_pending" == yes ]] || j_pending=no
     j_access=$(grep -m1 '^JOURNAL_ACCESS=' <<<"$blob" | cut -d= -f2- || true)
     j_storage=$(grep -m1 '^JOURNAL_STORAGE=' <<<"$blob" | cut -d= -f2- || true)
     j_dir=$(grep -m1 '^JOURNAL_DIR=' <<<"$blob" | cut -d= -f2- || true)
@@ -699,6 +734,7 @@ run_os() {
     elif ! $j_persist; then j_desc="volatile"
     elif [[ -z "$j_span" ]]; then j_desc="unknown"
     else j_desc="${j_days}d(${j_use:-?}/${j_max:-default})"
+      if [[ "$j_pending" == yes ]]; then j_desc="${j_desc%)};journald-restart-pending)"; fi
     fi
 
     printf "  reboot=%s(%s) security_pending=%s all_pending=%s uu=%s disk=%s%% kernel=%s\n" \
@@ -758,10 +794,16 @@ run_os() {
       # A journal that reaches back less than JOURNAL_MIN_DAYS because it is at JOURNAL_CAP_PCT of
       # its cap loses weekly jobs' logs before the next run. Needs full access, a persistent
       # journal and a known window, usage and cap; a window that is short but still filling is not.
-      if [[ "$j_access" == full ]] && $j_persist && [[ -n "$j_span" && -n "$j_use_b" && -n "$j_max_b" ]] \
-         && [[ "$j_max_b" -gt 0 && "$j_span" -lt $((JOURNAL_MIN_DAYS * 86400)) ]] \
-         && [[ $((j_use_b * 100)) -ge $((j_max_b * JOURNAL_CAP_PCT)) ]]; then
-        alerts+=$'\n'"📜 $short journal keeps only ${j_days} days at its cap (${j_use}/${j_max}): weekly jobs lose their logs; raise SystemMaxUse or quieten the noisiest unit"; any_action=true
+      # With a staged configuration that journald has not loaded, the running cap is unknown (it
+      # may still be the old one): a short window then alerts with the restart hint instead.
+      if [[ "$j_access" == full ]] && $j_persist && [[ -n "$j_span" ]] \
+         && [[ "$j_span" -lt $((JOURNAL_MIN_DAYS * 86400)) ]]; then
+        if [[ "$j_pending" == yes ]]; then
+          alerts+=$'\n'"📜 $short journal keeps only ${j_days} days and its journald.conf change is not active yet (journald started before it): restart systemd-journald or reboot to apply it"; any_action=true
+        elif [[ -n "$j_use_b" && -n "$j_max_b" && "$j_max_b" -gt 0 ]] \
+           && [[ $((j_use_b * 100)) -ge $((j_max_b * JOURNAL_CAP_PCT)) ]]; then
+          alerts+=$'\n'"📜 $short journal keeps only ${j_days} days at its cap (${j_use}/${j_max}): weekly jobs lose their logs; raise SystemMaxUse or quieten the noisiest unit"; any_action=true
+        fi
       fi
     fi
     # Firmware-pending alerts fire for EVERY tier — surfacing a pending firmware

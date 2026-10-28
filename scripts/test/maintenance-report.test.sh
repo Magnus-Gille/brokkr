@@ -588,5 +588,32 @@ set_probe other-host $'JOURNAL_ACCESS=full\nJOURNAL_STORAGE=persistent\nJOURNAL_
 run_os --dry-run
 check "journal: the first occurrence of a key wins" out_has "other-host journal keeps only 3.0 days at its cap (246.4M/256M)"
 
+# A staged journald.conf change that journald has not loaded yet (JOURNAL_PENDING=yes): the running
+# cap may still be the old one, so a short window alerts with the restart hint, never as "at its
+# cap", whatever the staged cap says.
+J_PENDING_TAIL="journald.conf change is not active yet (journald started before it): restart systemd-journald or reboot to apply it"
+jset other-host full persistent yes 1G 246.4M $((3 * DAY)); printf 'JOURNAL_PENDING=yes\n' >>"$TMP/probe-out/other-host"
+run_os --dry-run
+check "journal: a staged cap that is not active yet alerts a short window with the restart hint" out_has "other-host journal keeps only 3.0 days and its $J_PENDING_TAIL"
+check "journal: ... and never as at its cap" not out_has "journal keeps only 3.0 days at its cap"
+run_os
+check "journal: ... and the status marks the restart as pending" status_has "journal=3.0d(246.4M/1G;journald-restart-pending)"
+jset other-host full persistent yes 256M 246.4M $((12 * DAY)); printf 'JOURNAL_PENDING=yes\n' >>"$TMP/probe-out/other-host"
+run_os --dry-run
+check "journal: a pending restart with a long window does not alert" not out_has "journal keeps only"
+jset other-host full persistent yes 256M 246.4M $((3 * DAY)); printf 'JOURNAL_PENDING=no\n' >>"$TMP/probe-out/other-host"
+run_os --dry-run
+check "journal: JOURNAL_PENDING=no keeps the at-cap alert" out_has "other-host journal keeps only 3.0 days at its cap (246.4M/256M)"
+jset other-host full persistent yes 256M 246.4M $((3 * DAY)); printf 'JOURNAL_PENDING=yes;rm -rf /\n' >>"$TMP/probe-out/other-host"
+if run_os --dry-run; then pend_rc=0; else pend_rc=$?; fi
+check "journal: a garbled JOURNAL_PENDING is not read as pending" out_has "other-host journal keeps only 3.0 days at its cap (246.4M/256M)"
+check "journal: ... and is not echoed" not grep -q 'rm -rf' "$TMP/os.out"
+check "journal: ... and does not fail the run" test "$pend_rc" -eq 0
+jset inference-fixture.example full persistent yes 1G 246.4M $((3 * DAY)); printf 'JOURNAL_PENDING=yes\n' >>"$TMP/probe-out/inference-fixture.example"
+jset other-host full persistent yes 1G 100M $((20 * DAY))
+run_os --dry-run
+check "journal: a pending restart on a node-tier host does not alert" not out_has "inference-fixture journal keeps only"
+clear_probe inference-fixture.example
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

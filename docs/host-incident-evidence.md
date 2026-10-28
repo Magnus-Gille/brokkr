@@ -23,9 +23,17 @@ The daily maintenance report (`maintenance-report.sh os`) shows each host's
 journal window as `journal=<days>d(<used>/<cap>)`. For a deploy-tier host it
 alerts when the window is shorter than 8 days *and* usage is at least 90% of
 the cap. A journal that is still filling, after a raised cap or on a new host,
-does not alert. To read the figures, the probe user must be root or in `adm`
-or `systemd-journal`; otherwise the window shows as
-`unknown(no journal access)`.
+does not alert. The figures come from the persistent directory
+(`/var/log/journal`) only, and the window is measured on the system journal.
+To read them, the probe user must be root or in `adm` or `systemd-journal`;
+otherwise the window shows as `unknown(no journal access)`.
+
+journald reads its configuration only when it starts. The probe therefore
+compares each journald configuration file with the running journald. A staged
+change, such as `--apply` without `--restart` below, shows as
+`;journald-restart-pending` in the status. Until journald restarts, the running
+cap may still be the old one, so a short window then alerts with the restart
+hint, whatever the new cap says.
 
 ```bash
 ./scripts/setup-persistent-journal.sh --dry-run
