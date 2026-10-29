@@ -1,0 +1,13 @@
+# Brokkr · self-check the near-site archive copy monthly (user timer). Runs on the 2nd,
+# the day after the archive node's off-site verification on the 1st.
+[Unit]
+Description=Run Brokkr archive near-site self-check monthly
+
+[Timer]
+OnCalendar=*-*-02 03:30:00
+RandomizedDelaySec=2h
+Persistent=true
+Unit=brokkr-archive-nearsite.service
+
+[Install]
+WantedBy=timers.target

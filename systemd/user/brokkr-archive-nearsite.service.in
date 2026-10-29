@@ -1,0 +1,31 @@
+# Brokkr · monthly self-check of the near-site archive copy (oneshot, driven by
+# brokkr-archive-nearsite.timer). User unit for the host that holds the near-site copy.
+# Rendered and installed by scripts/deploy-archive-nearsite.sh; do not copy this
+# template by hand.
+[Unit]
+Description=Brokkr archive near-site self-check
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/archive-nearsite.md
+# No OnFailure=: brokkr-systemd-failure@.service is a system unit and does not
+# exist in user scope. A failed run stays visible in the service state and as a
+# failing or stale Heimdall archive-nearsite panel.
+
+[Service]
+Type=oneshot
+# Rendered by deploy-archive-nearsite.sh with an exact full revision and the
+# operator's protected-file paths.
+WorkingDirectory=%h/.local/lib/brokkr/archive-nearsite/releases/@REVISION@
+# Provides HEIMDALL_HUB_URL + HEIMDALL_FLEET_TOKEN; required (delivery is the point).
+EnvironmentFile=@DELIVERY_ENV@
+# The config is parsed (never sourced) by the script and is the only source of the
+# directory, manifest and pin, so the shared delivery env cannot redirect the check.
+ExecStart=%h/.local/lib/brokkr/archive-nearsite/releases/@REVISION@/scripts/archive-nearsite.sh --config @ARCHIVE_CONFIG@ --verify
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+# Only the snapshot, stamps and lock under the state dir are written.
+ReadWritePaths=%h/.local/state/brokkr
+# The check re-hashes the whole near-site copy.
+TimeoutStartSec=12h
