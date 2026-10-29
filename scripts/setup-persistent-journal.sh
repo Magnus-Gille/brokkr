@@ -55,7 +55,14 @@ fi
 
 install -d -m 0755 "$DROPIN_DIR"
 install -d -m 2755 "$JOURNAL_DIR"
-install -m 0644 "$SOURCE" "$DEST"
+# An identical policy, owned by this (root) user with mode 0644, is left untouched: rewriting it
+# would give it a fresh ctime, which the maintenance report reads as a journald.conf change that
+# journald has not loaded yet.
+if [[ -f "$DEST" && -O "$DEST" ]] && cmp -s "$SOURCE" "$DEST" && [[ -n "$(find "$DEST" -prune -perm 0644)" ]]; then
+  echo "already installed: $DEST matches the tracked policy (left untouched)"
+else
+  install -m 0644 "$SOURCE" "$DEST"
+fi
 
 if $restart; then
   systemctl restart systemd-journald.service

@@ -13,8 +13,42 @@ does not claim to diagnose the historical one.
 ## Preserve journal history
 
 Review the tracked policy first. It makes the system journal persistent and
-caps it at 256 MiB while keeping at least 1 GiB free, a conservative policy for
-small SD-card-backed hosts.
+caps it at 1 GiB while keeping at least 1 GiB free. The cap has to hold more
+than a week of history, so that a weekly job's output survives until its next
+run. The earlier 256 MiB cap filled in under three days on the control node,
+where one chatty service wrote about 88 MiB a day. `SystemKeepFree` still
+protects small SD-card-backed hosts.
+
+The daily maintenance report (`maintenance-report.sh os`) shows each host's
+journal window as `journal=<days>d(<used>/<cap>)`. For a deploy-tier host it
+alerts when the window is shorter than 8 days *and* usage is at least 90% of
+the cap. A journal that is still filling, after a raised cap or on a new host,
+does not alert. The figures come from the persistent directory
+(`/var/log/journal`) only, and the window is measured on the system journal.
+To read them, the probe user must be root or in `adm` or `systemd-journal`;
+otherwise the window shows as `unknown(no journal access)`.
+
+journald reads its configuration only when it starts. The probe therefore
+compares the change time (ctime) of each journald configuration file and of
+the `journald.conf.d` directories with the start of the running journald. ctime
+cannot be backdated, and a directory's ctime also changes when a drop-in is
+removed from it. A staged change, such as `--apply` without `--restart` below,
+shows as `;journald-restart-pending` in the status. Until journald restarts, the
+running cap may still be the old one, so a short window then alerts with the
+restart hint, whatever the new cap says. Rerunning `--apply` while the
+installed policy is already identical leaves the file untouched, so it does
+not raise this hint.
+
+The comparison is a heuristic: journald does not expose the configuration it
+loaded.
+- A symlinked file counts with its target.
+- `/etc/systemd` itself counts only while `journald.conf` or `journald.conf.d`
+  is missing there, which covers their removal. Any other change directly in
+  `/etc/systemd` then counts as well.
+- A package that removes a whole `journald.conf.d` under `/usr/lib` or
+  `/usr/local/lib` is not detected.
+- With a restart pending and `/var/log/journal` present, the window is judged
+  as persistent even if the staged `Storage=` says otherwise.
 
 ```bash
 ./scripts/setup-persistent-journal.sh --dry-run

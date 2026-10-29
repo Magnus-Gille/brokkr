@@ -73,7 +73,20 @@ check "non-root apply is refused before mutation" '[[ "$RC" -eq 64 && "$OUT" == 
 export MOCK_UID=0
 run --apply
 check "root apply installs the tracked bounded policy" '[[ "$RC" -eq 0 && "$OUT" == *"next boot"* && -f "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && ! -L "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && "$(stat -c %a "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" 2>/dev/null || stat -f %Lp "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf")" == 644 && ! -s "$CALLS" ]]'
-check "installed policy keeps persistent storage and a finite cap" 'grep -Fqx "Storage=persistent" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemMaxUse=256M" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemKeepFree=1G" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf"'
+check "installed policy keeps persistent storage and a finite cap" 'grep -Fqx "Storage=persistent" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemMaxUse=1G" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemKeepFree=1G" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf"'
+
+# An identical policy is not rewritten: a fresh file time would read, in the maintenance report, as
+# a journald.conf change that journald has not loaded yet.
+DEST_FILE="$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf"
+touch -t 202001010000 "$DEST_FILE"
+run --apply
+check "an identical installed policy is left untouched" '[[ "$RC" -eq 0 && "$OUT" == *"already installed"* && "$(date -r "$DEST_FILE" +%Y)" == 2020 ]]'
+chmod 600 "$DEST_FILE"; touch -t 202001010000 "$DEST_FILE"
+run --apply
+check "identical content with another mode is reinstalled as 0644" '[[ "$RC" -eq 0 && "$(date -r "$DEST_FILE" +%Y)" != 2020 && -n "$(find "$DEST_FILE" -prune -perm 0644)" ]]'
+printf '# local edit\n' >>"$DEST_FILE"; touch -t 202001010000 "$DEST_FILE"
+run --apply
+check "a changed installed policy is replaced by the tracked one" '[[ "$RC" -eq 0 && "$(date -r "$DEST_FILE" +%Y)" != 2020 ]] && cmp -s "$ROOT/journald/60-brokkr-persistent.conf" "$DEST_FILE"'
 
 : >"$CALLS"
 export MOCK_JOURNALCTL_CREATE=1 MOCK_JOURNALCTL_EXIT=0
