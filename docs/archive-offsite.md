@@ -6,7 +6,7 @@ sha256 manifest) is kept as three copies:
 | Copy | Where | How it is verified |
 |---|---|---|
 | Primary | Read-only on the node that holds it | Source of truth for every check below |
-| Near-site | A NAS on the same site | `sha256sum --check` of the manifest, run on the NAS over ssh |
+| Near-site | A NAS on the same site | `sha256sum --check` of a pinned manifest, run by the NAS itself ([near-site self-check](archive-nearsite.md)); the legacy ssh row below is optional |
 | Off-site | A dedicated rclone `crypt` remote on a separate cloud account | `rclone cryptcheck` plus a sampled restore |
 
 [`scripts/archive-offsite.sh`](../scripts/archive-offsite.sh) pushes the off-site copy
@@ -102,7 +102,7 @@ following the levels in [backup-evidence.md](backup-evidence.md):
 | `copy` | `rclone size` count of `<remote>:<name>` and presence of `<name>.sha256` | count equals the manifest and the manifest exists | fail if fewer objects or no manifest; warn if more |
 | `integrity` | `cryptcheck --one-way` and its summary notices, and `rclone cat` of the remote manifest compared byte for byte | exit 0, "N matching files" equal to the manifest count, no "hashes could not be checked" notice, manifest identical | fail |
 | `restore` | N random manifest entries (`ARCHIVE_RESTORE_SAMPLES`, default 32) downloaded through the crypt remote into a private scratch directory and hashed with sha256 | every sampled file matches and the scratch copy was removed | fail, including when removal fails |
-| `nearsite` | `sha256sum --check --quiet --strict -` of the local manifest, run in `ARCHIVE_NEARSITE_DIR` on `ARCHIVE_NEARSITE_SSH` | exit 0: every entry present and matching | fail (unreachable host, or the count of `FAILED` entries); warn when not configured; omitted with `ARCHIVE_NEARSITE=off` |
+| `nearsite` (legacy ssh; not needed with the [NAS self-check](archive-nearsite.md)) | `sha256sum --check --quiet --strict -` of the local manifest, run in `ARCHIVE_NEARSITE_DIR` on `ARCHIVE_NEARSITE_SSH` | exit 0: every entry present and matching | fail (unreachable host, or the count of `FAILED` entries); warn when not configured; omitted with `ARCHIVE_NEARSITE=off` |
 | `key-drill` | `ARCHIVE_KEY_DRILL_DATE`, recorded by the owner | the drill is at most 365 days old | warn when overdue or never recorded; fail when malformed or in the future |
 
 rclone lists an object whose stored hash is empty as a match and still exits 0. It
@@ -137,8 +137,27 @@ Limits worth knowing:
   covered by the cryptcheck.
 - `sha256sum --check` does not notice extra files on the NAS, only missing or changed
   ones. The NAS check re-reads the whole near-site copy on the NAS.
-- The near-site host must accept the archive node's ssh key non-interactively
-  (`BatchMode=yes`) and have GNU `sha256sum`.
+- The legacy ssh `nearsite` row needs the near-site host to accept the archive node's
+  ssh key non-interactively (`BatchMode=yes`) and have GNU `sha256sum`.
+
+### Near-site: the NAS checks itself (supported way)
+
+The supported way to verify the near-site copy needs no ssh access from the archive
+node and no new credential: the NAS runs
+[`scripts/archive-nearsite.sh`](../scripts/archive-nearsite.sh) from its own user timer
+and reports to its own Heimdall panel (`archive-nearsite-<node>`) with the producer
+credential already in its runtime env. It is described in
+[archive-nearsite.md](archive-nearsite.md).
+
+With the self-check deployed, keep `ARCHIVE_NEARSITE=off` on the archive node, so this
+verifier omits the `nearsite` row and never reaches into the NAS (leave
+`ARCHIVE_NEARSITE_SSH` and `ARCHIVE_NEARSITE_DIR` unset). Without `off`, an unset ssh
+target is reported as an unverified `warn` row. The NAS
+computes the hashes either way; what changes is who runs them and what vouches for the
+manifest. The self-check pins the sha256 of the manifest in the NAS's private config,
+so a manifest changed on the NAS can never pass, even though the NAS also holds the
+files. Extra files on the NAS are reported as information only and never change a
+row's status.
 
 ## Deployment
 
