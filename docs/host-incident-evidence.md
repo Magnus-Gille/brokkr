@@ -19,6 +19,26 @@ run. The earlier 256 MiB cap filled in under three days on the control node,
 where one chatty service wrote about 88 MiB a day. `SystemKeepFree` still
 protects small SD-card-backed hosts.
 
+The policy also sets `MaxFileSec=1day`. journald frees space by deleting whole
+archived files, oldest first. By default it rotates a file only at an eighth
+of the cap (128 MiB here) or after a month. On the control node the system
+journal grows about 12 MiB a day, a user service writes about 85 MiB a day to
+its own user journal, and both share the cap. One system file had therefore
+covered more than two days, and deleting it cut the system window from 3.3 to
+1.3 days at once. With a 1 GiB cap and no time-based rotation, the system
+window could swing between almost nothing and about ten days.
+
+With `MaxFileSec=1day`, journald rotates a file on the first write after it
+has held a day of entries. Each new file then covers about a day, and deleting
+one drops about a day of history. This narrows the swing but guarantees
+nothing:
+- a vacuum can still delete several files at once;
+- archives that already exist are not split;
+- system and user journals still share the cap, so no room is reserved for
+  system history.
+
+The report's `journal=` window remains the check that matters.
+
 The daily maintenance report (`maintenance-report.sh os`) shows each host's
 journal window as `journal=<days>d(<used>/<cap>)`. For a deploy-tier host it
 alerts when the window is shorter than 8 days *and* usage is at least 90% of
