@@ -58,6 +58,8 @@ private_file() { # file label
   fi
   [ "${meta%% *}" = "$(id -u)" ] || die "$label must be owned by the current user: $file"
   case "${meta##* }" in *00) ;; *) die "$label must have no group/other permissions: $file" ;; esac
+  # Owner-only but unreadable (mode 000/200) passes the checks above; fail here with 2, not at the open.
+  [ -r "$file" ] || die "$label must be readable by the current user: $file"
 }
 load_config() {
   local file=$1 line key value seen=" "
@@ -77,7 +79,7 @@ load_config() {
     fi
     printf -v "$key" '%s' "$value"
     export "${key?}"
-  done <"$file"
+  done <"$file" || die "cannot read config: $file"
 }
 load_config "$CONFIG"
 
@@ -115,7 +117,7 @@ load_delivery_env() {
     else
       tok_n=$((tok_n + 1)); DE_TOKEN=${BASH_REMATCH[2]}
     fi
-  done <"$file"
+  done <"$file" || die "cannot read delivery env: $file"
   [ "$hub_n" = 1 ] || die "delivery env must define HEIMDALL_HUB_URL exactly once"
   [ "$tok_n" = 1 ] || die "delivery env must define HEIMDALL_FLEET_TOKEN exactly once"
   # The endpoint check used by the other Heimdall tooling here, and the single unquoted

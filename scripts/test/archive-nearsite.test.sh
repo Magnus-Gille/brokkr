@@ -121,6 +121,7 @@ H=0000000000000000000000000000000000000000000000000000000000000000
 # (the unit starts it with env -i); the process environment of a manual run is ignored.
 DENV="$TMP/delivery.env"
 HUB=http://heimdall.invalid/api/panels
+GOODHUB="HEIMDALL_HUB_URL=$HUB"; GOODTOK="HEIMDALL_FLEET_TOKEN=$TOKEN"
 write_denv() { # lines...
   printf '%s\n' "$@" >"$DENV"; chmod 600 "$DENV"
 }
@@ -267,7 +268,22 @@ check "sha256sum reads a private copy of the pinned bytes" '[ "$RC" = 0 ] && ! g
 # --- config refusal -------------------------------------------------------------------------------
 chmod 640 "$CONF"
 verify; check "group-readable config refused (exit 2, nothing delivered)" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ]'
-chmod 600 "$CONF"; ln -sf "$CONF" "$TMP/link.conf"
+chmod 600 "$CONF"
+# Owner-only but unreadable (000, 200) passes the ownership/permission metadata check; the
+# open itself must not turn into exit 1. Root can read anything, so this needs a normal user.
+if [ "$(id -u)" != 0 ]; then
+  for mode in 000 200; do
+    chmod "$mode" "$CONF"
+    verify; check "an unreadable config (mode $mode) exits 2, not 1, and delivers nothing" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ]'
+    chmod 600 "$CONF"
+    write_denv "$GOODHUB" "$GOODTOK"; chmod "$mode" "$DENV"; run --verify RAWDENV=1
+    check "an unreadable delivery env (mode $mode) exits 2, not 1, and delivers nothing" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ] && no_token'
+    chmod 600 "$DENV"
+  done
+else
+  echo "skip - running as root; unreadable-file cases not exercised"
+fi
+ln -sf "$CONF" "$TMP/link.conf"
 cmd -- --verify --config "$TMP/link.conf"
 check "symlinked config refused" '[ "$RC" = 2 ] && [[ "$OUT" == *"non-symlink"* ]]'
 write_conf "PATH=/tmp"

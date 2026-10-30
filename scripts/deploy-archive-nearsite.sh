@@ -129,6 +129,9 @@ hidden_by_private_tmp() {
   return 1
 }
 if hidden_by_private_tmp "$ARCHIVE_CONFIG"; then refuse "near-site config is under a temporary directory that PrivateTmp hides from the unit"; fi
+# The unit reads the delivery env itself, inside the same private /tmp, so it needs the
+# same check as the config.
+if hidden_by_private_tmp "$DELIVERY_ENV"; then refuse "delivery env is under a temporary directory that PrivateTmp hides from the unit"; fi
 for key in ARCHIVE_NEARSITE_DIR ARCHIVE_NEARSITE_MANIFEST; do
   value=$(sed -n "s/^$key=//p" "$ARCHIVE_CONFIG" | tail -n 1 | tr -d "\"'")
   if [ -n "$value" ] && hidden_by_private_tmp "$value"; then

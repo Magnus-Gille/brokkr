@@ -261,6 +261,13 @@ refuses "near-site config rejected by the shipped parser refuses" "rejected by t
 reset; printf 'ARCHIVE_NEARSITE_DIR=/var/tmp/copy\nARCHIVE_NEARSITE_MANIFEST=%s\nARCHIVE_NEARSITE_MANIFEST_SHA256=%s\n' "$HOME_DIR/archive.sha256" "$(pin_of "$HOME_DIR/archive.sha256")" >"$CONFIG"
 BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS=/var/tmp refuses "a near-site directory under a PrivateTmp-hidden directory refuses" "ARCHIVE_NEARSITE_DIR is under a temporary directory that PrivateTmp hides" "$TARGET"
 reset
+reset; mkdir -p "$HOME_DIR/tmpish"; mv "$DELIVERY_ENV" "$HOME_DIR/tmpish/env"
+BROKKR_ARCHIVE_NEARSITE_DELIVERY_ENV="$HOME_DIR/tmpish/env" BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS="$HOME_DIR/tmpish" refuses "a delivery env under a PrivateTmp-hidden directory refuses" "delivery env is under a temporary directory that PrivateTmp hides" "$TARGET"
+BROKKR_ARCHIVE_NEARSITE_DELIVERY_ENV="$HOME_DIR/tmpish/env" BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS="/nonexistent-a $HOME_DIR/tmpish" refuses "a delivery env under any of several PrivateTmp roots refuses" "delivery env is under a temporary directory that PrivateTmp hides" "$TARGET"
+BROKKR_ARCHIVE_NEARSITE_DELIVERY_ENV="$HOME_DIR/tmpish/env" run "$TARGET"
+check "the same delivery env outside every PrivateTmp root is accepted" '[[ "$RC" -eq 0 ]]'
+rm -rf "$HOME_DIR/tmpish"
+reset
 BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS="$HOME_DIR/.config" refuses "a config under a PrivateTmp-hidden directory refuses" "near-site config is under a temporary directory that PrivateTmp hides" "$TARGET"
 reset; printf 'tampered\n' >>"$HOME_DIR/archive.sha256"
 refuses "a manifest that does not match the pin refuses" "rejected by the shipped verifier" "$TARGET"
