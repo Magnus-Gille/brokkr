@@ -25,7 +25,21 @@ cp "$ROOT/scripts/lib/deploy-source.sh" "$REPO/scripts/lib/"
 cp "$ROOT/heimdall/push.sh" "$REPO/heimdall/"
 cp "$ROOT/systemd/user/"brokkr-archive-nearsite.* "$REPO/systemd/user/"
 echo "unrelated file that must never ship" > "$REPO/README.md"
-git init -q "$REPO"; git -C "$REPO" config user.name test; git -C "$REPO" config user.email test@example.invalid
+# The shipped script has ONE fixed unit PATH (no override of any kind exists in production).
+# The fixture's fake tools live in temp directories, so only the fixture's COPY of the
+# script has that constant replaced by the fixture PATH; the shipped file is untouched.
+SHIPPED_UNIT_PATH=/usr/local/bin:/usr/bin:/bin
+FIXTURE_UNIT_PATH="$BIN:$PYBIN:$TMP/sysbin"
+if [ "$(grep -c "^unit_path=$SHIPPED_UNIT_PATH\$" "$REPO/scripts/deploy-archive-nearsite.sh")" != 1 ]; then
+  echo "not ok - the deploy script does not define the unit PATH exactly once as a constant" >&2; exit 1
+fi
+sed "s#^unit_path=$SHIPPED_UNIT_PATH\$#unit_path=$FIXTURE_UNIT_PATH#" "$REPO/scripts/deploy-archive-nearsite.sh" >"$TMP/deploy.patched"
+cat "$TMP/deploy.patched" >"$REPO/scripts/deploy-archive-nearsite.sh"
+# Fixture git is isolated from the caller's configuration (hooks, signing, templates).
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+git init -q "$REPO"
+git -C "$REPO" config user.name test; git -C "$REPO" config user.email test@example.invalid
+git -C "$REPO" config commit.gpgsign false; git -C "$REPO" config core.hooksPath /dev/null
 git -C "$REPO" add . ; git -C "$REPO" commit -qm fixture
 SHA="$(git -C "$REPO" rev-parse HEAD)"
 DEPLOY="$REPO/scripts/deploy-archive-nearsite.sh"
@@ -113,17 +127,7 @@ for tool in /bin/* /usr/bin/*; do
   [[ "$name" != sha256sum && -x "$tool" && ! -e "$TMP/sysbin/$name" ]] || continue
   ln -s "$tool" "$TMP/sysbin/$name"
 done
-# Same tools without any python or sha256sum: stands in for a node whose unit PATH lacks them.
-mkdir -p "$TMP/nopy"
-for tool in "$TMP"/sysbin/*; do
-  name=${tool##*/}
-  case "$name" in python*|sha256sum) continue ;; esac
-  ln -s "$tool" "$TMP/nopy/$name"
-done
-export MOCK_REMOTE_PATH="$BIN:$PYBIN:$TMP/sysbin"
-# The unit's own PATH (env -i PATH=...) is the production default; the hermetic fixture's
-# fakes live elsewhere, so the test points the unit PATH at the same fake directories.
-export BROKKR_ARCHIVE_NEARSITE_UNIT_PATH="$MOCK_REMOTE_PATH"
+export MOCK_REMOTE_PATH="$FIXTURE_UNIT_PATH"
 export PATH="$BIN:$PATH" TMPDIR="$TMP/payload-tmp"
 # The fixture itself may live under /tmp (Linux CI); PrivateTmp roots are set per case.
 export BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS=/nonexistent-private-tmp
@@ -273,6 +277,12 @@ reset; rm -f "$CONFIG"; printf 'x\n' >"$HOME_DIR/.config/brokkr/other"; ln -s "$
 refuses "symlinked near-site config refuses" "near-site config" "$TARGET"
 reset; write_config "ARCHIVE_NEARSITE=off"
 refuses "near-site config with an unknown key refuses (shipped parser)" "rejected by the shipped verifier" "$TARGET"
+reset; write_config "ARCHIVE_NODE=---"
+refuses "a node name that normalises to nothing is rejected by the shipped verifier" "rejected by the shipped verifier" "$TARGET"
+check "the node refusal says what is wrong" '[[ "$OUT" == *"cannot derive a node name"* ]]'
+reset; write_config "ARCHIVE_NODE=$(printf 'n%.0s' $(seq 1 41))"
+refuses "a 41-character node name is rejected by the shipped verifier" "rejected by the shipped verifier" "$TARGET"
+check "the long node refusal says what is wrong" '[[ "$OUT" == *"longer than 40"* ]]'
 reset; write_config "SURPRISE=1"
 refuses "near-site config rejected by the shipped parser refuses" "rejected by the shipped verifier" "$TARGET"
 reset; printf 'ARCHIVE_NEARSITE_DIR=/var/tmp/copy\nARCHIVE_NEARSITE_MANIFEST=%s\nARCHIVE_NEARSITE_MANIFEST_SHA256=%s\n' "$HOME_DIR/archive.sha256" "$(pin_of "$HOME_DIR/archive.sha256")" >"$CONFIG"
@@ -312,14 +322,27 @@ drop_symlinked_inputs
 
 # The unit runs under `env -i PATH=...`, so the dependencies must exist on THAT path, not
 # only on the ssh session's. The same prefix serves the probes, --validate and the unit.
+# Tools are moved to a directory that only the ssh session's PATH contains.
+mkdir -p "$TMP/sshonly" "$TMP/stash"
 reset
-BROKKR_ARCHIVE_NEARSITE_UNIT_PATH="$PYBIN:$TMP/sysbin" refuses "a sha256sum present only on the ssh PATH (not the unit's) refuses" "sha256sum" "$TARGET"
+mv "$BIN/sha256sum" "$TMP/sshonly/sha256sum"
+MOCK_REMOTE_PATH="$FIXTURE_UNIT_PATH:$TMP/sshonly" refuses "a sha256sum present only on the ssh PATH (not the unit's) refuses" "sha256sum" "$TARGET"
+mv "$TMP/sshonly/sha256sum" "$BIN/sha256sum"
 reset
-BROKKR_ARCHIVE_NEARSITE_UNIT_PATH="$BIN:$TMP/nopy" refuses "a python3 present only on the ssh PATH (not the unit's) refuses" "python3" "$TARGET"
+mv "$PYBIN/python3" "$TMP/sshonly/python3"
+for f in "$TMP"/sysbin/python*; do mv "$f" "$TMP/stash/"; done
+MOCK_REMOTE_PATH="$FIXTURE_UNIT_PATH:$TMP/sshonly" refuses "a python3 present only on the ssh PATH (not the unit's) refuses" "python3" "$TARGET"
+mv "$TMP/sshonly/python3" "$PYBIN/python3"
+for f in "$TMP"/stash/*; do mv "$f" "$TMP/sysbin/"; done
 reset
 run "$TARGET" --apply
-check "the unit's PATH and LANG come from the one definition the preflight probes with" 'grep -Fq "PATH=$MOCK_REMOTE_PATH LANG=C.UTF-8" "$SERVICE"'
-check "the production default unit PATH is /usr/local/bin:/usr/bin:/bin (one definition, template placeholder)" 'grep -Fq ":-/usr/local/bin:/usr/bin:/bin}" "$DEPLOY" && grep -Fq "PATH=@UNIT_PATH@ LANG=@UNIT_LANG@" "$REPO/systemd/user/brokkr-archive-nearsite.service.in"'
+check "the unit's PATH and LANG are the one definition the preflight probes with" 'grep -Fq "PATH=$FIXTURE_UNIT_PATH LANG=C.UTF-8" "$SERVICE"'
+# No override of the unit PATH exists in the shipped script: a relative or empty component
+# could make preflight and runtime resolve different binaries (even one inside the archive).
+SHIPPED="$ROOT/scripts/deploy-archive-nearsite.sh"
+check "the shipped deploy script defines the unit PATH once, as the fixed constant" '[[ "$(grep -c "^unit_path=$SHIPPED_UNIT_PATH\$" "$SHIPPED")" == 1 ]] && [[ "$(grep -c "^unit_path=" "$SHIPPED")" == 1 ]]'
+check "the shipped deploy script has no environment override of the unit PATH" '! grep -q "BROKKR_.*UNIT_PATH" "$SHIPPED" && ! grep -Eq "^unit_path=.*[\$\`]" "$SHIPPED"'
+check "the unit template takes PATH only from the rendered placeholder" 'grep -Fq "PATH=@UNIT_PATH@ LANG=@UNIT_LANG@" "$REPO/systemd/user/brokkr-archive-nearsite.service.in"'
 
 reset; printf 'tampered\n' >>"$HOME_DIR/archive.sha256"
 refuses "a manifest that does not match the pin refuses" "rejected by the shipped verifier" "$TARGET"

@@ -144,7 +144,7 @@ must lie outside the unit's private `/tmp` (checked on the resolved physical pat
 a symlinked parent directory into `/tmp` or `/var/tmp` is refused; the delivery env and
 config are checked the same way); the tools the check uses (bash, python3, GNU
 `sha256sum`, date, mktemp, tr, sed, stat, id, grep, rm, mv, mkdir, cat) must exist on the
-unit's own `PATH` (`/usr/local/bin:/usr/bin:/bin`), not merely on the ssh session's: the
+unit's own `PATH` (the fixed constant `/usr/local/bin:/usr/bin:/bin`, which nothing can override), not merely on the ssh session's: the
 probes and the `--validate` run use the same `env -i HOME=… PATH=… LANG=…` prefix that is
 rendered into the unit, defined once in the deploy script; and the shipped script's own `--validate --delivery-env` must accept the config, the
 delivery env's shape and the pin, which proves the pin matches the manifest and exercises

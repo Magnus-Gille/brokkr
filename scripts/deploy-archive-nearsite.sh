@@ -171,10 +171,12 @@ done
 # The unit starts the verifier as `env -i HOME=... PATH=$unit_path LANG=$unit_lang`. The
 # dependency probes and the shipped --validate run through exactly this prefix, and the
 # same two values are rendered into the unit, so the preflight and the unit cannot drift.
-# (The PATH override exists only for the hermetic test; ssh does not forward it.)
-unit_path=${BROKKR_ARCHIVE_NEARSITE_UNIT_PATH:-/usr/local/bin:/usr/bin:/bin}
+# The PATH is a fixed constant of absolute system directories: nothing can override it, so
+# neither an empty or relative component nor a caller's environment can make the probes and
+# the scheduled run resolve different binaries. (The hermetic test replaces the constant in
+# its own copy of this script.)
+unit_path=/usr/local/bin:/usr/bin:/bin
 unit_lang=C.UTF-8
-printf '%s' "$unit_path" | grep -Eq '^[A-Za-z0-9._/:+-]+$' || refuse "unit PATH is not a plain path list"
 unit_env() { /usr/bin/env -i HOME="$HOME" PATH="$unit_path" LANG="$unit_lang" "$@"; }
 for tool in bash python3 sha256sum date mktemp tr sed stat id grep rm mv mkdir cat; do
   unit_env /bin/sh -c 'command -v "$1" >/dev/null 2>&1' sh "$tool" \

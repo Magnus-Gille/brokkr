@@ -345,6 +345,18 @@ check "an over-long node name is refused" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUES
 write_conf "ARCHIVE_NODE=cfg-node"
 verify ARCHIVE_NODE=env-node
 check "ARCHIVE_NODE from the config wins over the environment" '[ "$(panel)" = "archive-nearsite-cfg-node pass" ]'
+# --validate is what the deploy preflight runs, so it must refuse what the scheduled run refuses.
+write_conf "ARCHIVE_NODE=---"
+run --validate
+check "validate refuses a node name that normalises to nothing (exit 2, no state)" '[ "$RC" = 2 ] && [[ "$OUT" == *"cannot derive a node name"* ]]'
+verify
+check "verify refuses the same node name (exit 2, nothing delivered)" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ]'
+write_conf "ARCHIVE_NODE=$(printf 'n%.0s' $(seq 1 41))"
+run --validate
+check "validate refuses a 41-character node name (exit 2)" '[ "$RC" = 2 ] && [[ "$OUT" == *"longer than 40"* ]]'
+write_conf "ARCHIVE_NODE=$(printf 'n%.0s' $(seq 1 40))"
+run --validate
+check "validate accepts a 40-character node name" '[ "$RC" = 0 ]'
 write_conf
 verify ARCHIVE_NODE= MOCK_HOSTNAME_FAIL=1
 check "no node name and failing hostname commands exit 2, not 1, and deliver nothing" '[ "$RC" = 2 ] && [[ "$OUT" == *"cannot derive a node name"* ]] && [ ! -f "$MOCK_REQUEST_FILE" ]'
