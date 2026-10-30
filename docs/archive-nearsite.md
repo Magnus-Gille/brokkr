@@ -140,8 +140,13 @@ non-symlink files, mode 600, owned by that user; the delivery env defining
 `HEIMDALL_HUB_URL` and `HEIMDALL_FLEET_TOKEN` once each and non-empty (tested with
 `grep -q`, exit status only). There is no forbidden-variable list: other keys in the shared
 file are simply ignored by the verifier, as described above. The directory and manifest
-must lie outside the unit's private `/tmp`; GNU `sha256sum` and `python3` must be present;
-and the shipped script's own `--validate --delivery-env` must accept the config, the
+must lie outside the unit's private `/tmp` (checked on the resolved physical path too, so
+a symlinked parent directory into `/tmp` or `/var/tmp` is refused; the delivery env and
+config are checked the same way); the tools the check uses (bash, python3, GNU
+`sha256sum`, date, mktemp, tr, sed, stat, id, grep, rm, mv, mkdir, cat) must exist on the
+unit's own `PATH` (`/usr/local/bin:/usr/bin:/bin`), not merely on the ssh session's: the
+probes and the `--validate` run use the same `env -i HOME=… PATH=… LANG=…` prefix that is
+rendered into the unit, defined once in the deploy script; and the shipped script's own `--validate --delivery-env` must accept the config, the
 delivery env's shape and the pin, which proves the pin matches the manifest and exercises
 the same parser the timer run uses. The deploy never creates or modifies the delivery env
 or any credential, and prints no value.

@@ -31,7 +31,9 @@ SHA="$(git -C "$REPO" rev-parse HEAD)"
 DEPLOY="$REPO/scripts/deploy-archive-nearsite.sh"
 
 # The remote PATH sees python3 only through a wrapper.
-REAL_PYTHON="$(command -v python3)"
+# The preflight runs python3 under `env -i` like the unit does, so the wrapper must point at
+# the real interpreter, not at a version-manager shim that needs the caller's environment.
+REAL_PYTHON="$(python3 -I -c 'import sys; print(sys.executable)')"
 printf '#!/bin/sh\nexec "%s" "$@"\n' "$REAL_PYTHON" >"$PYBIN/python3"
 chmod 755 "$PYBIN/python3"
 
@@ -91,10 +93,15 @@ chmod 755 "$BIN/"*
 
 # Fake sha256sum: only the version banner is answered (the deploy preflight needs GNU,
 # --validate hashes with python). Any other call is recorded so a hash run is provable.
-cat >"$BIN/sha256sum" <<'FAKE'
+# It runs under `env -i` like the unit, so the log and banner file paths are baked in
+# rather than read from the environment.
+cat >"$BIN/sha256sum" <<FAKE
 #!/usr/bin/env bash
-printf 'sha256sum %s\n' "$*" >>"$MOCK_CALLS"
-if [[ "${1:-}" == --version ]]; then echo "${MOCK_SHA_BANNER:-sha256sum (GNU coreutils) 9.4}"; exit 0; fi
+printf 'sha256sum %s\n' "\$*" >>"$CALLS"
+if [[ "\${1:-}" == --version ]]; then
+  if [[ -f "$TMP/sha-banner" ]]; then cat "$TMP/sha-banner"; else echo "sha256sum (GNU coreutils) 9.4"; fi
+  exit 0
+fi
 echo "fake sha256sum: unexpected invocation" >&2; exit 99
 FAKE
 chmod 755 "$BIN/sha256sum"
@@ -106,7 +113,17 @@ for tool in /bin/* /usr/bin/*; do
   [[ "$name" != sha256sum && -x "$tool" && ! -e "$TMP/sysbin/$name" ]] || continue
   ln -s "$tool" "$TMP/sysbin/$name"
 done
+# Same tools without any python or sha256sum: stands in for a node whose unit PATH lacks them.
+mkdir -p "$TMP/nopy"
+for tool in "$TMP"/sysbin/*; do
+  name=${tool##*/}
+  case "$name" in python*|sha256sum) continue ;; esac
+  ln -s "$tool" "$TMP/nopy/$name"
+done
 export MOCK_REMOTE_PATH="$BIN:$PYBIN:$TMP/sysbin"
+# The unit's own PATH (env -i PATH=...) is the production default; the hermetic fixture's
+# fakes live elsewhere, so the test points the unit PATH at the same fake directories.
+export BROKKR_ARCHIVE_NEARSITE_UNIT_PATH="$MOCK_REMOTE_PATH"
 export PATH="$BIN:$PATH" TMPDIR="$TMP/payload-tmp"
 # The fixture itself may live under /tmp (Linux CI); PrivateTmp roots are set per case.
 export BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS=/nonexistent-private-tmp
@@ -158,7 +175,7 @@ reset() {
   rm -rf "$HOME_DIR/.local" "$HOME_DIR/.config/systemd" "$HOME_DIR/.config/brokkr/other"
   rm -f "$DELIVERY_ENV" "$CONFIG"
   : >"$CALLS"
-  unset MOCK_ID_ROOT MOCK_LINGER MOCK_SHA_BANNER MOCK_CP_FAIL MOCK_MV_FAIL MOCK_TAR_FAIL
+  rm -f "$TMP/sha-banner"; unset MOCK_ID_ROOT MOCK_LINGER MOCK_CP_FAIL MOCK_MV_FAIL MOCK_TAR_FAIL
   export BROKKR_EXPECTED_COMMIT="$SHA" BROKKR_ARCHIVE_NEARSITE_DELIVERY_ENV="$DELIVERY_ENV"
   unset BROKKR_ARCHIVE_NEARSITE_CONFIG
   good_inputs
@@ -269,6 +286,41 @@ check "the same delivery env outside every PrivateTmp root is accepted" '[[ "$RC
 rm -rf "$HOME_DIR/tmpish"
 reset
 BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS="$HOME_DIR/.config" refuses "a config under a PrivateTmp-hidden directory refuses" "near-site config is under a temporary directory that PrivateTmp hides" "$TARGET"
+# A parent directory that is a symlink into a PrivateTmp root hides the file from the unit
+# although its lexical path does not: compare the resolved physical path too.
+HIDDEN="$HOME_DIR/hiddenroot"
+symlinked_inputs() { # moves the inputs under a hidden root, reachable only through $HOME_DIR/linkd
+  rm -rf "$HIDDEN" "$HOME_DIR/linkd"; mkdir -p "$HIDDEN/d"; ln -s "$HIDDEN/d" "$HOME_DIR/linkd"
+}
+drop_symlinked_inputs() { rm -rf "$HIDDEN" "$HOME_DIR/linkd"; }
+reset; symlinked_inputs; mv "$DELIVERY_ENV" "$HIDDEN/d/env"
+BROKKR_ARCHIVE_NEARSITE_DELIVERY_ENV="$HOME_DIR/linkd/env" BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS="$HIDDEN" refuses "a delivery env reached through a symlinked parent into a PrivateTmp root refuses" "delivery env is under a temporary directory that PrivateTmp hides" "$TARGET"
+BROKKR_ARCHIVE_NEARSITE_DELIVERY_ENV="$HOME_DIR/linkd/env" run "$TARGET"
+check "the same symlinked parent is fine when it does not lead into a PrivateTmp root" '[[ "$RC" -eq 0 ]]'
+drop_symlinked_inputs
+reset; symlinked_inputs; mv "$CONFIG" "$HIDDEN/d/near.conf"
+BROKKR_ARCHIVE_NEARSITE_CONFIG="$HOME_DIR/linkd/near.conf" BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS="$HIDDEN" refuses "a config reached through a symlinked parent into a PrivateTmp root refuses" "near-site config is under a temporary directory that PrivateTmp hides" "$TARGET"
+drop_symlinked_inputs
+reset; symlinked_inputs; mv "$HOME_DIR/archive.sha256" "$HIDDEN/d/archive.sha256"
+printf 'ARCHIVE_NEARSITE_DIR=%s\nARCHIVE_NEARSITE_MANIFEST=%s\nARCHIVE_NEARSITE_MANIFEST_SHA256=%s\n' "$HOME_DIR/archive" "$HOME_DIR/linkd/archive.sha256" "$(pin_of "$HIDDEN/d/archive.sha256")" >"$CONFIG"
+BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS="$HIDDEN" refuses "a manifest reached through a symlinked parent into a PrivateTmp root refuses" "ARCHIVE_NEARSITE_MANIFEST is under a temporary directory that PrivateTmp hides" "$TARGET"
+drop_symlinked_inputs
+reset; symlinked_inputs; mv "$HOME_DIR/archive" "$HIDDEN/d/archive"
+printf 'ARCHIVE_NEARSITE_DIR=%s\nARCHIVE_NEARSITE_MANIFEST=%s\nARCHIVE_NEARSITE_MANIFEST_SHA256=%s\n' "$HOME_DIR/linkd/archive" "$HOME_DIR/archive.sha256" "$(pin_of "$HOME_DIR/archive.sha256")" >"$CONFIG"
+BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS="$HIDDEN" refuses "a near-site directory that is a symlink into a PrivateTmp root refuses" "ARCHIVE_NEARSITE_DIR is under a temporary directory that PrivateTmp hides" "$TARGET"
+drop_symlinked_inputs
+
+# The unit runs under `env -i PATH=...`, so the dependencies must exist on THAT path, not
+# only on the ssh session's. The same prefix serves the probes, --validate and the unit.
+reset
+BROKKR_ARCHIVE_NEARSITE_UNIT_PATH="$PYBIN:$TMP/sysbin" refuses "a sha256sum present only on the ssh PATH (not the unit's) refuses" "sha256sum" "$TARGET"
+reset
+BROKKR_ARCHIVE_NEARSITE_UNIT_PATH="$BIN:$TMP/nopy" refuses "a python3 present only on the ssh PATH (not the unit's) refuses" "python3" "$TARGET"
+reset
+run "$TARGET" --apply
+check "the unit's PATH and LANG come from the one definition the preflight probes with" 'grep -Fq "PATH=$MOCK_REMOTE_PATH LANG=C.UTF-8" "$SERVICE"'
+check "the production default unit PATH is /usr/local/bin:/usr/bin:/bin (one definition, template placeholder)" 'grep -Fq ":-/usr/local/bin:/usr/bin:/bin}" "$DEPLOY" && grep -Fq "PATH=@UNIT_PATH@ LANG=@UNIT_LANG@" "$REPO/systemd/user/brokkr-archive-nearsite.service.in"'
+
 reset; printf 'tampered\n' >>"$HOME_DIR/archive.sha256"
 refuses "a manifest that does not match the pin refuses" "rejected by the shipped verifier" "$TARGET"
 check "the pin mismatch is reported without the full hashes" '[[ "$OUT" == *"does not match the pinned value"* ]] && ! grep -qE "[0-9a-f]{64}" <<<"$OUT"'
@@ -278,7 +330,7 @@ reset; export MOCK_ID_ROOT=1
 refuses "root runtime user refuses" "must not be root" "$TARGET"
 reset; export MOCK_LINGER=no
 refuses "disabled user lingering refuses" "linger" "$TARGET"
-reset; export MOCK_SHA_BANNER="sha256sum (Darwin) 1.0"
+reset; echo "sha256sum (Darwin) 1.0" >"$TMP/sha-banner"
 refuses "a non-GNU sha256sum refuses" "GNU sha256sum is required" "$TARGET"
 check "validate leaves no scratch state" '[[ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -print)" ]]'
 reset
@@ -361,7 +413,7 @@ check "release holds exactly the verifier, push helper, templates, and rendered 
 check "unrelated repository files never ship" '[[ ! -e "$RELEASE/README.md" ]]'
 check "release files are executable where needed and private" '[[ -x "$RELEASE/scripts/archive-nearsite.sh" && -x "$RELEASE/heimdall/push.sh" && "$(stat -c %a "$RELEASE" 2>/dev/null || stat -f %Lp "$RELEASE")" == 700 ]]'
 check "no staging directory is left behind" '[[ -z "$(find "$HOME_DIR/.local/lib/brokkr/archive-nearsite" -maxdepth 1 -name ".stage.*")" ]]'
-check "unit renders the exact SHA, delivery env, and config path under a clean environment" 'grep -Fxq "ExecStart=/usr/bin/env -i HOME=%h PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 %h/.local/lib/brokkr/archive-nearsite/releases/$SHA/scripts/archive-nearsite.sh --config $CONFIG --delivery-env $DELIVERY_ENV --verify" "$SERVICE" && grep -Fxq "WorkingDirectory=%h/.local/lib/brokkr/archive-nearsite/releases/$SHA" "$SERVICE"'
+check "unit renders the exact SHA, delivery env, and config path under a clean environment" 'grep -Fxq "ExecStart=/usr/bin/env -i HOME=%h PATH=$MOCK_REMOTE_PATH LANG=C.UTF-8 %h/.local/lib/brokkr/archive-nearsite/releases/$SHA/scripts/archive-nearsite.sh --config $CONFIG --delivery-env $DELIVERY_ENV --verify" "$SERVICE" && grep -Fxq "WorkingDirectory=%h/.local/lib/brokkr/archive-nearsite/releases/$SHA" "$SERVICE"'
 check "rendered unit loads no EnvironmentFile and has no blacklist (allowlist model)" '! grep -Eq "^(EnvironmentFile|UnsetEnvironment|PassEnvironment|Environment)=" "$SERVICE"'
 check "no secret is on the rendered command line (only file paths follow --delivery-env and --config)" '! grep -q "secret-sentinel" "$SERVICE" && ! grep -Eq "^ExecStart=.*(HEIMDALL_|TOKEN)" "$SERVICE"'
 check "rendered unit has no leftover placeholders, system-only directives, or old layout" '! grep -Eq "@[A-Z_]+@|^OnFailure|^User=|^SupplementaryGroups|/opt/brokkr|/home/brokkr|rclone" "$SERVICE" && grep -Fxq NoNewPrivileges=yes "$SERVICE" && grep -Fxq PrivateTmp=yes "$SERVICE"'

@@ -22,7 +22,7 @@ WorkingDirectory=%h/.local/lib/brokkr/archive-nearsite/releases/@REVISION@
 # never on a command line. The command line carries file paths only, no secret.
 # The config is parsed (never sourced) by the script and is the only source of the
 # directory, manifest and pin.
-ExecStart=/usr/bin/env -i HOME=%h PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 %h/.local/lib/brokkr/archive-nearsite/releases/@REVISION@/scripts/archive-nearsite.sh --config @ARCHIVE_CONFIG@ --delivery-env @DELIVERY_ENV@ --verify
+ExecStart=/usr/bin/env -i HOME=%h PATH=@UNIT_PATH@ LANG=@UNIT_LANG@ %h/.local/lib/brokkr/archive-nearsite/releases/@REVISION@/scripts/archive-nearsite.sh --config @ARCHIVE_CONFIG@ --delivery-env @DELIVERY_ENV@ --verify
 Nice=10
 IOSchedulingClass=idle
 NoNewPrivileges=yes

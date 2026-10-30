@@ -86,6 +86,13 @@ fi
 exec /bin/rm "$@"
 FAKE
 chmod 755 "$TMP/gnu/rm"
+# hostname wrapper: MOCK_HOSTNAME_FAIL=1 makes both `hostname -s` and `hostname` fail.
+cat >"$TMP/gnu/hostname" <<'FAKE'
+#!/usr/bin/env bash
+if [ "${MOCK_HOSTNAME_FAIL:-0}" = 1 ]; then echo "hostname: mock failure" >&2; exit 1; fi
+exec /bin/hostname "$@"
+FAKE
+chmod 755 "$TMP/gnu/hostname"
 export MOCK_SHA_CALLS="$TMP/sha-calls" MOCK_REQUEST_FILE="$TMP/request.json"
 cat >"$TMP/python/sitecustomize.py" <<'PY'
 import json, os, urllib.request
@@ -338,6 +345,9 @@ check "an over-long node name is refused" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUES
 write_conf "ARCHIVE_NODE=cfg-node"
 verify ARCHIVE_NODE=env-node
 check "ARCHIVE_NODE from the config wins over the environment" '[ "$(panel)" = "archive-nearsite-cfg-node pass" ]'
+write_conf
+verify ARCHIVE_NODE= MOCK_HOSTNAME_FAIL=1
+check "no node name and failing hostname commands exit 2, not 1, and deliver nothing" '[ "$RC" = 2 ] && [[ "$OUT" == *"cannot derive a node name"* ]] && [ ! -f "$MOCK_REQUEST_FILE" ]'
 write_conf
 cmd -- --config "$CONF"
 check "a missing mode is refused" '[ "$RC" = 2 ] && [[ "$OUT" == *usage* ]]'

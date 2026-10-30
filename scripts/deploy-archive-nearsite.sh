@@ -124,17 +124,34 @@ private_file "$ARCHIVE_CONFIG" "near-site config"
 # this preflight and vanish at run time. (The override exists only for the hermetic test,
 # whose fixtures may live under /tmp; ssh does not forward it.)
 tmp_roots=${BROKKR_ARCHIVE_NEARSITE_PRIVATE_TMP_ROOTS:-/tmp /var/tmp}
-hidden_by_private_tmp() {
-  for root in $tmp_roots; do case $1 in "$root"|"$root"/*) return 0 ;; esac; done
+physical_dir() { ( cd -P "$1" 2>/dev/null && pwd -P ); }
+hidden_by_private_tmp() { # lexical path against each root, and against the root's physical path
+  for root in $tmp_roots; do
+    case $1 in "$root"|"$root"/*) return 0 ;; esac
+    proot=$(physical_dir "$root") || continue
+    case $1 in "$proot"|"$proot"/*) return 0 ;; esac
+  done
   return 1
 }
-if hidden_by_private_tmp "$ARCHIVE_CONFIG"; then refuse "near-site config is under a temporary directory that PrivateTmp hides from the unit"; fi
+# A symlinked parent directory (or a directory that is itself a symlink) into a PrivateTmp
+# root hides a path although its lexical form does not: also test the resolved physical path.
+path_hidden() {
+  hidden_by_private_tmp "$1" && return 0
+  if [ -d "$1" ]; then
+    phys=$(physical_dir "$1") || return 1
+  else
+    phys_parent=$(physical_dir "$(dirname -- "$1")") || return 1
+    phys=$phys_parent/$(basename -- "$1")
+  fi
+  hidden_by_private_tmp "$phys"
+}
+if path_hidden "$ARCHIVE_CONFIG"; then refuse "near-site config is under a temporary directory that PrivateTmp hides from the unit"; fi
 # The unit reads the delivery env itself, inside the same private /tmp, so it needs the
 # same check as the config.
-if hidden_by_private_tmp "$DELIVERY_ENV"; then refuse "delivery env is under a temporary directory that PrivateTmp hides from the unit"; fi
+if path_hidden "$DELIVERY_ENV"; then refuse "delivery env is under a temporary directory that PrivateTmp hides from the unit"; fi
 for key in ARCHIVE_NEARSITE_DIR ARCHIVE_NEARSITE_MANIFEST; do
   value=$(sed -n "s/^$key=//p" "$ARCHIVE_CONFIG" | tail -n 1 | tr -d "\"'")
-  if [ -n "$value" ] && hidden_by_private_tmp "$value"; then
+  if [ -n "$value" ] && path_hidden "$value"; then
     refuse "$key is under a temporary directory that PrivateTmp hides from the unit"
   fi
 done
@@ -151,11 +168,21 @@ done
 # verifier under `env -i` and passes the file as --delivery-env, and the verifier takes only
 # the two Heimdall lines and ignores every other key, so an extra variable (LD_AUDIT,
 # BASH_ENV, PYTHONUSERBASE, an exported function, anything) cannot reach any process.
-command -v python3 >/dev/null 2>&1 || refuse "python3 is required"
-command -v bash >/dev/null 2>&1 || refuse "bash is required"
+# The unit starts the verifier as `env -i HOME=... PATH=$unit_path LANG=$unit_lang`. The
+# dependency probes and the shipped --validate run through exactly this prefix, and the
+# same two values are rendered into the unit, so the preflight and the unit cannot drift.
+# (The PATH override exists only for the hermetic test; ssh does not forward it.)
+unit_path=${BROKKR_ARCHIVE_NEARSITE_UNIT_PATH:-/usr/local/bin:/usr/bin:/bin}
+unit_lang=C.UTF-8
+printf '%s' "$unit_path" | grep -Eq '^[A-Za-z0-9._/:+-]+$' || refuse "unit PATH is not a plain path list"
+unit_env() { /usr/bin/env -i HOME="$HOME" PATH="$unit_path" LANG="$unit_lang" "$@"; }
+for tool in bash python3 sha256sum date mktemp tr sed stat id grep rm mv mkdir cat; do
+  unit_env /bin/sh -c 'command -v "$1" >/dev/null 2>&1' sh "$tool" \
+    || refuse "$tool is not available on the unit's PATH ($unit_path)"
+done
 # Captured first: a closing `grep -q` must not fail the check through SIGPIPE.
-sha_banner=$(sha256sum --version 2>/dev/null || true)
-case $sha_banner in *GNU*) ;; *) refuse "GNU sha256sum is required on this node" ;; esac
+sha_banner=$(unit_env sha256sum --version 2>/dev/null || true)
+case $sha_banner in *GNU*) ;; *) refuse "GNU sha256sum is required on the unit's PATH" ;; esac
 release_root=$HOME/.local/lib/brokkr/archive-nearsite
 release=$release_root/releases/$REVISION
 unit_dir=$config_home/systemd/user
@@ -177,7 +204,7 @@ validate_nearsite() { # script path, or - to read the script from stdin
   vscript=$1
   # A script piped to `bash -s` has no BASH_SOURCE, so give stdin input a real file.
   if [ "$vscript" = - ]; then vscript=$vstate/archive-nearsite.sh; cat >"$vscript"; fi
-  if vout=$(BROKKR_STATE_DIR="$vstate" TMPDIR="$vstate" bash "$vscript" --config "$ARCHIVE_CONFIG" --delivery-env "$DELIVERY_ENV" --validate 2>&1 </dev/null); then vrc=0; else vrc=$?; fi
+  if vout=$(unit_env BROKKR_STATE_DIR="$vstate" TMPDIR="$vstate" bash "$vscript" --config "$ARCHIVE_CONFIG" --delivery-env "$DELIVERY_ENV" --validate 2>&1 </dev/null); then vrc=0; else vrc=$?; fi
   rm -rf "$vstate"
   if [ -n "$vout" ]; then printf '%s\n' "$vout" | sed 's/^/preflight: /'; fi
   [ "$vrc" = 0 ] || refuse "near-site config or manifest rejected by the shipped verifier (--validate exit $vrc)"
@@ -267,7 +294,8 @@ if [ -n "$(find "$stage" ! -type d ! -type f -print)" ]; then refuse "payload co
 validate_nearsite "$stage/scripts/archive-nearsite.sh"
 # The payload is received and validated; only now change the node.
 render() {
-  sed -e "s|@REVISION@|$REVISION|g" -e "s|@DELIVERY_ENV@|$DELIVERY_ENV|g" -e "s|@ARCHIVE_CONFIG@|$ARCHIVE_CONFIG|g" "$1" >"$2"
+  sed -e "s|@REVISION@|$REVISION|g" -e "s|@DELIVERY_ENV@|$DELIVERY_ENV|g" -e "s|@ARCHIVE_CONFIG@|$ARCHIVE_CONFIG|g" \
+    -e "s|@UNIT_PATH@|$unit_path|g" -e "s|@UNIT_LANG@|$unit_lang|g" "$1" >"$2"
 }
 render "$stage/systemd/user/$service_unit.in" "$stage/$service_unit"
 cp "$stage/systemd/user/$timer_unit" "$stage/$timer_unit"

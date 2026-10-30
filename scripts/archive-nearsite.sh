@@ -132,7 +132,9 @@ if [ -n "$DELIVERY_ENV" ]; then load_delivery_env "$DELIVERY_ENV"; fi
 
 if [ "$MODE" = --verify ]; then
   # One panel per node, as for link health: a shared panel would let one node hide another.
-  node_raw="${ARCHIVE_NODE:-$(hostname -s 2>/dev/null || hostname 2>/dev/null)}"
+  # `|| true`: with both hostname commands failing, set -e would abort here with status 1,
+  # before any trap exists; the empty result is refused with 2 just below.
+  node_raw="${ARCHIVE_NODE:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)}"
   node="$(printf '%s' "${node_raw%%.*}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | tr -s '-' | sed 's/^-*//; s/-*$//')"
   [ -n "$node" ] || die "cannot derive a node name for the Heimdall panel (set ARCHIVE_NODE)"
   [ "${#node}" -le 40 ] || die "node name longer than 40 characters (set a shorter ARCHIVE_NODE)"
