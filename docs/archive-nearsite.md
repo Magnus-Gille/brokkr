@@ -51,8 +51,11 @@ The panel message starts with every row's status (for example `manifest=pass
 nearsite=pass`), then the details of any row that is not pass or that carries an extras
 note. Exit status: 0 delivered and passing, 1 delivered with a failing row (systemd marks
 the run failed), 2 for everything else: setup (including an unusable state directory or lock
-file), config, a missing Heimdall environment, an interruption before delivery, or a
-delivery failure. The snapshot is `~/.local/state/brokkr/archive-nearsite.json`; delivery stamps
+file), config, a missing or malformed delivery env, an interruption before delivery, a
+delivery failure, or a failure to remove the work directory afterwards. A cleanup failure
+is never allowed to change the result silently: it maps to 2 whatever was delivered (a
+delivered pass does not become 1, and a delivered failing row is reported as 2 with the
+result still delivered). The snapshot is `~/.local/state/brokkr/archive-nearsite.json`; delivery stamps
 use the `archive-nearsite-` prefix.
 
 ## Config
@@ -71,9 +74,37 @@ The directory, manifest and pin come only from this file, never from the environ
 | `ARCHIVE_NEARSITE_MANIFEST_SHA256` | Exactly 64 lowercase hex: the pinned sha256 of that manifest |
 | `ARCHIVE_NODE` | Optional panel node name (default the short hostname, at most 40 characters) |
 
-`archive-nearsite.sh --config FILE --validate` runs only the config and manifest checks:
-no hashing, no delivery, no state. `--verify` refuses (exit 2) without both Heimdall
-variables in the environment.
+`archive-nearsite.sh --config FILE [--delivery-env FILE] --validate` runs only the config
+and manifest checks (and the delivery env's shape, when given): no hashing, no delivery,
+no state. `--verify` requires `--delivery-env FILE` and refuses (exit 2) without it; the
+process environment is never a source of the credential.
+
+## The credential and the clean environment (allowlist)
+
+The Heimdall producer credential lives in a delivery env file shared with other Brokkr
+units. A blacklist of variables to strip from such a file can never be complete (loader
+hooks like `LD_AUDIT`, interpreter user-site hooks like `PYTHONUSERBASE`, `BASH_ENV`,
+exported shell functions, tracing options all exist), so the unit does not load the file
+into an environment at all:
+
+- the unit has no `EnvironmentFile=` and starts the verifier as
+  `/usr/bin/env -i HOME=%h PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 <script>
+  --config <conf> --delivery-env <file> --verify`, so the process begins with exactly
+  those three variables. The command line holds file paths only, never a secret;
+- the script reads `--delivery-env` itself, in-process with shell builtins (no subprocess
+  gets a value on its command line), after checking the file is a regular non-symlink
+  file owned by the user with no group/other permissions;
+- it accepts only the canonical lines `HEIMDALL_HUB_URL=<value>` and
+  `HEIMDALL_FLEET_TOKEN=<value>`, each exactly once and non-empty. An `export` prefix,
+  indentation, spaces around `=`, quotes, a duplicate or an empty value is refused with
+  exit 2 and a message that names the key and never shows a value, a prefix, a length or a
+  hash. Every other line is ignored. The token must be a single unquoted token
+  (`[[:alnum:]._~+/-]+` with up to two `=`, the grammar of
+  `scripts/prepare-heimdall-runtime-env.sh`) and the URL a plain `http(s)` endpoint (the
+  check the other Heimdall tooling here uses);
+- the two values are handed to `heimdall/push.sh` alone, as that one command's environment.
+  No other child process (python, sha256sum, grep) receives them, and the script switches
+  off `xtrace`/`verbose` and unsets `BASH_ENV`/`ENV` first as cheap defence for manual runs.
 
 ## Heimdall producer scope
 
@@ -106,20 +137,14 @@ BROKKR_ARCHIVE_NEARSITE_DELIVERY_ENV=/home/operator/.config/brokkr/env \
 `${XDG_CONFIG_HOME:-~/.config}/brokkr/archive-nearsite.conf`). The preflight requires:
 a non-root user with lingering enabled; the delivery env and the config as regular,
 non-symlink files, mode 600, owned by that user; the delivery env defining
-`HEIMDALL_HUB_URL` and `HEIMDALL_FLEET_TOKEN` once each, non-empty, and none of the
-variables that would let a shared env redirect or instrument the check (`PATH`, `HOME`,
-`TMPDIR`, `BROKKR_STATE_DIR`, `ARCHIVE_*`; shell startup and tracing controls `BASH_ENV`,
-`ENV`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `CDPATH`, `GLOBIGNORE`; exported functions
-`BASH_FUNC_*`; interpreter and loader hooks `PYTHON*`, `LD_PRELOAD`,
-`LD_LIBRARY_PATH`). The unit also lists the fixed names in `UnsetEnvironment=`, which
-systemd applies after `EnvironmentFile=`, so they are removed even if the env file
-changes later. The script itself turns off `xtrace`/`verbose` and unsets `BASH_ENV` and
-`ENV` before reading the token, but `BASH_ENV` would run before any line of the script,
-so the unit setting is the real guard for it. The directory and manifest
-outside the unit's private `/tmp`; GNU `sha256sum` and `python3`; and the shipped
-script's own `--validate` accepting the config, which proves the pin matches the manifest.
-The deploy never creates or modifies the delivery env or any credential, only tests
-the two keys for presence without capturing a value, and prints no value.
+`HEIMDALL_HUB_URL` and `HEIMDALL_FLEET_TOKEN` once each and non-empty (tested with
+`grep -q`, exit status only). There is no forbidden-variable list: other keys in the shared
+file are simply ignored by the verifier, as described above. The directory and manifest
+must lie outside the unit's private `/tmp`; GNU `sha256sum` and `python3` must be present;
+and the shipped script's own `--validate --delivery-env` must accept the config, the
+delivery env's shape and the pin, which proves the pin matches the manifest and exercises
+the same parser the timer run uses. The deploy never creates or modifies the delivery env
+or any credential, and prints no value.
 
 Apply installs `brokkr-archive-nearsite.service` and `.timer` and enables the timer
 (`enable --now`). It does not start the service itself, because a check re-hashes the

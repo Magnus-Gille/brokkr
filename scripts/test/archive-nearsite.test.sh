@@ -77,6 +77,15 @@ fi
 exec $GNU_SHA "\$@"
 FAKE
 chmod 755 "$TMP/gnu/sha256sum"
+# rm wrapper: MOCK_RM_FAIL=1 makes removing the verifier's work directory fail (any other rm works).
+cat >"$TMP/gnu/rm" <<'FAKE'
+#!/usr/bin/env bash
+if [ "${MOCK_RM_FAIL:-0}" = 1 ] && [ "${1:-}" = -rf ] && [[ "${!#}" == */.archive-nearsite.* ]]; then
+  echo "rm: mock failure" >&2; exit 1
+fi
+exec /bin/rm "$@"
+FAKE
+chmod 755 "$TMP/gnu/rm"
 export MOCK_SHA_CALLS="$TMP/sha-calls" MOCK_REQUEST_FILE="$TMP/request.json"
 cat >"$TMP/python/sitecustomize.py" <<'PY'
 import json, os, urllib.request
@@ -108,18 +117,34 @@ TOKEN=token-sentinel-4f9a
 SNAP="$TMP/state/archive-nearsite.json"
 OUTFILE="$TMP/out.txt"
 H=0000000000000000000000000000000000000000000000000000000000000000
-# cmd [NOHUB=1] [NOTOKEN=1] [NAME=value]... -- script arguments...
+# The Heimdall producer credential reaches the verifier only through --delivery-env FILE
+# (the unit starts it with env -i); the process environment of a manual run is ignored.
+DENV="$TMP/delivery.env"
+HUB=http://heimdall.invalid/api/panels
+write_denv() { # lines...
+  printf '%s\n' "$@" >"$DENV"; chmod 600 "$DENV"
+}
+# cmd [NOHUB=1] [NOTOKEN=1] [NODENV=1] [RAWDENV=1] [NAME=value]... -- script arguments...
+# NOHUB/NOTOKEN leave that line out of the delivery env, NODENV passes no --delivery-env,
+# RAWDENV uses the delivery env file as the test left it.
 cmd() {
-  local -a envs=(); local hub=http://heimdall.invalid/api/panels tok=$TOKEN kv
+  local -a envs=(); local nohub=0 notoken=0 nodenv=0 rawdenv=0 kv
   while [ "$1" != -- ]; do
-    case "$1" in NOHUB=1) hub= ;; NOTOKEN=1) tok= ;; *) envs+=("$1") ;; esac
+    case "$1" in NOHUB=1) nohub=1 ;; NOTOKEN=1) notoken=1 ;; NODENV=1) nodenv=1 ;; RAWDENV=1) rawdenv=1 ;; *) envs+=("$1") ;; esac
     shift
   done
   shift
+  local -a dargs=(--delivery-env "$DENV")
+  [ "$nodenv" = 0 ] || dargs=()
+  if [ "$rawdenv" = 0 ]; then
+    : >"$DENV"; chmod 600 "$DENV"
+    [ "$nohub" = 1 ] || printf 'HEIMDALL_HUB_URL=%s\n' "$HUB" >>"$DENV"
+    [ "$notoken" = 1 ] || printf 'HEIMDALL_FLEET_TOKEN=%s\n' "$TOKEN" >>"$DENV"
+  fi
   OUT=$(
-    export PATH="$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" HEIMDALL_HUB_URL="$hub" HEIMDALL_FLEET_TOKEN="$tok"
+    export PATH="$TMP/gnu:$PATH" PYTHONPATH="$TMP/python"
     for kv in ${envs[@]+"${envs[@]}"}; do export "${kv?}"; done
-    bash "$SCRIPT" "$@" 2>&1 </dev/null
+    bash "$SCRIPT" "$@" ${dargs[@]+"${dargs[@]}"} 2>&1 </dev/null
   ) && RC=0 || RC=$?
   printf '%s' "$OUT" >"$OUTFILE"
 }
@@ -307,12 +332,62 @@ check "two modes are refused" '[ "$RC" = 2 ]'
 
 # --- Heimdall delivery -------------------------------------------------------------------------------------
 rm -f "$MOCK_REQUEST_FILE" "$SNAP"
+cmd NODENV=1 -- --config "$CONF" --verify
+check "verify refuses without --delivery-env (exit 2, nothing written)" '[ "$RC" = 2 ] && [[ "$OUT" == *"not configured"* ]] && [ ! -f "$MOCK_REQUEST_FILE" ] && [ ! -f "$SNAP" ]'
+cmd NODENV=1 HEIMDALL_HUB_URL="$HUB" HEIMDALL_FLEET_TOKEN="$TOKEN" -- --config "$CONF" --verify
+check "the process environment is not a source of the credential (exit 2)" '[ "$RC" = 2 ] && [[ "$OUT" == *"not configured"* ]] && [ ! -f "$MOCK_REQUEST_FILE" ] && no_token'
 cmd NOHUB=1 NOTOKEN=1 -- --config "$CONF" --verify
-check "verify refuses without Heimdall delivery (exit 2, nothing written)" '[ "$RC" = 2 ] && [[ "$OUT" == *"not configured"* ]] && [ ! -f "$MOCK_REQUEST_FILE" ] && [ ! -f "$SNAP" ]'
+check "verify refuses an empty delivery env (exit 2)" '[ "$RC" = 2 ] && [[ "$OUT" == *"HEIMDALL_HUB_URL"* ]] && [ ! -f "$MOCK_REQUEST_FILE" ]'
 cmd NOTOKEN=1 -- --config "$CONF" --verify
-check "verify refuses with only a hub URL (exit 2)" '[ "$RC" = 2 ] && [[ "$OUT" == *"not configured"* ]]'
+check "verify refuses with only a hub URL (exit 2)" '[ "$RC" = 2 ] && [[ "$OUT" == *"HEIMDALL_FLEET_TOKEN"* ]]'
 cmd NOHUB=1 -- --config "$CONF" --verify
-check "verify refuses with only a token (exit 2) and does not print it" '[ "$RC" = 2 ] && [[ "$OUT" == *"not configured"* ]] && no_token'
+check "verify refuses with only a token (exit 2) and does not print it" '[ "$RC" = 2 ] && [[ "$OUT" == *"HEIMDALL_HUB_URL"* ]] && no_token'
+
+# The delivery env is parsed in-process: private regular file, the two canonical lines once
+# each and non-empty, every other key ignored. Refusals never print a value.
+denv_refused() { # description line...
+  local desc=$1; shift
+  write_denv "$@"; run --verify RAWDENV=1
+  check "delivery env: $desc" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ] && [ ! -f "$SNAP" ] && no_token && no_hash_run && [[ "$OUT" != *heimdall.invalid* ]]'
+}
+GOODHUB="HEIMDALL_HUB_URL=$HUB"; GOODTOK="HEIMDALL_FLEET_TOKEN=$TOKEN"
+denv_refused "a duplicate token is refused" "$GOODHUB" "$GOODTOK" "HEIMDALL_FLEET_TOKEN=${TOKEN}-other"
+denv_refused "a duplicate hub URL is refused" "$GOODHUB" "$GOODTOK" "HEIMDALL_HUB_URL=http://other.invalid/p"
+denv_refused "an empty token is refused" "$GOODHUB" "HEIMDALL_FLEET_TOKEN="
+denv_refused "an empty hub URL is refused" "HEIMDALL_HUB_URL=" "$GOODTOK"
+denv_refused "a double-quoted token is refused" "$GOODHUB" "HEIMDALL_FLEET_TOKEN=\"$TOKEN\""
+denv_refused "a single-quoted token is refused" "$GOODHUB" "HEIMDALL_FLEET_TOKEN='$TOKEN'"
+denv_refused "an export-prefixed token is refused" "$GOODHUB" "export HEIMDALL_FLEET_TOKEN=$TOKEN"
+denv_refused "an export-prefixed hub URL is refused" "export $GOODHUB" "$GOODTOK"
+denv_refused "whitespace around the token key is refused" "$GOODHUB" "HEIMDALL_FLEET_TOKEN = $TOKEN"
+denv_refused "an indented token line is refused" "$GOODHUB" "  $GOODTOK"
+denv_refused "trailing whitespace in the token is refused" "$GOODHUB" "$GOODTOK "
+denv_refused "a CR in the token is refused" "$GOODHUB" "$GOODTOK"$'\r'
+denv_refused "a token outside the b64token grammar is refused" "$GOODHUB" "HEIMDALL_FLEET_TOKEN=${TOKEN}\$x"
+denv_refused "a token with an embedded space is refused" "$GOODHUB" "HEIMDALL_FLEET_TOKEN=${TOKEN} more"
+denv_refused "a hub URL that is not http(s) is refused" "HEIMDALL_HUB_URL=ftp://heimdall.invalid/p" "$GOODTOK"
+denv_refused "a hub URL with a quote is refused" "HEIMDALL_HUB_URL=\"$HUB\"" "$GOODTOK"
+denv_refused "a hub URL with a space is refused" "HEIMDALL_HUB_URL=$HUB extra" "$GOODTOK"
+write_denv "$GOODHUB" "$GOODTOK"; chmod 640 "$DENV"; run --verify RAWDENV=1
+check "delivery env: a group-readable file is refused" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ] && no_token'
+write_denv "$GOODHUB" "$GOODTOK"; mv "$DENV" "$TMP/delivery.real"; ln -s "$TMP/delivery.real" "$DENV"; run --verify RAWDENV=1
+check "delivery env: a symlink is refused" '[ "$RC" = 2 ] && [[ "$OUT" == *"non-symlink"* ]] && [ ! -f "$MOCK_REQUEST_FILE" ] && no_token'
+rm -f "$DENV" "$TMP/delivery.real"; run --verify RAWDENV=1
+check "delivery env: a missing file is refused" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ]'
+mkdir -p "$TMP/.config/brokkr"
+printf '%s\n' "$GOODHUB" "$GOODTOK" >"$TMP/.config/brokkr/env"; chmod 600 "$TMP/.config/brokkr/env"
+rm -f "$MOCK_REQUEST_FILE" "$SNAP"; : >"$MOCK_SHA_CALLS"
+cmd RAWDENV=1 NODENV=1 -- --config "$CONF" --verify --delivery-env "$TMP/.config/brokkr/env"
+check "delivery env: the usual ~/.config/brokkr/env location (a hidden directory) is accepted" '[ "$RC" = 0 ] && [ "$(panel)" = "archive-nearsite-nas-host pass" ]'
+rm -rf "$TMP/.config"
+write_denv "# comment" "" "UNRELATED=1" "$GOODHUB" "HEIMDALL_FLEET_TOKEN_EXTRA=ignored" "$GOODTOK" "export OTHER=2" "PATH=/evil"
+run --verify RAWDENV=1
+check "delivery env: comments, blank lines and every other key are ignored" '[ "$RC" = 0 ] && [ "$(panel)" = "archive-nearsite-nas-host pass" ]'
+write_denv "$GOODHUB" "HEIMDALL_FLEET_TOKEN=Abc._~+/-xyz0123=="
+run --validate RAWDENV=1
+check "delivery env: the full b64token alphabet is accepted (validate checks the same parser)" '[ "$RC" = 0 ]'
+write_denv "$GOODHUB" "HEIMDALL_FLEET_TOKEN=$TOKEN$TOKEN"; chmod 640 "$DENV"; run --validate RAWDENV=1
+check "delivery env: validate refuses a group-readable file too, still delivering nothing" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ]'
 verify MOCK_HTTP_FAIL=1
 check "failed Heimdall delivery exits 2 and keeps the snapshot" '[ "$RC" = 2 ] && [[ "$OUT" == *"Heimdall delivery failed"* ]] && [ -f "$SNAP" ] && no_token'
 printf '%s  forged\n' "$H" >>"$MAN"
@@ -324,8 +399,8 @@ cp "$TMP/manifest.good" "$MAN"
 rm -rf "$TMP/state"
 run --validate
 check "validate passes and writes no state, delivery, or hash run" '[ "$RC" = 0 ] && [[ "$OUT" == *"4 manifest entries"* ]] && [ ! -e "$TMP/state" ] && [ ! -f "$MOCK_REQUEST_FILE" ] && no_hash_run'
-cmd NOHUB=1 NOTOKEN=1 -- --config "$CONF" --validate
-check "validate needs no Heimdall environment" '[ "$RC" = 0 ]'
+cmd NODENV=1 -- --config "$CONF" --validate
+check "validate needs no delivery env" '[ "$RC" = 0 ]'
 printf 'x' >>"$MAN"
 run --validate
 check "validate fails on a manifest that does not match the pin (exit 2, no hashing)" '[ "$RC" = 2 ] && [[ "$OUT" == *"does not match the pinned value"* ]] && no_hash_run'
@@ -339,18 +414,19 @@ check "validate output holds no file names or token" 'no_names && no_token'
 check "validate leaves no scratch directory behind" '[ -z "$(find "$TMPDIR" -mindepth 1 -print)" ]'
 
 # --- hardening: tracing, startup files, stdin, the staged copy, exit codes -------------------------------
-# The shared EnvironmentFile must not be able to leak the token or run code. BASH_ENV runs
-# before any line of the script, so the unit's UnsetEnvironment= is its real guard (see the
-# deploy test); the script clears SHELLOPTS tracing and BASH_ENV for everything it starts.
+# The unit starts the verifier with `env -i` and hands it the delivery env as a file, so
+# nothing the shared env file sets can reach it (an allowlist, not a list of bad names). The
+# script still switches off tracing and BASH_ENV/ENV itself as cheap defence for manual runs.
 cp "$TMP/manifest.good" "$MAN"; write_conf
+write_denv "$GOODHUB" "$GOODTOK"
 # An exported SHELLOPTS reaches every child bash with the script's own options (errexit,
 # nounset), which breaks interpreter version-manager shims; use the real interpreter here.
 mkdir -p "$TMP/realpy"
 ln -s "$(python3 -I -c 'import sys; print(sys.executable)')" "$TMP/realpy/python3"
 raw_run() { # extra env assignment for env(1); captures OUT and RC like cmd
   rm -f "$MOCK_REQUEST_FILE" "$SNAP"; : >"$MOCK_SHA_CALLS"
-  OUT=$(env "$1" PATH="$TMP/realpy:$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels \
-    HEIMDALL_FLEET_TOKEN=$TOKEN bash "$SCRIPT" --verify --config "$CONF" 2>&1 </dev/null) && RC=0 || RC=$?
+  OUT=$(env "$1" PATH="$TMP/realpy:$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" \
+    bash "$SCRIPT" --verify --config "$CONF" --delivery-env "$DENV" 2>&1 </dev/null) && RC=0 || RC=$?
   printf '%s' "$OUT" >"$OUTFILE"
 }
 raw_run SHELLOPTS=xtrace
@@ -360,8 +436,8 @@ rm -f "$TMP/bashenv-count"
 raw_run BASH_ENV="$TMP/bashenv.sh"
 check "BASH_ENV is not inherited by the child bash processes the script starts" '[ "$RC" = 0 ] && [ "$(wc -l <"$TMP/bashenv-count" | tr -d " ")" = 1 ]'
 rm -f "$MOCK_REQUEST_FILE" "$SNAP"; : >"$MOCK_SHA_CALLS"
-printf 'caller-stdin' | env PATH="$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels \
-  HEIMDALL_FLEET_TOKEN=$TOKEN bash "$SCRIPT" --verify --config "$CONF" >"$OUTFILE" 2>&1
+printf 'caller-stdin' | env PATH="$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" \
+  bash "$SCRIPT" --verify --config "$CONF" --delivery-env "$DENV" >"$OUTFILE" 2>&1
 RC=$?
 check "the hash run reads /dev/null, never the caller's stdin" '[ "$RC" = 0 ] && grep -qx "stdin_bytes=0" "$MOCK_SHA_CALLS"'
 verify MOCK_SWAP_MANIFEST="$MAN"
@@ -384,8 +460,8 @@ else
 fi
 rm -f "$MOCK_REQUEST_FILE" "$SNAP"; : >"$MOCK_SHA_CALLS"
 (
-  export PATH="$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN="$TOKEN" MOCK_SHA_SLEEP=3
-  exec bash "$SCRIPT" --verify --config "$CONF" >"$OUTFILE" 2>&1 </dev/null
+  export PATH="$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" MOCK_SHA_SLEEP=3
+  exec bash "$SCRIPT" --verify --config "$CONF" --delivery-env "$DENV" >"$OUTFILE" 2>&1 </dev/null
 ) &
 pid=$!
 for _ in $(seq 1 100); do grep -q 'sha256sum --check' "$MOCK_SHA_CALLS" && break; sleep 0.1; done
@@ -393,6 +469,57 @@ kill -TERM "$pid"
 wait "$pid"; RC=$?
 OUT=$(cat "$OUTFILE")
 check "a signal before delivery exits 2 and delivers nothing" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ] && [ -z "$(find "$TMP/state" -name ".archive-nearsite.*")" ]'
+
+# --- the unit's clean environment: only the two delivery values reach push.sh -----------------------------
+# A release-shaped tree whose push.sh is a fake that records variable NAMES (never values) and
+# whether the credential matches, so an injected variable would show up by name.
+REL="$TMP/rel"; mkdir -p "$REL/scripts" "$REL/heimdall"
+cp "$SCRIPT" "$REL/scripts/archive-nearsite.sh"
+printf '%s' "$TOKEN" >"$TMP/expected-token"
+cat >"$REL/heimdall/push.sh" <<FAKE
+#!/usr/bin/env bash
+compgen -e | LC_ALL=C sort >"$TMP/push-names"
+printf 'path=%s\nhome=%s\nhub_ok=%s\ntoken_ok=%s\n' "\$PATH" "\$HOME" \\
+  "\$([ "\${HEIMDALL_HUB_URL:-}" = "$HUB" ] && echo 1 || echo 0)" \\
+  "\$([ "\${HEIMDALL_FLEET_TOKEN:-}" = "\$(cat "$TMP/expected-token")" ] && echo 1 || echo 0)" >"$TMP/push-info"
+exit 0
+FAKE
+chmod 755 "$REL/heimdall/push.sh"
+write_conf "ARCHIVE_NODE=nas-host"
+write_denv "$GOODHUB" "$GOODTOK" "LD_AUDIT=/evil.so" "LD_PRELOAD=/evil.so" "LD_LIBRARY_PATH=/evil" "PYTHONUSERBASE=/evil" \
+  "PYTHONPATH=/evil" "PYTHONSTARTUP=/evil.py" "BASH_ENV=/evil.sh" "ENV=/evil.sh" "SHELLOPTS=xtrace" "BASHOPTS=extdebug" \
+  "PS4=evil" 'BASH_FUNC_x%%=() { echo evil; }' "PATH=/evil" "HOME=/evil" "TMPDIR=/evil" "BROKKR_STATE_DIR=/evil" "ARCHIVE_NODE=evil"
+UNIT_PATH="$TMP/realpy:$TMP/gnu:/usr/local/bin:/usr/bin:/bin"
+rm -f "$TMP/push-names" "$TMP/push-info"
+OUT=$(env -i HOME="$HOME" PATH="$UNIT_PATH" LANG=C.UTF-8 \
+  bash "$REL/scripts/archive-nearsite.sh" --config "$CONF" --delivery-env "$DENV" --verify 2>&1 </dev/null) && RC=0 || RC=$?
+printf '%s' "$OUT" >"$OUTFILE"
+check "env -i start: delivered despite a hostile delivery env" '[ "$RC" = 0 ] && [ -s "$TMP/push-names" ]'
+check "env -i start: push.sh gets exactly the credential and the hub URL, intact" 'grep -qx "hub_ok=1" "$TMP/push-info" && grep -qx "token_ok=1" "$TMP/push-info" && grep -qx HEIMDALL_HUB_URL "$TMP/push-names" && grep -qx HEIMDALL_FLEET_TOKEN "$TMP/push-names"'
+for var in LD_AUDIT LD_PRELOAD LD_LIBRARY_PATH PYTHONUSERBASE PYTHONPATH PYTHONSTARTUP BASH_ENV ENV SHELLOPTS BASHOPTS PS4 TMPDIR; do
+  check "env -i start: $var from the delivery env never reaches push.sh" '! grep -qx "$var" "$TMP/push-names"'
+done
+check "env -i start: no exported bash function (BASH_FUNC_*) reaches push.sh" '! grep -q "^BASH_FUNC_" "$TMP/push-names"'
+check "env -i start: PATH and HOME overrides in the delivery env are ignored" 'grep -qx "path=$UNIT_PATH" "$TMP/push-info" && grep -qx "home=$HOME" "$TMP/push-info" && ! grep -q "/evil" "$TMP/push-info"'
+check "env -i start: BROKKR_STATE_DIR from the delivery env is ignored (snapshot under HOME)" '[ -f "$HOME/.local/state/brokkr/archive-nearsite.json" ] && [ ! -e /evil ]'
+check "env -i start: no sentinel substring in the output" 'no_token'
+write_conf; write_denv "$GOODHUB" "$GOODTOK"
+
+# --- cleanup failures are explicit: exit 2, never a silently changed result ---------------------------------
+drop_work() { find "$TMP/state" -name '.archive-nearsite.*' -type d -exec /bin/rm -rf {} + 2>/dev/null; return 0; }
+verify MOCK_RM_FAIL=1
+check "a cleanup failure after a delivered pass exits 2 (not 1), result still delivered" '[ "$RC" = 2 ] && [ "$(panel)" = "archive-nearsite-nas-host pass" ] && [[ "$OUT" == *"work directory"* ]]'
+drop_work
+printf '%s  forged\n' "$H" >>"$MAN"
+verify MOCK_RM_FAIL=1
+check "a cleanup failure after a delivered failing row exits 2 (not 1), result still delivered" '[ "$RC" = 2 ] && [ "$(panel)" = "archive-nearsite-nas-host fail" ] && [[ "$OUT" == *"work directory"* ]]'
+drop_work
+verify MOCK_RM_FAIL=1 MOCK_HTTP_FAIL=1
+check "a cleanup failure after a delivery failure exits 2 (not 1)" '[ "$RC" = 2 ] && [[ "$OUT" == *"Heimdall delivery failed"* ]]'
+drop_work
+cp "$TMP/manifest.good" "$MAN"
+verify
+check "without a cleanup failure the same runs keep their codes (pass 0)" '[ "$RC" = 0 ]'
 
 echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

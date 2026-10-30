@@ -143,16 +143,11 @@ for key in HEIMDALL_HUB_URL HEIMDALL_FLEET_TOKEN; do
   [ "$(grep -Ec "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$DELIVERY_ENV")" = 1 ] \
     || refuse "delivery env must define $key exactly once"
 done
-# systemd applies EnvironmentFile after Environment=, so this file (shared with other
-# brokkr units) must not be able to redirect what this unit runs or reads, for example
-# the state directory or an ARCHIVE_* variable, nor inject shell startup files (BASH_ENV,
-# ENV), tracing that would write the token to the journal (SHELLOPTS, BASHOPTS, PS4),
-# exported shell functions (BASH_FUNC_*), or interpreter and loader hooks. The unit also
-# lists the fixed names in UnsetEnvironment=. Unrelated keys are allowed.
-forbidden='PATH|HOME|TMPDIR|BROKKR_STATE_DIR|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PS4|CDPATH|GLOBIGNORE|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PYTHONINSPECT|LD_PRELOAD|LD_LIBRARY_PATH|BASH_FUNC_[^=[:space:]]*|ARCHIVE_[A-Z0-9_]*'
-if bad_key=$(grep -Eo "^[[:space:]]*(export[[:space:]]+)?($forbidden)[[:space:]]*=" "$DELIVERY_ENV" | head -n 1) && [ -n "$bad_key" ]; then
-  refuse "delivery env must not set the verifier-controlling variable ${bad_key%%=*}"
-fi
+# There is deliberately no list of forbidden variables for this file (it is shared with
+# other brokkr units): the unit does not load it into an environment at all. It starts the
+# verifier under `env -i` and passes the file as --delivery-env, and the verifier takes only
+# the two Heimdall lines and ignores every other key, so an extra variable (LD_AUDIT,
+# BASH_ENV, PYTHONUSERBASE, an exported function, anything) cannot reach any process.
 command -v python3 >/dev/null 2>&1 || refuse "python3 is required"
 command -v bash >/dev/null 2>&1 || refuse "bash is required"
 # Captured first: a closing `grep -q` must not fail the check through SIGPIPE.
@@ -168,24 +163,25 @@ for unit in brokkr-archive-nearsite.service brokkr-archive-nearsite.timer; do
     refuse "unit backup $unit.previous-$REVISION already exists"
   fi
 done
-# Runs an archive-nearsite.sh in --validate mode against the near-site config. The mode
-# parses the config, checks that the manifest matches the pinned sha256 and is well
-# formed, and checks that the directory exists; it hashes nothing and prints counts
-# only. A scratch state dir keeps it away from the node's real state directory so a
+# Runs an archive-nearsite.sh in --validate mode against the near-site config and the
+# delivery env. The mode parses the config, checks the delivery env's shape with the same
+# parser --verify uses (in-process, no value printed), checks that the manifest matches
+# the pinned sha256 and is well formed, and checks that the directory exists; it hashes
+# nothing, delivers nothing and prints counts only. A scratch state dir keeps it away from the node's real state directory so a
 # dry-run leaves nothing behind.
 validate_nearsite() { # script path, or - to read the script from stdin
   vstate=$(mktemp -d) || refuse "cannot create a scratch directory"
   vscript=$1
   # A script piped to `bash -s` has no BASH_SOURCE, so give stdin input a real file.
   if [ "$vscript" = - ]; then vscript=$vstate/archive-nearsite.sh; cat >"$vscript"; fi
-  if vout=$(BROKKR_STATE_DIR="$vstate" TMPDIR="$vstate" bash "$vscript" --config "$ARCHIVE_CONFIG" --validate 2>&1 </dev/null); then vrc=0; else vrc=$?; fi
+  if vout=$(BROKKR_STATE_DIR="$vstate" TMPDIR="$vstate" bash "$vscript" --config "$ARCHIVE_CONFIG" --delivery-env "$DELIVERY_ENV" --validate 2>&1 </dev/null); then vrc=0; else vrc=$?; fi
   rm -rf "$vstate"
   if [ -n "$vout" ]; then printf '%s\n' "$vout" | sed 's/^/preflight: /'; fi
   [ "$vrc" = 0 ] || refuse "near-site config or manifest rejected by the shipped verifier (--validate exit $vrc)"
 }
 echo "preflight: runtime user $user (not root), user lingering enabled"
 echo "preflight: delivery env and near-site config are private regular files owned by $user"
-echo "preflight: delivery env has non-empty HEIMDALL_HUB_URL and HEIMDALL_FLEET_TOKEN (values not read)"
+echo "preflight: delivery env defines HEIMDALL_HUB_URL and HEIMDALL_FLEET_TOKEN once each (values never printed)"
 echo "preflight: GNU sha256sum and python3 present"
 echo "preflight: release target $release (absent)"
 echo "preflight: user unit directory $unit_dir"

@@ -2,33 +2,39 @@
 # Brokkr · self-check of the near-site copy of an immutable archive, run on the near-site
 # host itself and reported as a per-node Heimdall panel. See docs/archive-nearsite.md.
 #
-#   archive-nearsite.sh [--config FILE] --validate | --verify
+#   archive-nearsite.sh [--config FILE] [--delivery-env FILE] --validate | --verify
 #
 # --verify (monthly, from brokkr-archive-nearsite.timer) first proves that the manifest
 # on this host is byte-identical to the one pinned in the config (the trust anchor), then
 # runs `sha256sum --check` of that manifest against the near-site directory. --validate
 # runs only the config and manifest checks: no hashing, no delivery, no state. The host
 # computes the hashes itself, so no ssh access and no new credential is involved; delivery
-# uses the Heimdall producer credential already present in the runtime environment.
-# Tracing and startup files must never see the delivery token: a shared EnvironmentFile
-# could otherwise set SHELLOPTS=xtrace (the token test below would then be traced into the
-# journal) or BASH_ENV (which would run before any line here; the unit's UnsetEnvironment=
-# is the guard for that one). Drop them before anything else, for children too.
+# uses the Heimdall producer credential already present in the host's delivery env file.
+#
+# The unit starts this script with `env -i`, so nothing a shared env file sets can reach
+# it. The credential is read here, from --delivery-env FILE, with shell builtins only (no
+# subprocess gets a value on its command line): the two canonical lines HEIMDALL_HUB_URL=
+# and HEIMDALL_FLEET_TOKEN=, each exactly once; every other line is ignored. Only
+# heimdall/push.sh receives the two values, and nothing prints them. --verify requires the
+# option; the process environment is not a source of the credential.
+# Tracing and startup files are switched off first as cheap defence for manual runs.
 set +o xtrace +o verbose
-unset BASH_ENV ENV
+unset BASH_ENV ENV HEIMDALL_HUB_URL HEIMDALL_FLEET_TOKEN
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 STATE_DIR="${BROKKR_STATE_DIR:-${HOME:-/var/lib/brokkr}/.local/state/brokkr}"
 
 die() { echo "brokkr archive-nearsite: $*" >&2; exit 2; }
-usage() { die "usage: $0 [--config FILE] --validate|--verify"; }
+usage() { die "usage: $0 [--config FILE] [--delivery-env FILE] --validate|--verify"; }
 
 MODE=""
 CONFIG=""
+DELIVERY_ENV=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --config) [ "$#" -ge 2 ] || usage; CONFIG=$2; shift 2 ;;
+    --delivery-env) [ "$#" -ge 2 ] || usage; DELIVERY_ENV=$2; shift 2 ;;
     --validate|--verify) [ -z "$MODE" ] || usage; MODE=$1; shift ;;
     *) usage ;;
   esac
@@ -42,15 +48,21 @@ done
 # env) cannot redirect the check or replace the pin.
 CONFIG_KEYS=" ARCHIVE_NEARSITE_DIR ARCHIVE_NEARSITE_MANIFEST ARCHIVE_NEARSITE_MANIFEST_SHA256 ARCHIVE_NODE "
 unset ARCHIVE_NEARSITE_DIR ARCHIVE_NEARSITE_MANIFEST ARCHIVE_NEARSITE_MANIFEST_SHA256
-load_config() {
-  local file=$1 meta line key value seen=" "
-  local sq_re=$'^\'([^\']*)\'$' dq_re=$'^"([^"\\$`]*)"$' bad_re=$'[\'"\\$`[:space:]]'
-  [ -f "$file" ] && [ ! -L "$file" ] || die "config must be a regular non-symlink file: $file"
+# A sourced-never input file (config or delivery env) must be a regular, non-symlink file
+# owned by the current user with no group/other permissions.
+private_file() { # file label
+  local file=$1 label=$2 meta
+  [ -f "$file" ] && [ ! -L "$file" ] || die "$label must be a regular non-symlink file: $file"
   if ! meta=$(stat -c '%u %a' "$file" 2>/dev/null); then
-    meta=$(stat -f '%u %Lp' "$file" 2>/dev/null) || die "cannot inspect config: $file"
+    meta=$(stat -f '%u %Lp' "$file" 2>/dev/null) || die "cannot inspect $label: $file"
   fi
-  [ "${meta%% *}" = "$(id -u)" ] || die "config must be owned by the current user: $file"
-  case "${meta##* }" in *00) ;; *) die "config must have no group/other permissions: $file" ;; esac
+  [ "${meta%% *}" = "$(id -u)" ] || die "$label must be owned by the current user: $file"
+  case "${meta##* }" in *00) ;; *) die "$label must have no group/other permissions: $file" ;; esac
+}
+load_config() {
+  local file=$1 line key value seen=" "
+  local sq_re=$'^\'([^\']*)\'$' dq_re=$'^"([^"\\$`]*)"$' bad_re=$'[\'"\\$`[:space:]]'
+  private_file "$file" config
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "config line is not KEY=value: $file"
@@ -82,8 +94,41 @@ plain_path "$NS_DIR" || die "ARCHIVE_NEARSITE_DIR must be an absolute plain path
 plain_path "$MAN" || die "ARCHIVE_NEARSITE_MANIFEST must be an absolute plain path"
 [[ "$PIN" =~ ^[0-9a-f]{64}$ ]] || die "ARCHIVE_NEARSITE_MANIFEST_SHA256 must be exactly 64 lowercase hex characters"
 
+# The delivery env is parsed here, in-process: bash builtins only, so no subprocess sees a
+# value on its command line, and nothing below prints one. Refusals name the key, never a
+# value. The values stay in these two variables and are handed to push.sh alone.
+DE_HUB="" DE_TOKEN=""
+load_delivery_env() {
+  local file=$1 line key hub_n=0 tok_n=0
+  # Any spelling of the two keys (export, indentation, spaces before =) must be canonical.
+  local loose_re='^[[:space:]]*(export[[:space:]]+)?(HEIMDALL_HUB_URL|HEIMDALL_FLEET_TOKEN)[[:space:]]*='
+  local canon_re='^(HEIMDALL_HUB_URL|HEIMDALL_FLEET_TOKEN)=(.*)$'
+  # The unit runs from its release directory, so a relative path would change meaning.
+  [[ "$file" == /* ]] || die "--delivery-env must be an absolute path"
+  private_file "$file" "delivery env"
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ $loose_re ]] || continue
+    key=${BASH_REMATCH[2]}
+    [[ "$line" =~ $canon_re ]] || die "delivery env: $key must be written exactly as $key=<value>"
+    if [ "$key" = HEIMDALL_HUB_URL ]; then
+      hub_n=$((hub_n + 1)); DE_HUB=${BASH_REMATCH[2]}
+    else
+      tok_n=$((tok_n + 1)); DE_TOKEN=${BASH_REMATCH[2]}
+    fi
+  done <"$file"
+  [ "$hub_n" = 1 ] || die "delivery env must define HEIMDALL_HUB_URL exactly once"
+  [ "$tok_n" = 1 ] || die "delivery env must define HEIMDALL_FLEET_TOKEN exactly once"
+  # The endpoint check used by the other Heimdall tooling here, and the single unquoted
+  # b64token alphabet of scripts/prepare-heimdall-runtime-env.sh.
+  [[ "$DE_HUB" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || die "delivery env: HEIMDALL_HUB_URL must be a non-empty plain http(s) endpoint"
+  [[ "$DE_TOKEN" =~ ^[[:alnum:]._~+/\-]+={0,2}$ ]] || die "delivery env: HEIMDALL_FLEET_TOKEN must be a non-empty single unquoted token"
+}
+if [ "$MODE" = --verify ] && [ -z "$DELIVERY_ENV" ]; then
+  die "Heimdall delivery is not configured (--delivery-env FILE is required for --verify)"
+fi
+if [ -n "$DELIVERY_ENV" ]; then load_delivery_env "$DELIVERY_ENV"; fi
+
 if [ "$MODE" = --verify ]; then
-  [ -n "${HEIMDALL_HUB_URL:-}" ] && [ -n "${HEIMDALL_FLEET_TOKEN:-}" ] || die "Heimdall delivery is not configured"
   # One panel per node, as for link health: a shared panel would let one node hide another.
   node_raw="${ARCHIVE_NODE:-$(hostname -s 2>/dev/null || hostname 2>/dev/null)}"
   node="$(printf '%s' "${node_raw%%.*}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | tr -s '-' | sed 's/^-*//; s/-*$//')"
@@ -103,10 +148,17 @@ fi
 # Exit 1 means "delivered, with a failing row" and nothing else. Any other abort (an
 # unexpected error under set -e, an interruption before delivery) is a setup failure, 2.
 RESULT_DELIVERED_FAIL=0
+# A failed cleanup is a setup failure too (2), whatever was delivered: it never turns a
+# pass into a failing row (1) or hides itself behind an unrelated status.
 cleanup() {
-  local rc=$?
-  rm -rf "$WORK"
+  local rc=$? failed=0
+  rm -rf "$WORK" || failed=1
+  if [ "$failed" = 1 ]; then
+    echo "brokkr archive-nearsite: could not remove the work directory" >&2
+    exit 2
+  fi
   if [ "$rc" != 0 ] && [ "$RESULT_DELIVERED_FAIL" != 1 ]; then exit 2; fi
+  exit "$rc"
 }
 trap cleanup EXIT
 trap 'exit 2' HUP INT TERM
@@ -291,6 +343,8 @@ overall=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["st
 printf '%s %s\n' "$(date -u +%FT%TZ)" "verify complete: $overall"
 
 # A failing result is still evidence and is delivered; the exit code then records it.
+HEIMDALL_HUB_URL="$DE_HUB" \
+HEIMDALL_FLEET_TOKEN="$DE_TOKEN" \
 BROKKR_HEIMDALL_PANEL="archive-nearsite-$node" \
 BROKKR_HEIMDALL_LABEL="Archive Near-site Verification ($node)" \
 BROKKR_HEIMDALL_STAMP_PREFIX="archive-nearsite-" \

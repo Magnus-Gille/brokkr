@@ -285,21 +285,32 @@ refuses_release() { # an existing release must be refused without touching syste
 refuses_release
 check "existing release directory is left untouched" '[[ "$(cat "$RELEASE/marker")" == precious && "$(find "$RELEASE" -type f | wc -l | tr -d " ")" -eq 1 ]]'
 
-# --- delivery env may not redirect the verifier; shared unrelated keys are fine -------------
-for forbidden in ARCHIVE_NEARSITE_DIR ARCHIVE_NEARSITE_MANIFEST_SHA256 ARCHIVE_NODE BROKKR_STATE_DIR TMPDIR PATH BASH_ENV ENV SHELLOPTS BASHOPTS PS4 CDPATH GLOBIGNORE PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT LD_PRELOAD LD_LIBRARY_PATH; do
+# --- the delivery env is an allowlist input: only its two Heimdall lines are used ------------
+# The unit starts the verifier under env -i and reads the two lines itself, so there is no
+# list of forbidden variables: extra keys are ignored, whatever they are, and the preflight
+# runs the shipped parser (--validate --delivery-env) to prove the file's shape.
+for extra in LD_AUDIT LD_PRELOAD PYTHONUSERBASE PYTHONPATH BASH_ENV SHELLOPTS PATH HOME ARCHIVE_NODE; do
   reset
-  printf '%b%s=/tmp/redirect\n' "$HEAD_ENV" "$forbidden" >"$DELIVERY_ENV"
-  refuses "delivery env setting $forbidden refuses" "verifier-controlling variable" "$TARGET"
+  printf '%b%s=/tmp/redirect\n' "$HEAD_ENV" "$extra" >"$DELIVERY_ENV"
+  run "$TARGET"
+  check "a hostile $extra line in a shared delivery env is ignored, not an error (dry-run)" '[[ "$RC" -eq 0 && "$OUT" == *DRY-RUN* ]] && no_mutation'
 done
 reset
 printf '%bBASH_FUNC_evil%%%%=() { :; }\n' "$HEAD_ENV" >"$DELIVERY_ENV"
-refuses "delivery env exporting a bash function (BASH_FUNC_*) refuses" "verifier-controlling variable" "$TARGET"
+run "$TARGET"
+check "an exported-function line in a shared delivery env is ignored (dry-run)" '[[ "$RC" -eq 0 ]]'
 reset
-printf '%bexport BASH_ENV=/tmp/x\n' "$HEAD_ENV" >"$DELIVERY_ENV"
-refuses "delivery env with an export-prefixed BASH_ENV refuses" "verifier-controlling variable" "$TARGET"
+printf 'HEIMDALL_HUB_URL=https://heimdall.example.invalid/api/panels\nHEIMDALL_FLEET_TOKEN="secret-sentinel"\n' >"$DELIVERY_ENV"
+refuses "a quoted token is rejected by the shipped parser" "rejected by the shipped verifier" "$TARGET"
 reset
-printf '%bexport ARCHIVE_NEARSITE_MANIFEST=/tmp/x\n' "$HEAD_ENV" >"$DELIVERY_ENV"
-refuses "delivery env with an export-prefixed forbidden key refuses" "verifier-controlling variable" "$TARGET"
+printf 'HEIMDALL_HUB_URL=https://heimdall.example.invalid/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel$x\n' >"$DELIVERY_ENV"
+refuses "a token outside the b64token grammar is rejected by the shipped parser" "rejected by the shipped verifier" "$TARGET"
+reset
+printf 'HEIMDALL_HUB_URL="https://heimdall.example.invalid/api/panels"\nHEIMDALL_FLEET_TOKEN=secret-sentinel\n' >"$DELIVERY_ENV"
+refuses "a quoted hub URL is rejected by the shipped parser" "rejected by the shipped verifier" "$TARGET"
+reset
+printf 'export HEIMDALL_HUB_URL=https://heimdall.example.invalid/api/panels\nHEIMDALL_FLEET_TOKEN=secret-sentinel\n' >"$DELIVERY_ENV"
+refuses "an export-prefixed hub URL refuses" "HEIMDALL_HUB_URL" "$TARGET"
 reset
 printf '%bHEIMDALL_FLEET_TOKEN=other-secret\n' "$HEAD_ENV" >"$DELIVERY_ENV"
 refuses "duplicate HEIMDALL_FLEET_TOKEN refuses" "exactly once" "$TARGET"
@@ -320,7 +331,7 @@ rm -f "$HOME_DIR/.config/brokkr/custom.conf"
 reset
 mv "$DELIVERY_ENV" "$HOME_DIR/.config/brokkr/env"
 BROKKR_ARCHIVE_NEARSITE_DELIVERY_ENV="$HOME_DIR/.config/brokkr/env" run "$TARGET" --apply
-check "the delivery env path is a parameter (env instead of heimdall.env)" '[[ "$RC" -eq 0 ]] && grep -Fxq "EnvironmentFile=$HOME_DIR/.config/brokkr/env" "$SERVICE"'
+check "the delivery env path is a parameter (env instead of heimdall.env)" '[[ "$RC" -eq 0 ]] && grep -Fq -- "--delivery-env $HOME_DIR/.config/brokkr/env --verify" "$SERVICE"'
 rm -f "$HOME_DIR/.config/brokkr/env"
 
 # --- --apply: install --------------------------------------------------------------------------
@@ -343,12 +354,11 @@ check "release holds exactly the verifier, push helper, templates, and rendered 
 check "unrelated repository files never ship" '[[ ! -e "$RELEASE/README.md" ]]'
 check "release files are executable where needed and private" '[[ -x "$RELEASE/scripts/archive-nearsite.sh" && -x "$RELEASE/heimdall/push.sh" && "$(stat -c %a "$RELEASE" 2>/dev/null || stat -f %Lp "$RELEASE")" == 700 ]]'
 check "no staging directory is left behind" '[[ -z "$(find "$HOME_DIR/.local/lib/brokkr/archive-nearsite" -maxdepth 1 -name ".stage.*")" ]]'
-check "unit renders the exact SHA, delivery env, and config path" 'grep -Fxq "ExecStart=%h/.local/lib/brokkr/archive-nearsite/releases/$SHA/scripts/archive-nearsite.sh --config $CONFIG --verify" "$SERVICE" && grep -Fxq "WorkingDirectory=%h/.local/lib/brokkr/archive-nearsite/releases/$SHA" "$SERVICE" && grep -Fxq "EnvironmentFile=$DELIVERY_ENV" "$SERVICE"'
+check "unit renders the exact SHA, delivery env, and config path under a clean environment" 'grep -Fxq "ExecStart=/usr/bin/env -i HOME=%h PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 %h/.local/lib/brokkr/archive-nearsite/releases/$SHA/scripts/archive-nearsite.sh --config $CONFIG --delivery-env $DELIVERY_ENV --verify" "$SERVICE" && grep -Fxq "WorkingDirectory=%h/.local/lib/brokkr/archive-nearsite/releases/$SHA" "$SERVICE"'
+check "rendered unit loads no EnvironmentFile and has no blacklist (allowlist model)" '! grep -Eq "^(EnvironmentFile|UnsetEnvironment|PassEnvironment|Environment)=" "$SERVICE"'
+check "no secret is on the rendered command line (only file paths follow --delivery-env and --config)" '! grep -q "secret-sentinel" "$SERVICE" && ! grep -Eq "^ExecStart=.*(HEIMDALL_|TOKEN)" "$SERVICE"'
 check "rendered unit has no leftover placeholders, system-only directives, or old layout" '! grep -Eq "@[A-Z_]+@|^OnFailure|^User=|^SupplementaryGroups|/opt/brokkr|/home/brokkr|rclone" "$SERVICE" && grep -Fxq NoNewPrivileges=yes "$SERVICE" && grep -Fxq PrivateTmp=yes "$SERVICE"'
 check "rendered unit is sandboxed: read-only home, only the state dir writable, 12h timeout" 'grep -Fxq ProtectSystem=strict "$SERVICE" && grep -Fxq ProtectHome=read-only "$SERVICE" && grep -Fxq "ReadWritePaths=%h/.local/state/brokkr" "$SERVICE" && grep -Fxq TimeoutStartSec=12h "$SERVICE" && grep -Fxq Nice=10 "$SERVICE" && grep -Fxq IOSchedulingClass=idle "$SERVICE"'
-for var in BASH_ENV ENV SHELLOPTS BASHOPTS PS4 CDPATH GLOBIGNORE PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT LD_PRELOAD LD_LIBRARY_PATH; do
-  check "rendered unit unsets $var after the EnvironmentFile (UnsetEnvironment=)" 'grep -E "^UnsetEnvironment=" "$SERVICE" | tr " =" "\n\n" | grep -qx "$var"'
-done
 check "apply says a catch-up run can start after an upgrade and not on a first install" '[[ "$OUT" == *"catch-up"* && "$OUT" == *"first install"* ]]'
 check "timer runs on the 2nd, after the archive node's run on the 1st" 'grep -Fxq "OnCalendar=*-*-02 03:30:00" "$TIMER" && grep -Fxq Persistent=true "$TIMER" && grep -Fxq RandomizedDelaySec=2h "$TIMER"'
 check "timer is installed from the template" 'cmp -s "$TIMER" "$REPO/systemd/user/brokkr-archive-nearsite.timer"'
