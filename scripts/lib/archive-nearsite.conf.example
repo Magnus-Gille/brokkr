@@ -1,0 +1,17 @@
+# Brokkr · archive near-site self-check config (example). Copy to
+# ~/.config/brokkr/archive-nearsite.conf on the near-site host (the NAS that holds the
+# copy), then `chmod 600`. scripts/archive-nearsite.sh parses this file (it is never
+# sourced): KEY=value lines, only the keys below, each at most once, values plain or
+# wholly quoted with no $ or backticks. See docs/archive-nearsite.md.
+
+# The near-site copy; the manifest's relative paths resolve against this directory.
+ARCHIVE_NEARSITE_DIR=/srv/backups/example-archive
+# The sha256sum manifest of the archive, as copied to this host.
+ARCHIVE_NEARSITE_MANIFEST=/srv/backups/example-archive.sha256
+# The trust anchor: the sha256 of that manifest file (exactly 64 lowercase hex). A
+# manifest that differs from it never passes. Compute it on the archive node with
+# `sha256sum <manifest>`, compare it with `sha256sum` of the copy on this host, and
+# paste the value. The all-zero value below is a placeholder that nothing matches.
+ARCHIVE_NEARSITE_MANIFEST_SHA256=0000000000000000000000000000000000000000000000000000000000000000
+# Heimdall panel node name; defaults to the short hostname.
+#ARCHIVE_NODE=nas-host
