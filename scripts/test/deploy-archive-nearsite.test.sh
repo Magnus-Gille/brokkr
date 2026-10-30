@@ -35,7 +35,9 @@ if [ "$(grep -c "^unit_path=$SHIPPED_UNIT_PATH\$" "$REPO/scripts/deploy-archive-
 fi
 sed "s#^unit_path=$SHIPPED_UNIT_PATH\$#unit_path=$FIXTURE_UNIT_PATH#" "$REPO/scripts/deploy-archive-nearsite.sh" >"$TMP/deploy.patched"
 cat "$TMP/deploy.patched" >"$REPO/scripts/deploy-archive-nearsite.sh"
-# Fixture git is isolated from the caller's configuration (hooks, signing, templates).
+# Fixture git is isolated from the caller's configuration (hooks, signing, templates)
+# and from any inherited repository, index or command-scope config variables.
+while IFS= read -r git_var; do unset "$git_var"; done < <(compgen -e | grep -E '^GIT_')
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 git init -q "$REPO"
 git -C "$REPO" config user.name test; git -C "$REPO" config user.email test@example.invalid
