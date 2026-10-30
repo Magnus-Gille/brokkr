@@ -286,11 +286,17 @@ refuses_release
 check "existing release directory is left untouched" '[[ "$(cat "$RELEASE/marker")" == precious && "$(find "$RELEASE" -type f | wc -l | tr -d " ")" -eq 1 ]]'
 
 # --- delivery env may not redirect the verifier; shared unrelated keys are fine -------------
-for forbidden in ARCHIVE_NEARSITE_DIR ARCHIVE_NEARSITE_MANIFEST_SHA256 ARCHIVE_NODE BROKKR_STATE_DIR TMPDIR PATH; do
+for forbidden in ARCHIVE_NEARSITE_DIR ARCHIVE_NEARSITE_MANIFEST_SHA256 ARCHIVE_NODE BROKKR_STATE_DIR TMPDIR PATH BASH_ENV ENV SHELLOPTS BASHOPTS PS4 CDPATH GLOBIGNORE PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT LD_PRELOAD LD_LIBRARY_PATH; do
   reset
   printf '%b%s=/tmp/redirect\n' "$HEAD_ENV" "$forbidden" >"$DELIVERY_ENV"
   refuses "delivery env setting $forbidden refuses" "verifier-controlling variable" "$TARGET"
 done
+reset
+printf '%bBASH_FUNC_evil%%%%=() { :; }\n' "$HEAD_ENV" >"$DELIVERY_ENV"
+refuses "delivery env exporting a bash function (BASH_FUNC_*) refuses" "verifier-controlling variable" "$TARGET"
+reset
+printf '%bexport BASH_ENV=/tmp/x\n' "$HEAD_ENV" >"$DELIVERY_ENV"
+refuses "delivery env with an export-prefixed BASH_ENV refuses" "verifier-controlling variable" "$TARGET"
 reset
 printf '%bexport ARCHIVE_NEARSITE_MANIFEST=/tmp/x\n' "$HEAD_ENV" >"$DELIVERY_ENV"
 refuses "delivery env with an export-prefixed forbidden key refuses" "verifier-controlling variable" "$TARGET"
@@ -339,7 +345,11 @@ check "release files are executable where needed and private" '[[ -x "$RELEASE/s
 check "no staging directory is left behind" '[[ -z "$(find "$HOME_DIR/.local/lib/brokkr/archive-nearsite" -maxdepth 1 -name ".stage.*")" ]]'
 check "unit renders the exact SHA, delivery env, and config path" 'grep -Fxq "ExecStart=%h/.local/lib/brokkr/archive-nearsite/releases/$SHA/scripts/archive-nearsite.sh --config $CONFIG --verify" "$SERVICE" && grep -Fxq "WorkingDirectory=%h/.local/lib/brokkr/archive-nearsite/releases/$SHA" "$SERVICE" && grep -Fxq "EnvironmentFile=$DELIVERY_ENV" "$SERVICE"'
 check "rendered unit has no leftover placeholders, system-only directives, or old layout" '! grep -Eq "@[A-Z_]+@|^OnFailure|^User=|^SupplementaryGroups|/opt/brokkr|/home/brokkr|rclone" "$SERVICE" && grep -Fxq NoNewPrivileges=yes "$SERVICE" && grep -Fxq PrivateTmp=yes "$SERVICE"'
-check "rendered unit is sandboxed: read-only home, only the state dir writable, 12h timeout" 'grep -Fxq ProtectSystem=full "$SERVICE" && grep -Fxq ProtectHome=read-only "$SERVICE" && grep -Fxq "ReadWritePaths=%h/.local/state/brokkr" "$SERVICE" && grep -Fxq TimeoutStartSec=12h "$SERVICE" && grep -Fxq Nice=10 "$SERVICE" && grep -Fxq IOSchedulingClass=idle "$SERVICE"'
+check "rendered unit is sandboxed: read-only home, only the state dir writable, 12h timeout" 'grep -Fxq ProtectSystem=strict "$SERVICE" && grep -Fxq ProtectHome=read-only "$SERVICE" && grep -Fxq "ReadWritePaths=%h/.local/state/brokkr" "$SERVICE" && grep -Fxq TimeoutStartSec=12h "$SERVICE" && grep -Fxq Nice=10 "$SERVICE" && grep -Fxq IOSchedulingClass=idle "$SERVICE"'
+for var in BASH_ENV ENV SHELLOPTS BASHOPTS PS4 CDPATH GLOBIGNORE PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT LD_PRELOAD LD_LIBRARY_PATH; do
+  check "rendered unit unsets $var after the EnvironmentFile (UnsetEnvironment=)" 'grep -E "^UnsetEnvironment=" "$SERVICE" | tr " =" "\n\n" | grep -qx "$var"'
+done
+check "apply says a catch-up run can start after an upgrade and not on a first install" '[[ "$OUT" == *"catch-up"* && "$OUT" == *"first install"* ]]'
 check "timer runs on the 2nd, after the archive node's run on the 1st" 'grep -Fxq "OnCalendar=*-*-02 03:30:00" "$TIMER" && grep -Fxq Persistent=true "$TIMER" && grep -Fxq RandomizedDelaySec=2h "$TIMER"'
 check "timer is installed from the template" 'cmp -s "$TIMER" "$REPO/systemd/user/brokkr-archive-nearsite.timer"'
 check "existing unit is backed up as .previous-<SHA>" '[[ "$(cat "$SERVICE.previous-$SHA")" == "OLD SERVICE" ]]'

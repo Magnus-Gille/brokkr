@@ -16,6 +16,12 @@ Type=oneshot
 WorkingDirectory=%h/.local/lib/brokkr/archive-nearsite/releases/@REVISION@
 # Provides HEIMDALL_HUB_URL + HEIMDALL_FLEET_TOKEN; required (delivery is the point).
 EnvironmentFile=@DELIVERY_ENV@
+# The env file is shared with other units, so it must not be able to inject shell or
+# interpreter startup files, tracing, or library preloads into this one. systemd applies
+# UnsetEnvironment= after Environment= and EnvironmentFile= (systemd.exec(5)), so these
+# are removed whatever the file sets. The deploy preflight also refuses the same names and
+# any exported bash function (BASH_FUNC_*), which this list cannot name.
+UnsetEnvironment=BASH_ENV ENV SHELLOPTS BASHOPTS PS4 CDPATH GLOBIGNORE PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT LD_PRELOAD LD_LIBRARY_PATH
 # The config is parsed (never sourced) by the script and is the only source of the
 # directory, manifest and pin, so the shared delivery env cannot redirect the check.
 ExecStart=%h/.local/lib/brokkr/archive-nearsite/releases/@REVISION@/scripts/archive-nearsite.sh --config @ARCHIVE_CONFIG@ --verify
@@ -23,9 +29,13 @@ Nice=10
 IOSchedulingClass=idle
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=full
+# strict makes the whole filesystem read-only (ReadWritePaths is only an exception list:
+# with full, /srv, /mnt and /var would stay writable, and the near-site copy lives there).
+ProtectSystem=strict
 ProtectHome=read-only
-# Only the snapshot, stamps and lock under the state dir are written.
+# Everything written (snapshot, stamps, lock, work directory) is under the state dir, or
+# in the private /tmp. The deploy creates the state dir; if it is missing the unit fails
+# to start rather than running with a writable filesystem.
 ReadWritePaths=%h/.local/state/brokkr
 # The check re-hashes the whole near-site copy.
 TimeoutStartSec=12h

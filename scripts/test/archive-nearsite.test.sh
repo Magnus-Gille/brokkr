@@ -62,7 +62,20 @@ write_manifest; write_conf
 cp "$MAN" "$TMP/manifest.good"
 
 # sha256sum wrapper: records every invocation so a skipped hash run is provable.
-printf '#!/usr/bin/env bash\nprintf "sha256sum %%s\\n" "$*" >>"$MOCK_SHA_CALLS"\nexec %s "$@"\n' "$GNU_SHA" >"$TMP/gnu/sha256sum"
+#   MOCK_SWAP_MANIFEST=file  appends junk to that file just before a hash run (a manifest
+#                            changed after it was pinned);
+#   MOCK_SHA_SLEEP=n         keeps the hash run busy for n seconds (a window for a signal).
+# stdin bytes are recorded to prove the hash run reads /dev/null, never the caller's stdin.
+cat >"$TMP/gnu/sha256sum" <<FAKE
+#!/usr/bin/env bash
+printf 'sha256sum %s\n' "\$*" >>"\$MOCK_SHA_CALLS"
+if [[ "\$*" == *--check* ]]; then
+  printf 'stdin_bytes=%s\n' "\$(wc -c | tr -d ' ')" >>"\$MOCK_SHA_CALLS"
+  [ -z "\${MOCK_SWAP_MANIFEST:-}" ] || printf junk >>"\$MOCK_SWAP_MANIFEST"
+  [ -z "\${MOCK_SHA_SLEEP:-}" ] || sleep "\$MOCK_SHA_SLEEP"
+fi
+exec $GNU_SHA "\$@"
+FAKE
 chmod 755 "$TMP/gnu/sha256sum"
 export MOCK_SHA_CALLS="$TMP/sha-calls" MOCK_REQUEST_FILE="$TMP/request.json"
 cat >"$TMP/python/sitecustomize.py" <<'PY'
@@ -106,7 +119,7 @@ cmd() {
   OUT=$(
     export PATH="$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" HEIMDALL_HUB_URL="$hub" HEIMDALL_FLEET_TOKEN="$tok"
     for kv in ${envs[@]+"${envs[@]}"}; do export "${kv?}"; done
-    bash "$SCRIPT" "$@" 2>&1
+    bash "$SCRIPT" "$@" 2>&1 </dev/null
   ) && RC=0 || RC=$?
   printf '%s' "$OUT" >"$OUTFILE"
 }
@@ -122,7 +135,13 @@ message() { python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["
 no_hash_run() { ! grep -q 'sha256sum --check' "$MOCK_SHA_CALLS"; }
 # No fixture file name may appear in any captured output, snapshot, or delivered body.
 no_names() { ! grep -qE 'private-person-name|x\.jpg|big\.nef|ärkiv|ünï' "$OUTFILE" "$MOCK_REQUEST_FILE" "$SNAP" 2>/dev/null; }
-no_token() { ! grep -rqF "$TOKEN" "$OUTFILE" "$MOCK_REQUEST_FILE" "$SNAP" "$TMP/state" 2>/dev/null; }
+# Neither the token nor any run of 8 or more of its characters may appear anywhere.
+no_token() {
+  local i
+  for ((i = 0; i + 8 <= ${#TOKEN}; i++)); do
+    ! grep -rqF -- "${TOKEN:i:8}" "$OUTFILE" "$MOCK_REQUEST_FILE" "$SNAP" "$TMP/state" 2>/dev/null || return 1
+  done
+}
 
 # --- healthy run -----------------------------------------------------------------------------
 verify
@@ -195,6 +214,12 @@ format_case "a short digest fails" "text-mode" "abc  a.txt\n"
 format_case "a missing trailing newline fails" "does not end with a newline" "$H  a.txt"
 format_case "an empty manifest fails" "empty" ""
 format_case "a line with an empty path fails" "text-mode" "$H  \n"
+# GNU sha256sum --check reads standard input for the path "-": with an empty-content digest
+# a missing file would pass. Only the whole path "-" is special; "dir/-" and "a-b" are files.
+EMPTY=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+format_case "the path - (sha256sum reads stdin) fails even with the empty-content digest" "stdin" "$EMPTY  -\n"
+printf '%b' "$H  dir/-\n$H  a-b\n$H  -a\n" >"$MAN"; write_conf; verify
+check "paths that merely contain a dash are accepted by the manifest row" '[[ "$(row manifest)" == "pass "* ]]'
 check "format failures never print the offending path" '! grep -q "passwd" "$OUTFILE"'
 rm -f "$MAN"; ln -s "$TMP/manifest.good" "$MAN"; write_conf
 verify
@@ -312,6 +337,62 @@ mv "$TMP/nas.away" "$NAS"
 run --validate
 check "validate output holds no file names or token" 'no_names && no_token'
 check "validate leaves no scratch directory behind" '[ -z "$(find "$TMPDIR" -mindepth 1 -print)" ]'
+
+# --- hardening: tracing, startup files, stdin, the staged copy, exit codes -------------------------------
+# The shared EnvironmentFile must not be able to leak the token or run code. BASH_ENV runs
+# before any line of the script, so the unit's UnsetEnvironment= is its real guard (see the
+# deploy test); the script clears SHELLOPTS tracing and BASH_ENV for everything it starts.
+cp "$TMP/manifest.good" "$MAN"; write_conf
+# An exported SHELLOPTS reaches every child bash with the script's own options (errexit,
+# nounset), which breaks interpreter version-manager shims; use the real interpreter here.
+mkdir -p "$TMP/realpy"
+ln -s "$(python3 -I -c 'import sys; print(sys.executable)')" "$TMP/realpy/python3"
+raw_run() { # extra env assignment for env(1); captures OUT and RC like cmd
+  rm -f "$MOCK_REQUEST_FILE" "$SNAP"; : >"$MOCK_SHA_CALLS"
+  OUT=$(env "$1" PATH="$TMP/realpy:$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels \
+    HEIMDALL_FLEET_TOKEN=$TOKEN bash "$SCRIPT" --verify --config "$CONF" 2>&1 </dev/null) && RC=0 || RC=$?
+  printf '%s' "$OUT" >"$OUTFILE"
+}
+raw_run SHELLOPTS=xtrace
+check "SHELLOPTS=xtrace in the environment never traces the token (script and push.sh)" '[ "$RC" = 0 ] && no_token && [ "$(panel)" = "archive-nearsite-nas-host pass" ]'
+printf 'echo ran >>"%s"\n' "$TMP/bashenv-count" >"$TMP/bashenv.sh"
+rm -f "$TMP/bashenv-count"
+raw_run BASH_ENV="$TMP/bashenv.sh"
+check "BASH_ENV is not inherited by the child bash processes the script starts" '[ "$RC" = 0 ] && [ "$(wc -l <"$TMP/bashenv-count" | tr -d " ")" = 1 ]'
+rm -f "$MOCK_REQUEST_FILE" "$SNAP"; : >"$MOCK_SHA_CALLS"
+printf 'caller-stdin' | env PATH="$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels \
+  HEIMDALL_FLEET_TOKEN=$TOKEN bash "$SCRIPT" --verify --config "$CONF" >"$OUTFILE" 2>&1
+RC=$?
+check "the hash run reads /dev/null, never the caller's stdin" '[ "$RC" = 0 ] && grep -qx "stdin_bytes=0" "$MOCK_SHA_CALLS"'
+verify MOCK_SWAP_MANIFEST="$MAN"
+check "a manifest changed after the pin check does not reach the hash run (staged copy consumed)" \
+  '[ "$RC" = 0 ] && [[ "$(row manifest)" == "pass "* ]] && grep -Eq "^sha256sum --check --quiet --strict .*/\.archive-nearsite\.[^/]+/manifest$" "$MOCK_SHA_CALLS" && [ "$(wc -c <"$MAN" | tr -d " ")" -gt "$(wc -c <"$TMP/manifest.good" | tr -d " ")" ]'
+cp "$TMP/manifest.good" "$MAN"
+verify TMPDIR="$TMP/no-such-tmp"
+check "an unusable TMPDIR does not matter: everything is written under the state directory" '[ "$RC" = 0 ] && [ ! -e "$TMP/no-such-tmp" ]'
+
+# Exit 1 is reserved for "delivered, with a failing row": setup failures and interruption are 2.
+: >"$TMP/afile"
+verify BROKKR_STATE_DIR="$TMP/afile/state"
+check "an unusable state directory exits 2, not 1" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ]'
+if command -v flock >/dev/null 2>&1; then
+  mkdir -p "$TMP/lockstate/archive-nearsite.lock"
+  verify BROKKR_STATE_DIR="$TMP/lockstate"
+  check "an unusable lock file exits 2, not 1" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ]'
+else
+  echo "skip - flock not installed; lock-file failure not exercised"
+fi
+rm -f "$MOCK_REQUEST_FILE" "$SNAP"; : >"$MOCK_SHA_CALLS"
+(
+  export PATH="$TMP/gnu:$PATH" PYTHONPATH="$TMP/python" HEIMDALL_HUB_URL=http://heimdall.invalid/api/panels HEIMDALL_FLEET_TOKEN="$TOKEN" MOCK_SHA_SLEEP=3
+  exec bash "$SCRIPT" --verify --config "$CONF" >"$OUTFILE" 2>&1 </dev/null
+) &
+pid=$!
+for _ in $(seq 1 100); do grep -q 'sha256sum --check' "$MOCK_SHA_CALLS" && break; sleep 0.1; done
+kill -TERM "$pid"
+wait "$pid"; RC=$?
+OUT=$(cat "$OUTFILE")
+check "a signal before delivery exits 2 and delivers nothing" '[ "$RC" = 2 ] && [ ! -f "$MOCK_REQUEST_FILE" ] && [ -z "$(find "$TMP/state" -name ".archive-nearsite.*")" ]'
 
 echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

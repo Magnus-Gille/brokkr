@@ -10,6 +10,12 @@
 # runs only the config and manifest checks: no hashing, no delivery, no state. The host
 # computes the hashes itself, so no ssh access and no new credential is involved; delivery
 # uses the Heimdall producer credential already present in the runtime environment.
+# Tracing and startup files must never see the delivery token: a shared EnvironmentFile
+# could otherwise set SHELLOPTS=xtrace (the token test below would then be traced into the
+# journal) or BASH_ENV (which would run before any line here; the unit's UnsetEnvironment=
+# is the guard for that one). Drop them before anything else, for children too.
+set +o xtrace +o verbose
+unset BASH_ENV ENV
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
@@ -83,10 +89,10 @@ if [ "$MODE" = --verify ]; then
   node="$(printf '%s' "${node_raw%%.*}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | tr -s '-' | sed 's/^-*//; s/-*$//')"
   [ -n "$node" ] || die "cannot derive a node name for the Heimdall panel (set ARCHIVE_NODE)"
   [ "${#node}" -le 40 ] || die "node name longer than 40 characters (set a shorter ARCHIVE_NODE)"
-  mkdir -p "$STATE_DIR"
+  mkdir -p "$STATE_DIR" || die "cannot create the state directory $STATE_DIR"
   # Two runs must not interleave on the same snapshot.
   if command -v flock >/dev/null 2>&1; then
-    exec 9>"$STATE_DIR/archive-nearsite.lock"
+    exec 9>"$STATE_DIR/archive-nearsite.lock" || die "cannot open the lock file $STATE_DIR/archive-nearsite.lock"
     flock -n 9 || die "another archive-nearsite run holds $STATE_DIR/archive-nearsite.lock"
   fi
   WORK=$(mktemp -d "$STATE_DIR/.archive-nearsite.XXXXXX") || die "cannot create a work directory"
@@ -94,9 +100,16 @@ else
   # --validate writes no state: the deploy preflight runs it on the node in a dry run.
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/.archive-nearsite.XXXXXX") || die "cannot create a work directory"
 fi
-cleanup() { rm -rf "$WORK"; }
+# Exit 1 means "delivered, with a failing row" and nothing else. Any other abort (an
+# unexpected error under set -e, an interruption before delivery) is a setup failure, 2.
+RESULT_DELIVERED_FAIL=0
+cleanup() {
+  local rc=$?
+  rm -rf "$WORK"
+  if [ "$rc" != 0 ] && [ "$RESULT_DELIVERED_FAIL" != 1 ]; then exit 2; fi
+}
 trap cleanup EXIT
-trap 'cleanup; exit 1' HUP INT TERM
+trap 'exit 2' HUP INT TERM
 CHECKS="$WORK/checks.tsv"
 : >"$CHECKS"
 # Details carry counts only, never file names: names are personal data and must reach
@@ -144,6 +157,8 @@ def problem(data):
         if path.startswith(b"./"):
             return f"line {number} has a leading ./ in its path"
         parts = path.split(b"/")
+        if path == b"-":
+            return f"line {number} has the path - (sha256sum would read stdin for it)"
         if b"" in parts:
             return f"line {number} has an empty path component"
         if b".." in parts:
@@ -222,7 +237,8 @@ elif [[ "$sha_banner" != *GNU* ]]; then
   record nearsite fail "GNU sha256sum is required on this host"
 else
   # Output stays in files: failing names are personal data, so only counts are reported.
-  if ( cd "$NS_DIR" && LC_ALL=C sha256sum --check --quiet --strict "$WORK/manifest" ) >"$WORK/hash.out" 2>"$WORK/hash.err"
+  # stdin is /dev/null: the manifest check refuses the path "-", which sha256sum would read from it.
+  if ( cd "$NS_DIR" && LC_ALL=C sha256sum --check --quiet --strict "$WORK/manifest" ) >"$WORK/hash.out" 2>"$WORK/hash.err" </dev/null
   then src=0; else src=$?; fi
   if extras=$(python3 -I -c "$NEARSITE_PY" extras "$WORK/manifest" "$NS_DIR" 2>/dev/null) && [[ "$extras" =~ ^[0-9]+$ ]]; then
     if [ "$extras" = 1 ]; then extra_note="1 extra file"; else extra_note="$extras extra files"; fi
@@ -280,5 +296,5 @@ BROKKR_HEIMDALL_LABEL="Archive Near-site Verification ($node)" \
 BROKKR_HEIMDALL_STAMP_PREFIX="archive-nearsite-" \
 BROKKR_STATE_DIR="$STATE_DIR" \
   "$HERE/heimdall/push.sh" "$snapshot" || die "Heimdall delivery failed (verification result: $overall)"
-[ "$overall" != fail ] || exit 1
+if [ "$overall" = fail ]; then RESULT_DELIVERED_FAIL=1; exit 1; fi
 exit 0

@@ -28,7 +28,9 @@ What the check does not prove: that the pinned manifest describes the right arch
 is the same manifest the archive node pushes off-site, whose copy and integrity rows
 check it independently), or that the NAS could not be altered together with its config.
 Extra files on the NAS are reported as information, because `sha256sum --check` cannot
-notice them.
+notice them. A manifest entry whose path is exactly `-` is refused: `sha256sum --check`
+reads standard input for it, so an empty-content digest would pass with the file absent
+(the hash run also reads `/dev/null`, never the caller's stdin).
 
 ## Rows
 
@@ -48,8 +50,9 @@ the panel, the snapshot, the journal, and stderr.
 The panel message starts with every row's status (for example `manifest=pass
 nearsite=pass`), then the details of any row that is not pass or that carries an extras
 note. Exit status: 0 delivered and passing, 1 delivered with a failing row (systemd marks
-the run failed), 2 for setup, config, a missing Heimdall environment, or a delivery
-failure. The snapshot is `~/.local/state/brokkr/archive-nearsite.json`; delivery stamps
+the run failed), 2 for everything else: setup (including an unusable state directory or lock
+file), config, a missing Heimdall environment, an interruption before delivery, or a
+delivery failure. The snapshot is `~/.local/state/brokkr/archive-nearsite.json`; delivery stamps
 use the `archive-nearsite-` prefix.
 
 ## Config
@@ -104,17 +107,30 @@ BROKKR_ARCHIVE_NEARSITE_DELIVERY_ENV=/home/operator/.config/brokkr/env \
 a non-root user with lingering enabled; the delivery env and the config as regular,
 non-symlink files, mode 600, owned by that user; the delivery env defining
 `HEIMDALL_HUB_URL` and `HEIMDALL_FLEET_TOKEN` once each, non-empty, and none of the
-variables that would let a shared env redirect the check (`PATH`, `HOME`, `TMPDIR`,
-`BROKKR_STATE_DIR`, `PYTHONPATH`, `ARCHIVE_*`, and the like); the directory and manifest
+variables that would let a shared env redirect or instrument the check (`PATH`, `HOME`,
+`TMPDIR`, `BROKKR_STATE_DIR`, `ARCHIVE_*`; shell startup and tracing controls `BASH_ENV`,
+`ENV`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `CDPATH`, `GLOBIGNORE`; exported functions
+`BASH_FUNC_*`; interpreter and loader hooks `PYTHON*`, `LD_PRELOAD`,
+`LD_LIBRARY_PATH`). The unit also lists the fixed names in `UnsetEnvironment=`, which
+systemd applies after `EnvironmentFile=`, so they are removed even if the env file
+changes later. The script itself turns off `xtrace`/`verbose` and unsets `BASH_ENV` and
+`ENV` before reading the token, but `BASH_ENV` would run before any line of the script,
+so the unit setting is the real guard for it. The directory and manifest
 outside the unit's private `/tmp`; GNU `sha256sum` and `python3`; and the shipped
 script's own `--validate` accepting the config, which proves the pin matches the manifest.
 The deploy never creates or modifies the delivery env or any credential, only tests
 the two keys for presence without capturing a value, and prints no value.
 
-Apply installs `brokkr-archive-nearsite.service` and `.timer`, enables the timer, and
-does not start the service, because a check re-hashes the whole copy and takes hours.
-The unit runs at idle I/O priority with `ProtectHome=read-only`, a writable state
-directory only, and a 12 h start timeout. The timer fires on the 2nd of each month at
+Apply installs `brokkr-archive-nearsite.service` and `.timer` and enables the timer
+(`enable --now`). It does not start the service itself, because a check re-hashes the
+whole copy and takes hours. The timer is `Persistent=true`, though: on an upgrade where a
+scheduled run was missed while the timer was inactive, systemd can start one catch-up
+check shortly after the timer is enabled. A first install has no earlier trigger and
+starts nothing. The deploy prints this too. The unit runs at idle I/O priority with
+`ProtectSystem=strict` (the whole filesystem read-only) and `ProtectHome=read-only`, the
+state directory as the only writable path, a private `/tmp`, and a 12 h start timeout.
+Everything the check and `heimdall/push.sh` write (work directory, lock, snapshot,
+stamps) is under the state directory. The timer fires on the 2nd of each month at
 03:30 (random delay up to 2 h, persistent), the day after the archive node's
 verification on the 1st. A failed run is visible in the service state and as a
 failing or stale `archive-nearsite-<node>` panel.

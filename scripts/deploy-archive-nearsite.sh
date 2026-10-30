@@ -5,8 +5,11 @@
 #
 # Dry-run by default: the remote preflight (identity, lingering, protected inputs, GNU
 # sha256sum, near-site config and manifest-pin validation, release target) runs and
-# nothing is changed. Pass --apply to install. Applying enables the timer but never
-# starts the service: a check re-hashes the whole copy and takes hours. The Heimdall
+# nothing is changed. Pass --apply to install. Applying enables the timer and never starts
+# the service itself, but the timer is Persistent=true: on an upgrade where a scheduled run
+# was missed while the timer was inactive, systemd can start one catch-up check shortly
+# after enabling (a first install triggers nothing). A check re-hashes the whole copy and
+# takes hours, so it is not started by hand here either. The Heimdall
 # delivery env must already exist: this script never creates or changes it or any
 # credential, and never prints its values. See docs/archive-nearsite.md.
 #
@@ -142,8 +145,11 @@ for key in HEIMDALL_HUB_URL HEIMDALL_FLEET_TOKEN; do
 done
 # systemd applies EnvironmentFile after Environment=, so this file (shared with other
 # brokkr units) must not be able to redirect what this unit runs or reads, for example
-# the state directory or an ARCHIVE_* variable. Unrelated keys are allowed.
-forbidden='PATH|HOME|TMPDIR|BROKKR_STATE_DIR|PYTHONPATH|PYTHONHOME|LD_PRELOAD|LD_LIBRARY_PATH|ARCHIVE_[A-Z0-9_]*'
+# the state directory or an ARCHIVE_* variable, nor inject shell startup files (BASH_ENV,
+# ENV), tracing that would write the token to the journal (SHELLOPTS, BASHOPTS, PS4),
+# exported shell functions (BASH_FUNC_*), or interpreter and loader hooks. The unit also
+# lists the fixed names in UnsetEnvironment=. Unrelated keys are allowed.
+forbidden='PATH|HOME|TMPDIR|BROKKR_STATE_DIR|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PS4|CDPATH|GLOBIGNORE|PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PYTHONINSPECT|LD_PRELOAD|LD_LIBRARY_PATH|BASH_FUNC_[^=[:space:]]*|ARCHIVE_[A-Z0-9_]*'
 if bad_key=$(grep -Eo "^[[:space:]]*(export[[:space:]]+)?($forbidden)[[:space:]]*=" "$DELIVERY_ENV" | head -n 1) && [ -n "$bad_key" ]; then
   refuse "delivery env must not set the verifier-controlling variable ${bad_key%%=*}"
 fi
@@ -192,7 +198,8 @@ IFS= read -r -d '' REMOTE_CHECKS <<'REMOTE' || true
 validate_nearsite -
 if [ "$MODE" = dry-run ]; then
   echo "dry-run: --apply would stage the payload, move it to the release target, back up and replace the"
-  echo "dry-run: user units, and enable the timer. It would not start a check. Nothing was changed."
+  echo "dry-run: user units, and enable the timer. It would not start a check itself (a Persistent catch-up run"
+  echo "dry-run: can follow an upgrade if a scheduled run was missed). Nothing was changed."
 fi
 REMOTE
 
@@ -307,6 +314,8 @@ systemctl --user enable --now "$timer_unit"
 echo "next: start the first check with: systemctl --user start --no-block $service_unit"
 echo "next: check progress with: systemctl --user status $service_unit"
 echo "next: read the result with: cat ~/.local/state/brokkr/archive-nearsite.json"
+echo "note: the timer is Persistent=true. On a first install nothing is triggered. On an upgrade, if a scheduled run"
+echo "note: was missed while the timer was inactive, systemd may start one catch-up check shortly after enabling."
 echo "OK: archive near-site self-check installed; timer enabled"
 REMOTE
 
