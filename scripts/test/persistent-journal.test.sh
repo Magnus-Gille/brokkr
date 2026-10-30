@@ -74,6 +74,10 @@ export MOCK_UID=0
 run --apply
 check "root apply installs the tracked bounded policy" '[[ "$RC" -eq 0 && "$OUT" == *"next boot"* && -f "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && ! -L "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && "$(stat -c %a "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" 2>/dev/null || stat -f %Lp "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf")" == 644 && ! -s "$CALLS" ]]'
 check "installed policy keeps persistent storage and a finite cap" 'grep -Fqx "Storage=persistent" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemMaxUse=1G" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && grep -Fqx "SystemKeepFree=1G" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf"'
+# journald deletes whole archived files, oldest first. The system journal grows slowly and shares the
+# cap with chattier user journals, so without time-based rotation one deletion can drop many days of
+# system history at once. Rotating after a day of entries keeps one deletion to about a day.
+check "installed policy rotates journal files daily, in its only section [Journal]" 'grep -Fqx "MaxFileSec=1day" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && [[ "$(grep -c "^[[:space:]]*MaxFileSec[[:space:]]*=" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf")" == 1 ]] && grep -Fqx "[Journal]" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf" && [[ "$(grep -c "^\[" "$JOURNALD_DROPIN_DIR/60-brokkr-persistent.conf")" == 1 ]]'
 
 # An identical policy is not rewritten: a fresh file time would read, in the maintenance report, as
 # a journald.conf change that journald has not loaded yet.
