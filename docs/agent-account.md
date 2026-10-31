@@ -79,7 +79,8 @@ verified, so any failure leaves it closed.
    account, so the agent cannot add keys or drop the `from=` restriction, and root never
    writes inside the agent's home.
 7. Enables linger (tmux and user services survive logout), then the account itself (no
-   usable password, no expiry), then starts `user@<uid>`, which could not start while the
+   usable password, no expiry; the opt-in preservation mode below retains its existing
+   locked password field), then starts `user@<uid>`, which could not start while the
    account was expired, and hands an already running user manager the new environment
    (`systemctl --user -M <user>@ set-environment`; a failure only warns).
 
@@ -357,6 +358,24 @@ processes are not affected. Then:
    `--tmpfs-max-age`. With the reaper enabled, sessions that are already `closing` are ended
    one grace period after the reaper first sees them. Freeing memory sooner is a manual, destructive step for the
    operator: review the account's `/tmp` files and running processes first.
+
+To preserve an existing managed account's locked password field, add
+`--preserve-existing-locked-password EXPECTED_UID` to both the apply and any rollback
+command. Supply the canonical decimal UID from the approved account profile, rather than
+deriving the expected value from the account being checked. The option refuses a new or
+unmanaged account, a UID mismatch, or anything other than an unambiguous locked (`L`)
+result from `passwd -S`. The status check uses `sudo`, including during a dry-run. The
+provisioner consumes only the standard tool's status metadata; it does not inspect or
+copy shadow-file contents or print the status output.
+
+This mode checks identity and locked status before the first system mutation and again
+before the final linger/account-enable step. An initial refusal changes nothing; a
+later refusal leaves the temporary account expiry in place. The final `usermod` clears
+only expiry and receives no password or unlock argument. It does not replace, copy or
+restore the existing password field, and does not need a shadow-file comparison.
+Other administrators' concurrent changes are not prevented by a status check and must
+not be described as atomically locked out. Without this option, the existing default
+behavior, including new-account provisioning, remains unchanged.
 
 ## Removing the inference gateway allowance
 

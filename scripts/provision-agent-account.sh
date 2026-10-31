@@ -7,6 +7,7 @@
 #       [--cpu-quota 2000%] [--memory-high 20G] [--memory-max 24G] [--tasks-max 4096]
 #       [--allow-local-tcp '1420,4173,5173,32768-60999']
 #       [--inference-gateway-tcp IPv4:PORT|[IPv6]:PORT]
+#       [--preserve-existing-locked-password EXPECTED_UID]
 #       [--tmp-max-age 7d] [--tmpfs-max-age 1d] [--closing-session-grace off|6h]
 #   provision-agent-account.sh --revoke [--apply] --user NAME
 #
@@ -43,6 +44,7 @@ Usage:
       [--cpu-quota 2000%] [--memory-high 20G] [--memory-max 24G] [--tasks-max 4096]
       [--allow-local-tcp '1420,4173,5173,32768-60999']
       [--inference-gateway-tcp IPv4:PORT|[IPv6]:PORT]
+      [--preserve-existing-locked-password EXPECTED_UID]
       [--tmp-max-age 7d] [--tmpfs-max-age 1d] [--closing-session-grace off|6h]
   provision-agent-account.sh --revoke [--apply] --user NAME
 Dry-run unless --apply is given.
@@ -65,6 +67,8 @@ INFERENCE_GATEWAY_ADDR=
 INFERENCE_GATEWAY_PORT=
 INFERENCE_GATEWAY_FAMILY=
 INFERENCE_GATEWAY_CANONICAL=
+PRESERVE_LOCKED_UID=
+PRESERVE_LOCKED_GIVEN=0
 TMP_MAX_AGE=7d
 TMPFS_MAX_AGE=1d
 # Opt-in: the reaper cannot see deliberate detached tmux work inside a login (docs/agent-account.md).
@@ -77,7 +81,7 @@ while [[ $# -gt 0 ]]; do
     --apply) APPLY=1; shift; continue ;;
     --revoke) REVOKE=1; shift; continue ;;
     --user|--pubkey|--ssh-from|--cpu-quota|--memory-high|--memory-max|--tasks-max|--allow-local-tcp|--inference-gateway-tcp|\
-      --tmp-max-age|--tmpfs-max-age|--closing-session-grace)
+      --preserve-existing-locked-password|--tmp-max-age|--tmpfs-max-age|--closing-session-grace)
       [[ $# -ge 2 ]] || { usage >&2; die "$1 requires a value"; } ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
@@ -96,6 +100,13 @@ while [[ $# -gt 0 ]]; do
       INFERENCE_GATEWAY_GIVEN=1
       PROVISION_OPTS_GIVEN=1
       ;;
+    --preserve-existing-locked-password)
+      [[ $2 != --* ]] || die '--preserve-existing-locked-password requires a value'
+      [[ $PRESERVE_LOCKED_GIVEN -eq 0 ]] || die '--preserve-existing-locked-password may be specified only once'
+      PRESERVE_LOCKED_UID=$2
+      PRESERVE_LOCKED_GIVEN=1
+      PROVISION_OPTS_GIVEN=1
+      ;;
     --tmp-max-age) TMP_MAX_AGE=$2; PROVISION_OPTS_GIVEN=1 ;;
     --tmpfs-max-age) TMPFS_MAX_AGE=$2; PROVISION_OPTS_GIVEN=1 ;;
     --closing-session-grace) CLOSING_GRACE=$2; PROVISION_OPTS_GIVEN=1 ;;
@@ -108,8 +119,11 @@ missing=()
 for tool in useradd usermod loginctl systemctl systemd-run systemd-tmpfiles nft getent id install findmnt stat timeout ssh-keygen sshd cmp; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
-if [[ $APPLY -eq 1 ]]; then
+if [[ $APPLY -eq 1 || $PRESERVE_LOCKED_GIVEN -eq 1 ]]; then
   command -v sudo >/dev/null 2>&1 || missing+=(sudo)
+fi
+if [[ $PRESERVE_LOCKED_GIVEN -eq 1 ]]; then
+  command -v passwd >/dev/null 2>&1 || missing+=(passwd)
 fi
 [[ ${#missing[@]} -eq 0 ]] ||
   die "required tool(s) missing: ${missing[*]} (this script needs Linux with systemd, nftables, OpenSSH and shadow-utils)"
@@ -125,6 +139,10 @@ fi
 [[ $USER_NAME != "$(id -un)" ]] || die '--user must not be the invoking operator account'
 if [[ $REVOKE -eq 1 && $PROVISION_OPTS_GIVEN -eq 1 ]]; then
   die '--revoke accepts only --user and --apply'
+fi
+if [[ $PRESERVE_LOCKED_GIVEN -eq 1 ]]; then
+  [[ $PRESERVE_LOCKED_UID =~ ^[1-9][0-9]{0,9}$ ]] ||
+    die '--preserve-existing-locked-password requires a canonical positive decimal UID'
 fi
 
 valid_ipv6() { # structural check: hex groups of 1-4 digits, eight of them or at most one "::"
@@ -671,6 +689,26 @@ groups_problem() { # fail closed on ANY supplementary group
 
 account_problem() { groups_problem && subids_problem; }
 
+preserve_locked_password_problem() {
+  # Inspect public identity and passwd's status only; never read/copy a password field.
+  [[ $EXISTS -eq 1 ]] || { echo '--preserve-existing-locked-password requires an existing managed account'; return 1; }
+  read_account || { echo 'cannot verify the existing account identity'; return 1; }
+  [[ $UID_NUM == "$PRESERVE_LOCKED_UID" ]] || { echo 'existing account UID does not match --preserve-existing-locked-password'; return 1; }
+  require_marker
+  require_home
+  local status_output status_user status_code status_date status_min status_max status_warn status_inactive status_extra
+  status_output=$(LC_ALL=C sudo passwd -S "$USER_NAME") || {
+    echo 'cannot verify locked password status'; return 1;
+  }
+  [[ $status_output != *$'\n'* ]] || { echo 'cannot verify locked password status (multiple records)'; return 1; }
+  IFS=$' \t' read -r status_user status_code status_date status_min status_max status_warn status_inactive status_extra <<<"$status_output"
+  [[ $status_user == "$USER_NAME" && $status_code == L && -n $status_date && -z $status_extra &&
+     $status_min =~ ^-?[0-9]+$ && $status_max =~ ^-?[0-9]+$ &&
+     $status_warn =~ ^-?[0-9]+$ && $status_inactive =~ ^-?[0-9]+$ ]] || {
+    echo 'cannot verify locked password status'; return 1;
+  }
+}
+
 EXISTS=0
 if read_account; then
   EXISTS=1
@@ -685,6 +723,9 @@ elif [[ $REVOKE -eq 1 ]]; then
   die "account $USER_NAME does not exist; nothing to revoke"
 elif getent group "$USER_NAME" >/dev/null 2>&1; then
   die "group $USER_NAME already exists without a matching account; refusing"
+fi
+if [[ $PRESERVE_LOCKED_GIVEN -eq 1 ]]; then
+  problem=$(preserve_locked_password_problem) || die "$problem"
 fi
 
 print_mode() {
@@ -1130,8 +1171,16 @@ else
 fi
 
 step '7. linger, then enable the account (the last step; any earlier failure leaves it expired)'
+if [[ $PRESERVE_LOCKED_GIVEN -eq 1 && $APPLY -eq 1 ]]; then
+  problem=$(preserve_locked_password_problem) || fatal "cannot preserve the existing account: $problem (the account stays expired)"
+fi
 run loginctl enable-linger "$USER_NAME"
-run usermod -p '*' --expiredate '' "$USER_NAME"
+if [[ $PRESERVE_LOCKED_GIVEN -eq 1 ]]; then
+  # Omitting all password/unlock arguments preserves the current field, including concurrent updates.
+  run usermod --expiredate '' "$USER_NAME"
+else
+  run usermod -p '*' --expiredate '' "$USER_NAME"
+fi
 # The expired account's user manager could not start (PAM account check); start it now.
 # A user manager that was already running keeps its old environment until it restarts; hand it
 # the TMPDIR now so new user services and systemd-run --user jobs use the disk directory too.
