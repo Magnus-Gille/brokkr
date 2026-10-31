@@ -3,7 +3,8 @@
 `scripts/provision-agent-account.sh` creates and maintains a dedicated, unprivileged
 Linux account where coding agents (Claude Code or Codex sessions running builds) work on
 a host that also serves inference or other services. The account is resource-bounded and
-cannot reach the operator's account, local services or private networks.
+cannot reach the operator's account or files. It cannot reach local services or private
+networks unless the operator opts into the single exact gateway TCP endpoint described below.
 
 ## Threat model
 
@@ -210,9 +211,34 @@ Applied per UID in an nftables `output` hook (`policy accept`, so the internet w
   agent's own servers), DNS (TCP/UDP 53) to the local resolver, and new TCP connections
   to **loopback only** on `--allow-local-tcp` (default `1420,4173,5173,32768-60999`:
   common dev-server ports plus the ephemeral range used by tests that bind port 0).
+- Opt-in: one exact TCP destination supplied as `--inference-gateway-tcp IPv4:PORT` or
+  `--inference-gateway-tcp '[IPv6]:PORT'`. The per-UID rule matches only that literal address
+  and port and is placed before the generic local/private rejects. It includes a route check
+  that keeps IPv4 directed broadcasts rejected. All other defaults stay unchanged; the option
+  accepts no hostnames, ranges, wildcards or subnets.
 - Rejected: every other local destination (including the host's tailnet and LAN
   addresses), IPv4 `10/8`, `100.64/10`, `169.254/16`, `172.16/12`, `192.168/16`,
   multicast `224/4`, limited and directed broadcast (`fib daddr type broadcast`), IPv6 `fc00::/7`, `fe80::/10` and multicast `ff00::/8`.
+
+The gateway rule only permits a TCP connection to the selected listener. Choose a gateway that
+requires the approved agent-scoped authentication mechanism and enforces HTTP route privileges.
+Firewall access alone does not authenticate the agent, authorize model inference, grant model
+residency access or provide administrator access. Inference and residency/admin permissions remain
+separate application decisions.
+
+For a network-only check, from the agent account, a TCP connect can confirm the selected socket is
+reachable without submitting an inference request:
+
+```bash
+timeout 3 bash -c 'exec 3<>/dev/tcp/192.0.2.10/8080'
+```
+
+`192.0.2.10` is a documentation-only TEST-NET placeholder. Replace it with the selected literal
+gateway endpoint. This check does not verify authentication. For an authenticated check, use the
+gateway's documented authenticated, read-only identity, capability or catalogue endpoint with its
+approved agent-scoped auth flow. Inspect only the status/result needed to verify that capability;
+do not call a transcription or completion endpoint just to test connectivity, and do not put
+credentials on a command line.
 
 sshd's connection socket is root-owned, so SSH itself is unaffected. `ssh -L` forwarding
 runs as the agent and is subject to the same rules; use it to reach an agent's dev server.
@@ -267,6 +293,24 @@ BROKKR_EXPECTED_SOURCE="$(pwd -P)" BROKKR_EXPECTED_COMMIT=<accepted-full-sha> \
   --ssh-from 100.64.0.0/10,fd7a:115c:a1e0::/48 --memory-max 16G --memory-high 14G
 ```
 
+To opt into one inference gateway, add the same option to both the dry-run and apply commands.
+This documentation-only example uses the reserved TEST-NET address `192.0.2.10`; replace it with
+the operator-selected literal gateway address and TCP port:
+
+```bash
+./scripts/provision-agent-account.sh --user agent --pubkey ~/agent.pub \
+  --ssh-from 100.64.0.0/10,fd7a:115c:a1e0::/48 --inference-gateway-tcp 192.0.2.10:8080
+BROKKR_EXPECTED_SOURCE="$(pwd -P)" BROKKR_EXPECTED_COMMIT=<accepted-full-sha> \
+  ./scripts/provision-agent-account.sh --apply --user agent --pubkey ~/agent.pub \
+  --ssh-from 100.64.0.0/10,fd7a:115c:a1e0::/48 --memory-max 16G --memory-high 14G \
+  --inference-gateway-tcp 192.0.2.10:8080
+```
+
+Applying a gateway allowance uses the normal re-provision flow: it expires the account while the
+new rules are staged and validated, then re-enables it only after verification. If the existing
+egress table is missing, the provisioner ends its sessions before restoring isolation. Host
+application requires its own approved change window and the exact source binding.
+
 ## Verify after apply
 
 As the agent account (`ssh agent@host`):
@@ -306,6 +350,15 @@ processes are not affected. Then:
    `--tmpfs-max-age`. With the reaper enabled, sessions that are already `closing` are ended
    one grace period after the reaper first sees them. Freeing memory sooner is a manual, destructive step for the
    operator: review the account's `/tmp` files and running processes first.
+
+## Removing the inference gateway allowance
+
+Re-run the provisioner with the same accepted source and account options, omitting
+`--inference-gateway-tcp`. This validates and reloads the ruleset without that exception. The
+existing `ct state established,related accept` rule remains, so removing the exception blocks new
+connections but may leave already-established connections working. It also does not revoke any
+gateway credential. If immediate session termination or credential revocation is needed, handle
+that separately through the operator's approved, gateway-specific procedure.
 
 ## Rollback of the temporary-file and session housekeeping
 
