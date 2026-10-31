@@ -105,7 +105,7 @@ done
 
 # --- environment ------------------------------------------------------------------------------
 missing=()
-for tool in useradd usermod loginctl systemctl systemd-run systemd-tmpfiles nft getent id install findmnt stat timeout ssh-keygen sshd; do
+for tool in useradd usermod loginctl systemctl systemd-run systemd-tmpfiles nft getent id install findmnt stat timeout ssh-keygen sshd cmp; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [[ $APPLY -eq 1 ]]; then
@@ -449,6 +449,20 @@ put_file() { # mode owner group path; content on stdin
     cat
     printf -- '--- end ---\n'
   fi
+}
+
+payload_same() { # rendered-file target label; missing target means changed, malformed target aborts
+  local rendered=$1 target=$2 label=$3 status
+  if [[ ! -e $target && ! -L $target ]]; then return 1; fi
+  [[ -f $target && ! -L $target && -r $target ]] ||
+    fatal "$label is not a readable regular non-symlink file; the account stays expired"
+  cmp -s "$rendered" "$target"
+  status=$?
+  case $status in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) fatal "could not compare $label; the account stays expired" ;;
+  esac
 }
 
 # --- rendered content -------------------------------------------------------------------------
@@ -876,29 +890,98 @@ else
   echo "would verify with findmnt that $AGENT_TMP is not on tmpfs, ramfs or hugetlbfs"
 fi
 run install -d -m 0755 -o root -g root "$ROOT$(dirname "$HELPER")"
-put_file 0755 root root "$ROOT$HELPER" <"$HERE/agent-account-housekeeping.sh"
+sweep_timer_was_active=0
+reaper_timer_was_active=0
+sweep_changed=0
+reaper_changed=0
+if [[ $APPLY -eq 1 ]]; then
+  housekeeping_stage=$(mktemp -d "${TMPDIR:-/tmp}/brokkr-agent-housekeeping.XXXXXX")
+  cp "$HERE/agent-account-housekeeping.sh" "$housekeeping_stage/helper"
+  render_sweep_service >"$housekeeping_stage/sweep.service"
+  render_sweep_timer >"$housekeeping_stage/sweep.timer"
+  if [[ -n $CLOSING_GRACE_SEC ]]; then
+    render_reaper_service >"$housekeeping_stage/reaper.service"
+    render_reaper_timer >"$housekeeping_stage/reaper.timer"
+  fi
+  sweep_timer_was_active=0
+  reaper_timer_was_active=0
+  if systemctl is-active --quiet "$SWEEP_UNIT.timer"; then
+    sweep_timer_was_active=1
+  else
+    active_rc=$?
+    [[ $active_rc -eq 3 || $active_rc -eq 4 ]] ||
+      fatal "could not determine whether $SWEEP_UNIT.timer is active; the account stays expired"
+  fi
+  if [[ -n $CLOSING_GRACE_SEC ]]; then
+    if systemctl is-active --quiet "$REAPER_UNIT.timer"; then
+      reaper_timer_was_active=1
+    else
+      active_rc=$?
+      [[ $active_rc -eq 3 || $active_rc -eq 4 ]] ||
+        fatal "could not determine whether $REAPER_UNIT.timer is active; the account stays expired"
+    fi
+  fi
+  helper_changed=1
+  payload_same "$housekeeping_stage/helper" "$ROOT$HELPER" 'housekeeping helper' && helper_changed=0
+  sweep_service_same=0
+  sweep_timer_same=0
+  payload_same "$housekeeping_stage/sweep.service" "$SYSTEMD_DIR/$SWEEP_UNIT.service" 'tmp sweep service' && sweep_service_same=1
+  payload_same "$housekeeping_stage/sweep.timer" "$SYSTEMD_DIR/$SWEEP_UNIT.timer" 'tmp sweep timer' && sweep_timer_same=1
+  [[ $helper_changed -eq 0 && $sweep_service_same -eq 1 && $sweep_timer_same -eq 1 ]] && sweep_changed=0 || sweep_changed=1
+  if [[ -n $CLOSING_GRACE_SEC ]]; then
+    reaper_service_same=0
+    reaper_timer_same=0
+    payload_same "$housekeeping_stage/reaper.service" "$SYSTEMD_DIR/$REAPER_UNIT.service" 'session reaper service' && reaper_service_same=1
+    payload_same "$housekeeping_stage/reaper.timer" "$SYSTEMD_DIR/$REAPER_UNIT.timer" 'session reaper timer' && reaper_timer_same=1
+    [[ $helper_changed -eq 0 && $reaper_service_same -eq 1 && $reaper_timer_same -eq 1 ]] && reaper_changed=0 || reaper_changed=1
+  fi
+  put_file 0755 root root "$ROOT$HELPER" <"$housekeeping_stage/helper"
+  put_file 0644 root root "$SYSTEMD_DIR/$SWEEP_UNIT.service" <"$housekeeping_stage/sweep.service"
+  put_file 0644 root root "$SYSTEMD_DIR/$SWEEP_UNIT.timer" <"$housekeeping_stage/sweep.timer"
+  if [[ -n $CLOSING_GRACE_SEC ]]; then
+    put_file 0644 root root "$SYSTEMD_DIR/$REAPER_UNIT.service" <"$housekeeping_stage/reaper.service"
+    put_file 0644 root root "$SYSTEMD_DIR/$REAPER_UNIT.timer" <"$housekeeping_stage/reaper.timer"
+  fi
+  rm -rf "$housekeeping_stage"
+else
+  put_file 0755 root root "$ROOT$HELPER" <"$HERE/agent-account-housekeeping.sh"
+fi
 run install -d -m 0755 -o root -g root "$ROOT$(dirname "$WORKTREE_HELPER")"
 put_file 0755 root root "$ROOT$WORKTREE_HELPER" <"$HERE/agent-worktree.sh"
-render_sweep_service | put_file 0644 root root "$SYSTEMD_DIR/$SWEEP_UNIT.service"
-render_sweep_timer | put_file 0644 root root "$SYSTEMD_DIR/$SWEEP_UNIT.timer"
-if [[ -n $CLOSING_GRACE_SEC ]]; then
-  render_reaper_service | put_file 0644 root root "$SYSTEMD_DIR/$REAPER_UNIT.service"
-  render_reaper_timer | put_file 0644 root root "$SYSTEMD_DIR/$REAPER_UNIT.timer"
+if [[ $APPLY -eq 0 ]]; then
+  render_sweep_service | put_file 0644 root root "$SYSTEMD_DIR/$SWEEP_UNIT.service"
+  render_sweep_timer | put_file 0644 root root "$SYSTEMD_DIR/$SWEEP_UNIT.timer"
+  if [[ -n $CLOSING_GRACE_SEC ]]; then
+    render_reaper_service | put_file 0644 root root "$SYSTEMD_DIR/$REAPER_UNIT.service"
+    render_reaper_timer | put_file 0644 root root "$SYSTEMD_DIR/$REAPER_UNIT.timer"
+  fi
 fi
 run systemctl daemon-reload
-# enable --now leaves an active timer alone; the restart applies a changed schedule.
+# enable --now starts fresh/inactive timers. An active timer is restarted only when its helper,
+# service or timer payload changed; this preserves its existing schedule and elapsed timing.
 if [[ -n $CLOSING_GRACE_SEC ]]; then
   run systemctl enable --now "$SWEEP_UNIT.timer" "$REAPER_UNIT.timer"
-  run systemctl restart "$SWEEP_UNIT.timer" "$REAPER_UNIT.timer"
+  if [[ $sweep_timer_was_active -eq 1 && $sweep_changed -eq 1 ]]; then
+    run systemctl restart "$SWEEP_UNIT.timer"
+  fi
+  if [[ $reaper_timer_was_active -eq 1 && $reaper_changed -eq 1 ]]; then
+    run systemctl restart "$REAPER_UNIT.timer"
+  fi
 else
   run systemctl enable --now "$SWEEP_UNIT.timer"
-  run systemctl restart "$SWEEP_UNIT.timer"
+  if [[ $sweep_timer_was_active -eq 1 && $sweep_changed -eq 1 ]]; then
+    run systemctl restart "$SWEEP_UNIT.timer"
+  fi
   if [[ -e $SYSTEMD_DIR/$REAPER_UNIT.timer ]]; then
     run systemctl disable --now "$REAPER_UNIT.timer"
   elif [[ $APPLY -eq 0 ]]; then
     echo "if $REAPER_UNIT.timer is installed, would run: sudo systemctl disable --now $REAPER_UNIT.timer"
   fi
   echo "--closing-session-grace off: closing sessions of $USER_NAME are never ended automatically"
+fi
+if [[ $APPLY -eq 0 ]]; then
+  echo "would preserve active housekeeping timer timing when helper/service/timer payloads are unchanged"
+  echo "would restart only a previously active timer whose helper, service or timer payload changed"
 fi
 if [[ $APPLY -eq 1 ]]; then
   systemctl is-active --quiet systemd-tmpfiles-clean.timer ||
@@ -1037,10 +1120,10 @@ if [[ $APPLY -eq 1 ]]; then
     fi
   done
   [[ -z $SSHD_BACKUP ]] || sudo rm -f "$SSHD_BACKUP"
-  sudo systemctl try-reload-or-restart ssh.service
+  sudo systemctl reload ssh.service
 else
   render_sshd_dropin | put_file 0644 root root "$SSHD_DROPIN"
-  echo "would validate with 'sudo sshd -t' and 'sudo sshd -T -C user=$USER_NAME,addr=...' for 127.0.0.1 and every --ssh-from range (restoring the previous drop-in on failure), then: sudo systemctl try-reload-or-restart ssh.service"
+  echo "would validate with 'sudo sshd -t' and 'sudo sshd -T -C user=$USER_NAME,addr=...' for 127.0.0.1 and every --ssh-from range (restoring the previous drop-in on failure), then: sudo systemctl reload ssh.service"
 fi
 
 step '7. linger, then enable the account (the last step; any earlier failure leaves it expired)'

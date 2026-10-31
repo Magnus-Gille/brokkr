@@ -165,14 +165,15 @@ case "$1" in
     if grep -qx -- "$1" "$STUB_STATE/active"; then [[ $quiet -eq 1 ]] || echo active; exit 0; fi
     [[ $quiet -eq 1 ]] || echo inactive
     exit 3 ;;
-  enable) # enable --now UNIT: starting an inactive unit runs it, an active one is left alone
+  enable) # enable --now UNIT...: starting an inactive unit runs it, an active one is left alone
     [[ ${STUB_FAIL:-} != enable ]] || exit 1
-    unit=${!#}
-    if ! grep -qx -- "$unit" "$STUB_STATE/active"; then
-      mark_active "$unit"
-      [[ $unit != *.timer ]] || exit 0
-      load "$unit"
-    fi ;;
+    for unit in "${@:3}"; do
+      if ! grep -qx -- "$unit" "$STUB_STATE/active"; then
+        mark_active "$unit"
+        [[ $unit != *.timer ]] || continue
+        load "$unit"
+      fi
+    done ;;
   disable) # disable --now UNIT
     unit=${!#}
     grep -vx -- "$unit" "$STUB_STATE/active" >"$STUB_STATE/active.new" || true
@@ -211,7 +212,11 @@ case "$1" in
     shift 3
     if [[ ${STUB_CG_MISSING:-} != 1 ]]; then printf '%s\n' "$@" | cgroup "$slice"; fi ;;
   restart) [[ $2 == *.timer ]] || load "$2" ;;
-  reload) # run the installed unit's ExecReload= lines in order; a failing line stops the rest
+  reload) # run sshd or the installed egress unit's ExecReload= lines in order
+    if [[ $2 == ssh.service ]]; then
+      [[ ${STUB_SSH_RELOAD_FAIL:-} != 1 ]] || { echo 'systemctl stub: ssh reload failed' >&2; exit 1; }
+      exit 0
+    fi
     reload_unit=${2#brokkr-agent-egress-}
     reload_unit=${reload_unit%.service}
     reload_conf="$BROKKR_AGENT_ROOT/etc/brokkr/agent-account"
@@ -316,6 +321,14 @@ for path in "$@"; do
   line=$(grep -m1 "^$path " "$STUB_STATE/stat" 2>/dev/null) || { echo "stat: cannot stat '$path'" >&2; exit 1; }
   echo "${line#* }"
 done
+EOF
+stub cmp <<'EOF'
+#!/usr/bin/env bash
+if [[ ${STUB_CMP_ERROR:-} == 1 && ( "$1" == *.timer || "$2" == *.timer || "$1" == *brokkr-agent-housekeeping* || "$2" == *brokkr-agent-housekeeping* ) ]]; then
+  echo 'cmp stub: injected comparison error' >&2
+  exit 2
+fi
+exec /usr/bin/cmp "$@"
 EOF
 stub timeout <<'EOF'
 #!/usr/bin/env bash
@@ -726,11 +739,11 @@ for setting in AuthorizedKeysCommand AuthorizedPrincipalsFile AuthorizedPrincipa
   check "the sshd drop-in sets $setting to none" grep -qxF "    $setting none" "$DROPIN"
 done
 check 'the sshd drop-in disables host-based authentication' grep -qxF '    HostbasedAuthentication no' "$DROPIN"
-check 'sshd is reloaded only after the policy check' before 'sudo sshd -T' 'sudo systemctl try-reload-or-restart ssh.service'
-check 'the account is enabled only after the sshd reload' before 'sudo systemctl try-reload-or-restart ssh.service' 'sudo usermod -p'
+check 'sshd is reloaded only after the policy check' before 'sudo sshd -T' 'sudo systemctl reload ssh.service'
+check 'the account is enabled only after the sshd reload' before 'sudo systemctl reload ssh.service' 'sudo usermod -p'
 check 'linger is enabled' has_call 'sudo loginctl enable-linger agent-dev'
 check 'linger precedes the account enable' before 'sudo loginctl enable-linger' 'sudo usermod -p'
-check 'linger follows the sshd reload' before 'sudo systemctl try-reload-or-restart ssh.service' 'sudo loginctl enable-linger'
+check 'linger follows the sshd reload' before 'sudo systemctl reload ssh.service' 'sudo loginctl enable-linger'
 # cron and at
 check 'the account is denied cron' same_content "$CRON_DENY" 'agent-dev'
 check 'the account is denied at' same_content "$AT_DENY" 'agent-dev'
@@ -748,7 +761,7 @@ check 'the tmp directory is created through systemd-tmpfiles' has_call "sudo sys
 check 'the tmp directory exists on disk under the root' test -d "$ROOT_DIR$AGENT_TMP"
 check 'the tmp directory ownership and mode are read back' has_call "sudo stat -c %F:%U:%G:%a $ROOT_DIR/var/lib/brokkr/agent-tmp $ROOT_DIR$AGENT_TMP"
 check 'the tmp directory readback is reported' out_has "ok: $AGENT_TMP is a directory owned by agent-dev with mode 700"
-check 'the tmp directory exists before sshd hands it out' before 'sudo systemd-tmpfiles --create' 'sudo systemctl try-reload-or-restart ssh.service'
+check 'the tmp directory exists before sshd hands it out' before 'sudo systemd-tmpfiles --create' 'sudo systemctl reload ssh.service'
 check 'the tmp directory is verified before the account is enabled' before 'sudo stat -c' 'sudo usermod -p'
 check 'the housekeeping helper is the repository script' cmp -s "$HELPER" "$SOURCE_REPO/scripts/agent-account-housekeeping.sh"
 WORKTREE_HELPER="$ROOT_DIR/usr/local/bin/brokkr-agent-worktree"
@@ -765,8 +778,8 @@ for unit_file in "$SWEEP_SVC" "$SWEEP_TMR"; do
   check "${unit_file##*/} is 0644 root" meta_has "$unit_file 0644 root root"
 done
 check 'the sweep timer is enabled and started' has_call 'sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer'
-check 'the sweep timer is restarted so a changed schedule applies' has_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer'
-check 'the sweep timer is restarted after it is enabled' before 'sudo systemctl enable --now brokkr-agent-tmp-sweep' 'sudo systemctl restart brokkr-agent-tmp-sweep'
+check 'an inactive sweep timer is not redundantly restarted' no_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'the inactive sweep timer is enabled before later provisioning' before 'sudo systemctl enable --now brokkr-agent-tmp-sweep' 'sudo systemctl reload ssh.service'
 check 'an inactive tmpfiles clean timer is reported' out_has 'warning: systemd-tmpfiles-clean.timer is not active'
 check 'the running user manager gets the agent environment' same_content "$STATE/user-manager.env" "$(printf '%s\n' "TMPDIR=$AGENT_TMP" "CLAUDE_CODE_TMPDIR=$AGENT_TMP")"
 
@@ -788,7 +801,7 @@ check 're-run never restarts the egress unit' no_call "sudo systemctl restart $U
 check 're-run republishes the key' same_content "$RUNKEY" "$EXPECT_KEYS"
 check 're-run applies runtime properties to the active slice' has_call "sudo systemctl set-property --runtime user-1001.slice $SLICE_PROPS"
 check 're-run does not start the active slice' no_call 'sudo systemctl start user-1001.slice'
-check 're-run reloads sshd after the policy check' before 'sudo sshd -T' 'sudo systemctl try-reload-or-restart ssh.service'
+check 're-run reloads sshd after the policy check' before 'sudo sshd -T' 'sudo systemctl reload ssh.service'
 check 're-run goes through sudo only' only_via_sudo
 check 're-run can replace existing files (uutils install)' rc_is 0
 check 're-run leaves no staging file behind' staging_cleaned
@@ -976,6 +989,23 @@ check 'the next re-run recovers after a failing reload' rc_is 0
 check 'the next re-run publishes the key again' same_content "$RUNKEY" "$EXPECT_KEYS"
 check 'the next re-run enables the account again' has_call 'sudo usermod -p * --expiredate  agent-dev'
 
+# 3f2. sshd reload-only failure must fail closed -----------------------------------------------
+reset_host
+run --apply "${BASE[@]}"
+STUB_SSH_RELOAD_FAIL=1 run --apply "${BASE[@]}"
+check 'a failing sshd reload aborts the re-run non-zero' rc_is 1
+check 'a failing sshd reload is attempted directly' has_call 'sudo systemctl reload ssh.service'
+check 'a failing sshd reload has no restart fallback' no_call 'sudo systemctl (try-reload-or-restart|restart|start) ssh.service'
+check 'a failing sshd reload keeps the account expired' stays_expired
+
+# 3f3. housekeeping comparison errors fail closed before replacement ----------------------------
+reset_host
+run --apply "${BASE[@]}"
+STUB_CMP_ERROR=1 run --apply "${BASE[@]}"
+check 'a housekeeping comparison error aborts before overwrite' rc_is 1
+check 'a housekeeping comparison error is reported as an abort' out_has 'could not compare housekeeping helper'
+check 'a housekeeping comparison error does not restart a timer' no_call 'sudo systemctl restart'
+
 # 3g. an unloaded egress table means earlier sessions ran without isolation -------------------------
 reset_host
 run --apply "${BASE[@]}"
@@ -1154,8 +1184,29 @@ for unit_file in "$REAPER_SVC" "$REAPER_TMR"; do
   check "${unit_file##*/} is 0644 root" meta_has "$unit_file 0644 root root"
 done
 check 'both timers are enabled and started' has_call 'sudo systemctl enable --now brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
-check 'both timers are restarted so changed schedules apply' has_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer brokkr-agent-session-reaper-agent-dev.timer'
+check 'fresh sweep and reaper timers are not redundantly restarted' no_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'fresh sweep and reaper timers are not redundantly restarted individually' no_call 'sudo systemctl restart brokkr-agent-session-reaper-agent-dev.timer'
 check 'the reaper says what it does' out_has 'sessions: closing sessions of agent-dev are ended after 6h'
+run --apply "${BASE[@]}" --closing-session-grace 6h
+check 'unchanged active sweep and reaper timers keep their timing' no_call 'sudo systemctl restart'
+run --apply "${BASE[@]}" --closing-session-grace 7h
+check 'a changed reaper payload restarts the active reaper timer once' has_call 'sudo systemctl restart brokkr-agent-session-reaper-agent-dev.timer'
+check 'a changed reaper payload preserves the unchanged active sweep timer' no_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'a changed reaper payload restarts no other timer' test "$(call_count 'sudo systemctl restart')" = 1
+run --apply "${BASE[@]}" --tmpfs-max-age 2d --closing-session-grace 7h
+check 'a changed sweep payload restarts the active sweep timer once' has_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'a changed sweep payload preserves the unchanged active reaper timer' no_call 'sudo systemctl restart brokkr-agent-session-reaper-agent-dev.timer'
+check 'a changed sweep payload restarts no other timer' test "$(call_count 'sudo systemctl restart')" = 1
+printf '%s\n' '# timer drift for regression' >>"$SWEEP_TMR"
+run --apply "${BASE[@]}" --tmpfs-max-age 2d --closing-session-grace 7h
+check 'a changed timer payload restarts the active sweep timer once' has_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'a changed timer payload preserves the unchanged active reaper timer' no_call 'sudo systemctl restart brokkr-agent-session-reaper-agent-dev.timer'
+check 'a changed timer payload restarts no other timer' test "$(call_count 'sudo systemctl restart')" = 1
+printf '%s\n' '# helper drift for regression' >>"$HELPER"
+run --apply "${BASE[@]}" --tmpfs-max-age 2d --closing-session-grace 7h
+check 'a changed helper restarts both previously active timers' test "$(call_count 'sudo systemctl restart')" = 2
+check 'a changed helper restarts the sweep timer' has_call 'sudo systemctl restart brokkr-agent-tmp-sweep-agent-dev.timer'
+check 'a changed helper restarts the reaper timer' has_call 'sudo systemctl restart brokkr-agent-session-reaper-agent-dev.timer'
 # the longest accepted spans render arguments the installed helper accepts
 reset_host
 run --apply "${BASE[@]}" --tmpfs-max-age 9999d --closing-session-grace 9999d

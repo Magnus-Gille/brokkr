@@ -74,7 +74,8 @@ verified, so any failure leaves it closed.
    drop-in sorts first), which on a stock `sshd_config` is the first `Include`. It is validated with
    `sshd -t`, and with `sshd -T -C` for loopback and the network address of every
    `--ssh-from` range (including the `setenv` values), before sshd is reloaded; a rejected or overridden policy restores
-   the previous drop-in. sshd never reads `~/.ssh` for this
+   the previous drop-in. The validated configuration is applied with a reload only; a reload
+   failure aborts the run and never falls back to restarting or starting sshd. sshd never reads `~/.ssh` for this
    account, so the agent cannot add keys or drop the `from=` restriction, and root never
    writes inside the agent's home.
 7. Enables linger (tmux and user services survive logout), then the account itself (no
@@ -119,6 +120,12 @@ What the provisioner sets up:
 | `/etc/tmpfiles.d/brokkr-agent-<user>.conf` (`--tmp-max-age`, default `7d`) | `systemd-tmpfiles-clean.timer` (daily) removes entries of that directory whose access, modification and change times are all older than the age. The directory itself is recreated at boot. |
 | `brokkr-agent-tmp-sweep-<user>.timer` (hourly, `--tmpfs-max-age`, default `1d`) | Runs **as the account** (never root, so it can only delete what the account itself could) in `system.slice` (a throttled agent slice cannot stall it), with no network. It removes the account's regular files and symlinks under `/tmp` whose three times are all older than the age, then its empty directories. Aged directories of the account that it cannot enter (read-only build or module trees) get `u+rwx` first. It does not enter other users' directories, and it keeps sockets and FIFOs (tmux, ssh-agent). Any other error fails the unit after both passes. It covers programs that hard-code `/tmp`. |
 | `brokkr-agent-session-reaper-<user>.timer` (opt-in: every 10 min once `--closing-session-grace` is a span such as `6h`; the default `off` installs nothing) | Root, via logind only. A session whose SSH connection is gone but whose processes remain is `State=closing`. Once a session has been seen closing for the grace period, the reaper ends it with `loginctl terminate-session`; if it is still closing on a later run (processes that ignore SIGTERM), it sends SIGKILL with `loginctl kill-session`. It keeps a session whose scope holds a tmux server with an attached client (tmux sets its socket's execute bit while a client is attached), and a session whose processes it cannot read. The first-seen and terminate times are kept in `/run/brokkr-agent-sessions/<user>`. It is resource hygiene for a cooperative account, not a security boundary. |
+
+On apply, an already-active housekeeping timer keeps its current schedule when its helper,
+service and timer payloads are byte-for-byte unchanged. A fresh or inactive timer is started by
+`enable --now`; a previously active timer is restarted only when its relevant payload changed.
+Starting or restarting a new or changed timer can immediately run an overdue `OnBootSec=` job,
+including the `/tmp` sweep, so plan a provisioning or schedule change with that behavior in mind.
 
 `CARGO_TARGET_DIR` is deliberately **not** set account-wide. Every checkout or worktree
 already builds into its own `target/` on disk. One shared target directory would serialize
