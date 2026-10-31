@@ -490,7 +490,8 @@ UNIT_NAME=brokkr-agent-egress-agent-dev.service
 SLICE_PROPS='CPUQuota=2000% CPUWeight=20 IOWeight=20 MemoryHigh=20G MemoryMax=24G MemorySwapMax=0 TasksMax=4096'
 
 EXPECT_SLICE=$'[Slice]\nCPUQuota=2000%\nCPUWeight=20\nIOWeight=20\nMemoryHigh=20G\nMemoryMax=24G\nMemorySwapMax=0\nTasksMax=4096'
-expected_nft() { # allowlist
+expected_nft() { # allowlist [exact gateway rule]
+  local ports=$1 gateway_rule=${2:-}
   printf '%s\n' '#!/usr/sbin/nft -f' \
     'table inet brokkr_agent_agent_dev' \
     'delete table inet brokkr_agent_agent_dev' \
@@ -500,8 +501,10 @@ expected_nft() { # allowlist
     "${T}${T}meta skuid 1001 ct state established,related accept" \
     "${T}${T}meta skuid 1001 fib daddr type local udp dport 53 accept" \
     "${T}${T}meta skuid 1001 fib daddr type local tcp dport 53 accept" \
-    "${T}${T}meta skuid 1001 ip daddr 127.0.0.0/8 tcp dport { $1 } accept" \
-    "${T}${T}meta skuid 1001 ip6 daddr ::1 tcp dport { $1 } accept" \
+    "${T}${T}meta skuid 1001 ip daddr 127.0.0.0/8 tcp dport { $ports } accept" \
+    "${T}${T}meta skuid 1001 ip6 daddr ::1 tcp dport { $ports } accept"
+  if [[ -n $gateway_rule ]]; then printf '%s\n' "${T}${T}meta skuid 1001 $gateway_rule"; fi
+  printf '%s\n' \
     "${T}${T}meta skuid 1001 fib daddr type local counter reject" \
     "${T}${T}meta skuid 1001 ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter reject" \
     "${T}${T}meta skuid 1001 ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } counter reject" \
@@ -811,6 +814,62 @@ check 'nft ruleset follows the new allowlist' same_content "$NFT" "$(expected_nf
 check 'reload loaded the changed ruleset' same_content "$STATE/loaded.nft" "$(expected_nft '3000, 40000-40100')"
 run --apply "${BASE[@]}" --allow-local-tcp '0080,443-443'
 check 'ports are rendered as normalised decimals' same_content "$NFT" "$(expected_nft '80, 443')"
+
+# Optional inference access is an exact per-UID endpoint and remains before generic rejects.
+run --apply "${BASE[@]}" --inference-gateway-tcp '10.23.4.5:08080'
+check 'an IPv4 inference gateway applies successfully' rc_is 0
+check 'the IPv4 inference gateway is canonical and UID-bound' same_content "$NFT" "$(expected_nft '1420, 4173, 5173, 32768-60999' 'ip daddr 10.23.4.5 tcp dport 8080 fib daddr type != broadcast accept')"
+check 'the IPv4 gateway exception precedes the generic local reject' file_before "$NFT" 'ip daddr 10.23.4.5 tcp dport 8080' 'fib daddr type local counter reject'
+check 'the IPv4 gateway exception precedes the generic private reject' file_before "$NFT" 'ip daddr 10.23.4.5 tcp dport 8080' '10.0.0.0/8, 100.64.0.0/10'
+check 'the IPv4 gateway exception retains the directed-broadcast guard' grep -qF 'ip daddr 10.23.4.5 tcp dport 8080 fib daddr type != broadcast accept' "$NFT"
+check 'the IPv4 gateway ruleset is the one nft loaded' same_content "$STATE/loaded.nft" "$(expected_nft '1420, 4173, 5173, 32768-60999' 'ip daddr 10.23.4.5 tcp dport 8080 fib daddr type != broadcast accept')"
+run --apply "${BASE[@]}" --inference-gateway-tcp '[FD00:0000:0000:0000:0000:0000:0000:0001]:00443'
+check 'an IPv6 inference gateway applies successfully' rc_is 0
+check 'the IPv6 inference gateway uses deterministic canonical form' same_content "$NFT" "$(expected_nft '1420, 4173, 5173, 32768-60999' 'ip6 daddr fd00::1 tcp dport 443 fib daddr type != broadcast accept')"
+run --inference-gateway-tcp '[fd00:0:0::1]:443' "${BASE[@]}"
+check 'dry-run accepts an equivalent IPv6 spelling' rc_is 0
+check 'dry-run prints the full canonical IPv6 rule' out_has 'meta skuid 1001 ip6 daddr fd00::1 tcp dport 443 fib daddr type != broadcast accept'
+check 'dry-run identifies the selected gateway endpoint' out_has 'inference gateway TCP allow: [fd00::1]:443'
+run --inference-gateway-tcp '127.0.0.1:8443' "${BASE[@]}"
+check 'an explicit IPv4 loopback inference gateway is accepted' rc_is 0
+check 'an explicit IPv4 loopback gateway is UID-bound' out_has 'meta skuid 1001 ip daddr 127.0.0.1 tcp dport 8443 fib daddr type != broadcast accept'
+run --inference-gateway-tcp '[::1]:8443' "${BASE[@]}"
+check 'an explicit IPv6 loopback inference gateway is accepted' rc_is 0
+check 'an explicit IPv6 loopback gateway is UID-bound' out_has 'meta skuid 1001 ip6 daddr ::1 tcp dport 8443 fib daddr type != broadcast accept'
+
+# Removing the opt-in converges back to the default loaded policy.
+run --apply "${BASE[@]}"
+check 'omitting the gateway option removes the installed exception' rc_is 0
+check 'the installed ruleset returns to the unchanged default' same_content "$NFT" "$(expected_nft '1420, 4173, 5173, 32768-60999')"
+check 'the loaded ruleset returns to the unchanged default' same_content "$STATE/loaded.nft" "$(expected_nft '1420, 4173, 5173, 32768-60999')"
+
+# Broadcast classification is routing-dependent: the exact exception must retain its FIB gate.
+run "${BASE[@]}" --inference-gateway-tcp '192.0.2.255:443'
+check 'a broadcast-shaped literal keeps the runtime broadcast guard' out_has 'meta skuid 1001 ip daddr 192.0.2.255 tcp dport 443 fib daddr type != broadcast accept'
+
+# Gateway values are a single strict literal destination. Refusals happen before any sudo call.
+for endpoint in '' 'gateway.example:443' '10.23.4.5' '10.23.4.5:0' '10.23.4.5:65536' \
+  '010.23.4.5:443' '10.999.4.5:443' '10.23.4.5:443/32' '10.23.4.5:443,10.0.0.1:443' \
+  '10.23.4.5:443;id' $'10.23.4.5:443\n' '0.1.2.3:443' \
+  '224.0.0.1:443' '240.0.0.1:443' '255.255.255.255:443' \
+  '[::]:443' '[ff02::1]:443' '[::c000:201]:443' '[::ffff:c000:201]:443' \
+  'fd00::1:443' '[fd00::1]:443-444' '[fd00::1]:443 xyz' '[fd00::1%lo]:443'; do
+  expect_refusal "rejects inference gateway '$endpoint'" '--inference-gateway-tcp' \
+    "${BASE[@]}" --inference-gateway-tcp "$endpoint"
+done
+expect_refusal 'apply rejects an injection-shaped gateway before sudo' '--inference-gateway-tcp' \
+  --apply "${BASE[@]}" --inference-gateway-tcp '192.0.2.10:443;id'
+expect_refusal 'apply rejects an unspecified gateway before sudo' '--inference-gateway-tcp' \
+  --apply "${BASE[@]}" --inference-gateway-tcp '[::]:443'
+expect_refusal 'rejects a missing inference gateway value' 'requires a value' "${BASE[@]}" --inference-gateway-tcp
+expect_refusal 'rejects repeated inference gateway options' 'may be specified only once' \
+  "${BASE[@]}" --inference-gateway-tcp '10.0.0.1:443' --inference-gateway-tcp '10.0.0.2:443'
+expect_refusal 'revoke rejects the inference gateway option' '--revoke accepts only' \
+  --revoke --user agent-dev --inference-gateway-tcp '10.0.0.1:443'
+expect_refusal 'rejects IPv4-compatible notation outside loopback' '--inference-gateway-tcp' \
+  "${BASE[@]}" --inference-gateway-tcp '[::c000:201]:443'
+expect_refusal 'rejects IPv4-mapped notation' '--inference-gateway-tcp' \
+  "${BASE[@]}" --inference-gateway-tcp '[::ffff:c000:201]:443'
 
 # 3b. dry-run against an existing managed account uses its real uid ------------------------------
 run "${BASE[@]}"

@@ -6,6 +6,7 @@
 #   provision-agent-account.sh [--apply] --user NAME --pubkey FILE --ssh-from CIDR[,CIDR...]
 #       [--cpu-quota 2000%] [--memory-high 20G] [--memory-max 24G] [--tasks-max 4096]
 #       [--allow-local-tcp '1420,4173,5173,32768-60999']
+#       [--inference-gateway-tcp IPv4:PORT|[IPv6]:PORT]
 #       [--tmp-max-age 7d] [--tmpfs-max-age 1d] [--closing-session-grace off|6h]
 #   provision-agent-account.sh --revoke [--apply] --user NAME
 #
@@ -41,6 +42,7 @@ Usage:
   provision-agent-account.sh [--apply] --user NAME --pubkey FILE --ssh-from CIDR[,CIDR...]
       [--cpu-quota 2000%] [--memory-high 20G] [--memory-max 24G] [--tasks-max 4096]
       [--allow-local-tcp '1420,4173,5173,32768-60999']
+      [--inference-gateway-tcp IPv4:PORT|[IPv6]:PORT]
       [--tmp-max-age 7d] [--tmpfs-max-age 1d] [--closing-session-grace off|6h]
   provision-agent-account.sh --revoke [--apply] --user NAME
 Dry-run unless --apply is given.
@@ -57,6 +59,12 @@ MEM_HIGH=20G
 MEM_MAX=24G
 TASKS_MAX=4096
 LOCAL_TCP='1420,4173,5173,32768-60999'
+INFERENCE_GATEWAY_TCP=
+INFERENCE_GATEWAY_GIVEN=0
+INFERENCE_GATEWAY_ADDR=
+INFERENCE_GATEWAY_PORT=
+INFERENCE_GATEWAY_FAMILY=
+INFERENCE_GATEWAY_CANONICAL=
 TMP_MAX_AGE=7d
 TMPFS_MAX_AGE=1d
 # Opt-in: the reaper cannot see deliberate detached tmux work inside a login (docs/agent-account.md).
@@ -68,7 +76,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help) usage; exit 0 ;;
     --apply) APPLY=1; shift; continue ;;
     --revoke) REVOKE=1; shift; continue ;;
-    --user|--pubkey|--ssh-from|--cpu-quota|--memory-high|--memory-max|--tasks-max|--allow-local-tcp|\
+    --user|--pubkey|--ssh-from|--cpu-quota|--memory-high|--memory-max|--tasks-max|--allow-local-tcp|--inference-gateway-tcp|\
       --tmp-max-age|--tmpfs-max-age|--closing-session-grace)
       [[ $# -ge 2 ]] || { usage >&2; die "$1 requires a value"; } ;;
     *) usage >&2; die "unknown argument: $1" ;;
@@ -82,6 +90,12 @@ while [[ $# -gt 0 ]]; do
     --memory-max) MEM_MAX=$2; PROVISION_OPTS_GIVEN=1 ;;
     --tasks-max) TASKS_MAX=$2; PROVISION_OPTS_GIVEN=1 ;;
     --allow-local-tcp) LOCAL_TCP=$2; PROVISION_OPTS_GIVEN=1 ;;
+    --inference-gateway-tcp)
+      [[ $INFERENCE_GATEWAY_GIVEN -eq 0 ]] || die '--inference-gateway-tcp may be specified only once'
+      INFERENCE_GATEWAY_TCP=$2
+      INFERENCE_GATEWAY_GIVEN=1
+      PROVISION_OPTS_GIVEN=1
+      ;;
     --tmp-max-age) TMP_MAX_AGE=$2; PROVISION_OPTS_GIVEN=1 ;;
     --tmpfs-max-age) TMPFS_MAX_AGE=$2; PROVISION_OPTS_GIVEN=1 ;;
     --closing-session-grace) CLOSING_GRACE=$2; PROVISION_OPTS_GIVEN=1 ;;
@@ -135,6 +149,100 @@ valid_ipv6() { # structural check: hex groups of 1-4 digits, eight of them or at
     done
   done
   if [[ $addr == *::* ]]; then [[ $count -le 7 ]]; else [[ $count -eq 8 ]]; fi
+}
+
+valid_ipv4_unicast() { # canonical dotted decimal, excluding unspecified/reserved/multicast/broadcast ranges
+  local addr=$1 a b c d octet
+  [[ $addr =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]] || return 1
+  IFS=. read -r a b c d <<<"$addr"
+  for octet in "$a" "$b" "$c" "$d"; do [[ $octet -le 255 ]] || return 1; done
+  [[ $a -ne 0 && $a -lt 224 ]]
+}
+
+normalize_ipv6() { # valid input -> RFC 5952-style lowercase/compressed value in NORMALIZED_IPV6
+  local addr=$1 left right group i zero_start=-1 zero_len=0 run=0 prefix='' suffix='' piece
+  local -a lhs rhs groups normalized
+  NORMALIZED_IPV6=
+  if [[ $addr == *::* ]]; then
+    left=${addr%%::*}
+    right=${addr#*::}
+    if [[ -n $left ]]; then IFS=: read -r -a lhs <<<"$left"; else lhs=(); fi
+    if [[ -n $right ]]; then IFS=: read -r -a rhs <<<"$right"; else rhs=(); fi
+    groups=()
+    if [[ -n $left ]]; then groups=("${lhs[@]}"); fi
+    for ((i = 0; i < 8 - ${#lhs[@]} - ${#rhs[@]}; i++)); do groups+=(0); done
+    if [[ -n $right ]]; then groups+=("${rhs[@]}"); fi
+  else
+    IFS=: read -r -a groups <<<"$addr"
+  fi
+  for group in "${groups[@]}"; do
+    printf -v piece '%x' "$((16#$group))"
+    normalized+=("$piece")
+  done
+  # Reject IPv4-mapped addresses and deprecated IPv4-compatible forms. Keep only ::1 from
+  # the compatible block as the ordinary IPv6 loopback address.
+  if [[ ${normalized[0]} == 0 && ${normalized[1]} == 0 && ${normalized[2]} == 0 &&
+    ${normalized[3]} == 0 && ${normalized[4]} == 0 && ${normalized[5]} == ffff ]]; then
+    return 1
+  fi
+  if [[ ${normalized[0]} == 0 && ${normalized[1]} == 0 && ${normalized[2]} == 0 &&
+    ${normalized[3]} == 0 && ${normalized[4]} == 0 && ${normalized[5]} == 0 ]]; then
+    [[ ${normalized[6]} == 0 && ${normalized[7]} == 1 ]] || return 1
+  fi
+  (( 16#${normalized[0]} < 16#ff00 )) || return 1
+
+  for ((i = 0; i < 8; i++)); do
+    if [[ ${normalized[$i]} == 0 ]]; then
+      run=$((run + 1))
+    else
+      if [[ $run -gt $zero_len ]]; then zero_start=$((i - run)); zero_len=$run; fi
+      run=0
+    fi
+  done
+  if [[ $run -gt $zero_len ]]; then zero_start=$((8 - run)); zero_len=$run; fi
+  [[ $zero_len -lt 2 ]] && zero_start=-1
+  if [[ $zero_start -lt 0 ]]; then
+    NORMALIZED_IPV6=$(IFS=:; printf '%s' "${normalized[*]}")
+  else
+    for ((i = 0; i < zero_start; i++)); do prefix+="${prefix:+:}${normalized[$i]}"; done
+    for ((i = zero_start + zero_len; i < 8; i++)); do suffix+="${suffix:+:}${normalized[$i]}"; done
+    if [[ -n $prefix && -n $suffix ]]; then NORMALIZED_IPV6="$prefix::$suffix"
+    elif [[ -n $prefix ]]; then NORMALIZED_IPV6="$prefix::"
+    elif [[ -n $suffix ]]; then NORMALIZED_IPV6="::$suffix"
+    else NORMALIZED_IPV6=::
+    fi
+  fi
+}
+
+parse_inference_gateway() {
+  local endpoint=$1 addr port family
+  INFERENCE_GATEWAY_ADDR=
+  INFERENCE_GATEWAY_PORT=
+  INFERENCE_GATEWAY_FAMILY=
+  INFERENCE_GATEWAY_CANONICAL=
+  if [[ $endpoint =~ ^([0-9]{1,3}(\.[0-9]{1,3}){3}):([0-9]{1,5})$ ]]; then
+    addr=${endpoint%:*}
+    port=${endpoint##*:}
+    valid_ipv4_unicast "$addr" || return 1
+    family=ip
+  elif [[ $endpoint =~ ^\[([0-9a-fA-F:]+)\]:([0-9]{1,5})$ ]]; then
+    addr=${BASH_REMATCH[1]}
+    port=${BASH_REMATCH[2]}
+    valid_ipv6 "$addr" || return 1
+    normalize_ipv6 "$addr" || return 1
+    addr=$NORMALIZED_IPV6
+    family=ip6
+  else
+    return 1
+  fi
+  port=$((10#$port))
+  [[ $port -ge 1 && $port -le 65535 ]] || return 1
+  INFERENCE_GATEWAY_ADDR=$addr
+  INFERENCE_GATEWAY_PORT=$port
+  INFERENCE_GATEWAY_FAMILY=$family
+  if [[ $family == ip6 ]]; then INFERENCE_GATEWAY_CANONICAL="[$addr]:$port"
+  else INFERENCE_GATEWAY_CANONICAL="$addr:$port"
+  fi
 }
 
 valid_cidr() {
@@ -225,6 +333,11 @@ if [[ $REVOKE -eq 0 ]]; then
   for cidr in "${cidr_items[@]}"; do
     valid_cidr "$cidr" || die "--ssh-from entry is not an IPv4/IPv6 CIDR with explicit prefix: $cidr"
   done
+
+  if [[ $INFERENCE_GATEWAY_GIVEN -eq 1 ]]; then
+    parse_inference_gateway "$INFERENCE_GATEWAY_TCP" ||
+      die '--inference-gateway-tcp must be one literal IPv4:PORT or [IPv6]:PORT with a valid unicast address and TCP port 1-65535'
+  fi
 
   MEM_HIGH_BYTES=$(to_bytes "$MEM_HIGH") || die '--memory-high must look like 20G (1-6 digits, K/M/G/T)'
   MEM_MAX_BYTES=$(to_bytes "$MEM_MAX") || die '--memory-max must look like 24G (1-6 digits, K/M/G/T)'
@@ -357,7 +470,11 @@ render_nft() {
     "${t}${t}$m fib daddr type local udp dport 53 accept" \
     "${t}${t}$m fib daddr type local tcp dport 53 accept" \
     "${t}${t}$m ip daddr 127.0.0.0/8 tcp dport { $LOCAL_TCP_RENDERED } accept" \
-    "${t}${t}$m ip6 daddr ::1 tcp dport { $LOCAL_TCP_RENDERED } accept" \
+    "${t}${t}$m ip6 daddr ::1 tcp dport { $LOCAL_TCP_RENDERED } accept"
+  if [[ -n $INFERENCE_GATEWAY_ADDR ]]; then
+    printf '%s\n' "${t}${t}$m $INFERENCE_GATEWAY_FAMILY daddr $INFERENCE_GATEWAY_ADDR tcp dport $INFERENCE_GATEWAY_PORT fib daddr type != broadcast accept"
+  fi
+  printf '%s\n' \
     "${t}${t}$m fib daddr type local counter reject" \
     "${t}${t}$m ip daddr { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } counter reject" \
     "${t}${t}$m ip6 daddr { fc00::/7, fe80::/10, ff00::/8 } counter reject" \
@@ -638,6 +755,9 @@ print_mode
 echo "target: user=$USER_NAME home=$HOME_DIR ssh-from=$SSH_FROM"
 echo "budget: CPUQuota=$CPU_QUOTA MemoryHigh=$MEM_HIGH MemoryMax=$MEM_MAX TasksMax=$TASKS_MAX"
 echo "egress: loopback TCP allowlist { $LOCAL_TCP_RENDERED }"
+if [[ -n $INFERENCE_GATEWAY_CANONICAL ]]; then
+  echo "egress: inference gateway TCP allow: $INFERENCE_GATEWAY_CANONICAL"
+fi
 
 step '1. account (kept expired until every protection is verified)'
 if [[ $EXISTS -eq 1 ]]; then
