@@ -100,6 +100,32 @@ stub usermod <<'EOF'
 #!/usr/bin/env bash
 [[ -n ${STUB_SUDO:-} ]] || printf 'usermod %s\n' "$*" >>"$STUB_CALLS"
 [[ ${STUB_FAIL:-} != usermod ]] || { echo 'usermod stub: cannot lock the account' >&2; exit 1; }
+# Model the external command's password-changing arguments against synthetic data only.
+if [[ -f "$STUB_STATE/fake-shadow-marker" ]]; then
+  for argument in "$@"; do
+    case $argument in
+      -p*|--password|--password=*|-U*|--unlock)
+        printf '%s\n' PASSWORD_FIELD_REPLACED >"$STUB_STATE/fake-shadow-marker"
+        break ;;
+    esac
+  done
+fi
+EOF
+stub passwd <<'EOF'
+#!/usr/bin/env bash
+[[ -n ${STUB_SUDO:-} ]] || printf 'passwd %s\n' "$*" >>"$STUB_CALLS"
+[[ $1 == -S && $# == 2 ]] || { echo "passwd stub: unexpected: $*" >&2; exit 99; }
+count_file="$STUB_STATE/passwd-status-count"
+count=$(cat "$count_file" 2>/dev/null || echo 0)
+count=$((count + 1))
+printf '%s\n' "$count" >"$count_file"
+[[ ${STUB_PASSWD_FAIL_ON:-} != "$count" ]] || { echo 'passwd stub: status unavailable' >&2; exit 1; }
+if [[ $count -eq 2 && ${STUB_EXTERNAL_PASSWORD_CHANGE:-} == 1 ]]; then
+  printf '%s\n' LOCKED_CHANGED_EXTERNALLY >"$STUB_STATE/fake-shadow-marker"
+fi
+var="STUB_PASSWD_OUTPUT_$count"
+output=${!var:-${STUB_PASSWD_OUTPUT:-"$2 L 1970-01-01 0 99999 7 -1"}}
+printf '%s\n' "$output"
 EOF
 stub loginctl <<'EOF'
 #!/usr/bin/env bash
@@ -468,15 +494,17 @@ last_sudo_is() { [[ "$(grep '^sudo ' "$CALLS" | tail -1)" == "$1" ]]; }
 first_sudo_is() { [[ "$(grep -m1 '^sudo ' "$CALLS")" == "$1" ]]; }
 cg_is() { [[ "$(cat "$CGDIR/$1" 2>/dev/null)" == "$2" ]]; }
 # Only private mktemp staging cleanup is allowed without sudo.
-only_via_sudo() { ! grep -E '^(useradd|usermod|loginctl|nft|install|chmod|mv|rm|systemd-tmpfiles) ' "$CALLS" |
+only_via_sudo() { ! grep -E '^(useradd|usermod|passwd|loginctl|nft|install|chmod|mv|rm|systemd-tmpfiles) ' "$CALLS" |
   # Only the provisioner's own mktemp staging cleanup is unprivileged.
   grep -vqE '^rm (-f [^ ]*/brokkr-agent-account\.[A-Za-z0-9]+|-rf [^ ]*/brokkr-agent-housekeeping\.[A-Za-z0-9]+)$' &&
   no_call '^systemctl (daemon-reload|enable|disable|start|restart|reload|try-reload-or-restart|set-property|--user)'; }
 staging_cleaned() { ! ls "${TMPDIR:-/tmp}"/brokkr-agent-account.* >/dev/null 2>&1; }
-nothing_mutated() { only_via_sudo && no_call '^sudo '; }
-stays_expired() { no_call 'usermod -p ' && no_call 'enable-linger'; }
+nothing_mutated() {
+  only_via_sudo && ! grep '^sudo ' "$CALLS" | grep -qvxF 'sudo passwd -S agent-dev'
+}
+stays_expired() { no_call 'usermod -p ' && no_call 'usermod --expiredate  ' && no_call 'enable-linger'; }
 refused() { # pattern: rc 64, prefixed message, no mutation at all
-  [[ $RC -eq 64 ]] && out_has 'brokkr agent account:' && out_has "$1" && nothing_mutated
+  [[ $RC -eq 64 ]] && out_has 'brokkr agent account:' && out_has "$1" && nothing_mutated && no_call 'passwd -S'
 }
 expect_refusal() { # description pattern script-args...
   local desc=$1 pattern=$2
@@ -598,7 +626,124 @@ seed_user() { # name uid groups [marker-uid]
   fi
 }
 
+seed_preserve_user() {
+  seed_user agent-dev 1500 agent-dev 1500
+  # Synthetic non-secret sentinels: the provisioner must never inspect or alter password material.
+  printf 'LOCKED_MARKER_A\nLOCKED_MARKER_B\n' >"$STATE/fake-shadow-marker"
+}
+
+preserve_marker_unchanged() { same_content "$STATE/fake-shadow-marker" $'LOCKED_MARKER_A\nLOCKED_MARKER_B'; }
+preserve_usermod_only() {
+  ! grep '^sudo usermod ' "$CALLS" |
+    grep -vxF -e 'sudo usermod --expiredate 1 agent-dev' -e 'sudo usermod --expiredate  agent-dev' |
+    grep -q .
+}
+status_reads() { [[ "$(call_count 'sudo passwd -S agent-dev')" == "$1" ]]; }
+status_precedes_lockdown() { before 'sudo passwd -S agent-dev' 'sudo usermod --expiredate 1 agent-dev'; }
+last_status_precedes_linger() {
+  local status linger
+  status=$(grep -nF 'sudo passwd -S agent-dev' "$CALLS" | tail -1 | cut -d: -f1)
+  linger=$(call_line 'sudo loginctl enable-linger agent-dev')
+  [[ -n $status && -n $linger && $status -lt $linger ]]
+}
+status_immediately_precedes_linger() {
+  local status next
+  status=$(grep -nF 'sudo passwd -S agent-dev' "$CALLS" | tail -1 | cut -d: -f1)
+  next=$(sed -n "$((status + 1))p" "$CALLS")
+  [[ -n $status && $next == 'sudo loginctl enable-linger agent-dev' ]]
+}
+preserve_dryrun_readonly() { nothing_mutated && preserve_marker_unchanged; }
+fresh_refused_early() { [[ $RC -eq 64 ]] && nothing_mutated && no_call 'passwd -S'; }
+uid_refused_early() { [[ $RC -eq 64 ]] && nothing_mutated && no_call 'passwd -S'; }
+invalid_status_refused() { [[ $RC -eq 64 ]] && out_has 'locked password status'; }
+invalid_status_stops_enable() { no_call 'loginctl enable-linger|usermod --expiredate  '; }
+failed_status_refused() { [[ $RC -eq 64 ]] && out_has 'locked password status'; }
+late_status_aborts_before_enable() {
+  local status expired
+  status=$(grep -nF 'sudo passwd -S agent-dev' "$CALLS" | tail -1 | cut -d: -f1)
+  expired=$(call_line 'sudo usermod --expiredate 1 agent-dev')
+  [[ -n $expired && -n $status && $expired -lt $status ]] &&
+    no_call 'loginctl enable-linger|usermod --expiredate  '
+}
+
 echo provision-agent-account.test.sh
+
+# 0. preserve an existing locked password only under an explicit, verified contract ----------------
+reset_host
+seed_preserve_user
+run --apply --preserve-existing-locked-password 1500 "${BASE[@]}"
+check 'preserve mode accepts an existing managed account with locked password status' rc_is 0
+check 'preserve mode verifies the account status before its first lockdown mutation' status_precedes_lockdown
+check 'preserve mode checks locked status before linger and account enable' last_status_precedes_linger
+check 'preserve mode rechecks status immediately before linger' status_immediately_precedes_linger
+check 'preserve mode checks status initially and again immediately before linger' status_reads 2
+check 'preserve mode clears expiry exactly once before starting the user manager' test "$(call_count 'sudo usermod --expiredate  agent-dev')" = 1
+check 'preserve mode enables the account before the user manager' before 'sudo usermod --expiredate  agent-dev' 'sudo systemctl start user@1500.service'
+check 'preserve mode never sets, unlocks or replaces a password' preserve_usermod_only
+check 'preserve mode leaves synthetic locked markers unchanged' preserve_marker_unchanged
+reset_host
+seed_preserve_user
+STUB_EXTERNAL_PASSWORD_CHANGE=1 run --apply --preserve-existing-locked-password 1500 "${BASE[@]}"
+check 'preserve mode succeeds without restoring a stale synthetic password preimage' rc_is 0
+check 'preserve mode preserves an external synthetic password-field update' same_content "$STATE/fake-shadow-marker" LOCKED_CHANGED_EXTERNALLY
+reset_host
+seed_preserve_user
+run --apply "${BASE[@]}"
+check 'default existing-account mode still succeeds without password-status probing' rc_is 0
+check 'default existing-account mode does not call passwd' no_call 'passwd -S'
+check 'default existing-account mode keeps its original password-setting behavior' has_call 'sudo usermod -p * --expiredate  agent-dev'
+reset_host
+seed_preserve_user
+run --preserve-existing-locked-password 1500 "${BASE[@]}"
+check 'preserve mode dry-run accepts locked existing account' rc_is 0
+check 'preserve mode dry-run reads status once without mutation' status_reads 1
+check 'preserve mode dry-run plans expiry clear without password replacement' out_has "would run: sudo usermod --expiredate '' agent-dev"
+check 'preserve mode dry-run leaves the account and marker untouched' preserve_dryrun_readonly
+reset_host
+run --apply --preserve-existing-locked-password 1500 "${BASE[@]}"
+check 'preserve mode refuses a fresh account' rc_is 64
+check 'fresh-account refusal names the existing-managed-account requirement' out_has 'requires an existing managed account'
+check 'fresh-account refusal reads no password status and mutates nothing' fresh_refused_early
+reset_host
+seed_preserve_user
+run --apply --preserve-existing-locked-password 1501 "${BASE[@]}"
+check 'preserve mode refuses a mismatched expected uid' rc_is 64
+check 'uid mismatch is named' out_has 'does not match'
+check 'uid mismatch does not read status or mutate' uid_refused_early
+for invalid_uid in 0 01500 +1500 1500x; do
+  reset_host
+  seed_preserve_user
+  run --apply --preserve-existing-locked-password "$invalid_uid" "${BASE[@]}"
+  check "preserve mode refuses non-canonical uid '$invalid_uid' before status or mutation" uid_refused_early
+done
+expect_refusal 'preserve mode rejects a missing uid value' 'requires a value' --preserve-existing-locked-password "${BASE[@]}"
+expect_refusal 'preserve mode rejects a repeated option' 'may be specified only once' --preserve-existing-locked-password 1500 --preserve-existing-locked-password 1500 "${BASE[@]}"
+expect_refusal 'revoke rejects preserve mode' '--revoke accepts only' --revoke --user agent-dev --preserve-existing-locked-password 1500
+for status_output in \
+  'agent-dev P 1970-01-01 0 99999 7 -1' \
+  'agent-dev NP 1970-01-01 0 99999 7 -1' \
+  'agent-dev X 1970-01-01 0 99999 7 -1' \
+  'agent-dev L' \
+  'other L 1970-01-01 0 99999 7 -1' \
+  $'agent-dev L 1970-01-01 0 99999 7 -1\nagent-dev L 1970-01-01 0 99999 7 -1'; do
+  reset_host
+  seed_preserve_user
+  STUB_PASSWD_OUTPUT="$status_output" run --apply --preserve-existing-locked-password 1500 "${BASE[@]}"
+  check 'non-locked or malformed password status refuses preserve mode' invalid_status_refused
+  check 'invalid status does not proceed to linger or expiry clear' invalid_status_stops_enable
+done
+reset_host
+seed_preserve_user
+STUB_PASSWD_FAIL_ON=1 run --apply --preserve-existing-locked-password 1500 "${BASE[@]}"
+check 'failed initial status refuses preserve mode' failed_status_refused
+check 'failed initial status mutates nothing' nothing_mutated
+reset_host
+seed_preserve_user
+STUB_PASSWD_OUTPUT_2='agent-dev P 1970-01-01 0 99999 7 -1' run --apply --preserve-existing-locked-password 1500 "${BASE[@]}"
+check 'late password-status change aborts preserve mode' rc_is 1
+check 'late status failure says account stays expired' out_has 'account stays expired'
+check 'late status failure follows lockdown but precedes linger and expiry clear' late_status_aborts_before_enable
+check 'late status failure leaves synthetic locked markers unchanged' preserve_marker_unchanged
 
 # 1. dry-run -------------------------------------------------------------------------------------
 reset_host
