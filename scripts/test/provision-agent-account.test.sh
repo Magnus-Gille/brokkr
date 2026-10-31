@@ -469,7 +469,8 @@ first_sudo_is() { [[ "$(grep -m1 '^sudo ' "$CALLS")" == "$1" ]]; }
 cg_is() { [[ "$(cat "$CGDIR/$1" 2>/dev/null)" == "$2" ]]; }
 # The only unprivileged mutation allowed is removing put_file's own staging file.
 only_via_sudo() { ! grep -E '^(useradd|usermod|loginctl|nft|install|chmod|mv|rm|systemd-tmpfiles) ' "$CALLS" |
-  grep -vqE '^rm -f [^ ]*/brokkr-agent-account\.[A-Za-z0-9]+$' &&
+  # Only the provisioner's own mktemp staging cleanup is unprivileged.
+  grep -vqE '^rm (-f [^ ]*/brokkr-agent-account\.[A-Za-z0-9]+|-rf [^ ]*/brokkr-agent-housekeeping\.[A-Za-z0-9]+)$' &&
   no_call '^systemctl (daemon-reload|enable|disable|start|restart|reload|try-reload-or-restart|set-property|--user)'; }
 staging_cleaned() { ! ls "${TMPDIR:-/tmp}"/brokkr-agent-account.* >/dev/null 2>&1; }
 nothing_mutated() { only_via_sudo && no_call '^sudo '; }
