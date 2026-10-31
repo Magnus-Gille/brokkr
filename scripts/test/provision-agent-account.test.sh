@@ -467,7 +467,7 @@ file_before() { # file earlier-line later-line (first occurrence of each)
 last_sudo_is() { [[ "$(grep '^sudo ' "$CALLS" | tail -1)" == "$1" ]]; }
 first_sudo_is() { [[ "$(grep -m1 '^sudo ' "$CALLS")" == "$1" ]]; }
 cg_is() { [[ "$(cat "$CGDIR/$1" 2>/dev/null)" == "$2" ]]; }
-# The only unprivileged mutation allowed is removing put_file's own staging file.
+# Only private mktemp staging cleanup is allowed without sudo.
 only_via_sudo() { ! grep -E '^(useradd|usermod|loginctl|nft|install|chmod|mv|rm|systemd-tmpfiles) ' "$CALLS" |
   # Only the provisioner's own mktemp staging cleanup is unprivileged.
   grep -vqE '^rm (-f [^ ]*/brokkr-agent-account\.[A-Za-z0-9]+|-rf [^ ]*/brokkr-agent-housekeeping\.[A-Za-z0-9]+)$' &&

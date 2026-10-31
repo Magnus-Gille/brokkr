@@ -452,7 +452,10 @@ put_file() { # mode owner group path; content on stdin
 }
 
 payload_same() { # rendered-file target label; missing target means changed, malformed target aborts
-  local rendered=$1 target=$2 label=$3 status
+  local rendered=$1 target=$2 label=$3 status parent
+  parent=${target%/*}
+  [[ -d $parent && -r $parent && -x $parent ]] ||
+    fatal "cannot inspect parent of $label; the account stays expired"
   if [[ ! -e $target && ! -L $target ]]; then return 1; fi
   [[ -f $target && ! -L $target && -r $target ]] ||
     fatal "$label is not a readable regular non-symlink file; the account stays expired"
