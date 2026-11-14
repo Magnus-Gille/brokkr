@@ -25,6 +25,9 @@ WorkingDirectory=%h/.local/lib/brokkr/archive-nearsite/releases/@REVISION@
 ExecStart=/usr/bin/env -i HOME=%h PATH=@UNIT_PATH@ LANG=@UNIT_LANG@ %h/.local/lib/brokkr/archive-nearsite/releases/@REVISION@/scripts/archive-nearsite.sh --config @ARCHIVE_CONFIG@ --delivery-env @DELIVERY_ENV@ --verify
 Nice=10
 IOSchedulingClass=idle
+# Makes systemd account the run's block reads, so `systemctl --user show -p IOReadBytes brokkr-archive-nearsite.service`
+# reports how much of the near-site copy the check actually read.
+IOAccounting=yes
 NoNewPrivileges=yes
 PrivateTmp=yes
 # strict makes the whole filesystem read-only (ReadWritePaths is only an exception list:

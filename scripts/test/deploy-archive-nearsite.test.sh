@@ -443,6 +443,7 @@ check "rendered unit loads no EnvironmentFile and has no blacklist (allowlist mo
 check "no secret is on the rendered command line (only file paths follow --delivery-env and --config)" '! grep -q "secret-sentinel" "$SERVICE" && ! grep -Eq "^ExecStart=.*(HEIMDALL_|TOKEN)" "$SERVICE"'
 check "rendered unit has no leftover placeholders, system-only directives, or old layout" '! grep -Eq "@[A-Z_]+@|^OnFailure|^User=|^SupplementaryGroups|/opt/brokkr|/home/brokkr|rclone" "$SERVICE" && grep -Fxq NoNewPrivileges=yes "$SERVICE" && grep -Fxq PrivateTmp=yes "$SERVICE"'
 check "rendered unit is sandboxed: read-only home, only the state dir writable, 12h timeout" 'grep -Fxq ProtectSystem=strict "$SERVICE" && grep -Fxq ProtectHome=read-only "$SERVICE" && grep -Fxq "ReadWritePaths=%h/.local/state/brokkr" "$SERVICE" && grep -Fxq TimeoutStartSec=12h "$SERVICE" && grep -Fxq Nice=10 "$SERVICE" && grep -Fxq IOSchedulingClass=idle "$SERVICE"'
+check "rendered unit enables IOAccounting so the run's IOReadBytes is recorded" 'grep -Fxq IOAccounting=yes "$SERVICE"'
 check "apply says a catch-up run can start after an upgrade and not on a first install" '[[ "$OUT" == *"catch-up"* && "$OUT" == *"first install"* ]]'
 check "timer runs on the 2nd, after the archive node's run on the 1st" 'grep -Fxq "OnCalendar=*-*-02 03:30:00" "$TIMER" && grep -Fxq Persistent=true "$TIMER" && grep -Fxq RandomizedDelaySec=2h "$TIMER"'
 check "timer is installed from the template" 'cmp -s "$TIMER" "$REPO/systemd/user/brokkr-archive-nearsite.timer"'
