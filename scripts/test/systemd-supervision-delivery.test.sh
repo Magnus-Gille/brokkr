@@ -130,6 +130,7 @@ console.log(results.join("\n"));
 process.exit(results.some((r) => r.startsWith("FAIL")) ? 1 : 0);
 NODE
 LIB_OUT="$(ROOT="$ROOT" STALE="$TMP/audit.json" FRESH="$TMP/fresh.json" node "$TMP/lib-test.mjs" 2>&1)"; LIB_RC=$?
+: "$LIB_RC"
 while IFS= read -r line; do
   case "$line" in PASS*) ok "${line#PASS }";; FAIL*) bad "${line#FAIL }";; esac
 done <<<"$LIB_OUT"
@@ -138,6 +139,7 @@ check "lib suite exits 0" '[[ $LIB_RC -eq 0 ]]'
 # ---- CLI behaviour (never reaches the network) ----
 CREDS="$TMP/creds"; mkdir -m 0700 "$CREDS"
 CRED_NAME="brokkr-systemd-supervision-delivery-v1"
+# shellcheck disable=SC2120,SC2034  # RC is read inside check's eval; cli takes no args
 cli() { CREDENTIALS_DIRECTORY="$CREDS" node "$ROOT/scripts/systemd-supervision-delivery.mjs" "$@" <"$INPUT" >"$TMP/out" 2>"$TMP/err"; RC=$?; }
 
 INPUT="$TMP/fresh.json"
@@ -158,6 +160,7 @@ check "stale audit is a visible failure even when delivery is disabled" '[[ $RC 
 
 INPUT="$TMP/fresh.json"
 CREDENTIALS_DIRECTORY="$CREDS" node "$ROOT/scripts/systemd-supervision-delivery.mjs" --endpoint x <"$INPUT" >"$TMP/out" 2>"$TMP/err"; RC=$?
+: "$RC"
 check "arguments (endpoint/token) are refused" '[[ $RC -eq 1 ]] && grep -q arguments_forbidden "$TMP/err"'
 
 printf 'garbage' >"$TMP/garbage"; INPUT="$TMP/garbage"; cli
