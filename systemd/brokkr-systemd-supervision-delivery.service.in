@@ -1,0 +1,34 @@
+[Unit]
+Description=Deliver Brokkr systemd supervision audit to Heimdall
+Documentation=https://github.com/Magnus-Gille/brokkr/blob/main/docs/systemd-supervision-delivery.md
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+PrivateDevices=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+UMask=0077
+LoadCredential=brokkr-systemd-supervision-delivery-v1
+Environment=PATH=/usr/bin:/bin
+# The audit exits 1 when it has findings but still emits the document; only a
+# missing/invalid document (exit 2, empty stdout) or a delivery failure makes
+# this unit fail. The pipeline status is the delivery program's.
+# @RELEASE_DIR@ and the four @..._PATH@ inputs are owner-provisioned at install
+# time; none is committed.
+ExecStart=/usr/bin/bash -c '/usr/bin/node @RELEASE_DIR@/scripts/systemd-supervision-audit.mjs --baseline @RELEASE_DIR@/docs/systemd-supervision-baseline-v1.json --registry @REGISTRY_PATH@ --declarations @DECLARATIONS_PATH@ --observations @OBSERVATIONS_PATH@ | /usr/bin/node @RELEASE_DIR@/scripts/systemd-supervision-delivery.mjs'
+TimeoutStartSec=60
+
+# There is deliberately no [Install] section: the unit is inert until the
+# owner ceremony renders the placeholders, provisions the protected credential,
+# and starts the timer.

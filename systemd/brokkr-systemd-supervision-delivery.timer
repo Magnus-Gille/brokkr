@@ -1,0 +1,13 @@
+# Brokkr · deliver the systemd supervision audit to Heimdall every 15 minutes.
+# Heimdall's freshness window rejects anything older, so a stopped timer shows
+# up as a stale supervision projection rather than silent success.
+[Unit]
+Description=Deliver Brokkr systemd supervision audit every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+Unit=brokkr-systemd-supervision-delivery.service
+
+[Install]
+WantedBy=timers.target
