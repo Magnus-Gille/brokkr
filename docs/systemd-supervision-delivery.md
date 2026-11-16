@@ -27,6 +27,18 @@ node scripts/systemd-supervision-audit.mjs … | node scripts/systemd-supervisio
 - Output is one JSON line or a content-free error code on stderr. No endpoint, token, or
   payload is ever printed; arguments are refused.
 
+## Known constraints (verify on a host before enabling)
+
+- Heimdall keys the stored audit on `observed_at` and answers `409 observation_conflict` for a
+  *different* document with the same `observed_at`. The audit takes `observed_at` from the
+  observations file and `evaluated_at` from the clock, so a run that re-evaluates **unrefreshed**
+  observations is rejected (the unit fails, visibly) and, once `max_age_seconds` passes, is
+  `observation_stale` anyway. The observations producer must refresh before each run; the timer
+  cadence must not exceed that refresh. Only a retry within one run is byte-identical.
+- The credential check requires mode 0400/0600, as the maintenance-result delivery does. If systemd
+  grants a `DynamicUser` read through an ACL (mode 0440) the unit fails closed with `config_unsafe`;
+  confirm on the target host.
+
 ## Configuration (host-owned, never committed)
 
 systemd `LoadCredential=brokkr-systemd-supervision-delivery-v1` supplies a root- or
