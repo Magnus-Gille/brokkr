@@ -150,6 +150,9 @@ gatewayports no
 permittunnel no
 permituserenvironment no
 POLICY
+  if [[ "${MOCK_SSHD_MATCH_FORWARD:-}" == 1 && "$*" == *addr=100.64.0.7* ]]; then
+    printf 'allowtcpforwarding yes\n'
+  fi
 fi
 EOF
 cat >"$TMP/bin/testparm" <<'EOF'
@@ -328,6 +331,21 @@ check "confirmation receipt records all three probe classes" \
   python3 -c 'import json,sys; x=json.load(open(sys.argv[1])); assert x["status"]=="confirmed"; assert set(x["external_probes"].values())=={"pass","rejected"}' "$TMP/state/transactions/$TXID/transaction.json"
 if MOCK_WEAK_SHARE=1 "$SCRIPT" verify --config "$CONFIG" >"$TMP/weak-share.out" 2>&1; then weak_share_rc=0; else weak_share_rc=$?; fi
 check "post-apply verifier rejects a share-level guest/public override" test "$weak_share_rc" -ne 0
+
+# A Match block that re-enables forwarding for one client address is invisible
+# to the localhost-only evaluation; declared probe contexts must catch it.
+PROBE_CONFIG="$TMP/probe.conf"
+{ cat "$CONFIG"; printf 'ssh_probe_context=operator|100.64.0.7\n'; } >"$PROBE_CONFIG"
+chmod 0600 "$PROBE_CONFIG"
+if MOCK_SSHD_MATCH_FORWARD=1 "$SCRIPT" verify --config "$PROBE_CONFIG" >"$TMP/match-forward.out" 2>&1; then match_rc=0; else match_rc=$?; fi
+check "verifier rejects a Match override visible only in a declared probe context" test "$match_rc" -ne 0
+if "$SCRIPT" verify --config "$PROBE_CONFIG" >"$TMP/match-clean.out" 2>&1; then match_clean_rc=0; else match_clean_rc=$?; fi
+check "verifier accepts clean declared probe contexts" test "$match_clean_rc" -eq 0
+BAD_PROBE="$TMP/bad-probe.conf"
+{ cat "$CONFIG"; printf 'ssh_probe_context=operator|not-an-ip\n'; } >"$BAD_PROBE"
+chmod 0600 "$BAD_PROBE"
+if "$SCRIPT" render --config "$BAD_PROBE" >"$TMP/bad-probe.out" 2>&1; then bad_probe_rc=0; else bad_probe_rc=$?; fi
+check "a non-IP probe context is refused" test "$bad_probe_rc" -ne 0
 
 # Exercise an explicit rollback from a second transaction and prove that a
 # pending watchdog transaction fences concurrent applies.
