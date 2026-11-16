@@ -55,6 +55,7 @@ required to run or understand Brokkr.
 | `scripts/archive-nearsite.sh` | Pinned-manifest `sha256sum --check` of the near-site archive copy, run by the NAS itself, with its own [monthly Heimdall panel](docs/archive-nearsite.md) |
 | `scripts/offline-rotation.sh` | Owner-attended, never-deleting copy to a LUKS2 [offline rotation disk](docs/offline-rotation.md), with sha256, SMART and freshness checks; `offline-rotation-format.sh` is the guarded one-time format ceremony |
 | `scripts/memory-cgroup-preflight.py` | Read-only [Pi/Linux memory-controller gate and approved bounded-unit verification](docs/pi-memory-cgroups.md) |
+| `scripts/host-boundary-audit.py`, `scripts/root-at-rest-inventory.py` | Read-only, content-blind [boundary audit](runbooks/nas-control-node-boundary-hardening.md) and [root at-rest inventory](runbooks/nas-control-node-root-at-rest.md) for the NAS and control node |
 | `scripts/m5-fde-preflight.sh` | Read-only M5 LUKS/Secure Boot/TPM and backup-evidence ceremony gate |
 | `scripts/m5-network-profile.py` | Default-deny M5 UFW plus pre-INPUT tailnet/SSH/Samba/inference transaction with timed rollback and independent confirmation |
 | `scripts/provision-agent-account.sh` | Dry-run-first provisioning of an unprivileged, resource-bounded, egress-isolated [agent/build account](docs/agent-account.md) |
