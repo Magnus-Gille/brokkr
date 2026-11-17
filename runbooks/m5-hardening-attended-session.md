@@ -139,7 +139,7 @@ Never stop a timer to regain access. Roll back first.
    too would need a deliberate profile extension and review.
 4. **Passwordless sudo review**: a design question; agents rely on `sudo -n`.
    Out of scope here; track in GOPS-11.
-5. Delete `~/iceage-uninstall-20261002.tar.gz` only after the owner confirms.
+5. Host-local cleanup leftovers are tracked in GOPS-11, not in this public repo.
 
 ## 7. Rollback matrix
 
