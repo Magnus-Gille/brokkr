@@ -87,7 +87,8 @@ Copy the public example outside the checkout. Replace its documentation values
 from the baseline. List every inference listener, including loopback-only ones.
 Time Machine normally needs TCP 445 only; retaining TCP 139, UDP 137/138, or
 `nmbd` requires `retain_netbios=true` and a specific
-`netbios_exception_reason`. Enabling SSH X11, agent, or TCP forwarding similarly
+`netbios_exception_reason`. Add one `ssh_probe_context=user|ip` line per extra account/client the
+verifier must find hardened (covers `Match` overrides). Enabling SSH X11, agent, or TCP forwarding similarly
 requires a specific `ssh_exception_reason`.
 
 The mutation runs as root and the parser compares profile ownership with its

@@ -52,6 +52,7 @@ KNOWN_KEYS = {
     "ssh_tcp_forwarding",
     "ssh_x11_forwarding",
     "ssh_exception_reason",
+    "ssh_probe_context",
     "rollback_seconds",
 }
 NFT_TABLE = "brokkr_m5_tailnet"
@@ -96,6 +97,7 @@ class Profile:
     ssh_tcp_forwarding: bool = False
     ssh_x11_forwarding: bool = False
     ssh_exception_reason: str = ""
+    ssh_probe_contexts: list[tuple[str, str]] = field(default_factory=list)
     rollback_seconds: int = 300
 
 
@@ -168,7 +170,7 @@ def load_profile(path: Path) -> Profile:
             refuse(f"configuration line {number} has an empty or padded value")
         values.setdefault(key, []).append(value)
 
-    singletons = KNOWN_KEYS - {"tailscale_transport", "samba_rule", "listener"}
+    singletons = KNOWN_KEYS - {"tailscale_transport", "samba_rule", "listener", "ssh_probe_context"}
     for key in singletons:
         if len(values.get(key, [])) > 1:
             refuse(f"{key} may appear only once")
@@ -228,6 +230,17 @@ def load_profile(path: Path) -> Profile:
         refuse("retaining NetBIOS requires a specific reviewed exception reason")
     if (profile.ssh_agent_forwarding or profile.ssh_tcp_forwarding or profile.ssh_x11_forwarding) and len(profile.ssh_exception_reason.strip()) < 12:
         refuse("enabling SSH forwarding requires a specific reviewed exception reason")
+    for value in values.get("ssh_probe_context", []):
+        user, address = split_exact("ssh_probe_context", value, 2)
+        if not USER_RE.fullmatch(user):
+            refuse("ssh_probe_context user is not a safe local account name")
+        try:
+            ipaddress.ip_address(address)
+        except ValueError:
+            refuse("ssh_probe_context address must be an exact IP address")
+        if (user, address) in profile.ssh_probe_contexts:
+            refuse("ssh_probe_context entries must be unique")
+        profile.ssh_probe_contexts.append((user, address))
     try:
         profile.rollback_seconds = int(first(values, "rollback_seconds", "300"))
     except ValueError:
@@ -814,11 +827,14 @@ def verify(profile: Profile) -> None:
     if Counter(actual_rules) != expected_rules:
         refuse("post-apply verifier: active UFW allowances differ from the exact rendered profile")
 
-    sshd = run(["sshd", "-T", "-C", f"user={profile.operator_user},host=localhost,addr=127.0.0.1"], check=False)
-    effective = effective_map(sshd.stdout)
-    for key, expected in ssh_expected(profile).items():
-        if effective.get(key) != expected:
-            refuse(f"post-apply verifier: effective sshd {key} is not {expected}")
+    # Match blocks (Match Address/User/Group) can re-enable what the global
+    # policy disabled for one client; evaluate every declared context too.
+    for ssh_user, ssh_addr in [(profile.operator_user, "127.0.0.1"), *profile.ssh_probe_contexts]:
+        sshd = run(["sshd", "-T", "-C", f"user={ssh_user},host=localhost,addr={ssh_addr}"], check=False)
+        effective = effective_map(sshd.stdout)
+        for key, expected in ssh_expected(profile).items():
+            if effective.get(key) != expected:
+                refuse(f"post-apply verifier: effective sshd {key} is not {expected} for user {ssh_user} at {ssh_addr}")
 
     samba = run(["testparm", "-s"], check=False)
     smb = effective_map(samba.stdout)
