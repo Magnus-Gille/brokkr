@@ -2,7 +2,7 @@ BROKKR_SSH_TARGET ?= brokkr@control-node
 BROKKR_REMOTE_DIR ?= /opt/brokkr
 export OVERLAY COMMIT
 
-.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install agent-cli-update agent-cli-update-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight systemd-supervision-audit m5-network-render m5-network-preflight control-node-ssh-preflight test shellcheck
+.PHONY: patching maintenance-os maintenance-deps offsite-photos offsite-photos-dryrun offsite-photos-install agent-cli-update agent-cli-update-install deploy-control-node node-inventory inspect relocation-plan relocation-apply maintenance-plan maintenance-controller maintenance-executor m5-fde-preflight systemd-supervision-audit m5-network-render m5-network-preflight control-node-ssh-preflight host-boundary-audit root-at-rest-inventory test shellcheck
 
 patching: ## Install/refresh unattended-upgrades on all Pi hosts (ARGS="--dry-run" or a host)
 	@./scripts/setup-host-patching.sh $(ARGS)
@@ -64,6 +64,12 @@ m5-network-preflight: ## Run the non-mutating M5 network-profile gate (CONFIG=..
 
 control-node-ssh-preflight: ## Run the read-only control-node OpenSSH cutover preflight (ARGS="operator|host --phase ...")
 	@python3 scripts/control-node-ssh-cutover.py $(ARGS)
+
+host-boundary-audit: ## Run the read-only, content-blind listener/SSH/SMB boundary audit on this host (ARGS="--role nas --context user@addr")
+	@python3 scripts/host-boundary-audit.py $(ARGS)
+
+root-at-rest-inventory: ## Run the read-only, content-blind block-layer encryption inventory on this host (ARGS="--role nas --store label=/mount")
+	@python3 scripts/root-at-rest-inventory.py $(ARGS)
 
 maintenance-os: ## Run the OS maintenance report on the service host (ARGS="--dry-run --verbose")
 	@ssh $(BROKKR_SSH_TARGET) 'cd $(BROKKR_REMOTE_DIR) && bash scripts/maintenance-report.sh os $(ARGS)'
