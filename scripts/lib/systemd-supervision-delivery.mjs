@@ -31,6 +31,18 @@ const exact = (value, keys) => (
   keys.every((key) => Object.hasOwn(value, key))
 );
 
+/**
+ * Pure mode/owner predicate for the credential file. 0400/0600 are accepted for
+ * a trusted owner; 0440 (systemd's ACL mask under LoadCredential) only when the
+ * file is root:root, so a non-root owner can never widen read access to a group.
+ */
+export function credentialModeAllowed(stat, trustedOwners) {
+  const mode = stat.mode & 0o7777;
+  if (!trustedOwners.has(stat.uid)) return false;
+  if (mode === 0o400 || mode === 0o600) return true;
+  return mode === 0o440 && stat.uid === 0 && stat.gid === 0;
+}
+
 /** Read the protected credential. Mirrors the maintenance-result delivery guards. */
 export function readProtectedConfig(env = process.env) {
   const directory = env.CREDENTIALS_DIRECTORY;
@@ -53,9 +65,7 @@ export function readProtectedConfig(env = process.env) {
     fail("config_unsafe");
   }
   try {
-    const mode = stat.mode & 0o7777;
-    if (!stat.isFile() || !trustedOwners.has(stat.uid) ||
-        ![0o400, 0o440, 0o600].includes(mode) || stat.size < 2 || stat.size > MAX_CONFIG_BYTES) {
+    if (!stat.isFile() || !credentialModeAllowed(stat, trustedOwners) || stat.size < 2 || stat.size > MAX_CONFIG_BYTES) {
       fail("config_unsafe");
     }
     try { return JSON.parse(fs.readFileSync(descriptor, "utf8")); } catch { fail("config_invalid"); }

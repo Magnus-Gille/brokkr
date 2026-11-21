@@ -42,8 +42,9 @@ node scripts/systemd-supervision-audit.mjs … | node scripts/systemd-supervisio
 ## Configuration (host-owned, never committed)
 
 systemd `LoadCredential=brokkr-systemd-supervision-delivery-v1` supplies a root- or
-service-owned, mode `0400`/`0440`/`0600` JSON file (`0440` is what systemd
-`LoadCredential=` with `DynamicUser=` typically exposes; any other group/other bit is refused):
+service-owned, mode `0400`/`0600` JSON file; mode `0440` is accepted only for a `root:root` file
+(assumed to be systemd's ACL mask under `LoadCredential=` with `DynamicUser=`; verify with
+`stat` and `getfacl` on the host before install). Any other group/other bit is refused:
 
 ```json
 {"kind":"brokkr-systemd-supervision-delivery-config","schema_version":"v1",
@@ -64,7 +65,9 @@ token is the dedicated Heimdall supervision credential; never copy it into git, 
    service/timer, restart, watchdog, OOM, notifier, and freshness distinctions intact.
 
 Notes: the unit uses `ProtectHome=read-only` so a release directory under `/home` stays
-readable. No observations refresher ships yet (BROKKR-176); until one exists, 409
+readable, but a home directory with mode 0700/0750 and unreadable registry, declarations or
+observations paths still stops the dynamic user (a tighter alternative, `tmpfs` plus
+`BindReadOnlyPaths=`, is a possible follow-up). No observations refresher ships yet (BROKKR-176); until one exists, 409
 `observation_conflict` and `observation_stale` failures are expected on unrefreshed inputs.
 
 ## Rollback

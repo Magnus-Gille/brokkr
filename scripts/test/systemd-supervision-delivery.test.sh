@@ -102,6 +102,18 @@ await t("4xx (auth/schema/replay rejection) is a visible failure and not retried
     assert.equal(n, 1);
   }
 });
+await t("credential mode predicate: 0440 only for root:root (BROKKR-175)", () => {
+  const owners = new Set([0, 1000]);
+  const st = (uid, gid, mode) => ({ uid, gid, mode: 0o100000 | mode });
+  assert.equal(lib.credentialModeAllowed(st(0, 0, 0o440), owners), true);
+  assert.equal(lib.credentialModeAllowed(st(1000, 1000, 0o440), owners), false);
+  assert.equal(lib.credentialModeAllowed(st(0, 1000, 0o440), owners), false);
+  assert.equal(lib.credentialModeAllowed(st(0, 0, 0o660), owners), false);
+  assert.equal(lib.credentialModeAllowed(st(0, 0, 0o640), owners), false);
+  assert.equal(lib.credentialModeAllowed(st(1000, 1000, 0o600), owners), true);
+  assert.equal(lib.credentialModeAllowed(st(1000, 1000, 0o400), owners), true);
+  assert.equal(lib.credentialModeAllowed(st(4242, 0, 0o400), owners), false);
+});
 await t("exhausted retries fail visibly without leaking the token", async () => {
   const fetchFn = async () => { throw new TypeError(`boom ${TOKEN}`); };
   const message = await code(() => lib.deliver(freshBytes, transport, { fetchFn, sleep: async () => {} }));
@@ -154,12 +166,6 @@ chmod 0660 "$CREDS/$CRED_NAME"
 cli
 check "group-writable credential is unsafe" '[[ $RC -eq 1 ]] && grep -q "config_unsafe" "$TMP/err"'
 
-# systemd LoadCredential (DynamicUser) exposes the file as 0440 (BROKKR-175)
-chmod 0440 "$CREDS/$CRED_NAME"
-INPUT="$TMP/fresh.json"
-cli
-check "0440 credential from LoadCredential is accepted" '[[ $RC -eq 0 ]] && grep -q delivery_disabled "$TMP/out"'
-
 chmod 0600 "$CREDS/$CRED_NAME"
 cli
 check "disabled config delivers nothing and exits 0 (rollback path)" '[[ $RC -eq 0 ]] && grep -q "\"delivered\":false" "$TMP/out" && grep -q delivery_disabled "$TMP/out"'
@@ -176,11 +182,10 @@ check "arguments (endpoint/token) are refused" '[[ $RC -eq 1 ]] && grep -q argum
 printf 'garbage' >"$TMP/garbage"; INPUT="$TMP/garbage"; cli
 check "garbage stdin is rejected" '[[ $RC -eq 1 ]] && grep -q audit_invalid "$TMP/err"'
 
-printf '{"kind":"brokkr-systemd-supervision-delivery-config","schema_version":"v1","enabled":true,"endpoint":"https://heimdall.example.invalid/api/systemd-supervision","bearer_token":"dedicated-token-sentinel_1234567890"}' >"$CREDS/$CRED_NAME"
+printf '{"kind":"brokkr-systemd-supervision-delivery-config","schema_version":"v1","enabled":true,"endpoint":"http://heimdall.example.invalid/api/systemd-supervision","bearer_token":"dedicated-token-sentinel_1234567890"}' >"$CREDS/$CRED_NAME"
 INPUT="$TMP/fresh.json"
 # Non-https endpoint fails config validation before any network use, so this
 # exercises the real error path with the token present in the credential.
-sed -i 's#https://heimdall#http://heimdall#' "$CREDS/$CRED_NAME"
 cli
 check "invalid enabled config fails without network" '[[ $RC -eq 1 ]] && grep -q endpoint_invalid "$TMP/err"'
 check "token never appears in CLI output" '! grep -rq "dedicated-token-sentinel" "$TMP/out" "$TMP/err"'
