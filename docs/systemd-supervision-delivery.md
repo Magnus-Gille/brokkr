@@ -42,7 +42,9 @@ node scripts/systemd-supervision-audit.mjs … | node scripts/systemd-supervisio
 ## Configuration (host-owned, never committed)
 
 systemd `LoadCredential=brokkr-systemd-supervision-delivery-v1` supplies a root- or
-service-owned, mode `0400`/`0600` JSON file:
+service-owned, mode `0400`/`0600` JSON file; mode `0440` is accepted only for a `root:root` file
+(assumed to be systemd's ACL mask under `LoadCredential=` with `DynamicUser=`; verify with
+`stat` and `getfacl` on the host before install). Any other group/other bit is refused:
 
 ```json
 {"kind":"brokkr-systemd-supervision-delivery-config","schema_version":"v1",
@@ -62,8 +64,15 @@ token is the dedicated Heimdall supervision credential; never copy it into git, 
 3. Start the timer; verify `/supervision` in Heimdall shows a current audit with the
    service/timer, restart, watchdog, OOM, notifier, and freshness distinctions intact.
 
+Notes: the unit uses `ProtectHome=read-only` so a release directory under `/home` stays
+readable, but a home directory with mode 0700/0750 and unreadable registry, declarations or
+observations paths still stops the dynamic user (a tighter alternative, `tmpfs` plus
+`BindReadOnlyPaths=`, is a possible follow-up). No observations refresher ships yet (BROKKR-176); until one exists, 409
+`observation_conflict` and `observation_stale` failures are expected on unrefreshed inputs.
+
 ## Rollback
 
-Set `"enabled": false` in the credential (the program then delivers nothing and exits 0),
+Set `"enabled": false` in the credential (the program then delivers nothing and exits 0, provided the piped audit is fresh and valid:
+audit parsing precedes the config read, so a stale or invalid audit still fails the unit),
 or stop/disable the timer. Brokkr's local audit producer is unchanged. Heimdall will show
 the projection as stale once the freshness window passes.
