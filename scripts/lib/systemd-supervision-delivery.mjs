@@ -55,7 +55,7 @@ export function readProtectedConfig(env = process.env) {
   try {
     const mode = stat.mode & 0o7777;
     if (!stat.isFile() || !trustedOwners.has(stat.uid) ||
-        ![0o400, 0o600].includes(mode) || stat.size < 2 || stat.size > MAX_CONFIG_BYTES) {
+        ![0o400, 0o440, 0o600].includes(mode) || stat.size < 2 || stat.size > MAX_CONFIG_BYTES) {
       fail("config_unsafe");
     }
     try { return JSON.parse(fs.readFileSync(descriptor, "utf8")); } catch { fail("config_invalid"); }

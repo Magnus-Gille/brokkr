@@ -150,6 +150,16 @@ printf '{"kind":"brokkr-systemd-supervision-delivery-config","schema_version":"v
 cli
 check "group/other-readable credential is unsafe" '[[ $RC -eq 1 ]] && grep -q "config_unsafe" "$TMP/err"'
 
+chmod 0660 "$CREDS/$CRED_NAME"
+cli
+check "group-writable credential is unsafe" '[[ $RC -eq 1 ]] && grep -q "config_unsafe" "$TMP/err"'
+
+# systemd LoadCredential (DynamicUser) exposes the file as 0440 (BROKKR-175)
+chmod 0440 "$CREDS/$CRED_NAME"
+INPUT="$TMP/fresh.json"
+cli
+check "0440 credential from LoadCredential is accepted" '[[ $RC -eq 0 ]] && grep -q delivery_disabled "$TMP/out"'
+
 chmod 0600 "$CREDS/$CRED_NAME"
 cli
 check "disabled config delivers nothing and exits 0 (rollback path)" '[[ $RC -eq 0 ]] && grep -q "\"delivered\":false" "$TMP/out" && grep -q delivery_disabled "$TMP/out"'
@@ -168,6 +178,11 @@ check "garbage stdin is rejected" '[[ $RC -eq 1 ]] && grep -q audit_invalid "$TM
 
 printf '{"kind":"brokkr-systemd-supervision-delivery-config","schema_version":"v1","enabled":true,"endpoint":"https://heimdall.example.invalid/api/systemd-supervision","bearer_token":"dedicated-token-sentinel_1234567890"}' >"$CREDS/$CRED_NAME"
 INPUT="$TMP/fresh.json"
+# Non-https endpoint fails config validation before any network use, so this
+# exercises the real error path with the token present in the credential.
+sed -i 's#https://heimdall#http://heimdall#' "$CREDS/$CRED_NAME"
+cli
+check "invalid enabled config fails without network" '[[ $RC -eq 1 ]] && grep -q endpoint_invalid "$TMP/err"'
 check "token never appears in CLI output" '! grep -rq "dedicated-token-sentinel" "$TMP/out" "$TMP/err"'
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

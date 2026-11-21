@@ -9,7 +9,7 @@ Type=oneshot
 DynamicUser=yes
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectHome=yes
+ProtectHome=read-only
 ProtectSystem=strict
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
@@ -24,7 +24,7 @@ Environment=PATH=/usr/bin:/bin
 # The audit exits 1 when it has findings but still emits the document; only a
 # missing/invalid document (exit 2, empty stdout) or a delivery failure makes
 # this unit fail. The pipeline status is the delivery program's.
-# @RELEASE_DIR@ and the four @..._PATH@ inputs are owner-provisioned at install
+# @RELEASE_DIR@ and the three @..._PATH@ inputs are owner-provisioned at install
 # time; none is committed.
 ExecStart=/usr/bin/bash -c '/usr/bin/node @RELEASE_DIR@/scripts/systemd-supervision-audit.mjs --baseline @RELEASE_DIR@/docs/systemd-supervision-baseline-v1.json --registry @REGISTRY_PATH@ --declarations @DECLARATIONS_PATH@ --observations @OBSERVATIONS_PATH@ | /usr/bin/node @RELEASE_DIR@/scripts/systemd-supervision-delivery.mjs'
 TimeoutStartSec=60
